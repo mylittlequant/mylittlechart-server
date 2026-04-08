@@ -97,6 +97,7 @@ confirm = true
 endpoint = "/health"
 
 [dependencies]
-upstream = []
+# Serves mylittlechart-landing (static web + WASM) via tower_http ServeDir
+upstream = ["mylittlechart-landing"]
 # cloudflared tunnel exposes this server publicly as mylittlechart.org
 downstream = ["cloudflared-mylittlechart"]
