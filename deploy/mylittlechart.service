@@ -1,0 +1,29 @@
+[Unit]
+Description=mylittlechart.org server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mlc
+Group=mlc
+WorkingDirectory=/opt/mylittlechart
+ExecStart=/opt/mylittlechart/zengeld-server
+Restart=always
+RestartSec=5
+
+# Environment
+Environment=PORT=3000
+Environment=DATA_DIR=/opt/mylittlechart/data
+Environment=RUST_LOG=zengeld_server=info
+EnvironmentFile=-/opt/mylittlechart/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mylittlechart/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

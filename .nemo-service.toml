@@ -1,0 +1,102 @@
+[service]
+name = "zengeld-server"
+kind = "http_api"
+display_name = "Zengeld Server"
+description = "Backend для mylittlechart.org — auth, sync, OTA, telegram bot, agent keys"
+
+[links]
+public_url = "https://mylittlechart.org"
+local_url = "http://127.0.0.1:19200"
+admin_url = "http://127.0.0.1:19237"
+docs = "zengeld-server/docs/"
+
+[[endpoints]]
+method = "GET"
+path = "/health"
+description = "Health check"
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/heartbeat"
+description = "Client heartbeat — reports client alive, version, telemetry"
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/telemetry"
+description = "Submit anonymous telemetry data"
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/updates/latest"
+description = "Get latest release metadata for OTA updates"
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/admin/restart"
+description = "Gracefully restart the server process"
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/admin/upload"
+description = "Upload a new release binary"
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/admin/promote"
+description = "Promote an uploaded binary to latest"
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/auth/device-code"
+description = "Start device authorization flow — returns device code"
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/auth/poll"
+description = "Poll device authorization flow for completion"
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/sync/push"
+description = "Push cloud sync changes from client"
+auth = "bearer"
+public = false
+
+[[manage_actions]]
+id = "graceful_restart"
+label = "Graceful Restart"
+description = "Trigger a graceful server restart via admin API"
+method = "POST"
+path = "/api/admin/restart"
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+confirm = true
+
+[health]
+endpoint = "/health"
+
+[dependencies]
+upstream = []
+# cloudflared tunnel exposes this server publicly as mylittlechart.org
+downstream = ["cloudflared-mylittlechart"]
