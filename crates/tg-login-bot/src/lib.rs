@@ -1,6 +1,6 @@
 //! Telegram login bot — handles /start commands for web login flow.
 //!
-//! Runs as a background tokio task inside zengeld-server using raw Telegram
+//! Runs as a background tokio task inside mylittlechart-server using raw Telegram
 //! Bot API via reqwest (no teloxide dependency).
 
 use std::sync::Arc;

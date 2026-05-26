@@ -1,4 +1,4 @@
-//! zengeld-server — production server for mylittlechart.org
+//! mylittlechart-server — production server for mylittlechart.org
 //!
 //! Serves:
 //! - Static landing page from `../landing-pure/web/`
@@ -65,7 +65,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "zengeld_server=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "mylittlechart_server=info,tower_http=info".into()),
         )
         .init();
 
@@ -126,7 +126,7 @@ async fn main() {
     std::fs::create_dir_all(&binaries_dir).expect("Failed to create data/binaries directory");
 
     // Initialize SQLite database.
-    let db_path = format!("{}/zengeld.db", data_dir);
+    let db_path = format!("{}/mylittlechart.db", data_dir);
     let db_conn = db::init_db(&db_path).expect("Failed to initialize SQLite database");
     tracing::info!("Database initialized at {}", db_path);
 
@@ -347,7 +347,7 @@ async fn main() {
 
     // Bind both listeners.
     let main_addr = format!("0.0.0.0:{}", port);
-    tracing::info!("zengeld-server listening on {}", main_addr);
+    tracing::info!("mylittlechart-server listening on {}", main_addr);
     let main_listener = tokio::net::TcpListener::bind(&main_addr)
         .await
         .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", main_addr, e));

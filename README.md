@@ -1,4 +1,4 @@
-# zengeld-server
+# mylittlechart-server
 
 Backend server for mylittlechart.org — serves landing page, distributes OTA updates, collects telemetry, and handles OAuth authentication.
 
@@ -6,7 +6,7 @@ Backend server for mylittlechart.org — serves landing page, distributes OTA up
 
 Production (via Cloudflare Tunnel on port 19200):
 ```bash
-cd c:\Users\VA PC\CODING\ML_TRADING\nemo\zengeld-server
+cd c:\Users\VA PC\CODING\ML_TRADING\nemo\mylittlechart-server
 bash run-server.sh       # wrapper — auto-restarts on exit
 ```
 
@@ -19,11 +19,11 @@ cargo build --release
 
 The server runs inside a wrapper script (`run-server.sh` / `run-server.bat`) that auto-restarts the process after graceful shutdown. Downtime: ~1.5 seconds (Cloudflare retries during this window).
 
-**Key trick**: the wrapper copies the binary to `zengeld-server-running.exe` before launching, so cargo can always overwrite the original `target/release/zengeld-server.exe` without "access denied" — the running process uses the copy.
+**Key trick**: the wrapper copies the binary to `mylittlechart-server-running.exe` before launching, so cargo can always overwrite the original `target/release/mylittlechart-server.exe` without "access denied" — the running process uses the copy.
 
 ```bash
 # 1. Build new binary (NEVER blocked — running process uses a copy)
-cd c:\Users\VA PC\CODING\ML_TRADING\nemo\zengeld-server
+cd c:\Users\VA PC\CODING\ML_TRADING\nemo\mylittlechart-server
 cargo build --release
 
 # 2. Trigger graceful restart (wrapper copies new binary → starts it)
@@ -31,7 +31,7 @@ curl -s -X POST http://127.0.0.1:19200/api/admin/restart \
   -H "Authorization: Bearer <ADMIN_SECRET>"
 ```
 
-Flow: `cargo build` → overwrites `zengeld-server.exe` (unlocked) → `POST /admin/restart` → server exits → wrapper deletes old `-running` copy → copies new build to `-running` → starts it.
+Flow: `cargo build` → overwrites `mylittlechart-server.exe` (unlocked) → `POST /admin/restart` → server exits → wrapper deletes old `-running` copy → copies new build to `-running` → starts it.
 
 To stop permanently (no restart): `touch data/stop-server` before sending restart.
 
@@ -104,7 +104,7 @@ To stop permanently (no restart): `touch data/stop-server` before sending restar
 ## Directory Structure
 
 ```
-c:\Users\VA PC\CODING\ML_TRADING\nemo\zengeld-server\
+c:\Users\VA PC\CODING\ML_TRADING\nemo\mylittlechart-server\
 ├── Cargo.toml                    # [workspace] — members = ["crates/*"]
 ├── .env                          # ADMIN_SECRET + OAuth credentials
 ├── run-server.sh                 # Restart-loop wrapper (bash). Copies exe to -running before launch.
@@ -115,7 +115,7 @@ c:\Users\VA PC\CODING\ML_TRADING\nemo\zengeld-server\
 │   ├── setup.sh                  # Server setup script
 │   └── upload-release.sh         # Release upload helper
 ├── data/
-│   ├── zengeld.db                # SQLite (WAL mode)
+│   ├── mylittlechart.db                # SQLite (WAL mode)
 │   └── binaries/
 │       └── win64/
 │           └── {version}/zengeld-win64-{version}.exe

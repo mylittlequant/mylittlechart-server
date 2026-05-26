@@ -8,14 +8,14 @@ Type=simple
 User=mlc
 Group=mlc
 WorkingDirectory=/opt/mylittlechart
-ExecStart=/opt/mylittlechart/zengeld-server
+ExecStart=/opt/mylittlechart/mylittlechart-server
 Restart=always
 RestartSec=5
 
 # Environment
 Environment=PORT=3000
 Environment=DATA_DIR=/opt/mylittlechart/data
-Environment=RUST_LOG=zengeld_server=info
+Environment=RUST_LOG=mylittlechart_server=info
 EnvironmentFile=-/opt/mylittlechart/.env
 
 # Security hardening

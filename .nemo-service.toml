@@ -1,14 +1,14 @@
 [service]
-name = "zengeld-server"
+name = "mylittlechart-server"
 kind = "http_api"
-display_name = "Zengeld Server"
+display_name = "mylittlechart Server"
 description = "Backend для mylittlechart.org — auth, sync, OTA, telegram bot, agent keys"
 
 [links]
 public_url = "https://mylittlechart.org"
 local_url = "http://127.0.0.1:19200"
 admin_url = "http://127.0.0.1:19237"
-docs = "zengeld-server/docs/"
+docs = "mylittlechart-server/docs/"
 
 [[endpoints]]
 method = "GET"

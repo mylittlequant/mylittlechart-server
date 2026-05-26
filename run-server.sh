@@ -1,8 +1,8 @@
 #!/bin/bash
-# Wrapper script: runs zengeld-server in a restart loop.
+# Wrapper script: runs mylittlechart-server in a restart loop.
 #
 # Key trick: copies the binary to a versioned name before running,
-# so cargo can always overwrite target/release/zengeld-server.exe
+# so cargo can always overwrite target/release/mylittlechart-server.exe
 # without "access denied" — the running process uses the copy.
 #
 # Deploy flow: cargo build --release → curl -X POST .../api/admin/restart
@@ -12,7 +12,7 @@
 
 cd "$(dirname "$0")"
 
-SOURCE_BINARY="./target/release/zengeld-server.exe"
+SOURCE_BINARY="./target/release/mylittlechart-server.exe"
 STOP_FILE="./data/stop-server"
 
 while true; do
@@ -24,10 +24,10 @@ while true; do
     fi
 
     # Copy binary to a versioned name so cargo can freely overwrite the original
-    RUNNING_BINARY="./target/release/zengeld-server-running.exe"
+    RUNNING_BINARY="./target/release/mylittlechart-server-running.exe"
     cp -f "$SOURCE_BINARY" "$RUNNING_BINARY" 2>/dev/null
 
-    echo "[wrapper] Starting zengeld-server..."
+    echo "[wrapper] Starting mylittlechart-server..."
     "$RUNNING_BINARY"
     EXIT_CODE=$?
     echo "[wrapper] Server exited with code $EXIT_CODE"

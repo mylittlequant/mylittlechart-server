@@ -11,13 +11,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 NEMO_DIR="$(cd "$ROOT_DIR/.." && pwd)"
 
-echo "=== Building zengeld-server (release) ==="
+echo "=== Building mylittlechart-server (release) ==="
 cd "$ROOT_DIR"
 cargo build --release
 
 echo "=== Uploading binary ==="
-scp "$ROOT_DIR/target/release/zengeld-server" "$SERVER:$APP_DIR/zengeld-server.new"
-ssh "$SERVER" "mv $APP_DIR/zengeld-server.new $APP_DIR/zengeld-server && chmod +x $APP_DIR/zengeld-server"
+scp "$ROOT_DIR/target/release/mylittlechart-server" "$SERVER:$APP_DIR/mylittlechart-server.new"
+ssh "$SERVER" "mv $APP_DIR/mylittlechart-server.new $APP_DIR/mylittlechart-server && chmod +x $APP_DIR/mylittlechart-server"
 
 echo "=== Uploading landing page ==="
 scp -r "$NEMO_DIR/mylittlechart-landing/web/"* "$SERVER:$APP_DIR/static/"

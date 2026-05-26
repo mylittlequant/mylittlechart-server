@@ -1164,12 +1164,12 @@ fn render_html(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="30">
-<title>zengeld-server admin</title>
+<title>mylittlechart-server admin</title>
 <style>{style}</style>
 </head>
 <body>
 <header>
-    <h1>zengeld-server &mdash; admin dashboard</h1>
+    <h1>mylittlechart-server &mdash; admin dashboard</h1>
     <span class="refresh-note">auto-refresh every 30s</span>
 </header>
 <main>

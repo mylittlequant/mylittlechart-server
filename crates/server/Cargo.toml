@@ -1,10 +1,10 @@
 [package]
-name = "zengeld-server"
+name = "mylittlechart-server"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "zengeld-server"
+name = "mylittlechart-server"
 path = "src/main.rs"
 
 [dependencies]

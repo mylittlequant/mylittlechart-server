@@ -321,7 +321,7 @@ async fn exchange_code_for_identity(
 
             #[derive(serde::Deserialize)]
             struct GithubUser { id: u64, login: String, name: Option<String> }
-            let user: GithubUser = fetch_json(&http, "https://api.github.com/user", &access_token, Some("zengeld-server/0.1"))
+            let user: GithubUser = fetch_json(&http, "https://api.github.com/user", &access_token, Some("mylittlechart-server/0.1"))
                 .await
                 .map_err(|e| e)?;
 
@@ -781,7 +781,7 @@ async fn github_callback(state: Arc<AppState>, req: OAuthCallbackRequest) -> Res
         name: Option<String>,
     }
 
-    let user: GithubUser = match fetch_json(&http, "https://api.github.com/user", &access_token, Some("zengeld-server/0.1")).await {
+    let user: GithubUser = match fetch_json(&http, "https://api.github.com/user", &access_token, Some("mylittlechart-server/0.1")).await {
         Ok(u) => u,
         Err(e) => return e,
     };
