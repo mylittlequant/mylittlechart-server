@@ -87,11 +87,21 @@ pub async fn run_watch_loop(state: Arc<OpsdState>) {
             "public health down; box state probed"
         );
         let needs_unlock = bs.waiting_for_key
-            || matches!(bs.service, ServiceState::Inactive | ServiceState::Failed);
+            || matches!(bs.service, ServiceState::Inactive | ServiceState::Failed)
+            // Post-reboot state: tmpfs wiped, service stuck in ExecStartPre
+            // waiting for the key — systemctl reports "activating".
+            || (!bs.keyfile_present && !matches!(bs.service, ServiceState::Active));
         if !needs_unlock {
             // Service is up but public health fails — that is a tunnel/DNS/
             // nginx class problem, not something unlock can fix.
             tracing::error!("service active but public health down — not an unlock case, manual look needed");
+            state.audit(
+                "watch_skip",
+                &format!(
+                    "service={} keyfile_present={} waiting={}",
+                    bs.service_raw, bs.keyfile_present, bs.waiting_for_key
+                ),
+            );
             continue;
         }
 
