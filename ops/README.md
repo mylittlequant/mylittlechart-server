@@ -14,6 +14,15 @@ box** (zero new attack surface). See the plan:
 | pulled backups | `env/backups/mlc-utah-1/*.gcm` | encrypted; `backup-decrypt` to restore |
 | box snapshots | `/var/lib/mlc/backups/` on mlc-utah-1 | daily via `mlc-backup.timer` (03:17 UTC), 14 retained |
 | prod watch | d-watchdog `mlc-prod-vps` (external) | https://mylittlechart.org/health monitoring on opbox |
+| auto-unlock | d-watchdog process `mlc-guard` (`ops/mlc-guard.py`) | 60s loop: health down twice -> ssh probe -> if service waits for key / failed: boot-unlock (push key+secrets to box tmpfs, start), re-verify |
+
+## Reboot semantics
+
+The server waits for the SQLCipher key BEFORE binding ports, so a box reboot
+shows as health-down. `mlc-guard` detects that state and delivers the key —
+no operator action needed. Note: opbox is behind home NAT, the box cannot
+reach opbox, so the model is "box signals state by being down, opbox guard
+reacts" rather than a box-pulled queue.
 
 ## Daily use
 
