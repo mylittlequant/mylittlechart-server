@@ -26,7 +26,7 @@ KEY = os.path.join(NEMO, "env", "mlc-utah-box")
 SSH = ["ssh", "-i", KEY, "-o", "StrictHostKeyChecking=accept-new",
        "-o", "ConnectTimeout=15", "-o", "BatchMode=yes", HOST]
 SCP = ["scp", "-q", "-i", KEY, "-o", "StrictHostKeyChecking=accept-new"]
-BACKUP_DIR_OPBOX = os.path.join(NEMO, "env", "backups", "mlc-utah-1")
+BACKUP_DIR_OPBOX = os.path.join("E:\\", "backups", "mlc-utah-1")  # key stays on C: (env/backups/backup-key) — E: alone leaks nothing
 
 
 def sh(cmd, check=True):
@@ -99,8 +99,10 @@ def _encrypt_file(path):
 
 def cmd_backup_pull():
     os.makedirs(BACKUP_DIR_OPBOX, exist_ok=True)
+    import re
     rc, out = sh("ls -1t /var/lib/mlc/backups/")
-    files = [l for l in out.splitlines() if l.strip()]
+    # whitelist filenames — a compromised box must not inject paths/names
+    files = [l for l in out.splitlines() if re.fullmatch(r"[A-Za-z0-9.-]+\.(db|tar\.gz)", l.strip() or "")]
     if not files:
         sys.exit("no backups on box")
     latest_db = next((f for f in files if f.endswith(".db")), None)
@@ -110,6 +112,11 @@ def cmd_backup_pull():
         subprocess.run(SCP + [f"{HOST}:/var/lib/mlc/backups/{name}", dst], check=True)
         print("pulled:", name)
         _encrypt_file(dst)
+    import glob, time
+    snaps = sorted(glob.glob(os.path.join(BACKUP_DIR_OPBOX, "*.db.gcm")), key=os.path.getmtime)
+    for old in snaps[:-30]:
+        os.remove(old)
+        print("pruned:", os.path.basename(old))
 
 
 def cmd_backup_decrypt(name):
