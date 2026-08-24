@@ -2,12 +2,84 @@
 
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
+/// Default path to the SQLCipher key file (tmpfs, pushed by the operator).
+const DEFAULT_DBKEY_PATH: &str = "/run/mlc/dbkey";
+
+/// Parse database key file contents into a hex string for `PRAGMA key`.
+///
+/// Accepts either 64 hex characters (a 32-byte key in hex) or raw key bytes;
+/// trailing whitespace is stripped. Returns None if nothing is left.
+fn db_key_hex(raw: &[u8]) -> Option<String> {
+    let mut end = raw.len();
+    while end > 0 && raw[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let trimmed = &raw[..end];
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() == 64 && trimmed.iter().all(|b| b.is_ascii_hexdigit()) {
+        // Already hex — normalize to lowercase for the blob literal.
+        return Some(String::from_utf8_lossy(trimmed).to_lowercase());
+    }
+    Some(hex::encode(trimmed))
+}
+
+/// Read the SQLCipher key, waiting until the operator pushes the key file.
+///
+/// The key is delivered into tmpfs after service start; until the file
+/// appears we poll every 5 seconds and log every 30 seconds. There is no
+/// overall timeout — systemd RestartSec handles a service that never gets
+/// a key, and once the file appears startup continues normally.
+fn wait_for_db_key(path: &str) -> String {
+    let mut waited_secs = 0u64;
+    loop {
+        match std::fs::read(path) {
+            Ok(raw) => {
+                if let Some(key_hex) = db_key_hex(&raw) {
+                    return key_hex;
+                }
+                if waited_secs % 30 == 0 {
+                    tracing::error!("Database key file {} is empty — waiting for a valid key", path);
+                }
+            }
+            Err(_) => {
+                if waited_secs % 30 == 0 {
+                    tracing::info!("waiting for {}", path);
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        waited_secs += 5;
+    }
+}
+
 /// Initialize the database and create all tables.
 pub fn init_db(path: &str) -> Result<Connection> {
+    let key_path =
+        std::env::var("MLC_DBKEY_PATH").unwrap_or_else(|_| DEFAULT_DBKEY_PATH.to_string());
+    let key_hex = wait_for_db_key(&key_path);
+
     let conn = Connection::open(path)?;
 
+    // SQLCipher: the key must be the very first statement on the connection.
+    conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key_hex))?;
+
+    // The key now lives only in process memory — remove the tmpfs file.
+    if let Err(e) = std::fs::remove_file(&key_path) {
+        tracing::warn!("Failed to remove database key file {}: {}", key_path, e);
+    }
+
     // Enable WAL mode for better concurrent read performance.
-    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+        tracing::error!(
+            "Cannot read database {} with the provided key: {}. \
+             If this is an existing plaintext database, run the offline SQLCipher migration first.",
+            path,
+            e
+        );
+        return Err(e);
+    }
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
 
     conn.execute_batch(r#"
@@ -2474,4 +2546,37 @@ pub fn cleanup_stale_devices(conn: &Connection, stale_days: i64) -> rusqlite::Re
         [],
     );
     Ok(deleted)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::db_key_hex;
+
+    #[test]
+    fn db_key_hex_parses_hex_raw_and_whitespace() {
+        let hex64 = "ab".repeat(32); // 32 bytes as 64 hex chars
+        let raw32: Vec<u8> = (0u8..32).collect();
+
+        // 64 hex characters are used as-is (normalized to lowercase).
+        assert_eq!(db_key_hex(hex64.as_bytes()).as_deref(), Some(hex64.as_str()));
+        assert_eq!(
+            db_key_hex(hex64.to_uppercase().as_bytes()).as_deref(),
+            Some(hex64.as_str())
+        );
+
+        // Raw bytes are hex-encoded verbatim.
+        assert_eq!(
+            db_key_hex(&raw32).as_deref(),
+            Some(hex::encode(&raw32).as_str())
+        );
+
+        // Trailing whitespace is stripped before parsing.
+        let with_ws = format!("{} \r\n", hex64);
+        assert_eq!(db_key_hex(with_ws.as_bytes()).as_deref(), Some(hex64.as_str()));
+
+        // Empty / whitespace-only input yields no key.
+        assert_eq!(db_key_hex(b""), None);
+        assert_eq!(db_key_hex(b"  \n"), None);
+    }
 }

@@ -19,6 +19,7 @@
 //!   BUILD_ATTEST_PUBKEY    — hex-encoded Ed25519 public key(s), comma-separated (optional)
 //!   BUILD_ATTEST_ENFORCE   — "true"/"1" to reject unsigned clients (default: false)
 //!   BUILD_ATTEST_MAX_AGE_DAYS — max build age in days (default: 365)
+//!   MLC_DBKEY_PATH         — SQLCipher key file in tmpfs (default: /run/mlc/dbkey)
 
 use std::sync::{Arc, Mutex};
 
@@ -128,7 +129,13 @@ async fn main() {
 
     // Initialize SQLite database.
     let db_path = format!("{}/mylittlechart.db", data_dir);
-    let db_conn = db::init_db(&db_path).expect("Failed to initialize SQLite database");
+    let db_conn = match db::init_db(&db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to initialize database at {}: {}", db_path, e);
+            std::process::exit(1);
+        }
+    };
     tracing::info!("Database initialized at {}", db_path);
 
     // Shared shutdown channel: one signal fans out to both servers + admin restart.
