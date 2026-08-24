@@ -216,6 +216,17 @@ impl OpsdState {
         })
     }
 
+    /// SSH options for the box, including the TOFU hostkey pin file.
+    pub fn ssh_options<'a>(&'a self, key_pem: &'a [u8]) -> crate::ssh::SshOptions<'a> {
+        crate::ssh::SshOptions {
+            host: &self.box_cfg.host,
+            port: self.box_cfg.port,
+            user: &self.box_cfg.user,
+            key_pem,
+            pin_path: self.state_dir.join("known_box_key"),
+        }
+    }
+
     /// Record a deployed build. Best-effort like [`Self::audit`].
     pub fn record_build(&self, path: &str, size: u64) {
         let sha = git_head_sha().unwrap_or_default();

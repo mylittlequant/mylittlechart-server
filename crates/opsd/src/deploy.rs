@@ -199,14 +199,7 @@ pub async fn deploy(state: &Arc<OpsdState>, local: &Path) -> Result<DeployOutcom
     let sha = sha256_hex(&bytes);
     steps.push(format!("local artifact ok: {} bytes sha256={sha}", bytes.len()));
 
-    let key_pem = std::fs::read(&state.box_cfg.ssh_key_path)?;
-    let session = crate::ssh::open_session(&crate::ssh::SshOptions {
-        host: &state.box_cfg.host,
-        port: state.box_cfg.port,
-        user: &state.box_cfg.user,
-        key_pem: &key_pem,
-    })
-    .await?;
+    let session = crate::ops::connect(state).await?;
 
     let remote_new = format!("{REMOTE_BIN}.new");
     session.upload(&bytes, &remote_new, 0o755).await?;

@@ -27,6 +27,10 @@ const REMOTE_BACKUP_DIR: &str = "/var/lib/mlc/backups";
 /// Keep this many newest `*.db.gcm` snapshots on the opbox (mlcops.py used
 /// 30 for the pull side, 14 on the box).
 const RETAIN_DB_SNAPSHOTS: usize = 30;
+/// kv marker: name of the newest box snapshot already pulled to the opbox.
+pub const KV_LAST_PULLED: &str = "backup_last_pulled";
+/// Hourly pull-loop cadence.
+const PULL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 #[derive(Debug, Serialize)]
 pub struct PullOutcome {
@@ -218,11 +222,96 @@ pub async fn backup_pull(state: &Arc<OpsdState>) -> Result<PullOutcome, OpsdErro
         "backup_pull",
         &format!("pulled={} pruned={}", pulled.len(), pruned.len()),
     );
+    // Mark the newest pulled snapshot so the hourly loop doesn't re-pull it.
+    if let Some(db) = names.iter().find(|n| n.ends_with(".db")) {
+        state.kv_set(KV_LAST_PULLED, db);
+    }
     Ok(PullOutcome {
         pulled,
         encrypted,
         pruned,
     })
+}
+
+/// Should the loop pull? True when the box's latest snapshot differs from
+/// (or is absent in) what we have already pulled.
+pub fn needs_pull(latest: Option<&str>, last_pulled: Option<&str>) -> bool {
+    match (latest, last_pulled) {
+        (None, _) => false,
+        (Some(l), Some(p)) => l != p,
+        (Some(_), None) => true,
+    }
+}
+
+/// One loop iteration: list the box backup dir, pull only when there is a
+/// snapshot we don't have yet. Audit on an actual pull happens inside
+/// [`backup_pull`]; quiet ticks leave no trace.
+async fn pull_tick(state: &Arc<OpsdState>) -> Result<(), OpsdError> {
+    let session = crate::ops::connect(state).await?;
+    let out = session.exec(&format!("ls -1t {REMOTE_BACKUP_DIR}/")).await?;
+    let (db, _) = select_latest(&out.stdout);
+    let last = state.kv_get(KV_LAST_PULLED);
+    if !needs_pull(db.as_deref(), last.as_deref()) {
+        return Ok(());
+    }
+    let outcome = backup_pull(state).await?;
+    tracing::info!(
+        pulled = ?outcome.pulled,
+        pruned = ?outcome.pruned,
+        "hourly backup pull completed"
+    );
+    Ok(())
+}
+
+/// Hourly backup pull loop — replaces the Windows Task Scheduler task
+/// `mlc-backup-pull` (python mlcops.py). Spawned supervised from `api::serve`.
+pub async fn run_pull_loop(state: Arc<OpsdState>) {
+    let mut interval = tokio::time::interval(PULL_INTERVAL);
+    // Skip the immediate tick — the daemon may be restarted often during
+    // ops; an hour of quiet startup is fine.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if let Err(e) = pull_tick(&state).await {
+            tracing::error!("backup pull tick failed: {e}");
+        }
+    }
+}
+
+/// One entry of the local encrypted backup archive (`GET /api/backup/list`).
+#[derive(Debug, Serialize, PartialEq)]
+pub struct BackupEntry {
+    pub name: String,
+    pub size: u64,
+    pub modified_ts: u64,
+}
+
+/// List the opbox-side archive dir, newest first. Pure fs read.
+pub fn list_local(dir: &Path) -> Result<Vec<BackupEntry>, OpsdError> {
+    let mut entries = Vec::new();
+    if !dir.is_dir() {
+        return Ok(entries);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if !meta.is_file() {
+            continue;
+        }
+        let modified_ts = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        entries.push(BackupEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            size: meta.len(),
+            modified_ts,
+        });
+    }
+    entries.sort_by(|a, b| b.modified_ts.cmp(&a.modified_ts));
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -274,5 +363,58 @@ mod tests {
             .map(|i| (format!("snap-{i}.db.gcm"), i as u64))
             .collect();
         assert!(retention_prune(&snaps).is_empty());
+    }
+
+    #[test]
+    fn needs_pull_diff_logic() {
+        assert!(needs_pull(Some("b.db"), Some("a.db")));
+        assert!(!needs_pull(Some("a.db"), Some("a.db")));
+        assert!(needs_pull(Some("a.db"), None));
+        assert!(!needs_pull(None, Some("a.db")));
+        assert!(!needs_pull(None, None));
+    }
+
+    #[test]
+    fn list_local_newest_first() {
+        let dir = std::env::temp_dir().join(format!("opsd-list-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.db.gcm"), b"aa").unwrap();
+        std::fs::write(dir.join("new.db.gcm"), b"bbbb").unwrap();
+        // Force mtimes apart deterministically.
+        let mut t_old = filetime_now();
+        t_old -= 100;
+        set_mtime(&dir.join("old.db.gcm"), t_old);
+        set_mtime(&dir.join("new.db.gcm"), filetime_now());
+        let entries = list_local(&dir).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "new.db.gcm");
+        assert_eq!(entries[0].size, 4);
+        assert_eq!(entries[1].name, "old.db.gcm");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_local_missing_dir_is_empty() {
+        let dir = std::env::temp_dir().join("opsd-list-test-nonexistent-dir");
+        assert!(list_local(&dir).unwrap().is_empty());
+    }
+
+    fn filetime_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        let times = std::fs::FileTimes::new().set_modified(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
     }
 }

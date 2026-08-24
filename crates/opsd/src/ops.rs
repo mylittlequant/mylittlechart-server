@@ -54,19 +54,19 @@ pub struct UnlockOutcome {
     pub steps: Vec<String>,
 }
 
-fn ssh_opts<'a>(state: &'a OpsdState, key_pem: &'a [u8]) -> ssh::SshOptions<'a> {
-    ssh::SshOptions {
-        host: &state.box_cfg.host,
-        port: state.box_cfg.port,
-        user: &state.box_cfg.user,
-        key_pem,
-    }
-}
-
 pub(crate) async fn connect(state: &Arc<OpsdState>) -> Result<SshSession, OpsdError> {
     let key_pem = std::fs::read(&state.box_cfg.ssh_key_path)?;
-    let opts = ssh_opts(state, &key_pem);
-    Ok(ssh::open_session(&opts).await?)
+    let opts = state.ssh_options(&key_pem);
+    match ssh::open_session(&opts).await {
+        Ok(s) => Ok(s),
+        Err(e @ ssh::SshError::HostKeyMismatch { .. }) => {
+            // Loud audit: a changed host key on the management channel is a
+            // security event, not an ordinary failure.
+            state.audit("hostkey_mismatch", &e.to_string());
+            Err(OpsdError::Ssh(e))
+        }
+        Err(e) => Err(OpsdError::Ssh(e)),
+    }
 }
 
 pub fn check_unit(unit: &str) -> Result<(), OpsdError> {

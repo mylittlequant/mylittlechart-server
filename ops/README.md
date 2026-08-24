@@ -8,14 +8,18 @@ box** (zero new attack surface). See the plan:
 
 | Piece | Where | What |
 |---|---|---|
-| `ops/mlcops.py` | this repo | CLI: status / logs / restart / deploy / backup-now / backup-pull / backup-decrypt / key-push / ssh |
+| `ops/mlcops.py` | this repo | **deprecated-by-opsd** (fallback only; main deletes after opsd acceptance). CLI: status / logs / restart / deploy / backup-now / backup-pull / backup-decrypt / key-push / ssh |
 | box access key | `env/mlc-utah-box` (gitignored) | ed25519, root@144.172.97.222, only key allowed |
 | backup key | `env/backups/backup-key` (gitignored, 0600) | AES-256-GCM key for pulled backups; opbox only |
-| pulled backups | `env/backups/mlc-utah-1/*.gcm` | encrypted; `backup-decrypt` to restore |
+| pulled backups | `E:\backups\mlc-utah-1\*.gcm` | encrypted; opsd `backup-pull` (hourly loop) / `backup-decrypt` to restore |
 | box snapshots | `/var/lib/mlc/backups/` on mlc-utah-1 | daily via `mlc-backup.timer` (03:17 UTC), 14 retained |
 | prod watch | d-watchdog `mlc-prod-vps` (external) | https://mylittlechart.org/health monitoring on opbox |
-| auto-unlock | d-watchdog process `mlc-guard` (`ops/mlc-guard.py`) | 60s loop: health down twice -> ssh probe -> if service waits for key / failed: boot-unlock (push key+secrets to box tmpfs, start), re-verify |
-| opsd | `crates/opsd/` (binary `mlc-opsd`) | Rust daemon, local API 127.0.0.1:18360 + watch loop — the successor of mlcops.py/mlc-guard (v1) |
+| auto-unlock | d-watchdog process `mlc-guard` (`ops/mlc-guard.py`) | **deprecated-by-opsd** — opsd's watch loop does this (60s tick, auto boot-unlock, 5-min cooldown) |
+| opsd | `crates/opsd/` (binary `mlc-opsd`) | Rust daemon, local API 127.0.0.1:18360 + watch loop + hourly backup pull — **the sole owner of the pull cycle** |
+
+> Retired once opsd v1.2 is accepted: the Windows Task Scheduler task
+> `mlc-backup-pull` (python), `ops/mlc-guard.py`, and `ops/mlcops.py` as the
+> daily driver. The `.py` files stay in the repo until main removes them.
 
 ## mlc-opsd (v1)
 
@@ -40,12 +44,24 @@ Endpoints:
 | `POST /api/deploy {"path"}` | bearer | upload musl binary → sha256 check → save `.prev` → stop/mv/start → health-poll 30×3s → auto-rollback to `.prev` on failure; verdict + `builds`/`audit_log` records |
 | `POST /api/backup/now` | bearer | `systemctl start mlc-backup.service` + list `/var/lib/mlc/backups` |
 | `POST /api/backup/pull` | bearer | SFTP-pull latest `*.db` + `config-*.tar.gz` → `E:\backups\mlc-utah-1\` → AES-256-GCM (`env/backups/backup-key`, same nonce\|\|ct format as mlcops.py) → plaintext removed → keep 30 newest `*.db.gcm`. Box-reported filenames are whitelisted before touching the local fs |
+| `GET /api/backup/list` | bearer | opbox-side archive listing (names, sizes, mtimes) |
 | `GET /api/watch/state` | bearer | watch-loop counters: misses, last intervention, cooldown horizon |
 
 `box/state` uses `systemctl show -p ActiveState,SubState,MainPID,ExecMainStatus`
 (primary) with the journal grep as the fallback key-wait marker. The bind
 address is overridable via `MLC_OPSD_BIND` (side-by-side test runs next to
 the watchdog-managed production instance).
+
+SSH hostkey is TOFU-pinned: the first connect writes the box's SHA256
+fingerprint to `env/mlc-utah-1/opsd/known_box_key`; a later mismatch refuses
+the connection, writes `hostkey_mismatch` to `audit_log`, and fails every op
+until the pin is reviewed by hand.
+
+The hourly pull loop (supervised, 1h interval) lists `/var/lib/mlc/backups`,
+compares the newest snapshot against kv `backup_last_pulled`, and pulls only
+when there is something new. Verify it ticks: `audit_log` rows with
+`action='backup_pull'`, log line `hourly backup pull completed`, and kv
+`backup_last_pulled` advancing.
 
 The daemon's watch loop ticks every 60s: public `https://mylittlechart.org/health`
 via reqwest; two consecutive misses -> ssh probe -> if the service waits for
@@ -64,6 +80,7 @@ cargo run -p mlc-opsd -- logs mlc-server 100
 cargo run -p mlc-opsd -- deploy target/x86_64-unknown-linux-musl/release/mylittlechart-server
 cargo run -p mlc-opsd -- backup-now
 cargo run -p mlc-opsd -- backup-pull
+cargo run -p mlc-opsd -- backup-list
 cargo run -p mlc-opsd -- watch-state
 ```
 
@@ -72,9 +89,8 @@ d-watchdog registration (planned at acceptance): a process service
 `http://127.0.0.1:18360/health`; `mlc-guard` is retired once opsd's watch
 loop proves itself on a real box reboot.
 
-Still deferred: hostkey pinning (accept-any today — our own box by IP),
-machine-bound seal of box secrets (opsd reads the canonical env/ files at
-delivery time instead).
+Still deferred: machine-bound seal of box secrets (opsd reads the canonical
+env/ files at delivery time instead).
 
 ## Reboot semantics
 

@@ -52,6 +52,8 @@ enum Cmd {
     BackupPull,
     /// Watch-loop counters (misses, cooldown, last intervention).
     WatchState,
+    /// List the encrypted backup archive on the opbox.
+    BackupList,
 }
 
 /// Read the daemon API key from the state dir and call the local API.
@@ -197,6 +199,13 @@ async fn main() -> ExitCode {
             Ok((s, t)) => print_response(s, &t),
             Err(e) => {
                 eprintln!("mlc-opsd watch-state: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Cmd::BackupList => match call_api(reqwest::Method::GET, "/backup/list", None).await {
+            Ok((s, t)) => print_response(s, &t),
+            Err(e) => {
+                eprintln!("mlc-opsd backup-list: {e}");
                 ExitCode::FAILURE
             }
         },

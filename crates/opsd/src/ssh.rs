@@ -1,12 +1,17 @@
 //! Minimal SSH client wrapper around `russh` — trimmed port of
 //! mirage2operator's `operator-box/src/ssh.rs`, keeping only what this crate
-//! needs: key-auth `exec` and atomic SFTP `upload` against our own box.
+//! needs: key-auth `exec`, atomic SFTP `upload`, and SFTP `download` against
+//! our own box.
 //!
-//! Hostkey handler accepts any key: this is a single known box reached by IP.
-//! Key pinning against a stored fingerprint is a deliberate v1.1 option.
+//! Hostkey handling is TOFU pinning: the first successful connect writes the
+//! box's SHA256 fingerprint to `<state_dir>/known_box_key`; every later
+//! connect must present the same key. A mismatch refuses the connection and
+//! surfaces as [`SshError::HostKeyMismatch`] (audited by the caller) — the
+//! management channel must not silently follow a changed host key.
 
 use std::fmt;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::client;
@@ -21,6 +26,8 @@ pub struct SshOptions<'a> {
     pub port: u16,
     pub user: &'a str,
     pub key_pem: &'a [u8],
+    /// TOFU pin file for the box hostkey (`<state_dir>/known_box_key`).
+    pub pin_path: PathBuf,
 }
 
 pub struct ExecOutput {
@@ -29,23 +36,74 @@ pub struct ExecOutput {
     pub stderr: String,
 }
 
-pub struct AcceptAnyHostKey;
+/// Outcome of comparing a presented hostkey fingerprint against the pin file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinDecision {
+    /// No pin file yet — fingerprint learned and written (first connect).
+    Learned,
+    /// Presented key matches the pinned one.
+    Match,
+    /// Presented key differs — connection must be refused.
+    Mismatch,
+}
+
+/// TOFU-pinning hostkey handler.
+pub struct PinnedHostKey {
+    path: PathBuf,
+    /// (pinned, presented) recorded on mismatch so `open_session` can turn
+    /// russh's generic `UnknownKey` into a precise `HostKeyMismatch`.
+    mismatch: Arc<Mutex<Option<(String, String)>>>,
+}
+
+impl PinnedHostKey {
+    /// Decision point, unit-tested with a temp file. Side effect: on
+    /// `Learned` the fingerprint is written to the pin file.
+    fn check_fingerprint(&self, fp: &str) -> PinDecision {
+        match std::fs::read_to_string(&self.path) {
+            Ok(stored) if stored.trim() == fp => PinDecision::Match,
+            Ok(stored) => {
+                *self.mismatch.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((stored.trim().to_string(), fp.to_string()));
+                PinDecision::Mismatch
+            }
+            Err(_) => {
+                if let Err(e) = std::fs::write(&self.path, format!("{fp}\n")) {
+                    tracing::error!("cannot write hostkey pin {}: {e}", self.path.display());
+                }
+                PinDecision::Learned
+            }
+        }
+    }
+}
 
 #[async_trait::async_trait]
-impl client::Handler for AcceptAnyHostKey {
+impl client::Handler for PinnedHostKey {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let fp = server_public_key
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+        match self.check_fingerprint(&fp) {
+            PinDecision::Learned => {
+                tracing::info!("TOFU: pinned box hostkey {fp}");
+                Ok(true)
+            }
+            PinDecision::Match => Ok(true),
+            PinDecision::Mismatch => {
+                tracing::error!("box hostkey MISMATCH (pinned vs presented {fp}) — refusing");
+                Err(russh::Error::UnknownKey)
+            }
+        }
     }
 }
 
 /// A live ssh session; serves many `exec`/`upload` calls over one dial.
 pub struct SshSession {
-    handle: client::Handle<AcceptAnyHostKey>,
+    handle: client::Handle<PinnedHostKey>,
 }
 
 impl SshSession {
@@ -90,13 +148,24 @@ pub async fn open_session(opts: &SshOptions<'_>) -> Result<SshSession, SshError>
     let key_pem = std::str::from_utf8(opts.key_pem).map_err(|_| SshError::BadKeyEncoding)?;
     let key = russh::keys::decode_secret_key(key_pem, None).map_err(SshError::Key)?;
     let addr = format!("{}:{}", opts.host, opts.port);
-    let mut handle = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        client::connect(cfg, addr.clone(), AcceptAnyHostKey),
-    )
-    .await
-    .map_err(|_| SshError::Timeout(addr))?
-    .map_err(SshError::Russh)?;
+    let mismatch = Arc::new(Mutex::new(None));
+    let handler = PinnedHostKey {
+        path: opts.pin_path.clone(),
+        mismatch: mismatch.clone(),
+    };
+    let mut handle = tokio::time::timeout(CONNECT_TIMEOUT, client::connect(cfg, addr.clone(), handler))
+        .await
+        .map_err(|_| SshError::Timeout(addr))?
+        .map_err(|e| {
+            // A handler-side mismatch surfaces as russh's generic UnknownKey;
+            // the handler records the fingerprints so we can say precisely
+            // what happened.
+            let recorded = mismatch.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            match recorded {
+                Some((expected, got)) => SshError::HostKeyMismatch { expected, got },
+                None => SshError::Russh(e),
+            }
+        })?;
     let key_with_alg =
         PrivateKeyWithHashAlg::new(Arc::new(key), None).map_err(SshError::Key)?;
     let auth_ok = handle
@@ -113,7 +182,7 @@ pub async fn open_session(opts: &SshOptions<'_>) -> Result<SshSession, SshError>
 /// `exit-status` after EOF, and breaking early loses the exit code of a
 /// command that already ran (mirage incident 2026-08-02).
 async fn run_exec(
-    handle: &client::Handle<AcceptAnyHostKey>,
+    handle: &client::Handle<PinnedHostKey>,
     cmd: &str,
 ) -> Result<ExecOutput, SshError> {
     let fut = async {
@@ -152,7 +221,7 @@ async fn run_exec(
 /// rename over the target. Chunked at 32KB — sftp servers cap packet size
 /// and russh-sftp's write_all silently zero-fills on overflow.
 async fn upload_via_handle(
-    handle: &client::Handle<AcceptAnyHostKey>,
+    handle: &client::Handle<PinnedHostKey>,
     local_bytes: &[u8],
     remote_path: &str,
     mode: u32,
@@ -232,6 +301,9 @@ pub enum SshError {
     Russh(russh::Error),
     AuthFailed(String),
     Sftp(String),
+    /// The box presented a hostkey that differs from the TOFU-pinned one.
+    /// Refusing to work: the management channel may be MITM'd.
+    HostKeyMismatch { expected: String, got: String },
 }
 
 impl fmt::Display for SshError {
@@ -244,8 +316,57 @@ impl fmt::Display for SshError {
             SshError::Russh(e) => write!(f, "ssh: {e}"),
             SshError::AuthFailed(u) => write!(f, "ssh auth failed for user {u}"),
             SshError::Sftp(m) => write!(f, "sftp: {m}"),
+            SshError::HostKeyMismatch { expected, got } => write!(
+                f,
+                "box hostkey mismatch: pinned {expected}, presented {got} — refusing to connect"
+            ),
         }
     }
 }
 
 impl std::error::Error for SshError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_pin(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("opsd-pin-test-{}-{tag}", std::process::id()))
+    }
+
+    #[test]
+    fn pinning_learn_then_match_then_mismatch() {
+        let path = tmp_pin("flow");
+        let _ = std::fs::remove_file(&path);
+        let h = PinnedHostKey {
+            path: path.clone(),
+            mismatch: Arc::new(Mutex::new(None)),
+        };
+        // First connect: learn.
+        assert_eq!(h.check_fingerprint("SHA256:aaa"), PinDecision::Learned);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "SHA256:aaa");
+        // Same key: match, no mismatch recorded.
+        assert_eq!(h.check_fingerprint("SHA256:aaa"), PinDecision::Match);
+        assert!(h.mismatch.lock().unwrap().is_none());
+        // Different key: mismatch recorded, pin file unchanged.
+        assert_eq!(h.check_fingerprint("SHA256:bbb"), PinDecision::Mismatch);
+        assert_eq!(
+            h.mismatch.lock().unwrap().clone(),
+            Some(("SHA256:aaa".to_string(), "SHA256:bbb".to_string()))
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "SHA256:aaa");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn pinning_ignores_surrounding_whitespace_in_pin_file() {
+        let path = tmp_pin("ws");
+        std::fs::write(&path, "  SHA256:ccc\n").unwrap();
+        let h = PinnedHostKey {
+            path: path.clone(),
+            mismatch: Arc::new(Mutex::new(None)),
+        };
+        assert_eq!(h.check_fingerprint("SHA256:ccc"), PinDecision::Match);
+        std::fs::remove_file(&path).ok();
+    }
+}

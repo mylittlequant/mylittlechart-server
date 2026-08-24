@@ -50,6 +50,9 @@ where
 
 pub async fn serve(state: Arc<OpsdState>) -> Result<(), Box<dyn std::error::Error>> {
     spawn_supervised("watch", state.clone(), crate::watch::run_watch_loop);
+    // Hourly backup pull — the sole owner of the pull cycle (replaces the
+    // Windows Task Scheduler `mlc-backup-pull` task).
+    spawn_supervised("backup_pull", state.clone(), crate::backup::run_pull_loop);
 
     let api = Router::new()
         .route("/status", get(handle_status))
@@ -60,6 +63,7 @@ pub async fn serve(state: Arc<OpsdState>) -> Result<(), Box<dyn std::error::Erro
         .route("/deploy", post(handle_deploy))
         .route("/backup/now", post(handle_backup_now))
         .route("/backup/pull", post(handle_backup_pull))
+        .route("/backup/list", get(handle_backup_list))
         .route("/watch/state", get(handle_watch_state))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -173,4 +177,15 @@ async fn handle_backup_pull(State(state): State<Arc<OpsdState>>) -> axum::respon
 
 async fn handle_watch_state(State(state): State<Arc<OpsdState>>) -> axum::response::Response {
     Json(serde_json::to_value(crate::watch::view(&state)).unwrap()).into_response()
+}
+
+async fn handle_backup_list(State(state): State<Arc<OpsdState>>) -> axum::response::Response {
+    match crate::backup::list_local(&state.backup_pull_dir) {
+        Ok(entries) => Json(serde_json::json!({
+            "dir": state.backup_pull_dir,
+            "entries": entries,
+        }))
+        .into_response(),
+        Err(e) => err_response(e),
+    }
 }
