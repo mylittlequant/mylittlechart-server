@@ -29,6 +29,7 @@ mod auth;
 mod build_attest;
 mod db;
 mod models;
+mod pathutil;
 mod routes;
 mod state;
 
@@ -233,10 +234,19 @@ async fn main() {
             async move {
                 let base = std::path::Path::new(&dir);
 
+                // Path traversal guard (2026-07-27 incident): reject `\`,
+                // `.`/`..` and anything outside the component allowlist,
+                // then verify canonicalized containment inside `base`.
+                // Rejection surfaces as a bare 404 — no detail is leaked.
+                if !pathutil::is_safe_relative_path(&path) {
+                    return None;
+                }
+
                 // 1) Try {path}.html (clean URL: /privacy → privacy.html)
                 if !path.contains('.') {
-                    let html_path = base.join(format!("{}.html", path));
-                    if html_path.exists() {
+                    if let Some(html_path) =
+                        pathutil::resolve_under(base, &format!("{}.html", path))
+                    {
                         if let Ok(body) = tokio::fs::read(&html_path).await {
                             return Some(
                                 axum::response::Response::builder()
@@ -250,8 +260,7 @@ async fn main() {
                 }
 
                 // 2) Try exact path (for robots.txt, sitemap.xml, llms.txt, etc.)
-                let exact_path = base.join(&path);
-                if exact_path.is_file() {
+                if let Some(exact_path) = pathutil::resolve_under(base, &path) {
                     if let Ok(body) = tokio::fs::read(&exact_path).await {
                         let ct = match exact_path.extension().and_then(|e| e.to_str()) {
                             Some("xml") => "application/xml; charset=utf-8",
@@ -346,7 +355,9 @@ async fn main() {
         .with_state(dash_state);
 
     // Bind both listeners.
-    let main_addr = format!("0.0.0.0:{}", port);
+    // Main listener is loopback-only: all public traffic arrives via the
+    // local cloudflared tunnel, so there is no reason to expose the port.
+    let main_addr = format!("127.0.0.1:{}", port);
     tracing::info!("mylittlechart-server listening on {}", main_addr);
     let main_listener = tokio::net::TcpListener::bind(&main_addr)
         .await

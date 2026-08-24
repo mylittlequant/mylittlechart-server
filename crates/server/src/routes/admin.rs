@@ -12,6 +12,7 @@ use std::{path::PathBuf, sync::Arc};
 use subtle::ConstantTimeEq;
 
 use crate::models::types::{ErrorResponse, PromoteQuery, PromoteResponse, UploadQuery, UploadResponse};
+use crate::pathutil::is_safe_path_component;
 use crate::state::AppState;
 
 /// Verify ADMIN_SECRET from Authorization header. Returns error response if invalid.
@@ -55,16 +56,6 @@ pub async fn restart(
     let _ = state.shutdown_tx.send(());
 
     Json(serde_json::json!({ "status": "restarting" })).into_response()
-}
-
-/// Returns true only if `s` is a safe path component: non-empty, at most 64 chars,
-/// and contains only ASCII alphanumeric characters, dots, hyphens, and underscores.
-/// Rejects any form of path traversal (e.g. `..`, `/`, `\`).
-fn is_safe_path_component(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
 /// POST /api/admin/upload?platform=win64&version=0.2.0&release_notes=...
