@@ -1,0 +1,31 @@
+[package]
+name = "mlc-opsd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mlc-opsd"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+# NB: not the workspace rusqlite — that one carries bundled-sqlcipher-vendored-openssl
+# (the production DB needs SQLCipher), which requires a working perl to build
+# openssl-src and does not compile on the Windows opbox. opsd.sqlite holds no
+# secrets (audit/kv only), so plain bundled SQLite suffices.
+rusqlite = { version = "0.32", features = ["bundled"] }
+rand = { workspace = true }
+hex = { workspace = true }
+subtle = { workspace = true }
+reqwest = { workspace = true }
+clap = { workspace = true }
+russh = { workspace = true }
+russh-keys = { workspace = true }
+russh-sftp = { workspace = true }
+async-trait = { workspace = true }
