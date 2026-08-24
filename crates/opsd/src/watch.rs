@@ -20,6 +20,36 @@ const COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const MISS_THRESHOLD: u32 = 2;
 const KV_LAST_INTERVENTION: &str = "watch_last_intervention";
 
+/// Snapshot for `GET /api/watch/state` — observability without sqlite by hand.
+#[derive(Debug, serde::Serialize)]
+pub struct WatchStateView {
+    pub misses: u32,
+    pub miss_threshold: u32,
+    pub last_public_ok: Option<bool>,
+    pub last_intervention_ts: Option<i64>,
+    pub cooldown_until_ts: Option<i64>,
+}
+
+pub fn view(state: &Arc<OpsdState>) -> WatchStateView {
+    let shared = *state.watch.lock().unwrap_or_else(|e| e.into_inner());
+    let last = state
+        .kv_get(KV_LAST_INTERVENTION)
+        .and_then(|v| v.parse::<i64>().ok());
+    WatchStateView {
+        misses: shared.misses,
+        miss_threshold: MISS_THRESHOLD,
+        last_public_ok: shared.last_public_ok,
+        last_intervention_ts: last,
+        cooldown_until_ts: last.map(|ts| ts + COOLDOWN.as_secs() as i64),
+    }
+}
+
+fn set_shared(state: &Arc<OpsdState>, misses: u32, last_ok: bool) {
+    let mut w = state.watch.lock().unwrap_or_else(|e| e.into_inner());
+    w.misses = misses;
+    w.last_public_ok = Some(last_ok);
+}
+
 async fn public_health_ok(state: &Arc<OpsdState>) -> bool {
     match state.http.get(PUBLIC_HEALTH_URL).send().await {
         Ok(resp) => resp.status().is_success(),
@@ -55,7 +85,9 @@ pub async fn run_watch_loop(state: Arc<OpsdState>) {
     let mut misses: u32 = 0;
     loop {
         interval.tick().await;
-        if public_health_ok(&state).await {
+        let ok = public_health_ok(&state).await;
+        set_shared(&state, if ok { 0 } else { misses + 1 }, ok);
+        if ok {
             if misses > 0 {
                 tracing::info!("public health recovered after {misses} miss(es)");
             }

@@ -15,7 +15,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::ops;
-use crate::state::{OpsdState, BIND_ADDR};
+use crate::state::OpsdState;
 
 /// Re-spawn a background loop on any task exit (panic / unexpected return)
 /// with bounded backoff — a single panic must not permanently kill the
@@ -57,6 +57,10 @@ pub async fn serve(state: Arc<OpsdState>) -> Result<(), Box<dyn std::error::Erro
         .route("/logs", get(handle_logs))
         .route("/unlock", post(handle_unlock))
         .route("/box/state", get(handle_box_state))
+        .route("/deploy", post(handle_deploy))
+        .route("/backup/now", post(handle_backup_now))
+        .route("/backup/pull", post(handle_backup_pull))
+        .route("/watch/state", get(handle_watch_state))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_bearer,
@@ -67,8 +71,9 @@ pub async fn serve(state: Arc<OpsdState>) -> Result<(), Box<dyn std::error::Erro
         .route("/health", get(|| async { "ok" }))
         .nest("/api", api);
 
-    tracing::info!("mlc-opsd listening on http://{BIND_ADDR}");
-    let listener = tokio::net::TcpListener::bind(BIND_ADDR).await?;
+    let bind = crate::state::bind_addr();
+    tracing::info!("mlc-opsd listening on http://{bind}");
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -134,4 +139,38 @@ async fn handle_unlock(State(state): State<Arc<OpsdState>>) -> axum::response::R
         Ok(o) => Json(serde_json::to_value(o).unwrap()).into_response(),
         Err(e) => err_response(e),
     }
+}
+
+#[derive(Deserialize)]
+struct DeployBody {
+    /// Local path on the opbox to the musl binary.
+    path: String,
+}
+
+async fn handle_deploy(
+    State(state): State<Arc<OpsdState>>,
+    Json(body): Json<DeployBody>,
+) -> axum::response::Response {
+    match crate::deploy::deploy(&state, std::path::Path::new(&body.path)).await {
+        Ok(o) => Json(serde_json::to_value(o).unwrap()).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+async fn handle_backup_now(State(state): State<Arc<OpsdState>>) -> axum::response::Response {
+    match crate::backup::backup_now(&state).await {
+        Ok(listing) => Json(serde_json::json!({"ok": true, "files": listing})).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+async fn handle_backup_pull(State(state): State<Arc<OpsdState>>) -> axum::response::Response {
+    match crate::backup::backup_pull(&state).await {
+        Ok(o) => Json(serde_json::to_value(o).unwrap()).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+async fn handle_watch_state(State(state): State<Arc<OpsdState>>) -> axum::response::Response {
+    Json(serde_json::to_value(crate::watch::view(&state)).unwrap()).into_response()
 }

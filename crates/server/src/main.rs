@@ -23,7 +23,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 mod auth;
@@ -214,11 +214,33 @@ async fn main() {
         });
     }
 
-    // CORS layer — allow all origins (public API).
+    // CORS allowlist. The site and API are same-origin, so first-party
+    // browser flows never need CORS (OAuth callbacks are top-level
+    // navigations, not fetch; the desktop client is not a browser and sends
+    // no Origin header). Only the two public origins plus localhost dev are
+    // allowed; a foreign Origin gets no Access-Control-Allow-Origin and is
+    // blocked by the browser. Credentials are NOT enabled — the absolute-url
+    // fetch in the landing (index.html → /api/updates/latest) is anonymous.
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
+            let o = origin.as_bytes();
+            o == b"https://mylittlechart.org"
+                || o == b"https://www.mylittlechart.org"
+                || o.starts_with(b"http://localhost")
+                || o.starts_with(b"http://127.0.0.1")
+        }))
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+            axum::http::Method::PATCH,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ]);
 
     // Landing page static file service.
     // STATIC_DIR env var or fallback to ../landing-pure/web/ (dev) or ./static (deploy).

@@ -63,15 +63,32 @@ pub async fn restart(
 /// Requires `Authorization: Bearer {ADMIN_SECRET}` header.
 /// Accepts raw binary body (max 200 MB enforced by middleware).
 /// Computes SHA-256, saves to `data/binaries/{platform}/{version}/`, inserts into DB.
+///
+/// NOTE: the query string is parsed only AFTER the bearer check. With
+/// `Query<UploadQuery>` as an extractor, axum rejected unauthenticated
+/// requests with 400 "missing field platform" — leaking the endpoint's
+/// parameter shape to anyone probing it. Now an unauthenticated probe gets
+/// a flat 401 and nothing else.
 pub async fn upload_binary(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<UploadQuery>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     body: Bytes,
 ) -> Response {
     if let Err(e) = verify_admin_secret(&state, &headers) {
         return e;
     }
+
+    let Query(query) = match Query::<UploadQuery>::try_from_uri(&uri) {
+        Ok(q) => q,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("Invalid query parameters")),
+            )
+                .into_response();
+        }
+    };
 
     // Issue 2: Validate params — reject path traversal characters before touching the filesystem.
     if query.platform.is_empty() || query.version.is_empty() {
@@ -228,12 +245,24 @@ pub async fn upload_binary(
 /// Requires `Authorization: Bearer {ADMIN_SECRET}`.
 pub async fn promote(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<PromoteQuery>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
     if let Err(e) = verify_admin_secret(&state, &headers) {
         return e;
     }
+
+    // Same auth-before-parse rule as upload_binary above.
+    let Query(query) = match Query::<PromoteQuery>::try_from_uri(&uri) {
+        Ok(q) => q,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("Invalid query parameters")),
+            )
+                .into_response();
+        }
+    };
 
     if !is_safe_path_component(&query.platform) || !is_safe_path_component(&query.version) {
         return (

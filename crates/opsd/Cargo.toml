@@ -29,3 +29,5 @@ russh = { workspace = true }
 russh-keys = { workspace = true }
 russh-sftp = { workspace = true }
 async-trait = { workspace = true }
+sha2 = { workspace = true }
+aes-gcm = { workspace = true }

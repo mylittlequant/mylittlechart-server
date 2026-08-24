@@ -61,6 +61,25 @@ impl SshSession {
     ) -> Result<(), SshError> {
         upload_via_handle(&self.handle, local_bytes, remote_path, mode).await
     }
+
+    /// Download a remote file over the SFTP subsystem.
+    pub async fn download(&self, remote_path: &str) -> Result<Vec<u8>, SshError> {
+        let channel = self.handle.channel_open_session().await.map_err(SshError::Russh)?;
+        channel.request_subsystem(true, "sftp").await.map_err(SshError::Russh)?;
+        let sftp = SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| SshError::Sftp(e.to_string()))?;
+        let mut file = sftp
+            .open(remote_path)
+            .await
+            .map_err(|e| SshError::Sftp(format!("open {remote_path}: {e}")))?;
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)
+            .await
+            .map_err(|e| SshError::Sftp(format!("read {remote_path}: {e}")))?;
+        Ok(buf)
+    }
 }
 
 pub async fn open_session(opts: &SshOptions<'_>) -> Result<SshSession, SshError> {

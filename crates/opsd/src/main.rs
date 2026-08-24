@@ -13,6 +13,8 @@ use clap::{Parser, Subcommand};
 
 mod api;
 mod auth;
+mod backup;
+mod deploy;
 mod error;
 mod ops;
 mod ssh;
@@ -42,6 +44,14 @@ enum Cmd {
     Restart { unit: String },
     /// Journal tail (default: mlc-server, 50 lines).
     Logs { unit: Option<String>, lines: Option<u32> },
+    /// Deploy a local musl binary to the box with health-verified rollback.
+    Deploy { path: String },
+    /// Trigger an on-demand DB snapshot on the box.
+    BackupNow,
+    /// Pull the latest box backups to the opbox (encrypted at rest).
+    BackupPull,
+    /// Watch-loop counters (misses, cooldown, last intervention).
+    WatchState,
 }
 
 /// Read the daemon API key from the state dir and call the local API.
@@ -50,14 +60,14 @@ async fn call_api(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<(reqwest::StatusCode, String), error::OpsdError> {
-    let (state_dir, _) = state::resolve_paths()?;
+    let (state_dir, ..) = state::resolve_paths()?;
     let key = std::fs::read_to_string(state_dir.join("api-key"))
         .map_err(|e| error::OpsdError::CanonSecret(format!(
             "read api-key (is the daemon state dir initialized?): {e}"
         )))?;
     let client = reqwest::Client::new();
     let mut req = client
-        .request(method, format!("http://{}/api{}", state::BIND_ADDR, path))
+        .request(method, format!("http://{}/api{}", state::bind_addr(), path))
         .bearer_auth(key.trim());
     if let Some(b) = body {
         req = req.json(&b);
@@ -154,5 +164,41 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        Cmd::Deploy { path } => {
+            match call_api(
+                reqwest::Method::POST,
+                "/deploy",
+                Some(serde_json::json!({"path": path})),
+            )
+            .await
+            {
+                Ok((s, t)) => print_response(s, &t),
+                Err(e) => {
+                    eprintln!("mlc-opsd deploy: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::BackupNow => match call_api(reqwest::Method::POST, "/backup/now", None).await {
+            Ok((s, t)) => print_response(s, &t),
+            Err(e) => {
+                eprintln!("mlc-opsd backup-now: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Cmd::BackupPull => match call_api(reqwest::Method::POST, "/backup/pull", None).await {
+            Ok((s, t)) => print_response(s, &t),
+            Err(e) => {
+                eprintln!("mlc-opsd backup-pull: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Cmd::WatchState => match call_api(reqwest::Method::GET, "/watch/state", None).await {
+            Ok((s, t)) => print_response(s, &t),
+            Err(e) => {
+                eprintln!("mlc-opsd watch-state: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }

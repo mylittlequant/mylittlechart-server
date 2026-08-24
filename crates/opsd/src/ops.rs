@@ -28,6 +28,7 @@ pub enum ServiceState {
     Active,
     Inactive,
     Failed,
+    Activating,
     Other,
 }
 
@@ -35,9 +36,15 @@ pub enum ServiceState {
 pub struct BoxState {
     pub service: ServiceState,
     pub service_raw: String,
+    /// systemd SubState (running / auto-restart / dead / ...).
+    pub sub_state: String,
+    pub main_pid: u32,
+    /// ExecMainStatus from `systemctl show` — non-zero on a crashed start.
+    pub exec_main_status: i32,
     /// SQLCipher key file present in box tmpfs (lost on every reboot).
     pub keyfile_present: bool,
-    /// Recent journal shows the service stuck at the dbkey wait.
+    /// Recent journal shows the service stuck at the dbkey wait. Fallback
+    /// signal — the primary service state above comes from `systemctl show`.
     pub waiting_for_key: bool,
 }
 
@@ -56,7 +63,7 @@ fn ssh_opts<'a>(state: &'a OpsdState, key_pem: &'a [u8]) -> ssh::SshOptions<'a> 
     }
 }
 
-async fn connect(state: &Arc<OpsdState>) -> Result<SshSession, OpsdError> {
+pub(crate) async fn connect(state: &Arc<OpsdState>) -> Result<SshSession, OpsdError> {
     let key_pem = std::fs::read(&state.box_cfg.ssh_key_path)?;
     let opts = ssh_opts(state, &key_pem);
     Ok(ssh::open_session(&opts).await?)
@@ -121,43 +128,76 @@ fn parse_status(stdout: &str) -> BoxStatus {
     }
 }
 
-/// Is mlc-server up, is the dbkey in tmpfs, is the service stuck waiting
-/// for the key. Watch loop decides interventions from this.
+/// Service state, dbkey presence, key-wait detection. Primary signal is
+/// `systemctl show` (ActiveState/SubState/MainPID/ExecMainStatus); the
+/// journal grep stays as the fallback marker for "stuck waiting for key".
+/// Watch loop decides interventions from this.
 pub async fn box_state(state: &Arc<OpsdState>) -> Result<BoxState, OpsdError> {
     let session = connect(state).await?;
     let out = session
         .exec(
-            "echo \"service:$(systemctl is-active mlc-server)\"; \
+            "systemctl show mlc-server -p ActiveState,SubState,MainPID,ExecMainStatus 2>/dev/null; \
              echo \"keyfile:$(test -f /run/mlc/dbkey && echo present || echo absent)\"; \
              echo \"waiting:$(journalctl -u mlc-server --no-pager -n 300 2>/dev/null \
                  | grep -q 'waiting for /run/mlc/dbkey' && echo yes || echo no)\"",
         )
         .await?;
-    Ok(parse_box_state(&out.stdout))
+    let mut bs = parse_box_state(&out.stdout);
+    if bs.service == ServiceState::Other {
+        // Fallback: `systemctl show` output missing/unparsable — degrade to
+        // the v1 is-active probe rather than report Other forever.
+        let out = session
+            .exec("systemctl is-active mlc-server 2>/dev/null")
+            .await?;
+        bs.service_raw = out.stdout.trim().to_string();
+        bs.service = classify_service(&bs.service_raw);
+    }
+    Ok(bs)
+}
+
+fn classify_service(raw: &str) -> ServiceState {
+    match raw {
+        "active" => ServiceState::Active,
+        "inactive" => ServiceState::Inactive,
+        "failed" => ServiceState::Failed,
+        "activating" => ServiceState::Activating,
+        _ => ServiceState::Other,
+    }
 }
 
 fn parse_box_state(stdout: &str) -> BoxState {
     let mut service_raw = String::new();
+    let mut sub_state = String::new();
+    let mut main_pid = 0u32;
+    let mut exec_main_status = 0i32;
     let mut keyfile_present = false;
     let mut waiting_for_key = false;
     for line in stdout.lines() {
+        if let Some((key, val)) = line.split_once('=') {
+            // systemctl show emits Key=Value lines.
+            match key {
+                "ActiveState" => service_raw = val.trim().to_string(),
+                "SubState" => sub_state = val.trim().to_string(),
+                "MainPID" => main_pid = val.trim().parse().unwrap_or(0),
+                "ExecMainStatus" => exec_main_status = val.trim().parse().unwrap_or(0),
+                _ => {}
+            }
+            continue;
+        }
         let Some((key, val)) = line.split_once(':') else { continue };
         match key {
-            "service" => service_raw = val.trim().to_string(),
             "keyfile" => keyfile_present = val.trim() == "present",
             "waiting" => waiting_for_key = val.trim() == "yes",
             _ => {}
         }
     }
-    let service = match service_raw.as_str() {
-        "active" => ServiceState::Active,
-        "inactive" => ServiceState::Inactive,
-        "failed" => ServiceState::Failed,
-        _ => ServiceState::Other,
-    };
+    let service = classify_service(&service_raw);
     BoxState {
         service,
         service_raw,
+        sub_state,
+        main_pid,
+        exec_main_status,
         keyfile_present,
         waiting_for_key,
     }
@@ -295,18 +335,37 @@ mod tests {
 
     #[test]
     fn parse_box_state_waiting() {
-        let s = parse_box_state("service:inactive\nkeyfile:absent\nwaiting:yes\n");
-        assert_eq!(s.service, ServiceState::Inactive);
+        let s = parse_box_state(
+            "ActiveState=activating\nSubState=auto-restart\nMainPID=0\nExecMainStatus=1\n\
+             keyfile:absent\nwaiting:yes\n",
+        );
+        assert_eq!(s.service, ServiceState::Activating);
+        assert_eq!(s.sub_state, "auto-restart");
+        assert_eq!(s.main_pid, 0);
+        assert_eq!(s.exec_main_status, 1);
         assert!(!s.keyfile_present);
         assert!(s.waiting_for_key);
     }
 
     #[test]
     fn parse_box_state_healthy() {
-        let s = parse_box_state("service:active\nkeyfile:present\nwaiting:no\n");
+        let s = parse_box_state(
+            "ActiveState=active\nSubState=running\nMainPID=8357\nExecMainStatus=0\n\
+             keyfile:present\nwaiting:no\n",
+        );
         assert_eq!(s.service, ServiceState::Active);
+        assert_eq!(s.sub_state, "running");
+        assert_eq!(s.main_pid, 8357);
         assert!(s.keyfile_present);
         assert!(!s.waiting_for_key);
+    }
+
+    #[test]
+    fn parse_box_state_missing_show_output_is_other() {
+        // systemctl show failed entirely → caller falls back to is-active.
+        let s = parse_box_state("keyfile:present\nwaiting:no\n");
+        assert_eq!(s.service, ServiceState::Other);
+        assert_eq!(s.service_raw, "");
     }
 
     #[test]

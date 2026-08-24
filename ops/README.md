@@ -37,6 +37,15 @@ Endpoints:
 | `GET /api/logs?unit=&lines=` | bearer | journal tail (unit whitelist, lines clamped to 1..500) |
 | `POST /api/restart {"unit"}` | bearer | whitelist only: mlc-server / nginx / fail2ban |
 | `POST /api/unlock` | bearer | boot-unlock: push canon `sqlcipher.key` + `server.env` to box tmpfs (0600 root), start mlc-server, verify health |
+| `POST /api/deploy {"path"}` | bearer | upload musl binary → sha256 check → save `.prev` → stop/mv/start → health-poll 30×3s → auto-rollback to `.prev` on failure; verdict + `builds`/`audit_log` records |
+| `POST /api/backup/now` | bearer | `systemctl start mlc-backup.service` + list `/var/lib/mlc/backups` |
+| `POST /api/backup/pull` | bearer | SFTP-pull latest `*.db` + `config-*.tar.gz` → `E:\backups\mlc-utah-1\` → AES-256-GCM (`env/backups/backup-key`, same nonce\|\|ct format as mlcops.py) → plaintext removed → keep 30 newest `*.db.gcm`. Box-reported filenames are whitelisted before touching the local fs |
+| `GET /api/watch/state` | bearer | watch-loop counters: misses, last intervention, cooldown horizon |
+
+`box/state` uses `systemctl show -p ActiveState,SubState,MainPID,ExecMainStatus`
+(primary) with the journal grep as the fallback key-wait marker. The bind
+address is overridable via `MLC_OPSD_BIND` (side-by-side test runs next to
+the watchdog-managed production instance).
 
 The daemon's watch loop ticks every 60s: public `https://mylittlechart.org/health`
 via reqwest; two consecutive misses -> ssh probe -> if the service waits for
@@ -52,6 +61,10 @@ cargo run -p mlc-opsd -- status
 cargo run -p mlc-opsd -- unlock
 cargo run -p mlc-opsd -- restart mlc-server
 cargo run -p mlc-opsd -- logs mlc-server 100
+cargo run -p mlc-opsd -- deploy target/x86_64-unknown-linux-musl/release/mylittlechart-server
+cargo run -p mlc-opsd -- backup-now
+cargo run -p mlc-opsd -- backup-pull
+cargo run -p mlc-opsd -- watch-state
 ```
 
 d-watchdog registration (planned at acceptance): a process service
@@ -59,9 +72,9 @@ d-watchdog registration (planned at acceptance): a process service
 `http://127.0.0.1:18360/health`; `mlc-guard` is retired once opsd's watch
 loop proves itself on a real box reboot.
 
-Deferred to v1.1: `deploy` with rollback, `backup-pull` inside the daemon,
-hostkey pinning, machine-bound seal of box secrets (v1 reads the canonical
-env/ files at delivery time instead).
+Still deferred: hostkey pinning (accept-any today — our own box by IP),
+machine-bound seal of box secrets (opsd reads the canonical env/ files at
+delivery time instead).
 
 ## Reboot semantics
 
