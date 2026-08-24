@@ -11,7 +11,9 @@ Usage:
   mlcops.py deploy <binary>        # upload new musl binary, restart, verify health
   mlcops.py backup-now             # consistent DB snapshot into /var/lib/mlc/backups
   mlcops.py backup-pull            # pull latest backup to opbox env/backups/mlc-utah-1/
-  mlcops.py key-push <keyfile>     # push SQLCipher key to tmpfs /run/mlc/dbkey (0600 root), arm service
+  mlcops.py key-push [keyfile]    # push SQLCipher key -> tmpfs /run/mlc/dbkey (0600 root, RAM only)
+  mlcops.py secrets-push           # push canonical server.env -> tmpfs /run/mlc/server.env
+  mlcops.py boot-unlock            # after box reboot: key + secrets + start service
   mlcops.py ssh <cmd...>           # raw passthrough
 """
 import os, subprocess, sys, time
@@ -129,18 +131,41 @@ def cmd_backup_decrypt(name):
     print("decrypted ->", out_path)
 
 
-def cmd_key_push(keyfile):
+CANON_KEY = os.path.join(NEMO, "env", "mlc-utah-1", "sqlcipher.key")
+CANON_ENV = os.path.join(NEMO, "env", "mlc-utah-1", "server.env")
+
+
+def _push_tmpfs(local, remote, mode="600"):
+    """Push a secret file into box tmpfs (/run/mlc), root-only. Box keeps no copy on disk."""
+    with open(local, "rb") as f:
+        data = f.read()
+    p = subprocess.run(SSH + [f"install -d -m 770 -o root -g mlc /run/mlc && cat > {remote} && chmod {mode} {remote} && echo DELIVERED:{remote}"],
+                       input=data, capture_output=True)
+    print(p.stdout.decode().strip(), p.stderr.decode().strip())
+    if p.returncode != 0 or "DELIVERED" not in p.stdout.decode():
+        sys.exit("push failed")
+
+
+def cmd_key_push(keyfile=None):
+    keyfile = keyfile or CANON_KEY
     if not os.path.isfile(keyfile):
         sys.exit(f"no such file: {keyfile}")
-    with open(keyfile, "rb") as f:
-        key = f.read().strip()
-    if len(key) < 32:
+    if len(open(keyfile, "rb").read().strip()) < 32:
         sys.exit("key looks too short")
-    p = subprocess.run(SSH + ["install -d -m 700 /run/mlc && cat > /run/mlc/dbkey && chmod 600 /run/mlc/dbkey && echo KEY-DELIVERED"],
-                       input=key, capture_output=True)
-    print(p.stdout.decode(), p.stderr.decode())
-    if p.returncode != 0:
-        sys.exit("key push failed")
+    _push_tmpfs(keyfile, "/run/mlc/dbkey")
+
+
+def cmd_secrets_push():
+    if not os.path.isfile(CANON_ENV):
+        sys.exit(f"canonical secrets missing: {CANON_ENV}")
+    _push_tmpfs(CANON_ENV, "/run/mlc/server.env")
+
+
+def cmd_boot_unlock():
+    """After box reboot: push db key + secrets, then start the service (it waits for the key)."""
+    cmd_key_push()
+    cmd_secrets_push()
+    sh("systemctl start mlc-server && sleep 3 && curl -s -o /dev/null -w 'health: %{http_code}\\n' http://127.0.0.1:19200/health")
 
 
 def main():
@@ -156,7 +181,9 @@ def main():
      "backup-now": cmd_backup_now,
      "backup-pull": cmd_backup_pull,
      "backup-decrypt": lambda: cmd_backup_decrypt(*rest),
-     "key-push": lambda: cmd_key_push(*rest),
+     "key-push": lambda: cmd_key_push(*rest) if rest else cmd_key_push(),
+     "secrets-push": cmd_secrets_push,
+     "boot-unlock": cmd_boot_unlock,
      "ssh": lambda: sh(" ".join(rest), check=False),
      }.get(cmd, lambda: sys.exit(f"unknown: {cmd}"))()
 
