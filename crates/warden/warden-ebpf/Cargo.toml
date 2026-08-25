@@ -1,0 +1,32 @@
+[package]
+name    = "warden-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Kernel-side BPF-LSM programs for mlc-warden, ported near-verbatim from
+# mirage2web's `mirage-secd/secd-ebpf` (Wave-2 Stage G Tier-2). `no_std`/
+# `no_main`, compiles to `bpfel-unknown-none` via `aya-build::build_ebpf`
+# (invoked from `../build.rs`, nightly-toolchain-only, see
+# `rust-toolchain.toml`). NOT a workspace member of `mylittlechart-server` —
+# the nightly/`-Z build-std` requirement is incompatible with the
+# stable-rustc workspace every other crate here uses; `../build.rs` shells
+# out to `cargo +nightly build -p warden-ebpf` via `aya-build`
+# out-of-workspace, only when `ML_WARDEN_BUILD_EBPF=1` is set.
+
+[dependencies]
+aya-ebpf     = "0.2"
+aya-log-ebpf = "0.2"
+
+[[bin]]
+name = "mlc-warden-tier2"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
+debug = 2
+
+[workspace]

@@ -1,0 +1,34 @@
+# mlc-warden — eBPF-LSM (Tier-2) hardening for mlc-server on mlc-utah-1.
+#
+# Install: cp to /etc/systemd/system/mlc-warden.service && systemctl daemon-reload.
+#
+# PREREQUISITES on the box (one-time, before enable):
+#   1. Kernel booted with BPF LSM active: /sys/kernel/security/lsm must list
+#      `bpf`. Ubuntu 24.04 6.8 generic does NOT enable it by default — add
+#      `lsm=landlock,lockdown,yama,integrity,apparmor,bpf` to
+#      GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, `update-grub`, reboot.
+#   2. bpffs mounted at /sys/fs/bpf (default on Ubuntu via sys-fs-bpf.mount).
+#   3. The protege unit (mlc-server.service) running — arming refuses
+#      against a stopped protege (MainPID=0).
+#
+# Enforcement lifetime = this process's lifetime (LSM attach links are
+# process-lived by design, see crates/warden/src/bpf_lsm/loader.rs) — hence
+# Restart=always. To disarm: `mlc-warden disarm` then `systemctl stop
+# mlc-warden` (the daemon's own cgroup is kill-protected; disarm opens a
+# 120s window on it so systemd can actually stop it).
+[Unit]
+Description=mlc-warden — eBPF-LSM hardening for mlc-server
+After=local-fs.target sys-fs-bpf.mount mlc-server.service
+Wants=mlc-server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mlc-warden run
+Restart=always
+RestartSec=3
+
+# Root is mandatory: bpf() + bpffs + cgroup id resolution.
+User=root
+
+[Install]
+WantedBy=multi-user.target

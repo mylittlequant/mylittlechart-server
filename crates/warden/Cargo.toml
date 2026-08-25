@@ -1,0 +1,41 @@
+[package]
+name    = "mlc-warden"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build   = "build.rs"
+
+# Standalone eBPF-LSM (BPF-LSM "Tier-2") hardening daemon for ONE protege
+# process: mlc-server on mlc-utah-1 (Ubuntu 24.04, kernel 6.8, cgroup-v2).
+# Mechanics ported from mirage2web's mirage-secd/mirage-warden (battle-tested
+# on a live 6.8 fleet); no identity/mesh/capsule machinery — deny events go
+# to tracing, window management via a root-only unix socket.
+#
+# `cargo check`/`cargo build` succeed on Windows too — every Linux-only code
+# path (aya BPF-LSM, /proc//sys/fs reads, unix socket) is
+# `#[cfg(target_os = "linux")]`-gated; the eBPF object embeds as an EMPTY
+# placeholder unless ML_WARDEN_BUILD_EBPF=1 (see build.rs), and `arm`
+# surfaces that as an honest Err at runtime.
+
+[[bin]]
+name = "mlc-warden"
+path = "src/main.rs"
+
+# aya-build/cargo_metadata drive the opt-in `warden-ebpf/` nightly compile
+# step — see build.rs. These host-side tools compile fine on stable/Windows
+# and are only ever INVOKED when ML_WARDEN_BUILD_EBPF=1 is set.
+[build-dependencies]
+aya-build      = "0.2"
+cargo_metadata = "0.23"
+
+[dependencies]
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = "1"
+
+# aya's userspace crate (via `aya-obj`) uses `std::os::fd`, which does not
+# exist on Windows — this target-gate keeps Windows `cargo build` green.
+[target.'cfg(target_os = "linux")'.dependencies]
+aya  = "0.14"
+libc = "0.2"

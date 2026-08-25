@@ -1,0 +1,18 @@
+# warden-ebpf toolchain pin (ported from mirage-secd/secd-ebpf).
+#
+# This crate compiles to `bpfel-unknown-none` via `-Z build-std=core`
+# (`aya-build::build_ebpf`, invoked from `mlc-warden/build.rs`) — a nightly
+# rustc + `rust-src` requirement, categorically separate from the stable
+# userspace `mlc-warden` binary. `bpf-linker` (LLVM 19,
+# `cargo install bpf-linker --locked`) is additionally required on the
+# build host/Docker image — not expressed here since it is a standalone
+# binary, not a rustup component.
+#
+# The mirage source crate validated `cargo +nightly check --target
+# bpfel-unknown-none -Z build-std=core` (RUSTFLAGS="-D warnings") clean
+# against this exact toolchain pin; the final link step + verifier + live
+# kernel validation is the linux Docker build stage and the mlc-utah-1
+# deployment itself.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]
