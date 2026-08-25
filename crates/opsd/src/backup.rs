@@ -55,11 +55,15 @@ pub fn valid_backup_name(name: &str) -> bool {
     name.ends_with(".db") || name.ends_with(".tar.gz")
 }
 
-/// From an `ls -1t` (newest first) listing pick the latest db snapshot and
-/// the latest config tarball. Returns owned names, never paths.
-pub fn select_latest(listing: &str) -> (Option<String>, Option<String>) {
+/// From an `ls -1t` (newest first) listing pick the latest db snapshot, the
+/// latest config tarball and the latest sync-store tarball. Prefix-scoped:
+/// `sync-*.tar.gz` is newer than `config-*.tar.gz` in the same run, so a
+/// bare `.tar.gz` match would shadow the config archive. Returns owned
+/// names, never paths.
+pub fn select_latest(listing: &str) -> (Option<String>, Option<String>, Option<String>) {
     let mut db = None;
     let mut cfg = None;
+    let mut sync = None;
     for line in listing.lines() {
         let name = line.trim();
         if !valid_backup_name(name) {
@@ -68,11 +72,14 @@ pub fn select_latest(listing: &str) -> (Option<String>, Option<String>) {
         if db.is_none() && name.ends_with(".db") {
             db = Some(name.to_string());
         }
-        if cfg.is_none() && name.ends_with(".tar.gz") {
+        if cfg.is_none() && name.starts_with("config-") && name.ends_with(".tar.gz") {
             cfg = Some(name.to_string());
         }
+        if sync.is_none() && name.starts_with("sync-") && name.ends_with(".tar.gz") {
+            sync = Some(name.to_string());
+        }
     }
-    (db, cfg)
+    (db, cfg, sync)
 }
 
 /// Which of `snapshots` (a `*.db.gcm` list, any order) survive retention.
@@ -168,8 +175,8 @@ pub async fn backup_now(state: &Arc<OpsdState>) -> Result<Vec<String>, OpsdError
 pub async fn backup_pull(state: &Arc<OpsdState>) -> Result<PullOutcome, OpsdError> {
     let session = crate::ops::connect(state).await?;
     let out = session.exec(&format!("ls -1t {REMOTE_BACKUP_DIR}/")).await?;
-    let (db, cfg) = select_latest(&out.stdout);
-    let names: Vec<String> = [db, cfg].into_iter().flatten().collect();
+    let (db, cfg, sync) = select_latest(&out.stdout);
+    let names: Vec<String> = [db, cfg, sync].into_iter().flatten().collect();
     if names.is_empty() {
         return Err(OpsdError::Remote("no backups on box".into()));
     }
@@ -193,12 +200,17 @@ pub async fn backup_pull(state: &Arc<OpsdState>) -> Result<PullOutcome, OpsdErro
         );
     }
 
-    // Retention: keep the newest RETAIN_DB_SNAPSHOTS *.db.gcm by mtime.
+    // Retention: keep the newest RETAIN_DB_SNAPSHOTS *.db.gcm and
+    // sync-*.tar.gz.gcm by mtime (config tarballs are small and unpruned, as
+    // before the sync store existed).
     let mut snapshots: Vec<(String, u64)> = Vec::new();
+    let mut sync_snaps: Vec<(String, u64)> = Vec::new();
     for entry in std::fs::read_dir(&state.backup_pull_dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".db.gcm") {
+        let is_db = name.ends_with(".db.gcm");
+        let is_sync = name.starts_with("sync-") && name.ends_with(".tar.gz.gcm");
+        if !is_db && !is_sync {
             continue;
         }
         let mtime = entry
@@ -208,10 +220,17 @@ pub async fn backup_pull(state: &Arc<OpsdState>) -> Result<PullOutcome, OpsdErro
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        snapshots.push((name, mtime));
+        if is_db {
+            snapshots.push((name, mtime));
+        } else {
+            sync_snaps.push((name, mtime));
+        }
     }
     let mut pruned = Vec::new();
-    for name in retention_prune(&snapshots) {
+    for name in retention_prune(&snapshots)
+        .into_iter()
+        .chain(retention_prune(&sync_snaps))
+    {
         let p = state.backup_pull_dir.join(&name);
         if std::fs::remove_file(&p).is_ok() {
             pruned.push(name);
@@ -249,7 +268,7 @@ pub fn needs_pull(latest: Option<&str>, last_pulled: Option<&str>) -> bool {
 async fn pull_tick(state: &Arc<OpsdState>) -> Result<(), OpsdError> {
     let session = crate::ops::connect(state).await?;
     let out = session.exec(&format!("ls -1t {REMOTE_BACKUP_DIR}/")).await?;
-    let (db, _) = select_latest(&out.stdout);
+    let (db, _, _) = select_latest(&out.stdout);
     let last = state.kv_get(KV_LAST_PULLED);
     if !needs_pull(db.as_deref(), last.as_deref()) {
         return Ok(());
@@ -332,16 +351,17 @@ mod tests {
 
     #[test]
     fn select_latest_picks_newest_of_each_kind() {
-        let listing = "mylittlechart-b.db\nconfig-b.tar.gz\nmylittlechart-a.db\nconfig-a.tar.gz\nevil;rm.db\n";
-        let (db, cfg) = select_latest(listing);
+        let listing = "mylittlechart-b.db\nsync-b.tar.gz\nconfig-b.tar.gz\nmylittlechart-a.db\nconfig-a.tar.gz\nsync-a.tar.gz\nevil;rm.db\n";
+        let (db, cfg, sync) = select_latest(listing);
         assert_eq!(db.as_deref(), Some("mylittlechart-b.db"));
         assert_eq!(cfg.as_deref(), Some("config-b.tar.gz"));
+        assert_eq!(sync.as_deref(), Some("sync-b.tar.gz"));
     }
 
     #[test]
     fn select_latest_empty_listing() {
-        let (db, cfg) = select_latest("");
-        assert!(db.is_none() && cfg.is_none());
+        let (db, cfg, sync) = select_latest("");
+        assert!(db.is_none() && cfg.is_none() && sync.is_none());
     }
 
     #[test]

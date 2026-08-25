@@ -156,7 +156,7 @@ pub async fn sync_status_handler(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::sync_status(&conn, user_id, &device_id, &profile_id)
+        crate::syncstore::status(&conn, &state.sync_store, user_id, &device_id, &profile_id)
     })
     .await;
 
@@ -240,7 +240,7 @@ pub async fn sync_changes(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::sync_get_changes(&conn, user_id, &device_id, &profile_id, since)
+        crate::syncstore::changes(&conn, &state.sync_store, user_id, &device_id, &profile_id, since)
     })
     .await;
 
@@ -444,7 +444,7 @@ pub async fn sync_push(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::sync_push_items(&conn, user_id, &device_id, &profile_id, &db_items)
+        crate::syncstore::push(&conn, &state.sync_store, user_id, &device_id, &profile_id, &db_items)
     })
     .await;
 
@@ -532,7 +532,7 @@ pub async fn sync_pull(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::sync_pull_all(&conn, user_id, &device_id, &profile_id)
+        crate::syncstore::pull_all(&conn, &state.sync_store, user_id, &device_id, &profile_id)
     })
     .await;
 
@@ -620,7 +620,7 @@ pub async fn sync_delete_item_handler(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::sync_delete_item(&conn, user_id, &device_id, &profile_id, &sync_id, now_ms)
+        crate::syncstore::delete_item(&conn, &state.sync_store, user_id, &device_id, &profile_id, &sync_id, now_ms)
     })
     .await;
 
@@ -706,7 +706,7 @@ pub async fn sync_delete_all_handler(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::sync_delete_all(&conn, user_id, &device_id, &profile_id)
+        crate::syncstore::delete_all(&conn, &state.sync_store, user_id, &device_id, &profile_id)
     })
     .await;
 
@@ -969,7 +969,7 @@ pub async fn sync_list_profiles(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::sync_list_profiles_for_user(&conn, user_id)
+        crate::syncstore::list_profiles(&conn, &state.sync_store, user_id)
     })
     .await;
 
@@ -1066,7 +1066,7 @@ pub async fn sync_pull_profile(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::sync_pull_by_profile(&conn, user_id, &profile_id)
+        crate::syncstore::pull_by_profile(&conn, &state.sync_store, user_id, &profile_id)
     })
     .await;
 

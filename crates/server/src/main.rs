@@ -33,6 +33,7 @@ mod models;
 mod pathutil;
 mod routes;
 mod state;
+mod syncstore;
 
 use state::AppState;
 
@@ -144,6 +145,9 @@ async fn main() {
     // Build shared application state.
     let app_state = Arc::new(AppState {
         db: Mutex::new(db_conn),
+        sync_store: crate::syncstore::SyncStore::new(
+            std::path::Path::new(&data_dir).join("sync"),
+        ),
         data_dir,
         admin_secret,
         github_client_id,

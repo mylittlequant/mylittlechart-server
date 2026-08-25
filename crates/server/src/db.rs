@@ -1716,7 +1716,7 @@ pub struct SyncPushItem {
 }
 
 /// Allowed sync categories. Any other value is rejected.
-const VALID_SYNC_CATEGORIES: &[&str] = &[
+pub(crate) const VALID_SYNC_CATEGORIES: &[&str] = &[
     "preset",
     "watchlist",
     "template",
@@ -1743,7 +1743,7 @@ const SYNC_MAX_ITEM_BYTES: usize = 512 * 1024;
 const SYNC_MAX_PRESET_BYTES: usize = 2 * 1024 * 1024;
 
 /// Per-category size limit.
-fn max_item_bytes(category: &str) -> usize {
+pub(crate) fn max_item_bytes(category: &str) -> usize {
     match category {
         "preset" => SYNC_MAX_PRESET_BYTES,
         _ => SYNC_MAX_ITEM_BYTES,
@@ -1751,10 +1751,10 @@ fn max_item_bytes(category: &str) -> usize {
 }
 
 /// Maximum total content stored per user: 50 MiB.
-const SYNC_MAX_TOTAL_BYTES: i64 = 50 * 1024 * 1024;
+pub(crate) const SYNC_MAX_TOTAL_BYTES: i64 = 50 * 1024 * 1024;
 
 /// Maximum number of non-deleted items per user.
-const SYNC_MAX_ITEMS: i64 = 200;
+pub(crate) const SYNC_MAX_ITEMS: i64 = 200;
 
 /// Return `(item_count, last_modified_at, quota_used_bytes)` for the user + profile.
 ///
@@ -2579,4 +2579,32 @@ mod tests {
         assert_eq!(db_key_hex(b""), None);
         assert_eq!(db_key_hex(b"  \n"), None);
     }
+}
+
+/// In-memory plaintext connection with the parts of the production schema the
+/// sync plane touches — for unit tests only (no SQLCipher key dance, no file).
+#[cfg(test)]
+pub(crate) fn init_test_conn() -> Connection {
+    let conn = Connection::open_in_memory().expect("in-memory sqlite");
+    conn.execute_batch(
+        "
+        CREATE TABLE sync_items (
+            user_id      INTEGER NOT NULL,
+            device_id    TEXT    NOT NULL DEFAULT '',
+            profile_id   TEXT    NOT NULL DEFAULT '',
+            sync_id      TEXT    NOT NULL,
+            category     TEXT    NOT NULL,
+            name         TEXT    NOT NULL,
+            content      BLOB    NOT NULL,
+            checksum     TEXT    NOT NULL,
+            modified_at  INTEGER NOT NULL,
+            deleted      INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT    NOT NULL,
+            display_name TEXT    NOT NULL DEFAULT '',
+            PRIMARY KEY (user_id, device_id, profile_id, sync_id)
+        );
+        ",
+    )
+    .expect("test schema");
+    conn
 }

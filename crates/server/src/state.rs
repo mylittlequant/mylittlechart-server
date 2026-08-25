@@ -13,6 +13,10 @@ pub struct AppState {
     /// Root directory where runtime data is stored (binaries, DB file, etc.)
     pub data_dir: String,
 
+    /// Hot file store for chart-persistence sync categories (see syncstore.rs).
+    /// Root is `<data_dir>/sync/`. Cold categories stay in the SQLCipher DB.
+    pub sync_store: crate::syncstore::SyncStore,
+
     /// Secret required for admin endpoints (set via `ADMIN_SECRET` env var).
     pub admin_secret: String,
 
