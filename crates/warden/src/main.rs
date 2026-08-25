@@ -96,6 +96,10 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         window_secs: u64,
     },
+    /// Ask the running daemon to re-resolve the protege's CURRENT cgroup and
+    /// full-reconcile re-arm WITHOUT a restart — for deploy flows that did
+    /// their own stop/swap/start under an `open-window`.
+    RearmProtege,
     /// Ask the running daemon to open a window on its OWN cgroup, so
     /// `systemctl stop mlc-warden` can kill it (this fully disarms Tier-2 —
     /// enforcement dies with the daemon process).
@@ -141,6 +145,7 @@ fn run(cli: Cli) -> Result<(), String> {
             send_command(&cli.socket, &format!("restart-protege {window_secs}"))
         }
         Cmd::Disarm => send_command(&cli.socket, "disarm"),
+        Cmd::RearmProtege => send_command(&cli.socket, "rearm-protege"),
     }
 }
 
@@ -330,6 +335,7 @@ fn dispatch(line: &str, tier2: &tier2::Tier2, own_cgroup: u64, unit: &str) -> St
                 .unwrap_or(30);
             restart_protege(tier2, own_cgroup, unit, Duration::from_secs(secs))
         }
+        Some("rearm-protege") => rearm_protege(tier2, own_cgroup, unit),
         Some("disarm") => {
             // Open a window on our OWN cgroup so `systemctl stop mlc-warden`
             // can actually kill us; enforcement dies with the process.
@@ -429,6 +435,41 @@ fn restart_protege(
         tracing::warn!("[mlc-warden] close window for cgroup {old_cgroup} failed: {e}");
     }
     outcome
+}
+
+/// Re-arm WITHOUT a restart: re-resolve the protege's CURRENT cgroup id and
+/// full-reconcile the protected slots. For deploy flows that already did
+/// stop/swap/start themselves under an `open-window` — the new MainPID lives
+/// in a NEW cgroup that is unprotected until this runs.
+#[cfg(target_os = "linux")]
+fn rearm_protege(tier2: &tier2::Tier2, own_cgroup: u64, unit: &str) -> String {
+    use cgroups::UnitPid;
+
+    let pid = match cgroups::probe_main_pid_of_unit(unit) {
+        UnitPid::Pid(pid) => pid,
+        UnitPid::NoMainPid => {
+            return format!("err protege unit {unit} not running (MainPID=0) — nothing to re-arm");
+        }
+        UnitPid::Unreachable => {
+            return format!("err systemctl unreachable for {unit} — refusing to act on unknown state");
+        }
+    };
+    match cgroups::cgroup_id_of_pid(&pid.to_string()) {
+        Some(new_cgroup) => {
+            let mut slots = vec![(new_cgroup, true)];
+            if own_cgroup != 0 && own_cgroup != new_cgroup {
+                slots.push((own_cgroup, true));
+            }
+            match tier2.rearm(&slots) {
+                Ok(()) => {
+                    tracing::info!("[mlc-warden] re-armed {unit}: pid {pid} cgroup {new_cgroup}");
+                    format!("ok re-armed {unit} (pid {pid}), cgroup {new_cgroup}")
+                }
+                Err(e) => format!("err re-arm failed: {e}"),
+            }
+        }
+        None => format!("err protege pid {pid} cgroup unresolvable — re-arm skipped"),
+    }
 }
 
 // ── CLI client side ─────────────────────────────────────────────────────────

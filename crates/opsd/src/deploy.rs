@@ -142,17 +142,28 @@ pub fn save_prev_cmd() -> String {
 }
 
 /// stop → atomic mv → start. `mv` within one filesystem is atomic, so a
-/// concurrent reader never sees a half-written binary.
+/// concurrent reader never sees a half-written binary. Tier-2 integration:
+/// the warden must open a kill-window BEFORE `systemctl stop` (otherwise the
+/// SIGTERM is denied and the stop job hangs to TimeoutStopSec), and re-arm
+/// AFTER start (the new MainPID lives in a new, unprotected cgroup). rearm
+/// is best-effort here — its reply is captured in stdout, and the chain's rc
+/// still comes from stop/mv/start alone (health polling is the real gate).
 pub fn swap_cmd() -> String {
     format!(
-        "systemctl stop mlc-server && mv '{REMOTE_BIN}.new' '{REMOTE_BIN}' && systemctl start mlc-server"
+        "/usr/local/bin/mlc-warden open-window 120; \
+         systemctl stop mlc-server && mv '{REMOTE_BIN}.new' '{REMOTE_BIN}' && systemctl start mlc-server; \
+         RC=$?; /usr/local/bin/mlc-warden rearm-protege 2>&1 || true; exit $RC"
     )
 }
 
-/// Restore the snapshot over the live binary and start.
+/// Restore the snapshot over the live binary and start. Same Tier-2 window +
+/// rearm dance as [`swap_cmd`]; open-window may legitimately fail when the
+/// protege is already dead (no resolvable cgroup) — best-effort either way.
 pub fn rollback_cmd() -> String {
     format!(
-        "systemctl stop mlc-server; mv -f '{REMOTE_BIN}.prev' '{REMOTE_BIN}' && systemctl start mlc-server"
+        "/usr/local/bin/mlc-warden open-window 120 2>/dev/null || true; \
+         systemctl stop mlc-server; mv -f '{REMOTE_BIN}.prev' '{REMOTE_BIN}' && systemctl start mlc-server; \
+         RC=$?; /usr/local/bin/mlc-warden rearm-protege 2>&1 || true; exit $RC"
     )
 }
 

@@ -281,12 +281,29 @@ pub async fn unlock(state: &Arc<OpsdState>) -> Result<UnlockOutcome, OpsdError> 
 pub async fn restart_unit(state: &Arc<OpsdState>, unit: &str) -> Result<String, OpsdError> {
     check_unit(unit)?;
     let session = connect(state).await?;
-    let out = session
-        .exec(&format!(
-            "systemctl restart {unit} && sleep 2 && systemctl is-active {unit}"
-        ))
-        .await?;
-    let state_str = out.stdout.trim().to_string();
+    // Tier-2 kill-protection: systemd's restart SIGTERM against mlc-server is
+    // denied unless mlc-warden opens a managed window. If the warden is down,
+    // enforcement died with it (process-lifetime attach) and a plain restart
+    // is safe — hence the || fallback.
+    let cmd = if unit == "mlc-server" {
+        format!(
+            "/usr/local/bin/mlc-warden restart-protege || systemctl restart {unit}; \
+             sleep 2; systemctl is-active {unit}"
+        )
+    } else {
+        format!("systemctl restart {unit} && sleep 2 && systemctl is-active {unit}")
+    };
+    let out = session.exec(&cmd).await?;
+    // The warden prints its own "ok restarted ..." line first — the verdict
+    // is the LAST line (is-active output).
+    let state_str = out
+        .stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     state.audit("restart", &format!("unit={unit} result={state_str}"));
     if out.exit_code != Some(0) || state_str != "active" {
         return Err(OpsdError::Remote(format!(
