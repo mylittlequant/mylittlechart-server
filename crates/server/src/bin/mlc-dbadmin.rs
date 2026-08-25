@@ -63,8 +63,40 @@ fn main() {
                 .expect("backup run");
             println!("BACKUP-OK {src} -> {out}");
         }
+        Some("query") => {
+            // Read-only inspection: `mlc-dbadmin query <db> "<sql>"` — rows
+            // printed pipe-separated, one per line. Text/NULL rendering only;
+            // blobs print as their byte length.
+            let db = args.get(2).expect("db").clone();
+            let sql = args.get(3).expect("sql").clone();
+            let conn = open_encrypted(&db, &key);
+            let mut stmt = conn.prepare(&sql).expect("prepare");
+            let cols = stmt.column_count();
+            let mut rows = stmt.query([]).expect("query");
+            while let Some(row) = rows.next().expect("row") {
+                let mut cells = Vec::with_capacity(cols);
+                for i in 0..cols {
+                    let v = row
+                        .get_ref(i)
+                        .map(|r| match r {
+                            rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                            rusqlite::types::ValueRef::Integer(n) => n.to_string(),
+                            rusqlite::types::ValueRef::Real(f) => f.to_string(),
+                            rusqlite::types::ValueRef::Text(t) => {
+                                String::from_utf8_lossy(t).into_owned()
+                            }
+                            rusqlite::types::ValueRef::Blob(b) => format!("<blob {}B>", b.len()),
+                        })
+                        .unwrap_or_else(|_| "?".into());
+                    cells.push(v);
+                }
+                println!("{}", cells.join("|"));
+            }
+        }
         _ => {
-            eprintln!("usage: mlc-dbadmin migrate <plain> <enc> | backup <db> <out>");
+            eprintln!(
+                "usage: mlc-dbadmin migrate <plain> <enc> | backup <db> <out> | query <db> <sql>"
+            );
             std::process::exit(2);
         }
     }
