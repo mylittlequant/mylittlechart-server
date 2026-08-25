@@ -545,6 +545,17 @@ pub fn delete_all(
     if dir.is_dir() {
         n += read_tree(&dir).len();
         fs::remove_dir_all(&dir).map_err(io_err)?;
+        // Prune now-empty parents (device dir, then user dir). remove_dir
+        // fails on non-empty — exactly the guard we want, no listing needed.
+        let mut up = dir.parent();
+        for _ in 0..2 {
+            if let Some(p) = up {
+                if fs::remove_dir(p).is_err() {
+                    break;
+                }
+                up = p.parent();
+            }
+        }
     }
     Ok(n)
 }
