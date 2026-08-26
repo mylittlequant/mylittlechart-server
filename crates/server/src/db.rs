@@ -249,6 +249,10 @@ pub fn init_db(path: &str) -> Result<Connection> {
     let _ = conn.execute("ALTER TABLE web_sessions ADD COLUMN ua_hash TEXT NOT NULL DEFAULT ''", []);
     // Safe migration: add link_user_id column to oauth_states if not present.
     let _ = conn.execute("ALTER TABLE oauth_states ADD COLUMN link_user_id INTEGER", []);
+    // Safe migration: add device_code column to oauth_states if not present.
+    // Carries the sign-in modal's device code through the OAuth round-trip so
+    // the web-callback can confirm the device without manual code entry.
+    let _ = conn.execute("ALTER TABLE oauth_states ADD COLUMN device_code TEXT", []);
     // Safe migrations: add agent-key columns to auth_tokens if not present.
     let _ = conn.execute("ALTER TABLE auth_tokens ADD COLUMN label TEXT NOT NULL DEFAULT ''", []);
     let _ = conn.execute("ALTER TABLE auth_tokens ADD COLUMN permissions TEXT NOT NULL DEFAULT '[\"read_bars\",\"read_indicators\",\"read_viewport\",\"read_config\"]'", []);
@@ -711,28 +715,29 @@ pub fn insert_oauth_state(
     now: &str,
     device_id: &str,
     link_user_id: Option<i64>,
+    device_code: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO oauth_states (state, provider, redirect_port, created_at, device_id, link_user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![state, provider, redirect_port as i64, now, device_id, link_user_id],
+        "INSERT INTO oauth_states (state, provider, redirect_port, created_at, device_id, link_user_id, device_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![state, provider, redirect_port as i64, now, device_id, link_user_id, device_code],
     )?;
     Ok(())
 }
 
 /// Validate and consume an OAuth state.
-/// Returns `(provider, redirect_port, device_id, link_user_id)` if valid.
+/// Returns `(provider, redirect_port, device_id, link_user_id, device_code)` if valid.
 /// Deletes the state after consumption (one-time use).
 pub fn consume_oauth_state(
     conn: &Connection,
     state: &str,
-) -> Result<Option<(String, u16, String, Option<i64>)>> {
-    let result: Option<(String, i64, String, Option<i64>)> = {
+) -> Result<Option<(String, u16, String, Option<i64>, Option<String>)>> {
+    let result: Option<(String, i64, String, Option<i64>, Option<String>)> = {
         let mut stmt = conn.prepare(
-            "SELECT provider, redirect_port, device_id, link_user_id FROM oauth_states WHERE state = ?1",
+            "SELECT provider, redirect_port, device_id, link_user_id, device_code FROM oauth_states WHERE state = ?1",
         )?;
         let mut rows = stmt.query(params![state])?;
         if let Some(row) = rows.next()? {
-            Some((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Some((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
         } else {
             None
         }
@@ -740,7 +745,7 @@ pub fn consume_oauth_state(
     if result.is_some() {
         conn.execute("DELETE FROM oauth_states WHERE state = ?1", params![state])?;
     }
-    Ok(result.map(|(p, port, dev, link_uid)| (p, port as u16, dev, link_uid)))
+    Ok(result.map(|(p, port, dev, link_uid, dcode)| (p, port as u16, dev, link_uid, dcode)))
 }
 
 /// Clean up expired OAuth states (older than 10 minutes).

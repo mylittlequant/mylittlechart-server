@@ -176,6 +176,11 @@ pub struct AuthorizeQuery {
     /// this provider into the existing account.
     #[serde(default, deserialize_with = "deserialize_link_flag")]
     pub link: bool,
+    /// Optional device code from the wasm/desktop sign-in modal. When present,
+    /// the web-callback confirms this device code after a successful login, so
+    /// the device poll completes without manual code entry.
+    #[serde(default)]
+    pub device_code: Option<String>,
 }
 
 /// Deserializes a query string flag that can be `"1"`, `"true"`, `"yes"`, or absent.

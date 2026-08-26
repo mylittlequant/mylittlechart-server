@@ -78,16 +78,24 @@ pub async fn authorize(
 
     // Store state in DB for validation on callback.
     let device_id = query.device_id.clone().unwrap_or_default();
+    // Device code from the sign-in modal (normalized; empty = absent).
+    let device_code = query
+        .device_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| c.to_uppercase());
     {
         let now = chrono::Utc::now().to_rfc3339();
         let state_clone = state.clone();
         let state_param_clone = state_param.clone();
         let provider_clone = provider.clone();
         let device_id_clone = device_id.clone();
+        let device_code_clone = device_code.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
             let conn = state_clone.db.lock().unwrap_or_else(|e| e.into_inner());
             let _ = crate::db::cleanup_oauth_states(&conn);
-            crate::db::insert_oauth_state(&conn, &state_param_clone, &provider_clone, redirect_port, &now, &device_id_clone, link_user_id)
+            crate::db::insert_oauth_state(&conn, &state_param_clone, &provider_clone, redirect_port, &now, &device_id_clone, link_user_id, device_code_clone.as_deref())
         })
         .await
         {
@@ -179,6 +187,7 @@ pub async fn web_callback(
     let state_param = query.state.clone();
     // link_user_id is populated when the state was stored as part of a "link provider" flow.
     let mut link_user_id: Option<i64> = None;
+    let mut device_code: Option<String> = None;
     if provider.as_str() != "twitter" {
         if let Some(ref sp) = state_param {
             let state_clone = state.clone();
@@ -190,8 +199,9 @@ pub async fn web_callback(
             .await;
 
             match consumed {
-                Ok(Ok(Some((_prov, _port, _dev, luid)))) => {
+                Ok(Ok(Some((_prov, _port, _dev, luid, dcode)))) => {
                     link_user_id = luid;
+                    device_code = dcode;
                 }
                 Ok(Ok(None)) => {
                     return (
@@ -223,6 +233,9 @@ pub async fn web_callback(
     let session_expires_at = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
     let display_name_log = display_name.clone();
     let ua_hash = extract_ua_hash(&headers);
+    // `state` moves into the session-creation closure below; the device-code
+    // confirm in the success arm needs its own handle.
+    let state_for_device = state.clone();
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(i64, String)> {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -252,6 +265,51 @@ pub async fn web_callback(
                 "session_id={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400",
                 session_id
             );
+
+            // Sign-in modal flow: confirm the pending device code so the
+            // device's /api/auth/poll completes on its own.
+            if let Some(code) = device_code {
+                let state_clone = state_for_device.clone();
+                let code_clone = code.clone();
+                let confirmed = tokio::task::spawn_blocking(move || {
+                    let conn = state_clone.db.lock().unwrap_or_else(|e| e.into_inner());
+                    let now = chrono::Utc::now().to_rfc3339();
+                    match crate::db::get_device_code(&conn, &code_clone) {
+                        Ok(Some(row)) if row.expires_at >= now && row.status == "pending" => {
+                            crate::db::confirm_device_code(&conn, &code_clone, user_id).unwrap_or(false)
+                        }
+                        _ => false,
+                    }
+                })
+                .await
+                .unwrap_or(false);
+                if confirmed {
+                    tracing::info!("Device code confirmed via OAuth web-callback: user_id={}", user_id);
+                } else {
+                    tracing::warn!("Device code {} not confirmed (expired/used/missing)", code);
+                }
+                let note = if confirmed {
+                    "This device is now signed in."
+                } else {
+                    "Signed in, but the device code was expired or already used — request a new one in the app."
+                };
+                let html = format!(
+                    concat!(
+                        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>mylittlechart</title></head>",
+                        "<body style=\"background:#0a0f1a;color:#feffee;font-family:sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center\">",
+                        "<div><h2 style=\"color:#f4cd63\">Signed in</h2><p>{}</p>",
+                        "<p style=\"opacity:0.6\">You can close this tab.</p></div></body></html>"
+                    ),
+                    note
+                );
+                return (
+                    StatusCode::OK,
+                    [(header::SET_COOKIE, cookie.as_str()), (header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    html,
+                )
+                    .into_response();
+            }
+
             (
                 StatusCode::FOUND,
                 [
@@ -499,7 +557,7 @@ pub async fn callback(
             .await;
 
             match consumed {
-                Ok(Ok(Some((_provider_stored, _port, device_id_stored, _link_uid)))) => {
+                Ok(Ok(Some((_provider_stored, _port, device_id_stored, _link_uid, _dcode)))) => {
                     // State is valid. If the request didn't include a device_id,
                     // populate it from the stored state so it propagates to finish_oauth.
                     if req.device_id.is_none() && !device_id_stored.is_empty() {
