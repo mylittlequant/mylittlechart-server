@@ -244,6 +244,15 @@ async fn main() {
         .allow_headers([
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
+            // wasm cloud client (mlc-cloud FetchTransport) headers — needed
+            // for cross-origin dev (localhost); prod is same-origin.
+            axum::http::HeaderName::from_static("x-profile-id"),
+            axum::http::HeaderName::from_static("x-device-id"),
+            axum::http::HeaderName::from_static("x-build-attestation"),
+            axum::http::HeaderName::from_static("x-build-version"),
+            axum::http::HeaderName::from_static("x-build-timestamp"),
+            axum::http::HeaderName::from_static("x-build-platform"),
+            axum::http::HeaderName::from_static("x-confirm-delete"),
         ]);
 
     // Landing page static file service.
