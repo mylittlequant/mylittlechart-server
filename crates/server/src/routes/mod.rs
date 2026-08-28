@@ -21,6 +21,7 @@ pub mod device_auth;
 pub mod heartbeat;
 pub mod link;
 pub mod oauth;
+pub mod proxy;
 pub mod sessions;
 pub mod sync;
 pub mod telemetry;
@@ -39,6 +40,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/admin/restart", post(admin::restart))
         .route("/admin/promote", post(admin::promote))
         // Standard routes (axum default 2MB is fine).
+        .route("/proxy/entitlement", get(proxy::entitlement))
         .route("/heartbeat", post(heartbeat::handle_heartbeat))
         .route("/telemetry", post(telemetry::submit_telemetry))
         .route("/updates/latest", get(updates::get_latest))

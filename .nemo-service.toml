@@ -18,6 +18,13 @@ auth = "none"
 public = true
 
 [[endpoints]]
+method = "GET"
+path = "/api/proxy/entitlement"
+description = "Public archive-proxy policy (gate=open|entitled, entitled bool, relay=planned|paid)"
+auth = "none"
+public = true
+
+[[endpoints]]
 method = "POST"
 path = "/api/heartbeat"
 description = "Client heartbeat — reports client alive, version, telemetry"

@@ -20,6 +20,9 @@
 //!   BUILD_ATTEST_ENFORCE   — "true"/"1" to reject unsigned clients (default: false)
 //!   BUILD_ATTEST_MAX_AGE_DAYS — max build age in days (default: 365)
 //!   MLC_DBKEY_PATH         — SQLCipher key file in tmpfs (default: /run/mlc/dbkey)
+//!   MLC_PROXY_GATE         — "open" (default, must-proxy free) or "entitled"
+//!                            (paywall the whole /archive-proxy; do not flip
+//!                            until a paid claim exists)
 
 use std::sync::{Arc, Mutex};
 
