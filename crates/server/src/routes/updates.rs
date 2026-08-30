@@ -126,36 +126,36 @@ pub async fn download_binary(
         }
     };
 
-    // Open the file and stream it.
-    let file = match tokio::fs::File::open(&row.file_path).await {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!("Failed to open binary '{}': {}", row.file_path, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new("Binary file not found on disk")),
-            )
-                .into_response();
-        }
-    };
-
-    // Derive a filename from the file path for Content-Disposition.
-    let filename = std::path::Path::new(&row.file_path)
-        .file_name()
-        .and_then(|n| n.to_str())
+    // Redirect to the artifact on the edge instead of streaming it from here.
+    //
+    // Since 2026-08-30 this process runs on the control box, reachable only
+    // across the WireGuard link. Streaming an 82 MB binary through it would put
+    // bulk client traffic on the control channel and make every download depend
+    // on the control box being up — for a file that is neither user data nor
+    // control state. The edges already hold it and serve it from their own disk
+    // at /dl/, the way they serve the wasm bundle.
+    //
+    // The Location is relative on purpose: the client stays on whichever edge
+    // answered it, and no hostname is baked in.
+    //
+    // The filename comes from the manifest's own path, and that path is not
+    // uniform: rows written while the server ran on Windows carry
+    // `./data\binaries\win64\…` while newer ones carry an absolute Linux
+    // path. Split on both separators rather than trusting either.
+    let filename = row
+        .file_path
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .filter(|s| !s.is_empty())
         .unwrap_or("download");
 
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
+    let location = format!("/dl/{}/{}/{}", platform, row.version, filename);
 
     Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(header::CONTENT_LENGTH, row.file_size.to_string())
-        .body(body)
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, location)
+        // The mapping can change; never let a client or proxy remember it.
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
