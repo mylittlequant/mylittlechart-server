@@ -23,9 +23,12 @@
 //!   BUILD_ATTEST_ENFORCE   — "true"/"1" to reject unsigned clients (default: false)
 //!   BUILD_ATTEST_MAX_AGE_DAYS — max build age in days (default: 365)
 //!   MLC_DBKEY_PATH         — SQLCipher key file in tmpfs (default: /run/mlc/dbkey)
-//!   MLC_PROXY_GATE         — "open" (default, must-proxy free) or "entitled"
-//!                            (paywall the whole /archive-proxy; do not flip
-//!                            until a paid claim exists)
+//!   MLC_FREE_FEATURES      — comma-separated feature names granted to every
+//!                            caller with no paid claim (see entitlements.rs).
+//!                            Unset (default): every feature is free — this is
+//!                            what makes the paywall inert until deliberately
+//!                            flipped. Valid names: multi_profile,
+//!                            archive_proxy. Replaces the old MLC_PROXY_GATE.
 //!   MLC_ROLE               — "control" (default) or "edge". Control runs the
 //!                            database and every identity/sync/admin route.
 //!                            Edge never opens a database — it boots with no
@@ -40,6 +43,7 @@ use tower_http::services::ServeDir;
 mod auth;
 mod build_attest;
 mod db;
+mod entitlements;
 mod models;
 mod pathutil;
 mod routes;

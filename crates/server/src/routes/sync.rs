@@ -110,6 +110,58 @@ async fn resolve_user_id(
 }
 
 // ============================================================================
+// Multi-profile entitlement gate
+// ============================================================================
+
+/// Enforce the multi-profile entitlement rule for a write that carries
+/// `profile_id`, i.e. `sync_push` and `sync_setup_e2e` — the two writes that
+/// can introduce a new profile (see `entitlements::profile_write_allowed`
+/// for the exact rule: a `profile_id` the server has never seen before for
+/// this user is a profile creation and is gated by the free limit /
+/// `Feature::MultiProfile`; an already-known `profile_id` always passes).
+///
+/// Returns `Ok(())` when the write may proceed, or the `Response` to return
+/// verbatim when it may not (403 for the entitlement refusal, 500 on a DB
+/// failure while checking it).
+async fn check_profile_entitlement(
+    state: Arc<AppState>,
+    user_id: i64,
+    profile_id: String,
+) -> Result<(), Response> {
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let known = crate::syncstore::known_profile_ids(&conn, &state.control_plane().sync_store, user_id)?;
+        let features = crate::entitlements::resolve_for_user(Some(user_id));
+        Ok(crate::entitlements::profile_write_allowed(&known, &profile_id, &features))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "profile limit reached: this account may hold 1 profile without the multi-profile entitlement",
+            )),
+        )
+            .into_response()),
+        Ok(Err(e)) => {
+            tracing::error!("DB error checking profile entitlement: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response())
+        }
+        Err(_) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response()),
+    }
+}
+
+// ============================================================================
 // GET /api/sync/status
 // ============================================================================
 
@@ -427,6 +479,11 @@ pub async fn sync_push(
             Json(ErrorResponse::new("profile_id is required (X-Profile-Id header)")),
         )
             .into_response();
+    }
+
+    // Multi-profile entitlement gate — see check_profile_entitlement.
+    if let Err(resp) = check_profile_entitlement(state.clone(), user_id, profile_id.clone()).await {
+        return resp;
     }
 
     // Convert to db types — content is passed through verbatim as bytes.
@@ -884,11 +941,20 @@ pub async fn sync_setup_e2e(
             .into_response();
     }
 
+    let profile_id = extract_profile_id_or_default(&headers);
+
+    // Multi-profile entitlement gate — see check_profile_entitlement.
+    // e2e-setup can be the FIRST write for a brand-new profile_id (a client
+    // may set up encryption before ever pushing an item), so it must be
+    // enforced here too, not just in sync_push.
+    if let Err(resp) = check_profile_entitlement(state.clone(), user_id, profile_id.clone()).await {
+        return resp;
+    }
+
     let now = chrono::Utc::now().to_rfc3339();
     let salt = body.salt.clone();
     let iterations = body.iterations;
     let encrypted_master_key = body.encrypted_master_key.clone();
-    let profile_id = extract_profile_id_or_default(&headers);
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());

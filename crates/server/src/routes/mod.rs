@@ -18,6 +18,7 @@ pub mod admin;
 pub mod agent_keys;
 pub mod dashboard;
 pub mod device_auth;
+pub mod entitlements;
 pub mod heartbeat;
 pub mod link;
 pub mod oauth;
@@ -42,6 +43,10 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/admin/promote", post(admin::promote))
         // Standard routes (axum default 2MB is fine).
         .route("/proxy/entitlement", get(proxy::entitlement))
+        // General entitlements probe — superset of /proxy/entitlement, answers
+        // for anonymous callers too. Needs the database to resolve a caller
+        // (session/bearer), so control role only (see edge_api_router below).
+        .route("/entitlements", get(entitlements::get_entitlements))
         .route("/heartbeat", post(heartbeat::handle_heartbeat))
         .route("/telemetry", post(telemetry::submit_telemetry))
         .route("/updates/latest", get(updates::get_latest))
@@ -111,9 +116,12 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
 /// verifiable with a 200.
 ///
 /// Kept: `/proxy/entitlement`, the one endpoint in the full router that
-/// takes no `State` at all — it reads only `MLC_PROXY_GATE` from the
-/// environment. `heartbeat` and `telemetry` are intentionally NOT kept here
-/// even though they are public/unauthenticated: both write to the database
+/// takes no `State` at all — it reads only `entitlements::free_features()`
+/// (env var `MLC_FREE_FEATURES`) from the environment, no database. The
+/// newer `/entitlements` is NOT kept here: it resolves a caller via
+/// session/bearer, which needs the database. `heartbeat` and `telemetry`
+/// are intentionally NOT kept here either, even though they too are
+/// public/unauthenticated: both write to the database
 /// (see routes/heartbeat.rs, routes/telemetry.rs), so mounting them on edge
 /// would 500 on every call. Stage 2 (rate-limit lease) is the reason this
 /// router exists at all, but it lands as its own follow-up, not a

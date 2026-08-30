@@ -25,6 +25,13 @@ auth = "none"
 public = true
 
 [[endpoints]]
+method = "GET"
+path = "/api/entitlements"
+description = "Feature entitlements for the caller (session cookie, bearer token, or anonymous). Returns {features:[...], expires_at:ms}. Free set comes from MLC_FREE_FEATURES; unset means every feature, which is the default and changes nothing."
+auth = "optional"
+public = true
+
+[[endpoints]]
 method = "POST"
 path = "/api/heartbeat"
 description = "Client heartbeat — reports client alive, version, telemetry"

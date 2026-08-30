@@ -2045,6 +2045,27 @@ pub fn sync_cleanup_tombstones(conn: &Connection, older_than_ms: i64) -> Result<
     )?)
 }
 
+/// Distinct `profile_id`s that appear anywhere in `sync_items` for a user,
+/// INCLUDING tombstoned (`deleted = 1`) rows.
+///
+/// This is the cold-plane half of the multi-profile entitlement's "has the
+/// server ever seen this profile_id" / count check (see
+/// `syncstore::known_profile_ids`, `entitlements::profile_write_allowed`,
+/// and their callers in `routes/sync.rs`). It is deliberately NOT the same
+/// query as `sync_list_profiles_for_user`, which filters to non-deleted
+/// rows for the profile-list UI — a profile the user soft-deleted every
+/// item of has still been seen by the server and must not become
+/// re-creatable for free.
+pub fn sync_distinct_profile_ids(conn: &Connection, user_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT profile_id FROM sync_items WHERE user_id = ?1")?;
+    let mut rows = stmt.query(params![user_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
+}
+
 /// Summary info for one profile as seen across all devices.
 #[derive(Debug, Clone)]
 pub struct ProfileSyncInfo {
@@ -2623,6 +2644,16 @@ pub(crate) fn init_test_conn() -> Connection {
             created_at   TEXT    NOT NULL,
             display_name TEXT    NOT NULL DEFAULT '',
             PRIMARY KEY (user_id, device_id, profile_id, sync_id)
+        );
+
+        CREATE TABLE sync_e2e_params (
+            user_id              INTEGER NOT NULL,
+            profile_id           TEXT    NOT NULL DEFAULT '',
+            salt                 TEXT    NOT NULL,
+            iterations           INTEGER NOT NULL DEFAULT 600000,
+            created_at           TEXT    NOT NULL,
+            encrypted_master_key BLOB    DEFAULT NULL,
+            PRIMARY KEY (user_id, profile_id)
         );
         ",
     )

@@ -22,7 +22,7 @@
 //! their existing shapes. Errors are carried as `rusqlite::Error` so the
 //! handlers' error mapping stays untouched.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -690,6 +690,57 @@ pub fn list_profiles(
     Ok(by_profile.into_values().collect())
 }
 
+/// Every `profile_id` the server has ever stored an item under for this
+/// user — the union of the cold SQL plane (`sync_items`, via
+/// `db::sync_distinct_profile_ids`) and the hot file plane (profile
+/// directories under `<data_dir>/sync/<user_id>/<device_id>/`).
+///
+/// This is the authoritative source for the multi-profile entitlement (see
+/// `entitlements::profile_write_allowed`, called from `routes/sync.rs`):
+/// "how many profiles does this user have" and "has the server ever seen
+/// this profile_id" both answer from this set, because it is the number a
+/// person would recognise as their own profile count and it stays correct
+/// for a user whose data lives entirely in the hot store.
+///
+/// Deliberately does NOT read `sync_e2e_params`. Two measured facts on
+/// production (2026-08-30) rule that out: it can hold rows for profile_ids
+/// that exist nowhere else (counting from it would inflate a real user from
+/// four profiles to six), and those extra rows are not safe to delete on
+/// sight — they carry E2E key material (salt, iteration count, wrapped
+/// master key) for a profile that may be sitting on a device's disk with no
+/// server-side copy of its content yet, so deleting the row would make that
+/// vault unrecoverable from another device. `sync_e2e_setup` therefore
+/// remains an enforcement POINT (it can be the first write that introduces
+/// a profile) without being a counting SOURCE — do not "simplify" this by
+/// counting from the table it writes to.
+pub fn known_profile_ids(
+    conn: &Connection,
+    store: &SyncStore,
+    user_id: i64,
+) -> rusqlite::Result<HashSet<String>> {
+    let mut ids: HashSet<String> = crate::db::sync_distinct_profile_ids(conn, user_id)?
+        .into_iter()
+        .collect();
+
+    let _guard = store.io.lock().unwrap_or_else(|e| e.into_inner());
+    let udir = store.user_dir(user_id);
+    if let Ok(devs) = fs::read_dir(&udir) {
+        for dev in devs.flatten() {
+            let Ok(profs) = fs::read_dir(dev.path()) else {
+                continue;
+            };
+            for prof in profs.flatten() {
+                let pname = prof.file_name().to_string_lossy().into_owned();
+                // "_" is the sanitized on-disk form of the empty (legacy
+                // default) profile_id — see `sanitize`.
+                let profile_id = if pname == "_" { String::new() } else { pname };
+                ids.insert(profile_id);
+            }
+        }
+    }
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,6 +890,46 @@ mod tests {
         let p = profiles.iter().find(|p| p.profile_id == "prof").unwrap();
         assert_eq!(p.display_name.as_deref(), Some("Work"));
         assert_eq!(p.item_count, 1);
+    }
+
+    #[test]
+    fn known_profile_ids_unions_and_dedups_cold_and_hot() {
+        let dir = TestDir::new();
+        let s = store(&dir);
+        let conn = crate::db::init_test_conn();
+
+        // "hot-only": lives only as a file-store directory (preset category).
+        push(&conn, &s, 1, "dev", "hot-only", &[item("p1", "preset", 100)]).unwrap();
+        // "cold-only": lives only in sync_items (vault category).
+        push(&conn, &s, 1, "dev", "cold-only", &[item("v1", "vault", 100)]).unwrap();
+        // "both": present in both stores — must be counted once, not twice.
+        push(&conn, &s, 1, "dev", "both", &[item("p2", "preset", 100)]).unwrap();
+        push(&conn, &s, 1, "dev", "both", &[item("v2", "vault", 100)]).unwrap();
+
+        let known = known_profile_ids(&conn, &s, 1).unwrap();
+        assert_eq!(known.len(), 3);
+        assert!(known.contains("hot-only"));
+        assert!(known.contains("cold-only"));
+        assert!(known.contains("both"));
+    }
+
+    #[test]
+    fn known_profile_ids_ignores_sync_e2e_params_debris() {
+        // A row in sync_e2e_params with no corresponding sync_items or
+        // hot-store data must NOT count as a known profile — see this
+        // function's doc comment for the production evidence that motivates
+        // this (2026-08-30: two such rows exist for a real user).
+        let dir = TestDir::new();
+        let s = store(&dir);
+        let conn = crate::db::init_test_conn();
+
+        push(&conn, &s, 1, "dev", "real-profile", &[item("p1", "preset", 100)]).unwrap();
+        crate::db::sync_set_e2e_params(&conn, 1, "orphan-e2e-only", "0".repeat(32).as_str(), 600_000, None, "2026-01-01T00:00:00Z").unwrap();
+
+        let known = known_profile_ids(&conn, &s, 1).unwrap();
+        assert_eq!(known.len(), 1);
+        assert!(known.contains("real-profile"));
+        assert!(!known.contains("orphan-e2e-only"));
     }
 
     #[test]
