@@ -81,7 +81,7 @@ pub async fn submit_telemetry(
     let now = chrono::Utc::now().to_rfc3339();
 
     tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         let user_id = raw_token.as_deref().and_then(|t| {
             let hash = hash_token(t);

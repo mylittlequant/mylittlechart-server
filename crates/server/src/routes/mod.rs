@@ -28,9 +28,10 @@ pub mod telemetry;
 pub mod tg_login;
 pub mod updates;
 
-/// Build the `/api` sub-router with all endpoints.
+/// Build the `/api` sub-router for a control-role process: every endpoint,
+/// unchanged from before the 2026-08-30 control/edge split.
 /// The state is `Arc<AppState>` and is attached via `.with_state()` on the outer router.
-pub fn api_router(state: Arc<AppState>) -> Router {
+pub fn control_api_router(state: Arc<AppState>) -> Router {
     Router::new()
         // Admin endpoints — protected by ADMIN_SECRET.
         .route(
@@ -96,4 +97,27 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/sync/profiles", get(sync::sync_list_profiles))
         .route("/sync/pull-profile", get(sync::sync_pull_profile))
         .with_state(state)
+}
+
+/// Build the `/api` sub-router for an edge-role process.
+///
+/// An edge process holds no `ControlPlane` (see `state.rs`) — every route
+/// here must be answerable without touching `AppState::control_plane()`.
+/// Deliberately NOT mounted: identity (device-auth, oauth, tg-login, link,
+/// agent-key, sessions/account), sync, admin, and updates — all of them read
+/// or write the database. Not mounting beats a runtime check: a route that
+/// does not exist cannot be reached by a bug, and its absence is verifiable
+/// from outside with a plain 404, the same way `/health`'s presence is
+/// verifiable with a 200.
+///
+/// Kept: `/proxy/entitlement`, the one endpoint in the full router that
+/// takes no `State` at all — it reads only `MLC_PROXY_GATE` from the
+/// environment. `heartbeat` and `telemetry` are intentionally NOT kept here
+/// even though they are public/unauthenticated: both write to the database
+/// (see routes/heartbeat.rs, routes/telemetry.rs), so mounting them on edge
+/// would 500 on every call. Stage 2 (rate-limit lease) is the reason this
+/// router exists at all, but it lands as its own follow-up, not a
+/// db-shaped hole opened today.
+pub fn edge_api_router(_state: Arc<AppState>) -> Router {
+    Router::new().route("/proxy/entitlement", get(proxy::entitlement))
 }

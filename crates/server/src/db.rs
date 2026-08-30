@@ -2229,11 +2229,20 @@ pub fn list_sessions_for_user(conn: &Connection, user_id: i64) -> Result<Vec<Ses
 
 /// Delete all data for a user and the user row itself.
 ///
-/// Cascade order: sync_e2e_params → sync_items → auth_tokens → device_users
-/// → user_providers → web_sessions → users.
+/// Cascade order: telemetry → sync_e2e_params → sync_items → auth_tokens →
+/// device_users → user_providers → web_sessions → users.
+///
+/// `telemetry` rows are SQL-only (2026-08-30 gap fix — the table carries a
+/// `user_id` column, see `CREATE TABLE IF NOT EXISTS telemetry` above, but
+/// nothing purged it here; a deleted user's telemetry survived indefinitely).
+/// The hot-plane sync files (`<data_dir>/sync/<user_id>/…`) are NOT touched
+/// by this function — the caller (routes/sessions.rs::delete_account) also
+/// calls `syncstore::purge_user` for those, since this module has no
+/// filesystem access.
 ///
 /// Returns the number of rows deleted from `users` (1 on success, 0 if user not found).
 pub fn delete_account(conn: &Connection, user_id: i64) -> Result<usize> {
+    conn.execute("DELETE FROM telemetry WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM sync_e2e_params WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM sync_items WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM auth_tokens WHERE user_id = ?1", params![user_id])?;
@@ -2500,6 +2509,13 @@ pub fn confirm_link_token(conn: &Connection, token: &str, user_id: i64) -> Resul
 /// and tombstones) for users whose most-recent `modified_at` is older than the
 /// threshold. Also cleans up orphaned `sync_e2e_params` rows for users who no
 /// longer have any sync items.
+///
+/// This covers the cold plane only (`sync_items` in SQLCipher). The hot plane
+/// — presets/layouts/watchlists/… under `<data_dir>/sync/<user_id>/…` — is a
+/// separate counterpart, `syncstore::cleanup_inactive`, called alongside this
+/// function from the same periodic task in `main.rs`; a hot-only user (one who
+/// never wrote a cold category) never appears in this query at all, so the two
+/// sweeps cannot be merged into one.
 ///
 /// Returns the number of `sync_items` rows deleted.
 pub fn cleanup_inactive_sync_data(conn: &Connection, inactive_days: i64) -> rusqlite::Result<usize> {

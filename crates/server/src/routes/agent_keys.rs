@@ -176,7 +176,7 @@ pub async fn generate_key(
     let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<GenerateOutcome> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         let user_id = match crate::db::resolve_web_session(&conn, &session_id, &ua_hash)? {
             Some(id) => id,
@@ -297,7 +297,7 @@ pub async fn request_agent_key(
     let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let _ = crate::db::cleanup_agent_key_requests(&conn);
 
         // Global throttle: prevent request floods without per-IP middleware.
@@ -368,7 +368,7 @@ pub async fn poll_agent_key(
     let code = query.code.to_uppercase();
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<(String, Option<String>)>> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let poll_result = crate::db::poll_agent_key_request(&conn, &code)?;
         // After delivering the raw key to the agent (confirmed → claimed transition),
         // immediately null out claimed_key so the plaintext is not retained server-side.
@@ -503,7 +503,7 @@ pub async fn confirm_agent_key(
 
     let result =
         tokio::task::spawn_blocking(move || -> rusqlite::Result<ConfirmKeyOutcome> {
-            let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
             let user_id = match crate::db::resolve_web_session(&conn, &session_id, &ua_hash)? {
                 Some(id) => id,
@@ -652,7 +652,7 @@ pub async fn deny_agent_key(
     let ua_hash = extract_ua_hash(&headers);
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<DenyKeyOutcome> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         let user_id = match crate::db::resolve_web_session(&conn, &session_id, &ua_hash)? {
             Some(id) => id,
@@ -742,7 +742,7 @@ pub async fn get_agent_key_info(
     let ua_hash = extract_ua_hash(&headers);
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<InfoOutcome> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         // Verify session.
         match crate::db::resolve_web_session(&conn, &session_id, &ua_hash)? {
@@ -857,7 +857,7 @@ pub async fn list_keys(
     let want_sync = query.format == "sync";
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<ListOutcome> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         // Resolve user_id — try cookie first, then Bearer.
         let user_id = if let Some(sid) = session_id {
@@ -992,7 +992,7 @@ pub async fn revoke_key(
     let ua_hash = extract_ua_hash(&headers);
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<RevokeOutcome> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         let user_id = match crate::db::resolve_web_session(&conn, &session_id, &ua_hash)? {
             Some(id) => id,
@@ -1271,7 +1271,7 @@ pub async fn update_key_usage(
         .collect();
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<usize>> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         let token_hash = hash_token(&raw_token);
         let user_id = match crate::db::resolve_token_hash_with_expiry(&conn, &token_hash)? {

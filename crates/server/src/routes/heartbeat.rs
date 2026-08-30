@@ -52,7 +52,7 @@ pub async fn handle_heartbeat(
         .collect();
 
     tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::upsert_device(&conn, &device_id, &device_name, &app_version, &os, &now)
     })
     .await

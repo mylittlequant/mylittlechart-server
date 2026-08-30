@@ -182,7 +182,7 @@ pub async fn upload_binary(
     let sha256_clone = sha256.clone();
 
     let db_result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::upsert_release(
             &conn,
             &version,
@@ -277,7 +277,7 @@ pub async fn promote(
     let platform = query.platform.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::promote_release(&conn, &version, &platform, &now)
     })
     .await;

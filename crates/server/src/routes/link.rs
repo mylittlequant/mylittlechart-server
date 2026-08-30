@@ -96,7 +96,7 @@ pub async fn init_link(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let _ = crate::db::cleanup_expired_sessions(&conn);
         crate::db::create_link_token(&conn, &device_name, &device_id)
     })
@@ -148,7 +148,7 @@ pub async fn poll_link(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::poll_link_token(&conn, &token)
     })
     .await;
@@ -241,7 +241,7 @@ pub async fn confirm_link(
 
     let result =
         tokio::task::spawn_blocking(move || -> rusqlite::Result<ConfirmLinkOutcome> {
-            let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
             // Validate session.
             let user_id = match crate::db::resolve_web_session(&conn, &session_id, &ua_hash)? {

@@ -39,7 +39,7 @@ pub async fn create_tg_login(
             let ua_hash = extract_ua_hash(&headers);
             let state_clone = state.clone();
             tokio::task::spawn_blocking(move || {
-                let conn = state_clone.db.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = state_clone.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
                 crate::db::resolve_web_session(&conn, &sid, &ua_hash)
             })
             .await
@@ -58,7 +58,7 @@ pub async fn create_tg_login(
 
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state_clone.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state_clone.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let _ = crate::db::cleanup_tg_login_tokens(&conn);
         crate::db::create_tg_login_token(&conn, link_user_id, &now, &expires_at)
     })
@@ -117,7 +117,7 @@ pub async fn poll_tg_login(
 
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<serde_json::Value> {
-        let conn = state_clone.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state_clone.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let poll_result = crate::db::poll_tg_login_token(&conn, &token)?;
 
         match poll_result {

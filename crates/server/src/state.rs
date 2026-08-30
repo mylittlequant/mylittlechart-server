@@ -2,20 +2,86 @@
 
 use std::sync::Mutex;
 
-/// Shared application state.
+/// Which role this process plays in the production topology.
 ///
-/// `rusqlite::Connection` is `!Send`, so we wrap it in a `std::sync::Mutex`.
-/// SQLite queries are sub-millisecond, so blocking on this lock is acceptable.
-pub struct AppState {
-    /// SQLite connection protected by a standard (blocking) mutex.
-    pub db: Mutex<rusqlite::Connection>,
+/// 2026-08-30 split: production runs one control box (this binary + the
+/// SQLCipher database) and two edge boxes (nginx serving static + a relay).
+/// Stage 2 needs an edge to also run this binary — stripped down, holding a
+/// rate-limit lease — so the role has to exist as a real boot-time choice,
+/// not just a plan.
+///
+/// Read once at boot from `MLC_ROLE` (see `ServerRole::from_env`); defaults
+/// to `Control` so a fresh checkout with no new env var set behaves exactly
+/// like today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerRole {
+    /// Runs the database and every identity/sync/admin endpoint. Today's
+    /// only role, and the default.
+    Control,
+    /// Runs a stripped subset with no database at all (see `ControlPlane`
+    /// and `routes::edge_api_router`).
+    Edge,
+}
 
-    /// Root directory where runtime data is stored (binaries, DB file, etc.)
-    pub data_dir: String,
+impl ServerRole {
+    /// Read `MLC_ROLE` from the environment (`"control"` / `"edge"`,
+    /// case-insensitive). Unset or unrecognised values default to `Control`
+    /// — the only role that existed before this split, so an operator who
+    /// never heard of `MLC_ROLE` gets unchanged behaviour.
+    pub fn from_env() -> Self {
+        match std::env::var("MLC_ROLE") {
+            Ok(v) if v.eq_ignore_ascii_case("edge") => ServerRole::Edge,
+            Ok(v) if v.eq_ignore_ascii_case("control") => ServerRole::Control,
+            Ok(other) => {
+                tracing::warn!(
+                    "Unrecognised MLC_ROLE={:?} — defaulting to control",
+                    other
+                );
+                ServerRole::Control
+            }
+            Err(_) => ServerRole::Control,
+        }
+    }
+}
+
+impl std::fmt::Display for ServerRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ServerRole::Control => "control",
+            ServerRole::Edge => "edge",
+        })
+    }
+}
+
+/// Resources that exist only on a control-role process: the SQLCipher
+/// database and the hot sync-file store. An edge-role process never
+/// constructs one of these — see `ServerRole` and the boot gate in
+/// `main.rs`, which skips `db::init_db` (and its wait for the SQLCipher key
+/// file) entirely on edge.
+pub struct ControlPlane {
+    /// SQLite connection protected by a standard (blocking) mutex.
+    ///
+    /// `rusqlite::Connection` is `!Send`, so we wrap it in a `std::sync::Mutex`.
+    /// SQLite queries are sub-millisecond, so blocking on this lock is acceptable.
+    pub db: Mutex<rusqlite::Connection>,
 
     /// Hot file store for chart-persistence sync categories (see syncstore.rs).
     /// Root is `<data_dir>/sync/`. Cold categories stay in the SQLCipher DB.
     pub sync_store: crate::syncstore::SyncStore,
+}
+
+/// Shared application state.
+pub struct AppState {
+    /// Control-plane resources (database + hot sync store), or `None` on an
+    /// edge-role process. Private: reach it through the `control_plane()`
+    /// accessor below so there is exactly one place that decides what
+    /// happens when a control-only handler runs on an edge process — never
+    /// possible in practice (step 3 in routes/mod.rs does not mount those
+    /// handlers on edge), but a clear invariant beats a silent `None` deref.
+    control_plane: Option<ControlPlane>,
+
+    /// Root directory where runtime data is stored (binaries, DB file, etc.)
+    pub data_dir: String,
 
     /// Secret required for admin endpoints (set via `ADMIN_SECRET` env var).
     pub admin_secret: String,
@@ -52,4 +118,62 @@ pub struct AppState {
     ///
     /// Controlled by `BUILD_ATTEST_MAX_AGE_DAYS` env var (default: 365 days).
     pub build_attest_max_age_secs: u64,
+}
+
+impl AppState {
+    /// Construct `AppState` with an explicit control plane (`Some` on a
+    /// control-role process, `None` on edge). This is the only place that
+    /// sets `control_plane` — the field is private, so every other call
+    /// site (all route handlers) is forced through `control_plane()` below.
+    pub fn new(
+        control_plane: Option<ControlPlane>,
+        data_dir: String,
+        admin_secret: String,
+        github_client_id: String,
+        github_client_secret: String,
+        discord_client_id: String,
+        discord_client_secret: String,
+        telegram_bot_token: String,
+        google_client_id: String,
+        google_client_secret: String,
+        twitter_client_id: String,
+        twitter_client_secret: String,
+        shutdown_tx: tokio::sync::broadcast::Sender<()>,
+        build_attest_pubkeys: Vec<[u8; 32]>,
+        build_attest_enforce: bool,
+        build_attest_max_age_secs: u64,
+    ) -> Self {
+        Self {
+            control_plane,
+            data_dir,
+            admin_secret,
+            github_client_id,
+            github_client_secret,
+            discord_client_id,
+            discord_client_secret,
+            telegram_bot_token,
+            google_client_id,
+            google_client_secret,
+            twitter_client_id,
+            twitter_client_secret,
+            shutdown_tx,
+            build_attest_pubkeys,
+            build_attest_enforce,
+            build_attest_max_age_secs,
+        }
+    }
+
+    /// The single accessor for control-plane resources (database + hot sync
+    /// store).
+    ///
+    /// Panics if called on an edge-role process. That is acceptable ONLY
+    /// because every caller of this accessor is a control-only route, and
+    /// `routes::edge_api_router` (routes/mod.rs) does not mount any of them
+    /// on edge — the panic documents an invariant that a routing bug would
+    /// have to break first, it does not paper over a reachable edge case.
+    pub fn control_plane(&self) -> &ControlPlane {
+        self.control_plane.as_ref().expect(
+            "control_plane accessed on an edge-role process — this handler must not be mounted by edge_api_router",
+        )
+    }
 }

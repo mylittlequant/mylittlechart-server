@@ -104,7 +104,7 @@ pub async fn render(
     State(state): State<Arc<AppState>>,
 ) -> Result<Html<String>, StatusCode> {
     let html = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         build_dashboard(&conn)
     })
     .await

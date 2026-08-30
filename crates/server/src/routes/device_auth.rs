@@ -75,7 +75,7 @@ pub async fn create_code(
     let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let _ = crate::db::cleanup_expired_sessions(&conn);
         crate::db::create_device_code(&conn, &device_id, &now, &expires_at)
     })
@@ -130,7 +130,7 @@ pub async fn poll_code(
     let code = req.code.to_uppercase();
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<PollOutcome> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let row = crate::db::get_device_code(&conn, &code)?;
 
         let row = match row {
@@ -292,7 +292,7 @@ pub async fn confirm_code(
     let ua_hash = extract_ua_hash(&headers);
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<ConfirmOutcome> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         // Validate session.
         let user_id = match crate::db::resolve_web_session(&conn, &session_id, &ua_hash)? {
@@ -399,7 +399,7 @@ pub async fn me(
     let ua_hash = extract_ua_hash(&headers);
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<MeResponse>> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         let user_id = match crate::db::resolve_web_session(&conn, &session_id, &ua_hash)? {
             Some(id) => id,
@@ -469,7 +469,7 @@ pub async fn logout(
 ) -> Response {
     if let Some(session_id) = extract_session_id(&headers) {
         let _ = tokio::task::spawn_blocking(move || {
-            let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
             crate::db::delete_web_session(&conn, &session_id)
         })
         .await;

@@ -62,7 +62,7 @@ pub async fn authorize(
             let ua_hash = extract_ua_hash(&headers);
             let state_clone = state.clone();
             tokio::task::spawn_blocking(move || {
-                let conn = state_clone.db.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = state_clone.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
                 crate::db::resolve_web_session(&conn, &sid, &ua_hash)
             })
             .await
@@ -93,7 +93,7 @@ pub async fn authorize(
         let device_id_clone = device_id.clone();
         let device_code_clone = device_code.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            let conn = state_clone.db.lock().unwrap_or_else(|e| e.into_inner());
+            let conn = state_clone.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
             let _ = crate::db::cleanup_oauth_states(&conn);
             crate::db::insert_oauth_state(&conn, &state_param_clone, &provider_clone, redirect_port, &now, &device_id_clone, link_user_id, device_code_clone.as_deref())
         })
@@ -193,7 +193,7 @@ pub async fn web_callback(
             let state_clone = state.clone();
             let sp_clone = sp.clone();
             let consumed = tokio::task::spawn_blocking(move || {
-                let conn = state_clone.db.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = state_clone.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
                 crate::db::consume_oauth_state(&conn, &sp_clone)
             })
             .await;
@@ -238,7 +238,7 @@ pub async fn web_callback(
     let state_for_device = state.clone();
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(i64, String)> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         let user_id = if let Some(existing_uid) = link_user_id {
             // Link flow: add this provider to the existing account.
@@ -272,7 +272,7 @@ pub async fn web_callback(
                 let state_clone = state_for_device.clone();
                 let code_clone = code.clone();
                 let confirmed = tokio::task::spawn_blocking(move || {
-                    let conn = state_clone.db.lock().unwrap_or_else(|e| e.into_inner());
+                    let conn = state_clone.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
                     let now = chrono::Utc::now().to_rfc3339();
                     match crate::db::get_device_code(&conn, &code_clone) {
                         Ok(Some(row)) if row.expires_at >= now && row.status == "pending" => {
@@ -551,7 +551,7 @@ pub async fn callback(
             let state_clone = state.clone();
             let state_param_clone = state_param.clone();
             let consumed = tokio::task::spawn_blocking(move || {
-                let conn = state_clone.db.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = state_clone.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
                 crate::db::consume_oauth_state(&conn, &state_param_clone)
             })
             .await;
@@ -663,7 +663,7 @@ pub async fn telegram_web_callback(
             let ua_hash_for_link = extract_ua_hash(&headers);
             let state_clone = state.clone();
             tokio::task::spawn_blocking(move || {
-                let conn = state_clone.db.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = state_clone.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
                 crate::db::resolve_web_session(&conn, &sid, &ua_hash_for_link)
             })
             .await
@@ -685,7 +685,7 @@ pub async fn telegram_web_callback(
     let provider_user_id = query.id.clone();
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(i64, String)> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         let user_id = if let Some(existing_uid) = link_user_id {
             // Link flow: add Telegram identity to existing account.
@@ -1125,7 +1125,7 @@ async fn finish_oauth(
     let provider_clone = provider.clone();
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(i64, String)> {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
         // Upsert the user row for this provider identity.
         let new_user_id = crate::db::upsert_user(&conn, &provider, &provider_user_id, &display_name, &now)?;

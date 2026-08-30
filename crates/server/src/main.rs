@@ -9,6 +9,9 @@
 //!
 //! Configuration via environment variables:
 //!   PORT                   — listen port (default: 19200)
+//!   BIND_ADDR              — listen address (default: 127.0.0.1; set to the
+//!                            WireGuard address on a control box so edges can
+//!                            reach it, never to a public interface)
 //!   ADMIN_SECRET           — bearer token for admin upload endpoint
 //!   GITHUB_CLIENT_ID       — GitHub OAuth app client ID
 //!   GITHUB_CLIENT_SECRET   — GitHub OAuth app client secret
@@ -23,6 +26,11 @@
 //!   MLC_PROXY_GATE         — "open" (default, must-proxy free) or "entitled"
 //!                            (paywall the whole /archive-proxy; do not flip
 //!                            until a paid claim exists)
+//!   MLC_ROLE               — "control" (default) or "edge". Control runs the
+//!                            database and every identity/sync/admin route.
+//!                            Edge never opens a database — it boots with no
+//!                            control plane and mounts only the stateless
+//!                            subset (see routes::edge_api_router).
 
 use std::sync::{Arc, Mutex};
 
@@ -74,6 +82,11 @@ async fn main() {
                 .unwrap_or_else(|_| "mylittlechart_server=info,tower_http=info".into()),
         )
         .init();
+
+    // Which role this process plays (2026-08-30 control/edge split, see
+    // state.rs). Read once, before anything role-dependent below.
+    let role = state::ServerRole::from_env();
+    tracing::info!("Server role: {}", role);
 
     // Read configuration from environment.
     let port: u16 = std::env::var("PORT")
@@ -127,30 +140,48 @@ async fn main() {
         build_attest_max_age_secs / 86400
     );
 
-    // Ensure data directories exist.
-    let binaries_dir = format!("{}/binaries", data_dir);
-    std::fs::create_dir_all(&binaries_dir).expect("Failed to create data/binaries directory");
+    // Control plane (database + hot sync store) — control role only. An edge
+    // process must never open a database: no wait on the SQLCipher key at
+    // `MLC_DBKEY_PATH`, no data directory, no migrations (`db::init_db`'s
+    // `wait_for_db_key` loop would otherwise block edge boot forever, since
+    // an edge box has no key to give it).
+    let control_plane = match role {
+        state::ServerRole::Control => {
+            // Ensure data directories exist.
+            let binaries_dir = format!("{}/binaries", data_dir);
+            std::fs::create_dir_all(&binaries_dir)
+                .expect("Failed to create data/binaries directory");
 
-    // Initialize SQLite database.
-    let db_path = format!("{}/mylittlechart.db", data_dir);
-    let db_conn = match db::init_db(&db_path) {
-        Ok(conn) => conn,
-        Err(e) => {
-            tracing::error!("Failed to initialize database at {}: {}", db_path, e);
-            std::process::exit(1);
+            // Initialize SQLite database.
+            let db_path = format!("{}/mylittlechart.db", data_dir);
+            let db_conn = match db::init_db(&db_path) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::error!("Failed to initialize database at {}: {}", db_path, e);
+                    std::process::exit(1);
+                }
+            };
+            tracing::info!("Database initialized at {}", db_path);
+
+            Some(state::ControlPlane {
+                db: Mutex::new(db_conn),
+                sync_store: crate::syncstore::SyncStore::new(
+                    std::path::Path::new(&data_dir).join("sync"),
+                ),
+            })
+        }
+        state::ServerRole::Edge => {
+            tracing::info!("Edge role: no database, no hot sync store, no data directory");
+            None
         }
     };
-    tracing::info!("Database initialized at {}", db_path);
 
     // Shared shutdown channel: one signal fans out to both servers + admin restart.
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
     // Build shared application state.
-    let app_state = Arc::new(AppState {
-        db: Mutex::new(db_conn),
-        sync_store: crate::syncstore::SyncStore::new(
-            std::path::Path::new(&data_dir).join("sync"),
-        ),
+    let app_state = Arc::new(AppState::new(
+        control_plane,
         data_dir,
         admin_secret,
         github_client_id,
@@ -162,20 +193,25 @@ async fn main() {
         google_client_secret,
         twitter_client_id,
         twitter_client_secret,
-        shutdown_tx: shutdown_tx.clone(),
+        shutdown_tx.clone(),
         build_attest_pubkeys,
         build_attest_enforce,
         build_attest_max_age_secs,
-    });
+    ));
 
-    // Start the Telegram login bot (background task).
-    // The bot calls db::confirm_tg_login_token synchronously via the closure.
-    {
+    // Start the Telegram login bot (background task) — control role only.
+    // The bot calls db::confirm_tg_login_token synchronously via the closure,
+    // which needs the control plane; an edge process has none.
+    if role == state::ServerRole::Control {
         let bot_token = app_state.telegram_bot_token.clone();
         let confirm_fn: tg_login_bot::ConfirmFn = {
             let state = app_state.clone();
             Arc::new(move |token, tg_user_id, display_name| {
-                let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = state
+                    .control_plane()
+                    .db
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 db::confirm_tg_login_token(&conn, token, tg_user_id, display_name)
                     .unwrap_or(false)
             })
@@ -184,9 +220,13 @@ async fn main() {
         tg_login_bot::start(bot_token, confirm_fn, bot_shutdown);
     }
 
-    // Spawn background cleanup task — runs every 12 hours.
-    // Handles expired sessions, tokens, stale devices, and inactive sync data.
-    {
+    // Spawn background cleanup task — runs every 12 hours, control role only
+    // (everything it cleans lives in the control plane).
+    // Handles expired sessions, tokens, stale devices, and inactive sync data
+    // — both the cold plane (SQL `sync_items`) and the hot plane (files under
+    // `<data_dir>/sync/`, see `syncstore::cleanup_inactive`; added 2026-08-30
+    // — the SQL sweep alone never touched hot-only users' files).
+    if role == state::ServerRole::Control {
         let state = app_state.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 60 * 60));
@@ -196,22 +236,26 @@ async fn main() {
                 interval.tick().await;
                 let state = state.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                    let cp = state.control_plane();
+                    let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
                     let sessions = crate::db::cleanup_expired_sessions(&conn)
                         .map(|_| 0usize)
                         .unwrap_or(0);
                     let tokens = crate::db::cleanup_expired_auth_tokens(&conn).unwrap_or(0);
                     let devices = crate::db::cleanup_stale_devices(&conn, 365).unwrap_or(0);
                     let sync = crate::db::cleanup_inactive_sync_data(&conn, 365).unwrap_or(0);
-                    (sessions, tokens, devices, sync)
+                    drop(conn);
+                    let sync_files =
+                        crate::syncstore::cleanup_inactive(&cp.sync_store, 365).unwrap_or(0);
+                    (sessions, tokens, devices, sync, sync_files)
                 })
                 .await;
                 match result {
-                    Ok((_sessions, tokens, devices, sync)) => {
-                        if tokens + devices + sync > 0 {
+                    Ok((_sessions, tokens, devices, sync, sync_files)) => {
+                        if tokens + devices + sync + sync_files > 0 {
                             tracing::info!(
-                                "Periodic cleanup: {} expired tokens, {} stale devices, {} inactive sync items",
-                                tokens, devices, sync
+                                "Periodic cleanup: {} expired tokens, {} stale devices, {} inactive sync items, {} inactive sync user dirs",
+                                tokens, devices, sync, sync_files
                             );
                         }
                     }
@@ -372,20 +416,30 @@ async fn main() {
         }
     };
 
-    // Read dashboard port from environment (default 19237).
-    let dash_port: u16 = std::env::var("DASHBOARD_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(19237);
+    // Dashboard router — localhost only, no auth, control role only: it reads
+    // the database directly (routes/dashboard.rs) and an edge process has
+    // none. Not binding the listener at all (further down) beats a runtime
+    // check on every request — an admin surface that isn't listening cannot
+    // be reached by a bug, and "is it up" is externally verifiable the same
+    // way `/health`'s absence would be: connection refused.
+    let dash_app = (role == state::ServerRole::Control).then(|| {
+        axum::Router::new()
+            .route("/", axum::routing::get(routes::dashboard::render))
+            .with_state(app_state.clone())
+    });
 
-    // Clone state for the dashboard router before moving it into the main router.
-    let dash_state = app_state.clone();
-
-    // Assemble the full router.
+    // Assemble the full router. `/api` mounts the role-appropriate route
+    // table — see `routes::control_api_router` / `routes::edge_api_router`.
+    let api_router = match role {
+        state::ServerRole::Control => routes::control_api_router(app_state),
+        state::ServerRole::Edge => routes::edge_api_router(app_state),
+    };
     let app = axum::Router::new()
         // Liveness probe for d-watchdog (root-level, before /{page} catch-all).
+        // Kept on every role: it carries no data and is the one thing an
+        // edge box must answer for d-watchdog to supervise it at all.
         .route("/health", axum::routing::get(|| async { "ok" }))
-        .nest("/api", routes::api_router(app_state))
+        .nest("/api", api_router)
         // Clean URLs + file serving for subpages (before static fallback)
         .route("/{page}", axum::routing::get(handler_single))
         .route("/{dir}/{page}", axum::routing::get(handler_nested))
@@ -394,29 +448,45 @@ async fn main() {
         .layer(cors)
         .layer(axum::middleware::from_fn(security_headers));
 
-    // Dashboard router — localhost only, no auth.
-    let dash_app = axum::Router::new()
-        .route("/", axum::routing::get(routes::dashboard::render))
-        .with_state(dash_state);
-
-    // Bind both listeners.
-    // Main listener is loopback-only: all public traffic arrives via the
-    // local cloudflared tunnel, so there is no reason to expose the port.
-    let main_addr = format!("127.0.0.1:{}", port);
+    // Bind the main listener.
+    //
+    // The main listener defaults to loopback, which is right when nginx sits
+    // on the same box. `BIND_ADDR` overrides it for the split topology, where
+    // this process runs on the control box and the edges reach it across the
+    // WireGuard link — there is no local nginx to talk to. It is still never
+    // bound to a public interface: on the control box the address given is the
+    // tunnel's, and the firewall accepts :19200 only with `iifname wg0`.
+    //
+    // (The previous comment here said public traffic arrives via a local
+    // cloudflared tunnel. That stopped being true at the 2026-08-24 cutover,
+    // which moved the site to direct DNS.)
+    let bind_host = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let main_addr = format!("{}:{}", bind_host, port);
     tracing::info!("mylittlechart-server listening on {}", main_addr);
     let main_listener = tokio::net::TcpListener::bind(&main_addr)
         .await
         .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", main_addr, e));
 
-    let dash_addr = format!("127.0.0.1:{}", dash_port);
-    tracing::info!("Admin dashboard listening on http://{}", dash_addr);
-    let dash_listener = tokio::net::TcpListener::bind(&dash_addr)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to bind dashboard to {}: {}", dash_addr, e));
-
-    // Subscribe both servers to the shutdown channel before spawning the signal task.
+    // Subscribe to the shutdown channel before spawning the signal task, for
+    // both listeners that will exist — otherwise a shutdown broadcast that
+    // fires between spawn and subscribe would be missed.
     let mut main_shutdown_rx = shutdown_tx.subscribe();
-    let mut dash_shutdown_rx = shutdown_tx.subscribe();
+    let dash_listen = if let Some(dash_app) = dash_app {
+        // Read dashboard port from environment (default 19237).
+        let dash_port: u16 = std::env::var("DASHBOARD_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(19237);
+        let dash_addr = format!("127.0.0.1:{}", dash_port);
+        tracing::info!("Admin dashboard listening on http://{}", dash_addr);
+        let dash_listener = tokio::net::TcpListener::bind(&dash_addr)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to bind dashboard to {}: {}", dash_addr, e));
+        Some((dash_listener, dash_app, shutdown_tx.subscribe()))
+    } else {
+        tracing::info!("Edge role: admin dashboard listener not started");
+        None
+    };
 
     // Spawn a task that waits for Ctrl-C (SIGINT) or SIGTERM, then broadcasts shutdown.
     // NOTE: /api/admin/restart can also trigger shutdown via app_state.shutdown_tx.
@@ -442,25 +512,29 @@ async fn main() {
         let _ = shutdown_tx.send(());
     });
 
-    // Graceful-shutdown futures for each server.
+    // Graceful-shutdown future for the main server.
     let main_shutdown = async move {
         let _ = main_shutdown_rx.recv().await;
     };
-    let dash_shutdown = async move {
-        let _ = dash_shutdown_rx.recv().await;
-    };
-
-    // Run both servers concurrently. Both drain when the shutdown signal fires.
     // A 30-second hard timeout prevents a stuck connection from blocking deploys.
-    let main_serve = axum::serve(main_listener, app)
-        .with_graceful_shutdown(main_shutdown);
-    let dash_serve = axum::serve(dash_listener, dash_app)
-        .with_graceful_shutdown(dash_shutdown);
+    let main_serve = axum::serve(main_listener, app).with_graceful_shutdown(main_shutdown);
 
-    tokio::select! {
-        r = main_serve => r.expect("Main server error"),
-        r = dash_serve => r.expect("Dashboard server error"),
-    };
+    // Run the main server, plus the dashboard when this is a control process.
+    // Both drain when the shutdown signal fires.
+    match dash_listen {
+        Some((dash_listener, dash_app, mut dash_shutdown_rx)) => {
+            let dash_shutdown = async move {
+                let _ = dash_shutdown_rx.recv().await;
+            };
+            let dash_serve =
+                axum::serve(dash_listener, dash_app).with_graceful_shutdown(dash_shutdown);
+            tokio::select! {
+                r = main_serve => r.expect("Main server error"),
+                r = dash_serve => r.expect("Dashboard server error"),
+            };
+        }
+        None => main_serve.await.expect("Main server error"),
+    }
 
     tracing::info!("Server shut down gracefully");
 }

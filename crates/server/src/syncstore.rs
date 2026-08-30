@@ -560,6 +560,86 @@ pub fn delete_all(
     Ok(n)
 }
 
+/// Hard-delete every hot file for a user (all devices, all profiles, all
+/// categories). Called from account deletion (routes/sessions.rs::delete_account)
+/// alongside `db::delete_account`'s SQL cascade — that cascade is SQL-only and
+/// cannot see this filesystem tree (2026-08-30 gap fix: the hot store was the
+/// one place a deleted user's data reliably survived deletion).
+///
+/// Reuses `SyncStore::user_dir` — the same path builder every other function
+/// in this module uses — rather than assembling `<root>/<user_id>` again.
+///
+/// Idempotent: a missing directory (already purged, retried request, or a
+/// user who never wrote a hot-category item) is success, not an error. The
+/// caller must not fail account deletion over this — the SQL cascade above
+/// already committed by the time this runs.
+pub fn purge_user(store: &SyncStore, user_id: i64) -> rusqlite::Result<()> {
+    let dir = store.user_dir(user_id);
+    let _guard = store.io.lock().unwrap_or_else(|e| e.into_inner());
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err(e)),
+    }
+}
+
+/// Delete hot-store files for users who haven't synced in `inactive_days` days.
+///
+/// Counterpart to `db::cleanup_inactive_sync_data` for the hot plane: that
+/// function only sees `sync_items` (cold categories), so a user who only ever
+/// wrote hot categories (presets/layouts/watchlists/…) never shows up there
+/// and their files under `<data_dir>/sync/<user_id>/` would otherwise
+/// accumulate forever.
+///
+/// A user's whole directory is removed only when EVERY item under it — any
+/// device, any profile, any category — has `modified_at` older than the
+/// threshold, mirroring the "whole user, not partial" semantics of the SQL
+/// sweep. A user directory with no readable items at all (e.g. only empty
+/// leftover subdirectories) is left alone — there is no age signal to act on.
+///
+/// Returns the number of user directories removed.
+pub fn cleanup_inactive(store: &SyncStore, inactive_days: i64) -> rusqlite::Result<usize> {
+    let threshold_ms =
+        (chrono::Utc::now() - chrono::Duration::days(inactive_days)).timestamp_millis();
+    let _guard = store.io.lock().unwrap_or_else(|e| e.into_inner());
+    let mut removed = 0usize;
+    let Ok(users) = fs::read_dir(&store.root) else {
+        return Ok(removed);
+    };
+    for user_entry in users.flatten() {
+        let user_path = user_entry.path();
+        if !user_path.is_dir() {
+            continue;
+        }
+        let Some(max_modified) = user_max_modified(&user_path) else {
+            continue;
+        };
+        if max_modified < threshold_ms && fs::remove_dir_all(&user_path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Most recent `modified_at` across every item under a user's directory
+/// (`<user_id>/<device_id>/<profile_id>/<category>/*.json`), or `None` if the
+/// tree holds no readable item.
+fn user_max_modified(user_path: &Path) -> Option<i64> {
+    let mut max: Option<i64> = None;
+    let devs = fs::read_dir(user_path).ok()?;
+    for dev in devs.flatten() {
+        let Ok(profs) = fs::read_dir(dev.path()) else {
+            continue;
+        };
+        for prof in profs.flatten() {
+            for item in read_tree(&prof.path()) {
+                max = Some(max.map_or(item.modified_at, |m| m.max(item.modified_at)));
+            }
+        }
+    }
+    max
+}
+
 /// Profile list merged across stores. `has_vault`/`has_recovery_key` and
 /// `display_name` come from the SQL (cold) plane; file-side profiles add
 /// counts/bytes/recency.
@@ -759,5 +839,47 @@ mod tests {
         let p = profiles.iter().find(|p| p.profile_id == "prof").unwrap();
         assert_eq!(p.display_name.as_deref(), Some("Work"));
         assert_eq!(p.item_count, 1);
+    }
+
+    #[test]
+    fn purge_user_removes_whole_tree_and_is_idempotent() {
+        let dir = TestDir::new();
+        let s = store(&dir);
+        let conn = crate::db::init_test_conn();
+
+        push(&conn, &s, 1, "devA", "prof1", &[item("p1", "preset", 100)]).unwrap();
+        push(&conn, &s, 1, "devB", "prof2", &[item("w1", "watchlist", 100)]).unwrap();
+        // A second user's data must survive user 1's purge.
+        push(&conn, &s, 2, "devA", "prof1", &[item("p2", "preset", 100)]).unwrap();
+
+        assert!(s.user_dir(1).is_dir());
+        purge_user(&s, 1).unwrap();
+        assert!(!s.user_dir(1).exists());
+        assert!(s.user_dir(2).is_dir());
+
+        // Idempotent: purging an already-absent (or never-existed) user is Ok.
+        purge_user(&s, 1).unwrap();
+        purge_user(&s, 999).unwrap();
+    }
+
+    #[test]
+    fn cleanup_inactive_removes_only_stale_users() {
+        let dir = TestDir::new();
+        let s = store(&dir);
+        let conn = crate::db::init_test_conn();
+
+        // User 1: stale — last write far in the past.
+        push(&conn, &s, 1, "dev", "prof", &[item("p1", "preset", 1_000)]).unwrap();
+        // User 2: active — last write "now".
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        push(&conn, &s, 2, "dev", "prof", &[item("p2", "preset", now_ms)]).unwrap();
+
+        let removed = cleanup_inactive(&s, 365).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!s.user_dir(1).exists());
+        assert!(s.user_dir(2).is_dir());
+
+        // Second pass is a no-op — nothing left to remove.
+        assert_eq!(cleanup_inactive(&s, 365).unwrap(), 0);
     }
 }

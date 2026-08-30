@@ -14,9 +14,24 @@ use rusqlite::Connection;
 
 use crate::error::OpsdError;
 
-pub const BOX_HOST: &str = "144.172.97.222";
+// Defaults describe the box opsd was written for. Every one is overridable by
+// environment, because the fleet stopped being one box on 2026-08-30: the
+// database moved to a control box and these constants kept pointing at the
+// old one, so the hourly pull was archiving a stale snapshot while looking
+// healthy. A backup that silently goes stale is worse than one that is absent.
+// The box opsd operates on is the one holding the database, and on 2026-08-30
+// that stopped being mlc-utah-1: identity moved to the control box and
+// mlc-utah-1 became a pure edge running nginx only. Pointing here at the old
+// box would have kept the hourly pull archiving a snapshot that no longer
+// changes — a backup that silently goes stale, which is worse than none.
+pub const BOX_HOST: &str = "144.172.97.2";
 pub const BOX_PORT: u16 = 22;
 pub const BOX_USER: &str = "root";
+/// Name of the per-box directory under `env/` holding that box's canonical
+/// secrets (`sqlcipher.key`, `server.env`) and opsd state.
+pub const BOX_CANON_DIR: &str = "mlc-c2-1";
+/// SSH key file under `env/` used to reach the box.
+pub const BOX_SSH_KEY: &str = "mlc-c2-box";
 pub const PUBLIC_HEALTH_URL: &str = "https://mylittlechart.org/health";
 pub const APP_HEALTH_REMOTE: &str = "http://127.0.0.1:19200/health";
 pub const BIND_ADDR: &str = "127.0.0.1:18360";
@@ -88,17 +103,26 @@ pub fn resolve_paths() -> Result<(PathBuf, BoxConfig, PathBuf), OpsdError> {
     let root = find_nemo_root(&std::env::current_dir()?)
         .ok_or(OpsdError::NemoRootNotFound)?;
     let env_dir = root.join("env");
+    // `MLC_BOX_CANON_DIR` selects which box's secrets and state this daemon
+    // operates on; the host/user/key can be moved independently of it.
+    let canon_dir = std::env::var("MLC_BOX_CANON_DIR")
+        .unwrap_or_else(|_| BOX_CANON_DIR.to_string());
     let state_dir = match std::env::var("MLC_OPSD_STATE_DIR") {
         Ok(dir) => PathBuf::from(dir),
-        Err(_) => env_dir.join("mlc-utah-1").join("opsd"),
+        Err(_) => env_dir.join(&canon_dir).join("opsd"),
     };
     let box_cfg = BoxConfig {
-        host: BOX_HOST.to_string(),
-        port: BOX_PORT,
-        user: BOX_USER.to_string(),
-        ssh_key_path: env_dir.join("mlc-utah-box"),
-        canon_key_path: env_dir.join("mlc-utah-1").join("sqlcipher.key"),
-        canon_env_path: env_dir.join("mlc-utah-1").join("server.env"),
+        host: std::env::var("MLC_BOX_HOST").unwrap_or_else(|_| BOX_HOST.to_string()),
+        port: std::env::var("MLC_BOX_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(BOX_PORT),
+        user: std::env::var("MLC_BOX_USER").unwrap_or_else(|_| BOX_USER.to_string()),
+        ssh_key_path: env_dir.join(
+            std::env::var("MLC_BOX_SSH_KEY").unwrap_or_else(|_| BOX_SSH_KEY.to_string()),
+        ),
+        canon_key_path: env_dir.join(&canon_dir).join("sqlcipher.key"),
+        canon_env_path: env_dir.join(&canon_dir).join("server.env"),
     };
     Ok((state_dir, box_cfg, env_dir))
 }

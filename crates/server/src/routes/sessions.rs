@@ -41,7 +41,7 @@ async fn require_web_session(
     let ua_hash = extract_ua_hash(headers);
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::resolve_web_session(&conn, &session_id, &ua_hash)
     })
     .await;
@@ -90,7 +90,7 @@ pub async fn list_sessions(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::list_sessions_for_user(&conn, user_id)
     })
     .await;
@@ -173,7 +173,7 @@ pub async fn revoke_session(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::revoke_key(&conn, user_id, &hash_prefix)
     })
     .await;
@@ -242,7 +242,7 @@ pub async fn export_account(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::export_account_data(&conn, user_id)
     })
     .await;
@@ -301,8 +301,10 @@ pub async fn export_account(
 
 /// Permanently delete the authenticated user's account.
 ///
-/// Removes all user data: sync items, E2E params, auth tokens, device links,
-/// provider links, web sessions, and the user row itself.
+/// Removes all user data: telemetry, sync items (both the SQL cold plane and
+/// the hot file plane — see `syncstore::purge_user`), E2E params, auth
+/// tokens, device links, provider links, web sessions, and the user row
+/// itself.
 ///
 /// Requires the `X-Confirm-Delete: yes` header **and** a JSON body with
 /// `{ "confirm": "DELETE" }` to prevent accidental calls.
@@ -359,8 +361,24 @@ pub async fn delete_account(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::delete_account(&conn, user_id)
+        let cp = state.control_plane();
+        let outcome = {
+            let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+            crate::db::delete_account(&conn, user_id)
+        };
+        // Hot-plane purge is separate from the SQL cascade above (SQLCipher
+        // never sees the hot-category files — see syncstore.rs). Only run it
+        // when the account row actually deleted; log-and-continue rather than
+        // fail the whole request if the directory is already gone (idempotent
+        // by design — a retried delete, or a user who never wrote a hot item).
+        if let Ok(n) = outcome {
+            if n > 0 {
+                if let Err(e) = crate::syncstore::purge_user(&cp.sync_store, user_id) {
+                    tracing::error!("Failed to purge sync files for user {}: {}", user_id, e);
+                }
+            }
+        }
+        outcome
     })
     .await;
 
