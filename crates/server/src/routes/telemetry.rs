@@ -1,4 +1,13 @@
 //! POST /api/telemetry — accept metrics from updater clients.
+//!
+//! Storage is split by mutability (2026-08-31): `device_profile` holds the
+//! near-immutable hardware/build facts and is written only when they change;
+//! `device_metrics` is the time series and is what the per-device daily cap
+//! (`MLC_TELEMETRY_DAILY_CAP`) and the retention ring apply to. The cap is
+//! the one control here that does not depend on a well-behaved client — the
+//! client's own OTA-tick cadence is exactly what let one dev machine post
+//! tens of thousands of rows. See
+//! docs/mlc/plans/data-domains-identity-and-fingerprinting-2026-08-30.md §3.
 
 use axum::{
     extract::State,
@@ -8,6 +17,7 @@ use axum::{
 use std::sync::Arc;
 
 use crate::auth::{extract_bearer, hash_token};
+use crate::db::DeviceProfileFields;
 use crate::models::types::{TelemetryRequest, TelemetryResponse};
 use crate::state::AppState;
 
@@ -24,12 +34,23 @@ pub async fn submit_telemetry(
     // with field-appropriate length caps.
 
     // Sanitize device_id: only hex digits and hyphens (UUID format), max 36 chars.
-    let device_id: Option<String> = req.device_id.as_deref().map(|s| {
-        s.chars()
-            .filter(|c| c.is_ascii_hexdigit() || *c == '-')
-            .take(36)
-            .collect()
-    }).filter(|s: &String| !s.is_empty());
+    // Every row exists to be counted against one device's daily cap — a post
+    // with no usable device_id after sanitising cannot be capped, so it is
+    // rejected outright rather than stored under an uncapped NULL bucket.
+    let device_id: String = match req
+        .device_id
+        .as_deref()
+        .map(|s| {
+            s.chars()
+                .filter(|c| c.is_ascii_hexdigit() || *c == '-')
+                .take(36)
+                .collect::<String>()
+        })
+        .filter(|s: &String| !s.is_empty())
+    {
+        Some(id) => id,
+        None => return Err(StatusCode::BAD_REQUEST),
+    };
 
     let gpu_name: String = req
         .gpu_name
@@ -80,10 +101,10 @@ pub async fn submit_telemetry(
 
     let now = chrono::Utc::now().to_rfc3339();
 
-    tokio::task::spawn_blocking(move || {
-        // Bearer token resolves against identity (auth_tokens); the insert
-        // itself lands in the operational database — `telemetry` moved there
-        // in the 2026-08-30 store split.
+    tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
+        // Bearer token resolves against identity (auth_tokens); both storage
+        // calls below land in the operational database — `device_profile` /
+        // `device_metrics` moved there in the 2026-08-30 store split.
         let user_id = raw_token.as_deref().and_then(|t| {
             let hash = hash_token(t);
             let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
@@ -91,17 +112,37 @@ pub async fn submit_telemetry(
         });
 
         let ops_conn = state.control_plane().ops_db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::insert_telemetry(
-            &ops_conn,
-            device_id.as_deref(),
-            user_id,
-            &now,
-            &app_version,
-            &os,
-            &arch,
-            &gpu_name,
+
+        // Profile: the near-immutable half. `upsert_device_profile` compares
+        // against the stored row itself and skips the write when nothing
+        // changed — a device with unchanged hardware produces no write here
+        // no matter how often it posts.
+        let profile_fields = DeviceProfileFields {
+            app_version,
+            os,
+            arch,
+            gpu_name,
             screen_width,
             screen_height,
+        };
+        crate::db::upsert_device_profile(&ops_conn, &device_id, &profile_fields, &now)?;
+
+        // Per-device daily cap — the one volume control that does not depend
+        // on a well-behaved client (see module doc). Over-cap silently drops
+        // the metrics row; the caller still gets a success response, since
+        // telling a runaway client anything useful here is exactly what
+        // would let it adapt around the cap.
+        let today = &now[..10]; // RFC 3339 "YYYY-MM-DD" date prefix, UTC
+        let count_today = crate::db::count_device_metrics_today(&ops_conn, &device_id, today)?;
+        if count_today >= state.telemetry_daily_cap {
+            return Ok(());
+        }
+
+        crate::db::insert_device_metrics(
+            &ops_conn,
+            &device_id,
+            user_id,
+            &now,
             connector_count,
             window_count,
             avg_fps,

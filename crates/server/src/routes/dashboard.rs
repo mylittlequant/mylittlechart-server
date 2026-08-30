@@ -106,8 +106,9 @@ pub async fn render(
     let html = tokio::task::spawn_blocking(move || {
         let cp = state.control_plane();
         let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
-        // `devices`, `telemetry`, `releases` live in the operational database
-        // (2026-08-30 store split) — the dashboard reads both connections.
+        // `devices`, `device_profile`, `device_metrics`, `releases` live in
+        // the operational database (2026-08-30 store split) — the dashboard
+        // reads both connections.
         let ops_conn = cp.ops_db.lock().unwrap_or_else(|e| e.into_inner());
         build_dashboard(&conn, &ops_conn)
     })
@@ -138,15 +139,16 @@ fn build_dashboard(
     Ok(render_html(&summary, &releases, &devices, &telemetry, &users, &sync_users))
 }
 
-/// `devices`/`telemetry`/`releases` counts read from `ops_conn`; everything
-/// else (users, cloud sync) reads from `identity_conn` — see the 2026-08-30
-/// store split.
+/// `devices`/`device_metrics`/`releases` counts read from `ops_conn`;
+/// everything else (users, cloud sync) reads from `identity_conn` — see the
+/// 2026-08-30 store split. `device_metrics` is the telemetry time series
+/// (2026-08-31 split from `device_profile`, the near-immutable half).
 fn query_summary(
     identity_conn: &rusqlite::Connection,
     ops_conn: &rusqlite::Connection,
 ) -> rusqlite::Result<SummaryStats> {
     let unique_devices: i64 = ops_conn.query_row(
-        "SELECT COUNT(DISTINCT device_id) FROM telemetry WHERE device_id IS NOT NULL",
+        "SELECT COUNT(DISTINCT device_id) FROM device_metrics",
         [],
         |row| row.get(0),
     )?;
@@ -158,15 +160,14 @@ fn query_summary(
     )?;
 
     let active_last_24h: i64 = ops_conn.query_row(
-        "SELECT COUNT(DISTINCT device_id) FROM telemetry \
-         WHERE device_id IS NOT NULL \
-           AND received_at >= datetime('now', '-24 hours')",
+        "SELECT COUNT(DISTINCT device_id) FROM device_metrics \
+         WHERE received_at >= datetime('now', '-24 hours')",
         [],
         |row| row.get(0),
     )?;
 
     let total_telemetry: i64 = ops_conn.query_row(
-        "SELECT COUNT(*) FROM telemetry",
+        "SELECT COUNT(*) FROM device_metrics",
         [],
         |row| row.get(0),
     )?;
@@ -280,32 +281,36 @@ fn query_heartbeat_map(
 
 /// Telemetry/heartbeat data (steps 1-2) reads from `ops_conn`; the linked-users
 /// join (step 3, `device_users`/`users`) reads from `identity_conn` — see the
-/// 2026-08-30 store split.
+/// 2026-08-30 store split. Step 1 itself joins `device_metrics` (the time
+/// series) against `device_profile` (the near-immutable hardware/build
+/// facts) — see the 2026-08-31 split in `init_ops_db`.
 fn query_unified_devices(
     identity_conn: &rusqlite::Connection,
     ops_conn: &rusqlite::Connection,
 ) -> rusqlite::Result<Vec<UnifiedDevice>> {
-    // Step 1: per-device aggregate from telemetry using window function.
+    // Step 1: per-device aggregate from device_metrics using a window
+    // function, joined to device_profile for the fields that no longer live
+    // in the time series.
     let mut stmt = ops_conn.prepare(
         "WITH latest AS (
             SELECT *,
                    ROW_NUMBER() OVER (PARTITION BY device_id ORDER BY received_at DESC) AS rn
-            FROM telemetry
-            WHERE device_id IS NOT NULL
+            FROM device_metrics
         )
         SELECT
             latest.device_id,
-            COALESCE(latest.app_version, '') AS app_version,
-            COALESCE(latest.os, '') AS os,
-            COALESCE(latest.arch, '') AS arch,
-            COALESCE(latest.gpu_name, '') AS gpu_name,
-            COALESCE(latest.screen_width, 0) AS screen_width,
-            COALESCE(latest.screen_height, 0) AS screen_height,
+            COALESCE(dp.app_version, '') AS app_version,
+            COALESCE(dp.os, '') AS os,
+            COALESCE(dp.arch, '') AS arch,
+            COALESCE(dp.gpu_name, '') AS gpu_name,
+            COALESCE(dp.screen_width, 0) AS screen_width,
+            COALESCE(dp.screen_height, 0) AS screen_height,
             COALESCE(latest.avg_fps, 0.0) AS avg_fps,
             COALESCE(latest.received_at, '') AS last_seen,
-            (SELECT COUNT(*) FROM telemetry t2 WHERE t2.device_id = latest.device_id) AS telemetry_count,
-            (SELECT MAX(uptime_secs) FROM telemetry t3 WHERE t3.device_id = latest.device_id) AS max_uptime
+            (SELECT COUNT(*) FROM device_metrics t2 WHERE t2.device_id = latest.device_id) AS telemetry_count,
+            (SELECT MAX(uptime_secs) FROM device_metrics t3 WHERE t3.device_id = latest.device_id) AS max_uptime
         FROM latest
+        LEFT JOIN device_profile dp ON dp.device_id = latest.device_id
         WHERE rn = 1
         ORDER BY latest.received_at DESC",
     )?;
@@ -382,13 +387,23 @@ fn query_unified_devices(
     Ok(out)
 }
 
+/// Raw per-post rows for the dashboard's telemetry table — `device_metrics`
+/// joined to `device_profile` for the fields the 2026-08-31 split moved out
+/// of the time series (see `query_unified_devices`'s doc comment).
 fn query_telemetry(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<TelemetryEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT device_id, received_at, app_version, os, arch, gpu_name,
-                screen_width, screen_height, avg_fps, uptime_secs,
-                connector_count, window_count, ws_connections, total_bars
-         FROM telemetry
-         ORDER BY received_at DESC
+        "SELECT dm.device_id, dm.received_at,
+                COALESCE(dp.app_version, '') AS app_version,
+                COALESCE(dp.os, '') AS os,
+                COALESCE(dp.arch, '') AS arch,
+                COALESCE(dp.gpu_name, '') AS gpu_name,
+                COALESCE(dp.screen_width, 0) AS screen_width,
+                COALESCE(dp.screen_height, 0) AS screen_height,
+                dm.avg_fps, dm.uptime_secs,
+                dm.connector_count, dm.window_count, dm.ws_connections, dm.total_bars
+         FROM device_metrics dm
+         LEFT JOIN device_profile dp ON dp.device_id = dm.device_id
+         ORDER BY dm.received_at DESC
          LIMIT 50",
     )?;
     let mut rows = stmt.query([])?;

@@ -65,12 +65,13 @@ pub struct ControlPlane {
     /// SQLite queries are sub-millisecond, so blocking on this lock is acceptable.
     pub db: Mutex<rusqlite::Connection>,
 
-    /// Operational (unencrypted) connection: `devices`, `telemetry`, `releases`.
+    /// Operational (unencrypted) connection: `devices`, `device_profile`,
+    /// `device_metrics`, `releases`.
     ///
     /// Split out of `db` on 2026-08-30 (see
     /// docs/mlc/audits/2026-08-30-entry-lock-vault-and-user-persistence.md §6/§11)
-    /// — none of these three tables are irreplaceable identity data, and none
-    /// of them need the SQLCipher key. Opened with a plain `Connection::open`
+    /// — none of these tables are irreplaceable identity data, and none of
+    /// them need the SQLCipher key. Opened with a plain `Connection::open`
     /// (see `db::init_ops_db`), independent of the tmpfs key wait that gates
     /// `db` above, so a box with no key pushed yet still accepts heartbeats
     /// and serves OTA manifests. `device_users` is NOT here — it is a
@@ -128,6 +129,14 @@ pub struct AppState {
     ///
     /// Controlled by `BUILD_ATTEST_MAX_AGE_DAYS` env var (default: 365 days).
     pub build_attest_max_age_secs: u64,
+
+    /// Maximum `device_metrics` rows accepted per device per UTC calendar
+    /// day (see `routes::telemetry::submit_telemetry`) — the one telemetry
+    /// volume control that does not depend on a well-behaved client.
+    ///
+    /// Controlled by `MLC_TELEMETRY_DAILY_CAP` env var (default: 48), read
+    /// once at boot next to `MLC_TELEMETRY_RETENTION_DAYS`.
+    pub telemetry_daily_cap: i64,
 }
 
 impl AppState {
@@ -151,6 +160,7 @@ impl AppState {
         build_attest_pubkeys: Vec<[u8; 32]>,
         build_attest_enforce: bool,
         build_attest_max_age_secs: u64,
+        telemetry_daily_cap: i64,
     ) -> Self {
         Self {
             control_plane,
@@ -168,6 +178,7 @@ impl AppState {
             build_attest_pubkeys,
             build_attest_enforce,
             build_attest_max_age_secs,
+            telemetry_daily_cap,
         }
     }
 

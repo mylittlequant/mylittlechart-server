@@ -26,9 +26,16 @@
 //!   BUILD_ATTEST_ENFORCE   — "true"/"1" to reject unsigned clients (default: false)
 //!   BUILD_ATTEST_MAX_AGE_DAYS — max build age in days (default: 365)
 //!   MLC_DBKEY_PATH         — SQLCipher key file in tmpfs (default: /run/mlc/dbkey)
-//!   MLC_TELEMETRY_RETENTION_DAYS — days of `telemetry` rows to keep in the
+//!   MLC_TELEMETRY_RETENTION_DAYS — days of `device_metrics` rows (the
+//!                            telemetry time series) to keep in the
 //!                            operational database before the periodic
 //!                            cleanup task deletes them (default: 30).
+//!   MLC_TELEMETRY_DAILY_CAP — max `device_metrics` rows accepted per device
+//!                            per UTC calendar day; over-cap posts are
+//!                            dropped silently (default: 48).
+//!   MLC_DEVICE_PROFILE_RETENTION_DAYS — days a `device_profile` row may go
+//!                            untouched before the periodic cleanup task
+//!                            deletes it (default: 180).
 //!   MLC_FREE_FEATURES      — comma-separated feature names granted to every
 //!                            caller with no paid claim (see entitlements.rs).
 //!                            Unset (default): every feature is free — this is
@@ -144,12 +151,29 @@ async fn main() {
         .unwrap_or(365)
         .saturating_mul(86400);
 
-    // Retention for the operational database's `telemetry` table — read once
-    // here, used by the periodic cleanup task below.
+    // Retention for the operational database's `device_metrics` table (the
+    // telemetry time series) — read once here, used by the periodic cleanup
+    // task below.
     let telemetry_retention_days: i64 = std::env::var("MLC_TELEMETRY_RETENTION_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
+
+    // Retention for `device_profile` — much longer than `device_metrics`
+    // gets, since it is one row per device rather than a time series.
+    let device_profile_retention_days: i64 = std::env::var("MLC_DEVICE_PROFILE_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180);
+
+    // Per-device daily cap on `device_metrics` inserts — read once at boot
+    // (not per request) and handed to every telemetry post via AppState. See
+    // routes/telemetry.rs for why this, and not the client cadence, is the
+    // control that actually holds under a misbehaving client.
+    let telemetry_daily_cap: i64 = std::env::var("MLC_TELEMETRY_DAILY_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48);
 
     tracing::info!(
         "Build attestation: enforce={}, max_age={}d",
@@ -183,8 +207,10 @@ async fn main() {
 
             // Initialize the operational database (plain SQLite, no key wait —
             // see state::ControlPlane::ops_db). Then run the one-time move of
-            // `devices`/`telemetry`/`releases` out of identity, if their
-            // identity copies still exist (2026-08-30 store split).
+            // `devices`/`releases` out of identity, if their identity copies
+            // still exist (2026-08-30 store split). `telemetry` was a third
+            // leg of that same move; see `db::migrate_legacy_ops_tables`'s
+            // doc comment for why it is gone from this list.
             let ops_db_path = format!("{}/operational.db", data_dir);
             let ops_conn = match db::init_ops_db(&ops_db_path) {
                 Ok(conn) => conn,
@@ -234,6 +260,7 @@ async fn main() {
         build_attest_pubkeys,
         build_attest_enforce,
         build_attest_max_age_secs,
+        telemetry_daily_cap,
     ));
 
     // Start the Telegram login bot (background task) — control role only.
@@ -282,16 +309,21 @@ async fn main() {
                     let tokens = crate::db::cleanup_expired_auth_tokens(&conn).unwrap_or(0);
                     let sync = crate::db::cleanup_inactive_sync_data(&conn, 365).unwrap_or(0);
 
-                    // `devices`/`telemetry` live in the operational database
-                    // (2026-08-30 store split); `device_users` stays in
-                    // identity, so reconciling it against `devices` needs
-                    // both connections held at once — see
-                    // `cleanup_orphan_device_users`.
+                    // `devices`/`device_metrics`/`device_profile` live in the
+                    // operational database (2026-08-30 store split);
+                    // `device_users` stays in identity, so reconciling it
+                    // against `devices` needs both connections held at once —
+                    // see `cleanup_orphan_device_users`.
                     let ops_conn = cp.ops_db.lock().unwrap_or_else(|e| e.into_inner());
                     let devices = crate::db::cleanup_stale_devices(&ops_conn, 365).unwrap_or(0);
                     let telemetry_purged =
                         crate::db::cleanup_old_telemetry(&ops_conn, telemetry_retention_days)
                             .unwrap_or(0);
+                    let profiles_purged = crate::db::cleanup_stale_device_profiles(
+                        &ops_conn,
+                        device_profile_retention_days,
+                    )
+                    .unwrap_or(0);
                     let orphan_links =
                         crate::db::cleanup_orphan_device_users(&conn, &ops_conn).unwrap_or(0);
                     drop(ops_conn);
@@ -299,16 +331,17 @@ async fn main() {
 
                     let sync_files =
                         crate::syncstore::cleanup_inactive(&cp.sync_store, 365).unwrap_or(0);
-                    (sessions, tokens, devices, orphan_links, telemetry_purged, sync, sync_files)
+                    (sessions, tokens, devices, orphan_links, telemetry_purged, profiles_purged, sync, sync_files)
                 })
                 .await;
                 match result {
-                    Ok((_sessions, tokens, devices, orphan_links, telemetry_purged, sync, sync_files)) => {
-                        if tokens + devices + orphan_links + telemetry_purged + sync + sync_files > 0 {
+                    Ok((_sessions, tokens, devices, orphan_links, telemetry_purged, profiles_purged, sync, sync_files)) => {
+                        if tokens + devices + orphan_links + telemetry_purged + profiles_purged + sync + sync_files > 0 {
                             tracing::info!(
                                 "Periodic cleanup: {} expired tokens, {} stale devices, {} orphaned device links, \
-                                 {} old telemetry rows, {} inactive sync items, {} inactive sync user dirs",
-                                tokens, devices, orphan_links, telemetry_purged, sync, sync_files
+                                 {} old telemetry rows, {} stale device profiles, {} inactive sync items, \
+                                 {} inactive sync user dirs",
+                                tokens, devices, orphan_links, telemetry_purged, profiles_purged, sync, sync_files
                             );
                         }
                     }

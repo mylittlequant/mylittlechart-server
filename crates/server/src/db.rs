@@ -430,12 +430,20 @@ pub fn cleanup_orphan_users(conn: &rusqlite::Connection) -> rusqlite::Result<usi
 // ============================================================================
 // Operational database (2026-08-30 store split)
 //
-// `devices`, `telemetry` and `releases` live here, not in the SQLCipher
-// identity database — none of the three is irreplaceable identity data, and
-// none needs the SQLCipher key. See
+// `devices`, `device_profile`/`device_metrics` and `releases` live here, not
+// in the SQLCipher identity database — none of them is irreplaceable
+// identity data, and none needs the SQLCipher key. See
 // docs/mlc/audits/2026-08-30-entry-lock-vault-and-user-persistence.md §6/§11.
 // `device_users` deliberately stays in identity: it is a relationship between
 // an account and a device, not a heartbeat.
+//
+// `telemetry` (one wide table, every column on every post) was replaced on
+// 2026-08-31 by `device_profile` (near-immutable hardware/software facts,
+// written only when they change) + `device_metrics` (the actual time series,
+// capped per device per day) — see
+// docs/mlc/plans/data-domains-identity-and-fingerprinting-2026-08-30.md §3.
+// The old table is dropped by `drop_legacy_telemetry_table`, called from
+// `init_ops_db`.
 //
 // Every function below the "Devices" / "Telemetry" / "Releases" section
 // headers still takes a plain `&Connection` — same as before the split — the
@@ -443,7 +451,8 @@ pub fn cleanup_orphan_users(conn: &rusqlite::Connection) -> rusqlite::Result<usi
 // (`ControlPlane::ops_db`) instead of the identity one now.
 // ============================================================================
 
-/// Initialize the operational database: `devices`, `telemetry`, `releases`.
+/// Initialize the operational database: `devices`, `device_profile`,
+/// `device_metrics`, `releases`.
 ///
 /// Plain SQLite, no SQLCipher key (see `ControlPlane::ops_db`'s doc comment
 /// for why) — opened independently of the identity database's key wait, so a
@@ -458,6 +467,14 @@ pub fn init_ops_db(path: &str) -> Result<Connection> {
     // the widened UNIQUE), since that is what a fresh operational database
     // should start as, not the pre-migration shape identity's own history
     // carries.
+    //
+    // `device_profile` / `device_metrics` replace the single wide `telemetry`
+    // table (2026-08-31 split, see the section header above this function):
+    // `device_profile` holds the six facts that only change when the
+    // hardware or build does (one row per device, upserted only on an actual
+    // change — see `upsert_device_profile`); `device_metrics` is the real
+    // time series and is what the per-device daily cap and the retention
+    // ring both apply to. The `(device_id, received_at)` index serves both.
     conn.execute_batch(r#"
         CREATE TABLE IF NOT EXISTS devices (
             device_id TEXT PRIMARY KEY,
@@ -469,17 +486,23 @@ pub fn init_ops_db(path: &str) -> Result<Connection> {
             total_heartbeats INTEGER NOT NULL DEFAULT 0
         );
 
-        CREATE TABLE IF NOT EXISTS telemetry (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_id TEXT,
-            user_id INTEGER,
-            received_at TEXT NOT NULL,
-            app_version TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS device_profile (
+            device_id TEXT PRIMARY KEY,
+            app_version TEXT NOT NULL DEFAULT '',
             os TEXT NOT NULL DEFAULT '',
             arch TEXT NOT NULL DEFAULT '',
             gpu_name TEXT NOT NULL DEFAULT '',
             screen_width INTEGER NOT NULL DEFAULT 0,
             screen_height INTEGER NOT NULL DEFAULT 0,
+            first_seen TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS device_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            user_id INTEGER,
+            received_at TEXT NOT NULL,
             connector_count INTEGER NOT NULL DEFAULT 0,
             window_count INTEGER NOT NULL DEFAULT 0,
             avg_fps REAL NOT NULL DEFAULT 0,
@@ -487,6 +510,8 @@ pub fn init_ops_db(path: &str) -> Result<Connection> {
             total_bars INTEGER NOT NULL DEFAULT 0,
             ws_connections INTEGER NOT NULL DEFAULT 0
         );
+        CREATE INDEX IF NOT EXISTS idx_device_metrics_device_received
+            ON device_metrics(device_id, received_at);
 
         CREATE TABLE IF NOT EXISTS releases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -503,6 +528,12 @@ pub fn init_ops_db(path: &str) -> Result<Connection> {
         );
     "#)?;
 
+    // `telemetry` (the pre-split wide table) is superseded by `device_profile`
+    // + `device_metrics` above. It held zero rows in production at the time
+    // of this change; this still verifies rather than assumes — see the
+    // function doc.
+    drop_legacy_telemetry_table(&conn)?;
+
     Ok(conn)
 }
 
@@ -517,8 +548,34 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     .map(|found| found.is_some())
 }
 
-/// One-time move of `devices`, `telemetry` and `releases` out of the identity
-/// database into the operational database. Called once at boot, after both
+/// Drop the pre-2026-08-31 `telemetry` table from the operational database,
+/// now that `device_profile` + `device_metrics` replace it.
+///
+/// Verified, not assumed: a non-empty `telemetry` table is left in place with
+/// a loud error instead of being silently dropped, the same discipline
+/// `move_legacy_table` (below) uses for the 2026-08-30 identity→operational
+/// move. Idempotent: a `telemetry` table already gone (fresh install, or any
+/// boot after the first successful drop) is a silent no-op.
+fn drop_legacy_telemetry_table(ops_conn: &Connection) -> Result<()> {
+    if !table_exists(ops_conn, "telemetry")? {
+        return Ok(());
+    }
+    let count: i64 = ops_conn.query_row("SELECT COUNT(*) FROM telemetry", [], |row| row.get(0))?;
+    if count > 0 {
+        tracing::error!(
+            "telemetry table holds {} row(s) — NOT dropping. Expected empty per the \
+             2026-08-31 device_profile/device_metrics split; investigate before removing.",
+            count
+        );
+        return Ok(());
+    }
+    ops_conn.execute("DROP TABLE telemetry", [])?;
+    tracing::info!("Dropped legacy empty telemetry table (replaced by device_profile/device_metrics)");
+    Ok(())
+}
+
+/// One-time move of `devices` and `releases` out of the identity database
+/// into the operational database. Called once at boot, after both
 /// connections are open (see main.rs).
 ///
 /// For each table: if it still exists in `identity_conn`, copy every row into
@@ -528,9 +585,17 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
 /// drop — both copies are left in place — and logs a loud error rather than
 /// silently losing rows.
 ///
+/// `telemetry` was a third leg of this same 2026-08-30 move and is no longer
+/// copied: the wide `telemetry` shape has no destination table after the
+/// 2026-08-31 device_profile/device_metrics split, and production's copy was
+/// confirmed empty before that split. It is now *retired* rather than moved —
+/// see [`drop_legacy_identity_telemetry`] below for the identity side and
+/// `drop_legacy_telemetry_table` (called from `init_ops_db`) for the
+/// operational one. Both refuse to drop a table that turns out to hold rows.
+///
 /// Idempotent: a table missing from `sqlite_master` in identity (already
 /// moved, or a fresh install — identity's own `init_db` no longer creates
-/// these three) is skipped with no log line. A table that does get moved logs
+/// these) is skipped with no log line. A table that does get moved logs
 /// exactly one line with its row count, including zero.
 pub fn migrate_legacy_ops_tables(identity_conn: &Connection, ops_conn: &Connection) -> Result<()> {
     move_legacy_table(
@@ -543,32 +608,56 @@ pub fn migrate_legacy_ops_tables(identity_conn: &Connection, ops_conn: &Connecti
     move_legacy_table(
         identity_conn,
         ops_conn,
-        "telemetry",
-        "id, device_id, user_id, received_at, app_version, os, arch, gpu_name, \
-         screen_width, screen_height, connector_count, window_count, avg_fps, \
-         uptime_secs, total_bars, ws_connections",
-        16,
-    )?;
-    move_legacy_table(
-        identity_conn,
-        ops_conn,
         "releases",
         "id, version, platform, channel, sha256, file_path, file_size, \
          release_notes, signature, created_at",
         10,
     )?;
+    drop_legacy_identity_telemetry(identity_conn)?;
+    Ok(())
+}
+
+/// Retire an identity-side `telemetry` table left over from before the
+/// 2026-08-30 store split.
+///
+/// The migration leg that used to copy this table is gone — its destination
+/// no longer exists after the device_profile/device_metrics split. Without
+/// this, a box restored from a pre-split backup would carry a stray
+/// `telemetry` table in the identity database forever, quietly breaking the
+/// property the split exists to establish: identity holds only identity.
+///
+/// Same discipline as [`drop_legacy_telemetry_table`] on the operational
+/// side — a non-empty table is left alone with a loud error, because the only
+/// reason it would be non-empty is that an assumption behind the split was
+/// wrong, and that deserves a human rather than a `DROP`.
+fn drop_legacy_identity_telemetry(identity_conn: &Connection) -> Result<()> {
+    if !table_exists(identity_conn, "telemetry")? {
+        return Ok(());
+    }
+    let count: i64 =
+        identity_conn.query_row("SELECT COUNT(*) FROM telemetry", [], |row| row.get(0))?;
+    if count > 0 {
+        tracing::error!(
+            "identity.telemetry holds {} row(s) — NOT dropping. The 2026-08-31 split assumed \
+             every box had already emptied it; investigate before removing.",
+            count
+        );
+        return Ok(());
+    }
+    identity_conn.execute("DROP TABLE telemetry", [])?;
+    tracing::info!("Dropped the empty legacy identity.telemetry table");
     Ok(())
 }
 
 /// Copy every row of `table` from `identity_conn` to `ops_conn` using the
 /// exact column list in `columns`, verify the row count, then drop it from
 /// identity. `column_count` is `columns`' length, needed up front to build
-/// the `?1..?N` placeholder list generically for any of the three tables.
+/// the `?1..?N` placeholder list generically for either caller.
 ///
 /// Rows are read and re-inserted as `rusqlite::types::Value` — the schema is
 /// identical on both sides (see `init_ops_db`), so no per-column type
-/// conversion is needed, and a single generic function covers all three
-/// tables instead of one hand-written copy per table.
+/// conversion is needed, and a single generic function covers both tables
+/// instead of one hand-written copy per table.
 fn move_legacy_table(
     identity_conn: &Connection,
     ops_conn: &Connection,
@@ -633,14 +722,32 @@ fn move_legacy_table(
     Ok(())
 }
 
-/// Delete `telemetry` rows older than `retention_days` from the operational
-/// database. Applied by the periodic cleanup task in main.rs; the day count
-/// comes from `MLC_TELEMETRY_RETENTION_DAYS` (default 30).
+/// Delete `device_metrics` rows older than `retention_days` from the
+/// operational database — the retention ring for the telemetry time series
+/// (see `device_metrics`' doc comment in `init_ops_db` for the split from
+/// `device_profile`). Applied by the periodic cleanup task in main.rs; the
+/// day count comes from `MLC_TELEMETRY_RETENTION_DAYS` (default 30).
 ///
 /// Returns the number of rows deleted.
 pub fn cleanup_old_telemetry(conn: &Connection, retention_days: i64) -> rusqlite::Result<usize> {
     let threshold = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
-    conn.execute("DELETE FROM telemetry WHERE received_at < ?1", params![threshold])
+    conn.execute("DELETE FROM device_metrics WHERE received_at < ?1", params![threshold])
+}
+
+/// Delete `device_profile` rows untouched for `retention_days` — a much
+/// longer horizon than `device_metrics` gets, since a profile row is one per
+/// device and near-free to keep. Pruned by its own `updated_at`, NOT by
+/// joining against `devices`: an empty or reset operational store must never
+/// be able to delete rows on the strength of what it does *not* contain —
+/// see `purge_orphan_device_users`'s doc comment for the incident that
+/// pattern already caused once (seven `device_users` rows lost).
+///
+/// `retention_days` comes from `MLC_DEVICE_PROFILE_RETENTION_DAYS` (default 180).
+///
+/// Returns the number of rows deleted.
+pub fn cleanup_stale_device_profiles(conn: &Connection, retention_days: i64) -> rusqlite::Result<usize> {
+    let threshold = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
+    conn.execute("DELETE FROM device_profile WHERE updated_at < ?1", params![threshold])
 }
 
 /// Query every `device_id` currently known to the operational database.
@@ -723,21 +830,103 @@ pub fn upsert_device(
 
 // ============================================================================
 // Telemetry
+//
+// Split by mutability (2026-08-31, see `init_ops_db`'s doc comment):
+// `device_profile` — one row per device, the near-immutable hardware/build
+// facts, written only when they change (`upsert_device_profile`);
+// `device_metrics` — the actual time series, subject to the per-device daily
+// cap (`count_device_metrics_today`) and the retention ring
+// (`cleanup_old_telemetry`, above).
 // ============================================================================
 
-/// Insert a telemetry record.
-#[allow(clippy::too_many_arguments)]
-pub fn insert_telemetry(
+/// The six near-immutable hardware/software facts tracked per device in
+/// `device_profile`. Grouped into one struct so `upsert_device_profile` can
+/// compare "did anything change" as a single equality check instead of six
+/// separate parameters.
+#[derive(Debug, PartialEq)]
+pub struct DeviceProfileFields {
+    pub app_version: String,
+    pub os: String,
+    pub arch: String,
+    pub gpu_name: String,
+    pub screen_width: i64,
+    pub screen_height: i64,
+}
+
+/// Write `device_id`'s profile row only if `fields` differs from what is
+/// already stored (or nothing is stored yet). A device whose hardware and
+/// build are unchanged since its last post produces no write at all here —
+/// `updated_at` only moves when something actually changed, which is also
+/// what `cleanup_stale_device_profiles` prunes by.
+///
+/// Returns `true` if a row was inserted or updated, `false` if the existing
+/// row already matched `fields` and nothing was written.
+pub fn upsert_device_profile(
     conn: &Connection,
-    device_id: Option<&str>,
+    device_id: &str,
+    fields: &DeviceProfileFields,
+    now: &str,
+) -> Result<bool> {
+    let existing: Option<DeviceProfileFields> = conn
+        .query_row(
+            "SELECT app_version, os, arch, gpu_name, screen_width, screen_height
+             FROM device_profile WHERE device_id = ?1",
+            params![device_id],
+            |row| {
+                Ok(DeviceProfileFields {
+                    app_version: row.get(0)?,
+                    os: row.get(1)?,
+                    arch: row.get(2)?,
+                    gpu_name: row.get(3)?,
+                    screen_width: row.get(4)?,
+                    screen_height: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+
+    if existing.as_ref() == Some(fields) {
+        return Ok(false);
+    }
+
+    conn.execute(
+        "INSERT INTO device_profile
+            (device_id, app_version, os, arch, gpu_name, screen_width, screen_height, first_seen, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+         ON CONFLICT(device_id) DO UPDATE SET
+             app_version = ?2, os = ?3, arch = ?4, gpu_name = ?5,
+             screen_width = ?6, screen_height = ?7, updated_at = ?8",
+        params![
+            device_id, fields.app_version, fields.os, fields.arch, fields.gpu_name,
+            fields.screen_width, fields.screen_height, now,
+        ],
+    )?;
+    Ok(true)
+}
+
+/// Count `device_metrics` rows for `device_id` received on `today`
+/// (`"YYYY-MM-DD"`, UTC). `received_at` is stored as RFC 3339 UTC, so a
+/// 10-byte date-prefix match is exact with no timezone conversion needed.
+/// Used by the ingest route to enforce `MLC_TELEMETRY_DAILY_CAP` — the one
+/// volume control that does not depend on a well-behaved client.
+pub fn count_device_metrics_today(conn: &Connection, device_id: &str, today: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM device_metrics WHERE device_id = ?1 AND substr(received_at, 1, 10) = ?2",
+        params![device_id, today],
+        |row| row.get(0),
+    )
+}
+
+/// Insert one `device_metrics` row — the time-varying half of a telemetry
+/// post (see `upsert_device_profile` for the near-immutable half). The
+/// caller is expected to have already checked `count_device_metrics_today`
+/// against the daily cap; this function does not enforce it.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_device_metrics(
+    conn: &Connection,
+    device_id: &str,
     user_id: Option<i64>,
     received_at: &str,
-    app_version: &str,
-    os: &str,
-    arch: &str,
-    gpu_name: &str,
-    screen_width: i64,
-    screen_height: i64,
     connector_count: i64,
     window_count: i64,
     avg_fps: f64,
@@ -746,14 +935,12 @@ pub fn insert_telemetry(
     ws_connections: i64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO telemetry
-            (device_id, user_id, received_at, app_version, os, arch, gpu_name,
-             screen_width, screen_height, connector_count, window_count, avg_fps,
+        "INSERT INTO device_metrics
+            (device_id, user_id, received_at, connector_count, window_count, avg_fps,
              uptime_secs, total_bars, ws_connections)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            device_id, user_id, received_at, app_version, os, arch, gpu_name,
-            screen_width, screen_height, connector_count, window_count, avg_fps,
+            device_id, user_id, received_at, connector_count, window_count, avg_fps,
             uptime_secs, total_bars, ws_connections,
         ],
     )?;
@@ -2525,9 +2712,10 @@ pub fn list_sessions_for_user(
 /// Cascade order: sync_e2e_params → sync_items → auth_tokens → device_users →
 /// user_providers → web_sessions → users.
 ///
-/// `telemetry` is NOT in this cascade — it moved to the operational database
-/// in the 2026-08-30 store split, so it is a separate statement against a
-/// separate connection now: `delete_account_telemetry`, below. The hot-plane
+/// `device_metrics` is NOT in this cascade — it moved to the operational
+/// database in the 2026-08-30 store split, so it is a separate statement
+/// against a separate connection now: `delete_account_telemetry`, below. The
+/// hot-plane
 /// sync files (`<data_dir>/sync/<user_id>/…`) are likewise NOT touched by
 /// this function — the caller (routes/sessions.rs::delete_account) calls
 /// both that and `syncstore::purge_user`, since this module has no
@@ -2546,15 +2734,17 @@ pub fn delete_account(conn: &Connection, user_id: i64) -> Result<usize> {
     Ok(n)
 }
 
-/// Delete `telemetry` rows for a user from the **operational** database.
+/// Delete `device_metrics` rows for a user from the **operational** database
+/// (2026-08-31 split: `device_profile` carries no `user_id`, so there is
+/// nothing of the deleted account's left in it either way).
 ///
 /// The operational-side half of account deletion — see `delete_account`'s
 /// doc comment for why this is a separate function on a separate connection
 /// rather than a line inside that cascade.
 ///
-/// Returns the number of telemetry rows deleted.
+/// Returns the number of `device_metrics` rows deleted.
 pub fn delete_account_telemetry(ops_conn: &Connection, user_id: i64) -> rusqlite::Result<usize> {
-    ops_conn.execute("DELETE FROM telemetry WHERE user_id = ?1", params![user_id])
+    ops_conn.execute("DELETE FROM device_metrics WHERE user_id = ?1", params![user_id])
 }
 
 /// Export all data the server holds for a user.
