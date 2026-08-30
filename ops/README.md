@@ -102,21 +102,38 @@ reacts" rather than a box-pulled queue.
 
 ## Daily use
 
+`ops/mlcops.py` was retired in `d1c321f` once opsd was accepted, and the file is
+gone. The daemon's HTTP API is the interface; every mutating call carries the
+bearer key from `env/mlc-c2-1/opsd/api-key`.
+
 ```bash
-python ops/mlcops.py status          # services, health, disk/mem
-python ops/mlcops.py deploy target/x86_64-unknown-linux-musl/release/mylittlechart-server
-python ops/mlcops.py backup-pull     # latest snapshot -> encrypted on opbox
+K=$(cat env/mlc-c2-1/opsd/api-key)
+
+curl -s -H "Authorization: Bearer $K" http://127.0.0.1:18360/api/status
+curl -s -X POST -H "Authorization: Bearer $K" http://127.0.0.1:18360/api/backup/now
+curl -s -X POST -H "Authorization: Bearer $K" http://127.0.0.1:18360/api/backup/pull
 ```
+
+`/health` is the one endpoint that takes no key.
 
 ## Deploy pipeline
 
-Build musl binary on opbox (docker, canonical):
+Build the musl binary (docker, canonical) and hand opsd its absolute path — it
+uploads, verifies sha256, keeps `.prev`, swaps, then polls health 30×3s and
+rolls back to `.prev` on failure:
 
 ```bash
 docker run --rm -v "$(pwd -W)":/home/rust/src messense/rust-musl-cross:x86_64-musl \
   cargo build --release --target x86_64-unknown-linux-musl
-python ops/mlcops.py deploy target/x86_64-unknown-linux-musl/release/mylittlechart-server
+
+curl -s -X POST -H "Authorization: Bearer $K" -H "Content-Type: application/json" \
+  -d '{"path":"<ABSOLUTE>/target/x86_64-unknown-linux-musl/release/mylittlechart-server"}' \
+  http://127.0.0.1:18360/api/deploy
 ```
+
+The same docker image runs `cargo check` — the native-Windows toolchain here
+cannot build `openssl-sys` (its bundled Perl lacks `Locale::Maketext::Simple`),
+so musl is the only working verification path on this box.
 
 ## Notes
 

@@ -84,13 +84,13 @@ pub async fn collect_status(state: &Arc<OpsdState>) -> Result<BoxStatus, OpsdErr
     let session = connect(state).await?;
     let out = session
         .exec(&format!(
-            "for u in {units}; do echo \"unit:$u:$(systemctl is-active $u)\"; done; \
-             echo \"app_health:$(curl -s -o /dev/null -w '%{{http_code}}' --max-time 5 {app})\"; \
+            "{resolve}for u in {units}; do echo \"unit:$u:$(systemctl is-active $u)\"; done; \
+             echo \"app_health:$(curl -s -o /dev/null -w '%{{http_code}}' --max-time 5 \"$H\")\"; \
              echo \"disk:$(df -h / | awk 'NR==2{{print $4\" free of \"$2}}')\"; \
              echo \"mem:$(free -m | awk '/Mem:/{{print $3\"/\"$2\" MB\"}}')\"; \
              echo \"uptime:$(uptime -p)\"",
+            resolve = crate::state::APP_HEALTH_RESOLVE,
             units = UNIT_WHITELIST.join(" "),
-            app = crate::state::APP_HEALTH_REMOTE,
         ))
         .await?;
     Ok(parse_status(&out.stdout))
@@ -256,8 +256,8 @@ pub async fn unlock(state: &Arc<OpsdState>) -> Result<UnlockOutcome, OpsdError> 
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let out = session
             .exec(&format!(
-                "curl -s -o /dev/null -w '%{{http_code}}' --max-time 5 {}",
-                crate::state::APP_HEALTH_REMOTE
+                "{}curl -s -o /dev/null -w '%{{http_code}}' --max-time 5 \"$H\"",
+                crate::state::APP_HEALTH_RESOLVE
             ))
             .await?;
         if out.stdout.trim() == "200" {

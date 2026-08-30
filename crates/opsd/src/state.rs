@@ -33,7 +33,19 @@ pub const BOX_CANON_DIR: &str = "mlc-c2-1";
 /// SSH key file under `env/` used to reach the box.
 pub const BOX_SSH_KEY: &str = "mlc-c2-box";
 pub const PUBLIC_HEALTH_URL: &str = "https://mylittlechart.org/health";
-pub const APP_HEALTH_REMOTE: &str = "http://127.0.0.1:19200/health";
+/// Shell prefix that resolves the app's health URL from the unit's own
+/// `BIND_ADDR` and leaves it in `$H` for the command that follows.
+///
+/// This was a fixed `http://127.0.0.1:19200/health`, carrying a comment that
+/// asserted the app was loopback-only. That stopped being true when `BIND_ADDR`
+/// was introduced and the control box moved to its tunnel address: every probe
+/// then returned 000, and on 2026-08-30 a deploy rolled itself back over a
+/// migration that had in fact succeeded — the old binary was declared unhealthy
+/// too, which is the tell that the probe, not the binary, was wrong.
+///
+/// Reading the address back from the unit keeps the probe honest through any
+/// future rebind, and falls back to loopback when the unit sets nothing.
+pub const APP_HEALTH_RESOLVE: &str = "H=http://$(systemctl show mlc-server -p Environment --value 2>/dev/null | tr ' ' '\\n' | sed -n 's/^BIND_ADDR=//p' | head -n1 | grep . || echo 127.0.0.1):19200/health; ";
 pub const BIND_ADDR: &str = "127.0.0.1:18360";
 
 /// Effective bind address. `MLC_OPSD_BIND` overrides the default for
