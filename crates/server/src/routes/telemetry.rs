@@ -81,15 +81,18 @@ pub async fn submit_telemetry(
     let now = chrono::Utc::now().to_rfc3339();
 
     tokio::task::spawn_blocking(move || {
-        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-
+        // Bearer token resolves against identity (auth_tokens); the insert
+        // itself lands in the operational database — `telemetry` moved there
+        // in the 2026-08-30 store split.
         let user_id = raw_token.as_deref().and_then(|t| {
             let hash = hash_token(t);
+            let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
             crate::db::resolve_token_hash(&conn, &hash).ok().flatten()
         });
 
+        let ops_conn = state.control_plane().ops_db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::insert_telemetry(
-            &conn,
+            &ops_conn,
             device_id.as_deref(),
             user_id,
             &now,

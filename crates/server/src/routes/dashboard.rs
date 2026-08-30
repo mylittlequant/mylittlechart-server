@@ -104,8 +104,12 @@ pub async fn render(
     State(state): State<Arc<AppState>>,
 ) -> Result<Html<String>, StatusCode> {
     let html = tokio::task::spawn_blocking(move || {
-        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        build_dashboard(&conn)
+        let cp = state.control_plane();
+        let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+        // `devices`, `telemetry`, `releases` live in the operational database
+        // (2026-08-30 store split) — the dashboard reads both connections.
+        let ops_conn = cp.ops_db.lock().unwrap_or_else(|e| e.into_inner());
+        build_dashboard(&conn, &ops_conn)
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -121,30 +125,39 @@ pub async fn render(
 // Database queries
 // ---------------------------------------------------------------------------
 
-fn build_dashboard(conn: &rusqlite::Connection) -> rusqlite::Result<String> {
-    let summary = query_summary(conn)?;
-    let releases = query_releases(conn)?;
-    let devices = query_unified_devices(conn)?;
-    let telemetry = query_telemetry(conn)?;
-    let users = query_users(conn)?;
-    let sync_users = query_sync_users(conn)?;
+fn build_dashboard(
+    identity_conn: &rusqlite::Connection,
+    ops_conn: &rusqlite::Connection,
+) -> rusqlite::Result<String> {
+    let summary = query_summary(identity_conn, ops_conn)?;
+    let releases = query_releases(ops_conn)?;
+    let devices = query_unified_devices(identity_conn, ops_conn)?;
+    let telemetry = query_telemetry(ops_conn)?;
+    let users = query_users(identity_conn, ops_conn)?;
+    let sync_users = query_sync_users(identity_conn)?;
     Ok(render_html(&summary, &releases, &devices, &telemetry, &users, &sync_users))
 }
 
-fn query_summary(conn: &rusqlite::Connection) -> rusqlite::Result<SummaryStats> {
-    let unique_devices: i64 = conn.query_row(
+/// `devices`/`telemetry`/`releases` counts read from `ops_conn`; everything
+/// else (users, cloud sync) reads from `identity_conn` — see the 2026-08-30
+/// store split.
+fn query_summary(
+    identity_conn: &rusqlite::Connection,
+    ops_conn: &rusqlite::Connection,
+) -> rusqlite::Result<SummaryStats> {
+    let unique_devices: i64 = ops_conn.query_row(
         "SELECT COUNT(DISTINCT device_id) FROM telemetry WHERE device_id IS NOT NULL",
         [],
         |row| row.get(0),
     )?;
 
-    let registered_devices: i64 = conn.query_row(
+    let registered_devices: i64 = ops_conn.query_row(
         "SELECT COUNT(*) FROM devices",
         [],
         |row| row.get(0),
     )?;
 
-    let active_last_24h: i64 = conn.query_row(
+    let active_last_24h: i64 = ops_conn.query_row(
         "SELECT COUNT(DISTINCT device_id) FROM telemetry \
          WHERE device_id IS NOT NULL \
            AND received_at >= datetime('now', '-24 hours')",
@@ -152,26 +165,26 @@ fn query_summary(conn: &rusqlite::Connection) -> rusqlite::Result<SummaryStats> 
         |row| row.get(0),
     )?;
 
-    let total_telemetry: i64 = conn.query_row(
+    let total_telemetry: i64 = ops_conn.query_row(
         "SELECT COUNT(*) FROM telemetry",
         [],
         |row| row.get(0),
     )?;
 
-    let total_releases: i64 = conn.query_row(
+    let total_releases: i64 = ops_conn.query_row(
         "SELECT COUNT(*) FROM releases",
         [],
         |row| row.get(0),
     )?;
 
-    let total_users: i64 = conn.query_row(
+    let total_users: i64 = identity_conn.query_row(
         "SELECT COUNT(*) FROM users",
         [],
         |row| row.get(0),
     )?;
 
     // Latest version per platform.
-    let mut stmt = conn.prepare(
+    let mut stmt = ops_conn.prepare(
         "SELECT platform, version FROM releases
          WHERE (platform, created_at) IN (
              SELECT platform, MAX(created_at) FROM releases GROUP BY platform
@@ -187,11 +200,11 @@ fn query_summary(conn: &rusqlite::Connection) -> rusqlite::Result<SummaryStats> 
     }
 
     // Cloud sync summary stats — these tables may not exist yet; treat missing as 0.
-    let total_sync_items: i64 = conn
+    let total_sync_items: i64 = identity_conn
         .query_row("SELECT COUNT(*) FROM sync_items", [], |row| row.get(0))
         .unwrap_or(0);
 
-    let total_sync_bytes: i64 = conn
+    let total_sync_bytes: i64 = identity_conn
         .query_row(
             "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM sync_items",
             [],
@@ -199,11 +212,11 @@ fn query_summary(conn: &rusqlite::Connection) -> rusqlite::Result<SummaryStats> 
         )
         .unwrap_or(0);
 
-    let e2e_users: i64 = conn
+    let e2e_users: i64 = identity_conn
         .query_row("SELECT COUNT(*) FROM sync_e2e_params", [], |row| row.get(0))
         .unwrap_or(0);
 
-    let syncing_users: i64 = conn
+    let syncing_users: i64 = identity_conn
         .query_row(
             "SELECT COUNT(DISTINCT user_id) FROM sync_items",
             [],
@@ -265,11 +278,15 @@ fn query_heartbeat_map(
     Ok(map)
 }
 
+/// Telemetry/heartbeat data (steps 1-2) reads from `ops_conn`; the linked-users
+/// join (step 3, `device_users`/`users`) reads from `identity_conn` — see the
+/// 2026-08-30 store split.
 fn query_unified_devices(
-    conn: &rusqlite::Connection,
+    identity_conn: &rusqlite::Connection,
+    ops_conn: &rusqlite::Connection,
 ) -> rusqlite::Result<Vec<UnifiedDevice>> {
     // Step 1: per-device aggregate from telemetry using window function.
-    let mut stmt = conn.prepare(
+    let mut stmt = ops_conn.prepare(
         "WITH latest AS (
             SELECT *,
                    ROW_NUMBER() OVER (PARTITION BY device_id ORDER BY received_at DESC) AS rn
@@ -296,7 +313,7 @@ fn query_unified_devices(
     let mut rows = stmt.query([])?;
 
     // Step 2: load heartbeat data for merging.
-    let heartbeat_map = query_heartbeat_map(conn)?;
+    let heartbeat_map = query_heartbeat_map(ops_conn)?;
 
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
@@ -340,10 +357,11 @@ fn query_unified_devices(
         });
     }
 
-    // Step 3: load linked users per device.
+    // Step 3: load linked users per device. `device_users` and `users` both
+    // stay in identity — this join is unaffected by the store split.
     let mut user_map: HashMap<String, Vec<(String, i64)>> = HashMap::new();
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = identity_conn.prepare(
             "SELECT du.device_id, u.display_name, u.id
              FROM device_users du
              JOIN users u ON u.id = du.user_id
@@ -396,8 +414,15 @@ fn query_telemetry(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Telemetr
     Ok(out)
 }
 
-fn query_users(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<UserEntry>> {
-    let mut stmt = conn.prepare(
+/// `users`/`user_providers`/`device_users` all stay in identity; device
+/// display names for the linked-devices column come from the operational
+/// database's `devices` table (2026-08-30 store split) — joined in Rust
+/// instead of one SQL `LEFT JOIN`, since a subquery can't span both files.
+fn query_users(
+    identity_conn: &rusqlite::Connection,
+    ops_conn: &rusqlite::Connection,
+) -> rusqlite::Result<Vec<UserEntry>> {
+    let mut stmt = identity_conn.prepare(
         "SELECT u.id,
                 COALESCE(u.public_id, ''),
                 u.display_name,
@@ -421,18 +446,25 @@ fn query_users(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<UserEntry>> 
         });
     }
 
+    // Device display names, for the COALESCE fallback below.
+    let heartbeat_map = query_heartbeat_map(ops_conn)?;
+
     // Load linked devices per user.
     let mut device_map: HashMap<i64, Vec<String>> = HashMap::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT du.user_id, COALESCE(d.device_name, du.device_id)
-             FROM device_users du
-             LEFT JOIN devices d ON d.device_id = du.device_id",
+        let mut stmt = identity_conn.prepare(
+            "SELECT du.user_id, du.device_id FROM device_users du",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let user_id: i64 = row.get(0)?;
-            let device_name: String = row.get(1)?;
+            let device_id: String = row.get(1)?;
+            // Matches the original COALESCE(d.device_name, du.device_id):
+            // a known device's name (even empty) wins, else the device_id.
+            let device_name = heartbeat_map
+                .get(&device_id)
+                .map(|(name, _)| name.clone())
+                .unwrap_or(device_id);
             device_map.entry(user_id).or_default().push(device_name);
         }
     }

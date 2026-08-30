@@ -83,35 +83,6 @@ pub fn init_db(path: &str) -> Result<Connection> {
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
 
     conn.execute_batch(r#"
-        CREATE TABLE IF NOT EXISTS devices (
-            device_id TEXT PRIMARY KEY,
-            device_name TEXT NOT NULL DEFAULT '',
-            app_version TEXT NOT NULL,
-            os TEXT NOT NULL DEFAULT '',
-            first_seen TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            total_heartbeats INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS telemetry (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_id TEXT,
-            user_id INTEGER,
-            received_at TEXT NOT NULL,
-            app_version TEXT NOT NULL,
-            os TEXT NOT NULL DEFAULT '',
-            arch TEXT NOT NULL DEFAULT '',
-            gpu_name TEXT NOT NULL DEFAULT '',
-            screen_width INTEGER NOT NULL DEFAULT 0,
-            screen_height INTEGER NOT NULL DEFAULT 0,
-            connector_count INTEGER NOT NULL DEFAULT 0,
-            window_count INTEGER NOT NULL DEFAULT 0,
-            avg_fps REAL NOT NULL DEFAULT 0,
-            uptime_secs INTEGER NOT NULL DEFAULT 0,
-            total_bars INTEGER NOT NULL DEFAULT 0,
-            ws_connections INTEGER NOT NULL DEFAULT 0
-        );
-
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             provider TEXT NOT NULL,
@@ -125,18 +96,6 @@ pub fn init_db(path: &str) -> Result<Connection> {
             token_hash TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL REFERENCES users(id),
             created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS releases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            version TEXT NOT NULL,
-            platform TEXT NOT NULL,
-            sha256 TEXT NOT NULL,
-            file_path TEXT NOT NULL,
-            file_size INTEGER NOT NULL DEFAULT 0,
-            release_notes TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            UNIQUE(version, platform)
         );
 
         CREATE TABLE IF NOT EXISTS oauth_states (
@@ -234,7 +193,13 @@ pub fn init_db(path: &str) -> Result<Connection> {
         );
     "#)?;
 
-    // Safe migration: add signature column to releases if not present.
+    // Safe migration: add signature column to releases if not present. `releases`
+    // moved to the operational database (2026-08-30 store split, see
+    // `init_ops_db`/`migrate_legacy_ops_tables` below) — this and the two
+    // releases-shape migrations further down only still matter for the one
+    // boot on a given box where `releases` has not been dropped from identity
+    // yet; both are self-guarded (`unwrap_or(false)` / `let _ =`) and become
+    // permanent no-ops once the move has happened.
     let _ = conn.execute("ALTER TABLE releases ADD COLUMN signature TEXT NOT NULL DEFAULT ''", []);
     // Safe migration: add channel column to releases if not present.
     let _ = conn.execute(
@@ -267,6 +232,11 @@ pub fn init_db(path: &str) -> Result<Connection> {
     let _ = conn.execute("ALTER TABLE sync_items ADD COLUMN display_name TEXT NOT NULL DEFAULT ''", []);
     // One-time cleanup: remove device_users entries where device_id doesn't exist
     // in the devices table (old profile_id entries from pre-v0.2.11 bug).
+    // `devices` lives in the operational database now (2026-08-30 store
+    // split) — this only still fires on the one boot where identity's copy
+    // hasn't been dropped yet; `let _ =` makes it a silent no-op afterwards.
+    // The steady-state equivalent is `cleanup_orphan_device_users` (below,
+    // cross-database), run from the periodic cleanup task in main.rs.
     let _ = conn.execute(
         "DELETE FROM device_users WHERE device_id NOT IN (SELECT device_id FROM devices)", [],
     );
@@ -455,6 +425,273 @@ pub fn cleanup_orphan_users(conn: &rusqlite::Connection) -> rusqlite::Result<usi
         "DELETE FROM users WHERE id NOT IN (SELECT DISTINCT user_id FROM user_providers)",
         [],
     )
+}
+
+// ============================================================================
+// Operational database (2026-08-30 store split)
+//
+// `devices`, `telemetry` and `releases` live here, not in the SQLCipher
+// identity database — none of the three is irreplaceable identity data, and
+// none needs the SQLCipher key. See
+// docs/mlc/audits/2026-08-30-entry-lock-vault-and-user-persistence.md §6/§11.
+// `device_users` deliberately stays in identity: it is a relationship between
+// an account and a device, not a heartbeat.
+//
+// Every function below the "Devices" / "Telemetry" / "Releases" section
+// headers still takes a plain `&Connection` — same as before the split — the
+// caller is simply expected to pass the operational connection
+// (`ControlPlane::ops_db`) instead of the identity one now.
+// ============================================================================
+
+/// Initialize the operational database: `devices`, `telemetry`, `releases`.
+///
+/// Plain SQLite, no SQLCipher key (see `ControlPlane::ops_db`'s doc comment
+/// for why) — opened independently of the identity database's key wait, so a
+/// box with no key pushed yet can still accept heartbeats and serve OTA
+/// manifests.
+pub fn init_ops_db(path: &str) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
+    // Same columns and constraints as the identity tables these replace —
+    // `releases` here is the already-migrated shape (channel + signature +
+    // the widened UNIQUE), since that is what a fresh operational database
+    // should start as, not the pre-migration shape identity's own history
+    // carries.
+    conn.execute_batch(r#"
+        CREATE TABLE IF NOT EXISTS devices (
+            device_id TEXT PRIMARY KEY,
+            device_name TEXT NOT NULL DEFAULT '',
+            app_version TEXT NOT NULL,
+            os TEXT NOT NULL DEFAULT '',
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            total_heartbeats INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS telemetry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT,
+            user_id INTEGER,
+            received_at TEXT NOT NULL,
+            app_version TEXT NOT NULL,
+            os TEXT NOT NULL DEFAULT '',
+            arch TEXT NOT NULL DEFAULT '',
+            gpu_name TEXT NOT NULL DEFAULT '',
+            screen_width INTEGER NOT NULL DEFAULT 0,
+            screen_height INTEGER NOT NULL DEFAULT 0,
+            connector_count INTEGER NOT NULL DEFAULT 0,
+            window_count INTEGER NOT NULL DEFAULT 0,
+            avg_fps REAL NOT NULL DEFAULT 0,
+            uptime_secs INTEGER NOT NULL DEFAULT 0,
+            total_bars INTEGER NOT NULL DEFAULT 0,
+            ws_connections INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS releases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            channel TEXT NOT NULL DEFAULT 'stable',
+            sha256 TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            file_size INTEGER NOT NULL DEFAULT 0,
+            release_notes TEXT NOT NULL DEFAULT '',
+            signature TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE(version, platform, channel)
+        );
+    "#)?;
+
+    Ok(conn)
+}
+
+/// Does a table with this name exist in `conn`?
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        params![name],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+}
+
+/// One-time move of `devices`, `telemetry` and `releases` out of the identity
+/// database into the operational database. Called once at boot, after both
+/// connections are open (see main.rs).
+///
+/// For each table: if it still exists in `identity_conn`, copy every row into
+/// `ops_conn` (`INSERT OR IGNORE`, so a crash between the copy and the drop
+/// on a previous boot doesn't fail a retry), compare row counts, and only
+/// then `DROP TABLE` it from identity. A count mismatch aborts that table's
+/// drop — both copies are left in place — and logs a loud error rather than
+/// silently losing rows.
+///
+/// Idempotent: a table missing from `sqlite_master` in identity (already
+/// moved, or a fresh install — identity's own `init_db` no longer creates
+/// these three) is skipped with no log line. A table that does get moved logs
+/// exactly one line with its row count, including zero.
+pub fn migrate_legacy_ops_tables(identity_conn: &Connection, ops_conn: &Connection) -> Result<()> {
+    move_legacy_table(
+        identity_conn,
+        ops_conn,
+        "devices",
+        "device_id, device_name, app_version, os, first_seen, last_seen, total_heartbeats",
+        7,
+    )?;
+    move_legacy_table(
+        identity_conn,
+        ops_conn,
+        "telemetry",
+        "id, device_id, user_id, received_at, app_version, os, arch, gpu_name, \
+         screen_width, screen_height, connector_count, window_count, avg_fps, \
+         uptime_secs, total_bars, ws_connections",
+        16,
+    )?;
+    move_legacy_table(
+        identity_conn,
+        ops_conn,
+        "releases",
+        "id, version, platform, channel, sha256, file_path, file_size, \
+         release_notes, signature, created_at",
+        10,
+    )?;
+    Ok(())
+}
+
+/// Copy every row of `table` from `identity_conn` to `ops_conn` using the
+/// exact column list in `columns`, verify the row count, then drop it from
+/// identity. `column_count` is `columns`' length, needed up front to build
+/// the `?1..?N` placeholder list generically for any of the three tables.
+///
+/// Rows are read and re-inserted as `rusqlite::types::Value` — the schema is
+/// identical on both sides (see `init_ops_db`), so no per-column type
+/// conversion is needed, and a single generic function covers all three
+/// tables instead of one hand-written copy per table.
+fn move_legacy_table(
+    identity_conn: &Connection,
+    ops_conn: &Connection,
+    table: &str,
+    columns: &str,
+    column_count: usize,
+) -> Result<()> {
+    if !table_exists(identity_conn, table)? {
+        return Ok(());
+    }
+
+    let rows: Vec<Vec<rusqlite::types::Value>> = {
+        let mut stmt = identity_conn.prepare(&format!("SELECT {} FROM {}", columns, table))?;
+        let mapped = stmt.query_map([], |row| {
+            let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                vals.push(row.get(i)?);
+            }
+            Ok(vals)
+        })?;
+        mapped.collect::<Result<Vec<Vec<rusqlite::types::Value>>>>()?
+    };
+    let source_count = rows.len();
+
+    let dest_before: i64 =
+        ops_conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| row.get(0))?;
+
+    let placeholders = (1..=column_count).map(|i| format!("?{}", i)).collect::<Vec<_>>().join(", ");
+    let insert_sql = format!(
+        "INSERT OR IGNORE INTO {} ({}) VALUES ({})",
+        table, columns, placeholders
+    );
+    for row in &rows {
+        let bound: Vec<&dyn rusqlite::ToSql> = row.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+        ops_conn.execute(&insert_sql, bound.as_slice())?;
+    }
+
+    let dest_after: i64 =
+        ops_conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| row.get(0))?;
+
+    // On a fresh operational database the copy must be exact. On a re-run after
+    // an interrupted migration the destination already holds these rows and
+    // `INSERT OR IGNORE` skips them, so the test relaxes to "nothing is
+    // missing" — otherwise an interrupted migration could never finish, and the
+    // identity table would be carried forever.
+    let verified = if dest_before == 0 {
+        dest_after == source_count as i64
+    } else {
+        dest_after >= source_count as i64
+    };
+    if !verified {
+        tracing::error!(
+            "{} migration verification FAILED: identity had {} row(s), operational held {} before \
+             and {} after — leaving both copies in place, NOT dropping identity.{}",
+            table, source_count, dest_before, dest_after, table
+        );
+        return Ok(());
+    }
+
+    identity_conn.execute(&format!("DROP TABLE {}", table), [])?;
+    tracing::info!("Migrated {} row(s) from identity.{} to the operational database", source_count, table);
+    Ok(())
+}
+
+/// Delete `telemetry` rows older than `retention_days` from the operational
+/// database. Applied by the periodic cleanup task in main.rs; the day count
+/// comes from `MLC_TELEMETRY_RETENTION_DAYS` (default 30).
+///
+/// Returns the number of rows deleted.
+pub fn cleanup_old_telemetry(conn: &Connection, retention_days: i64) -> rusqlite::Result<usize> {
+    let threshold = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
+    conn.execute("DELETE FROM telemetry WHERE received_at < ?1", params![threshold])
+}
+
+/// Query every `device_id` currently known to the operational database.
+fn known_device_ids(ops_conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = ops_conn.prepare("SELECT device_id FROM devices")?;
+    let ids = stmt.query_map([], |row| row.get::<_, String>(0))?.collect();
+    ids
+}
+
+/// Delete `device_users` rows (identity) whose `device_id` is not among
+/// `known_ids` (from the operational `devices` table), optionally scoped to
+/// one user. Shared by `cleanup_orphan_device_users` and
+/// `confirm_link_token` — both used to do this with a single SQL subquery
+/// before `devices` moved to a separate database file; a subquery can't span
+/// two connections, so the known-id set is fetched once and passed in here.
+fn purge_orphan_device_users(
+    identity_conn: &Connection,
+    known_ids: &[String],
+    user_id: Option<i64>,
+) -> Result<usize> {
+    // An empty operational store means "no information", never "no device
+    // exists". The operational database is disposable and unbacked by design —
+    // it can be deleted, reset, or emptied by retention at any time. The old
+    // single-database form of this cleanup was a `NOT IN (SELECT ...)`
+    // subquery, which against an empty `devices` table matches every row and
+    // would delete every account-to-device link in the backed-up identity
+    // database. That coupling must not survive the split.
+    if known_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let placeholders = known_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let mut sql = format!("DELETE FROM device_users WHERE device_id NOT IN ({})", placeholders);
+    let mut bound: Vec<&dyn rusqlite::ToSql> = known_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    if let Some(uid) = user_id.as_ref() {
+        sql.push_str(" AND user_id = ?");
+        bound.push(uid);
+    }
+    identity_conn.execute(&sql, bound.as_slice())
+}
+
+/// Remove `device_users` rows (identity) whose device no longer exists in the
+/// operational `devices` table — the steady-state counterpart of the
+/// one-time cleanup in `init_db` (which stops firing once `devices` is gone
+/// from identity). Run from the periodic cleanup task alongside
+/// `cleanup_stale_devices`.
+///
+/// Returns the number of rows deleted.
+pub fn cleanup_orphan_device_users(identity_conn: &Connection, ops_conn: &Connection) -> Result<usize> {
+    let known_ids = known_device_ids(ops_conn)?;
+    purge_orphan_device_users(identity_conn, &known_ids, None)
 }
 
 // ============================================================================
@@ -2213,57 +2450,92 @@ pub struct SessionRow {
 /// List all non-expired auth tokens for a user (sessions/devices list).
 ///
 /// Returns all token rows regardless of label to include device-session tokens.
-/// LEFT JOINs with `devices` to enrich each row with device metadata.
-pub fn list_sessions_for_user(conn: &Connection, user_id: i64) -> Result<Vec<SessionRow>> {
+/// Enriched with device metadata from the operational database's `devices`
+/// table (`ops_conn`) — used to be one `LEFT JOIN`, but `devices` moved out of
+/// identity in the 2026-08-30 store split, so a subquery can no longer span
+/// the two files; the enrichment is a second pass in Rust instead.
+pub fn list_sessions_for_user(
+    conn: &Connection,
+    ops_conn: &Connection,
+    user_id: i64,
+) -> Result<Vec<SessionRow>> {
     let mut stmt = conn.prepare(
         "SELECT SUBSTR(a.token_hash, 1, 16), a.label, a.initiated_by,
-                a.created_at, a.expires_at, a.last_used_at, a.last_ip,
-                COALESCE(d.device_name, ''), COALESCE(d.os, ''), COALESCE(d.app_version, '')
+                a.created_at, a.expires_at, a.last_used_at, a.last_ip, a.device_id
          FROM auth_tokens a
-         LEFT JOIN devices d ON d.device_id = a.device_id
          WHERE a.user_id = ?1
            AND (a.expires_at IS NULL OR a.expires_at > datetime('now'))
          ORDER BY a.created_at DESC",
     )?;
     let mut rows = stmt.query(params![user_id])?;
-    let mut sessions = Vec::new();
+    // device_id kept alongside each row only to look up device metadata
+    // below; it is not part of `SessionRow` itself.
+    let mut sessions: Vec<(SessionRow, String)> = Vec::new();
     while let Some(row) = rows.next()? {
-        sessions.push(SessionRow {
-            hash_prefix: row.get(0)?,
-            label: row.get(1)?,
-            initiated_by: row.get(2)?,
-            created_at: row.get(3)?,
-            expires_at: row.get(4)?,
-            last_used_at: row.get(5)?,
-            last_ip: row.get(6)?,
-            device_name: row.get(7)?,
-            device_os: row.get(8)?,
-            device_app_version: row.get(9)?,
-        });
+        let device_id: String = row.get(7)?;
+        sessions.push((
+            SessionRow {
+                hash_prefix: row.get(0)?,
+                label: row.get(1)?,
+                initiated_by: row.get(2)?,
+                created_at: row.get(3)?,
+                expires_at: row.get(4)?,
+                last_used_at: row.get(5)?,
+                last_ip: row.get(6)?,
+                device_name: String::new(),
+                device_os: String::new(),
+                device_app_version: String::new(),
+            },
+            device_id,
+        ));
     }
-    Ok(sessions)
+    drop(rows);
+    drop(stmt);
+
+    // device_id -> (device_name, os, app_version)
+    let mut device_meta: std::collections::HashMap<String, (String, String, String)> =
+        std::collections::HashMap::new();
+    {
+        let mut stmt = ops_conn.prepare("SELECT device_id, device_name, os, app_version FROM devices")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            device_meta.insert(row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?));
+        }
+    }
+
+    Ok(sessions
+        .into_iter()
+        .map(|(mut session, device_id)| {
+            if let Some((name, os, app_version)) = device_meta.get(&device_id) {
+                session.device_name = name.clone();
+                session.device_os = os.clone();
+                session.device_app_version = app_version.clone();
+            }
+            session
+        })
+        .collect())
 }
 
 // ============================================================================
 // Account deletion
 // ============================================================================
 
-/// Delete all data for a user and the user row itself.
+/// Delete all identity-database data for a user and the user row itself.
 ///
-/// Cascade order: telemetry → sync_e2e_params → sync_items → auth_tokens →
-/// device_users → user_providers → web_sessions → users.
+/// Cascade order: sync_e2e_params → sync_items → auth_tokens → device_users →
+/// user_providers → web_sessions → users.
 ///
-/// `telemetry` rows are SQL-only (2026-08-30 gap fix — the table carries a
-/// `user_id` column, see `CREATE TABLE IF NOT EXISTS telemetry` above, but
-/// nothing purged it here; a deleted user's telemetry survived indefinitely).
-/// The hot-plane sync files (`<data_dir>/sync/<user_id>/…`) are NOT touched
-/// by this function — the caller (routes/sessions.rs::delete_account) also
-/// calls `syncstore::purge_user` for those, since this module has no
-/// filesystem access.
+/// `telemetry` is NOT in this cascade — it moved to the operational database
+/// in the 2026-08-30 store split, so it is a separate statement against a
+/// separate connection now: `delete_account_telemetry`, below. The hot-plane
+/// sync files (`<data_dir>/sync/<user_id>/…`) are likewise NOT touched by
+/// this function — the caller (routes/sessions.rs::delete_account) calls
+/// both that and `syncstore::purge_user`, since this module has no
+/// cross-database or filesystem reach on its own; the caller is where the
+/// two-database nature of a full account deletion is meant to be visible.
 ///
 /// Returns the number of rows deleted from `users` (1 on success, 0 if user not found).
 pub fn delete_account(conn: &Connection, user_id: i64) -> Result<usize> {
-    conn.execute("DELETE FROM telemetry WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM sync_e2e_params WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM sync_items WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM auth_tokens WHERE user_id = ?1", params![user_id])?;
@@ -2272,6 +2544,17 @@ pub fn delete_account(conn: &Connection, user_id: i64) -> Result<usize> {
     conn.execute("DELETE FROM web_sessions WHERE user_id = ?1", params![user_id])?;
     let n = conn.execute("DELETE FROM users WHERE id = ?1", params![user_id])?;
     Ok(n)
+}
+
+/// Delete `telemetry` rows for a user from the **operational** database.
+///
+/// The operational-side half of account deletion — see `delete_account`'s
+/// doc comment for why this is a separate function on a separate connection
+/// rather than a line inside that cascade.
+///
+/// Returns the number of telemetry rows deleted.
+pub fn delete_account_telemetry(ops_conn: &Connection, user_id: i64) -> rusqlite::Result<usize> {
+    ops_conn.execute("DELETE FROM telemetry WHERE user_id = ?1", params![user_id])
 }
 
 /// Export all data the server holds for a user.
@@ -2459,9 +2742,13 @@ pub fn poll_link_token(conn: &Connection, token: &str) -> Result<Option<LinkToke
 /// generates a 30-day auth token, stores it (raw) in `link_tokens.auth_token`
 /// and (hashed) in `auth_tokens`.
 ///
+/// `ops_conn` is only used for the orphaned-`device_users` cleanup at the
+/// end (`devices` moved to the operational database — see
+/// `purge_orphan_device_users`); everything else here is identity-only.
+///
 /// Returns `true` if a pending, non-expired token was found and updated,
 /// or `false` if the token was not found / already used / expired.
-pub fn confirm_link_token(conn: &Connection, token: &str, user_id: i64) -> Result<bool> {
+pub fn confirm_link_token(conn: &Connection, ops_conn: &Connection, token: &str, user_id: i64) -> Result<bool> {
     use crate::auth::{generate_token, hash_token};
 
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -2512,13 +2799,9 @@ pub fn confirm_link_token(conn: &Connection, token: &str, user_id: i64) -> Resul
 
         // Clean up orphaned device_users entries for this user — old rows where
         // device_id was actually a profile_id (pre-v0.2.11 bug) and doesn't
-        // exist in the real `devices` table.
-        conn.execute(
-            "DELETE FROM device_users
-             WHERE user_id = ?1
-               AND device_id NOT IN (SELECT device_id FROM devices)",
-            params![user_id],
-        )?;
+        // exist in the real `devices` table (operational database now).
+        let known_ids = known_device_ids(ops_conn)?;
+        purge_orphan_device_users(conn, &known_ids, Some(user_id))?;
     }
 
     Ok(true)
@@ -2573,21 +2856,21 @@ pub fn cleanup_expired_auth_tokens(conn: &Connection) -> rusqlite::Result<usize>
     )?)
 }
 
-/// Delete devices not seen in `stale_days` days, and clean up orphaned `device_users` entries.
+/// Delete devices not seen in `stale_days` days, from the operational database.
+///
+/// `device_users` is no longer cleaned up here — it lives in identity and
+/// `devices` here lives in the operational database (2026-08-30 store
+/// split), so a single connection can no longer do both. The companion sweep
+/// is `cleanup_orphan_device_users`, called alongside this from the periodic
+/// cleanup task in main.rs.
 ///
 /// Returns the number of `devices` rows deleted.
 pub fn cleanup_stale_devices(conn: &Connection, stale_days: i64) -> rusqlite::Result<usize> {
     let threshold_dt = (chrono::Utc::now() - chrono::Duration::days(stale_days)).to_rfc3339();
-    let deleted = conn.execute(
+    conn.execute(
         "DELETE FROM devices WHERE last_seen < ?1",
         params![threshold_dt],
-    )?;
-    // Remove device_users entries that reference devices no longer in the table.
-    let _ = conn.execute(
-        "DELETE FROM device_users WHERE device_id NOT IN (SELECT device_id FROM devices)",
-        [],
-    );
-    Ok(deleted)
+    )
 }
 
 

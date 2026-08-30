@@ -241,7 +241,11 @@ pub async fn confirm_link(
 
     let result =
         tokio::task::spawn_blocking(move || -> rusqlite::Result<ConfirmLinkOutcome> {
-            let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+            let cp = state.control_plane();
+            let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+            // `devices` (for the orphaned-link cleanup inside confirm_link_token)
+            // lives in the operational database — 2026-08-30 store split.
+            let ops_conn = cp.ops_db.lock().unwrap_or_else(|e| e.into_inner());
 
             // Validate session.
             let user_id = match crate::db::resolve_web_session(&conn, &session_id, &ua_hash)? {
@@ -250,7 +254,7 @@ pub async fn confirm_link(
             };
 
             // Confirm the token. This also creates the device_users entry.
-            let updated = crate::db::confirm_link_token(&conn, &token, user_id)?;
+            let updated = crate::db::confirm_link_token(&conn, &ops_conn, &token, user_id)?;
             if updated {
                 Ok(ConfirmLinkOutcome::Ok)
             } else {

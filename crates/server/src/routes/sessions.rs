@@ -90,8 +90,12 @@ pub async fn list_sessions(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::list_sessions_for_user(&conn, user_id)
+        let cp = state.control_plane();
+        let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+        // Device metadata enrichment reads from the operational database —
+        // `devices` moved there in the 2026-08-30 store split.
+        let ops_conn = cp.ops_db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::list_sessions_for_user(&conn, &ops_conn, user_id)
     })
     .await;
 
@@ -366,13 +370,22 @@ pub async fn delete_account(
             let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
             crate::db::delete_account(&conn, user_id)
         };
-        // Hot-plane purge is separate from the SQL cascade above (SQLCipher
-        // never sees the hot-category files — see syncstore.rs). Only run it
-        // when the account row actually deleted; log-and-continue rather than
-        // fail the whole request if the directory is already gone (idempotent
-        // by design — a retried delete, or a user who never wrote a hot item).
+        // The account row lives in identity; its telemetry lives in the
+        // operational database (2026-08-30 store split) and its hot-plane
+        // sync files live on disk (SQLCipher never sees them — see
+        // syncstore.rs). All three are separate statements against separate
+        // stores, deliberately visible here rather than hidden inside one
+        // cascade function. Only run them when the account row actually
+        // deleted; log-and-continue rather than fail the whole request if a
+        // side store is already clean (idempotent by design — a retried
+        // delete, or a user who never wrote telemetry/hot items).
         if let Ok(n) = outcome {
             if n > 0 {
+                let ops_conn = cp.ops_db.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = crate::db::delete_account_telemetry(&ops_conn, user_id) {
+                    tracing::error!("Failed to delete operational telemetry for user {}: {}", user_id, e);
+                }
+                drop(ops_conn);
                 if let Err(e) = crate::syncstore::purge_user(&cp.sync_store, user_id) {
                     tracing::error!("Failed to purge sync files for user {}: {}", user_id, e);
                 }

@@ -59,11 +59,24 @@ impl std::fmt::Display for ServerRole {
 /// `main.rs`, which skips `db::init_db` (and its wait for the SQLCipher key
 /// file) entirely on edge.
 pub struct ControlPlane {
-    /// SQLite connection protected by a standard (blocking) mutex.
+    /// SQLCipher (identity) connection, protected by a standard (blocking) mutex.
     ///
     /// `rusqlite::Connection` is `!Send`, so we wrap it in a `std::sync::Mutex`.
     /// SQLite queries are sub-millisecond, so blocking on this lock is acceptable.
     pub db: Mutex<rusqlite::Connection>,
+
+    /// Operational (unencrypted) connection: `devices`, `telemetry`, `releases`.
+    ///
+    /// Split out of `db` on 2026-08-30 (see
+    /// docs/mlc/audits/2026-08-30-entry-lock-vault-and-user-persistence.md §6/§11)
+    /// — none of these three tables are irreplaceable identity data, and none
+    /// of them need the SQLCipher key. Opened with a plain `Connection::open`
+    /// (see `db::init_ops_db`), independent of the tmpfs key wait that gates
+    /// `db` above, so a box with no key pushed yet still accepts heartbeats
+    /// and serves OTA manifests. `device_users` is NOT here — it is a
+    /// relationship between an account and a device, not a heartbeat, and
+    /// stays in `db`.
+    pub ops_db: Mutex<rusqlite::Connection>,
 
     /// Hot file store for chart-persistence sync categories (see syncstore.rs).
     /// Root is `<data_dir>/sync/`. Cold categories stay in the SQLCipher DB.

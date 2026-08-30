@@ -23,6 +23,9 @@
 //!   BUILD_ATTEST_ENFORCE   — "true"/"1" to reject unsigned clients (default: false)
 //!   BUILD_ATTEST_MAX_AGE_DAYS — max build age in days (default: 365)
 //!   MLC_DBKEY_PATH         — SQLCipher key file in tmpfs (default: /run/mlc/dbkey)
+//!   MLC_TELEMETRY_RETENTION_DAYS — days of `telemetry` rows to keep in the
+//!                            operational database before the periodic
+//!                            cleanup task deletes them (default: 30).
 //!   MLC_FREE_FEATURES      — comma-separated feature names granted to every
 //!                            caller with no paid claim (see entitlements.rs).
 //!                            Unset (default): every feature is free — this is
@@ -138,6 +141,13 @@ async fn main() {
         .unwrap_or(365)
         .saturating_mul(86400);
 
+    // Retention for the operational database's `telemetry` table — read once
+    // here, used by the periodic cleanup task below.
+    let telemetry_retention_days: i64 = std::env::var("MLC_TELEMETRY_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
     tracing::info!(
         "Build attestation: enforce={}, max_age={}d",
         build_attest_enforce,
@@ -156,7 +166,7 @@ async fn main() {
             std::fs::create_dir_all(&binaries_dir)
                 .expect("Failed to create data/binaries directory");
 
-            // Initialize SQLite database.
+            // Initialize the identity database (SQLCipher, waits for the key).
             let db_path = format!("{}/mylittlechart.db", data_dir);
             let db_conn = match db::init_db(&db_path) {
                 Ok(conn) => conn,
@@ -167,8 +177,28 @@ async fn main() {
             };
             tracing::info!("Database initialized at {}", db_path);
 
+            // Initialize the operational database (plain SQLite, no key wait —
+            // see state::ControlPlane::ops_db). Then run the one-time move of
+            // `devices`/`telemetry`/`releases` out of identity, if their
+            // identity copies still exist (2026-08-30 store split).
+            let ops_db_path = format!("{}/operational.db", data_dir);
+            let ops_conn = match db::init_ops_db(&ops_db_path) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::error!("Failed to initialize operational database at {}: {}", ops_db_path, e);
+                    std::process::exit(1);
+                }
+            };
+            tracing::info!("Operational database initialized at {}", ops_db_path);
+
+            if let Err(e) = db::migrate_legacy_ops_tables(&db_conn, &ops_conn) {
+                tracing::error!("Operational store migration failed: {}", e);
+                std::process::exit(1);
+            }
+
             Some(state::ControlPlane {
                 db: Mutex::new(db_conn),
+                ops_db: Mutex::new(ops_conn),
                 sync_store: crate::syncstore::SyncStore::new(
                     std::path::Path::new(&data_dir).join("sync"),
                 ),
@@ -241,25 +271,41 @@ async fn main() {
                 let state = state.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let cp = state.control_plane();
+
                     let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
                     let sessions = crate::db::cleanup_expired_sessions(&conn)
                         .map(|_| 0usize)
                         .unwrap_or(0);
                     let tokens = crate::db::cleanup_expired_auth_tokens(&conn).unwrap_or(0);
-                    let devices = crate::db::cleanup_stale_devices(&conn, 365).unwrap_or(0);
                     let sync = crate::db::cleanup_inactive_sync_data(&conn, 365).unwrap_or(0);
+
+                    // `devices`/`telemetry` live in the operational database
+                    // (2026-08-30 store split); `device_users` stays in
+                    // identity, so reconciling it against `devices` needs
+                    // both connections held at once — see
+                    // `cleanup_orphan_device_users`.
+                    let ops_conn = cp.ops_db.lock().unwrap_or_else(|e| e.into_inner());
+                    let devices = crate::db::cleanup_stale_devices(&ops_conn, 365).unwrap_or(0);
+                    let telemetry_purged =
+                        crate::db::cleanup_old_telemetry(&ops_conn, telemetry_retention_days)
+                            .unwrap_or(0);
+                    let orphan_links =
+                        crate::db::cleanup_orphan_device_users(&conn, &ops_conn).unwrap_or(0);
+                    drop(ops_conn);
                     drop(conn);
+
                     let sync_files =
                         crate::syncstore::cleanup_inactive(&cp.sync_store, 365).unwrap_or(0);
-                    (sessions, tokens, devices, sync, sync_files)
+                    (sessions, tokens, devices, orphan_links, telemetry_purged, sync, sync_files)
                 })
                 .await;
                 match result {
-                    Ok((_sessions, tokens, devices, sync, sync_files)) => {
-                        if tokens + devices + sync + sync_files > 0 {
+                    Ok((_sessions, tokens, devices, orphan_links, telemetry_purged, sync, sync_files)) => {
+                        if tokens + devices + orphan_links + telemetry_purged + sync + sync_files > 0 {
                             tracing::info!(
-                                "Periodic cleanup: {} expired tokens, {} stale devices, {} inactive sync items, {} inactive sync user dirs",
-                                tokens, devices, sync, sync_files
+                                "Periodic cleanup: {} expired tokens, {} stale devices, {} orphaned device links, \
+                                 {} old telemetry rows, {} inactive sync items, {} inactive sync user dirs",
+                                tokens, devices, orphan_links, telemetry_purged, sync, sync_files
                             );
                         }
                     }

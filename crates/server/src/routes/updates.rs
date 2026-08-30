@@ -8,7 +8,6 @@ use axum::{
     Json,
 };
 use std::sync::Arc;
-use tokio_util::io::ReaderStream;
 
 use crate::models::types::{DownloadPath, DownloadQuery, ErrorResponse, LatestQuery, VersionManifest};
 use crate::state::AppState;
@@ -24,7 +23,8 @@ pub async fn get_latest(
     let channel = query.channel.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        // `releases` lives in the operational database (2026-08-30 store split).
+        let conn = state.control_plane().ops_db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::get_latest_release(&conn, &platform, &channel)
     })
     .await;
@@ -86,7 +86,7 @@ pub async fn download_binary(
             let platform = platform.clone();
             let version = version.clone();
             move || {
-                let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = state.control_plane().ops_db.lock().unwrap_or_else(|e| e.into_inner());
                 if version == "latest" {
                     crate::db::get_latest_release(&conn, &platform, &channel)
                 } else {

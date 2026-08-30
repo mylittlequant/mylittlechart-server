@@ -52,7 +52,8 @@ pub async fn handle_heartbeat(
         .collect();
 
     tokio::task::spawn_blocking(move || {
-        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        // `devices` lives in the operational database (2026-08-30 store split).
+        let conn = state.control_plane().ops_db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::upsert_device(&conn, &device_id, &device_name, &app_version, &os, &now)
     })
     .await
