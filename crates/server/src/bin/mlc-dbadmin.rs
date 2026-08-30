@@ -62,10 +62,29 @@ fn key_hex() -> String {
     }
 }
 
+/// Is this a plain SQLite file rather than a SQLCipher one?
+///
+/// SQLCipher overwrites the first 16 bytes of page 1 with the salt, so the
+/// `SQLite format 3\0` magic is present in exactly the unencrypted case.
+/// Since the 2026-08-30 store split there are two databases side by side —
+/// encrypted identity and plain `operational.db` — and applying `PRAGMA key`
+/// to the plain one fails with an unhelpful error.
+fn is_plain_sqlite(path: &str) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 16];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .map(|_| &magic == b"SQLite format 3\0")
+        .unwrap_or(false)
+}
+
+/// Open a database, applying the key only when the file is actually encrypted.
 fn open_encrypted(path: &str, key: &str) -> Connection {
     let conn = Connection::open(path).expect("open db");
-    let pragma = format!("PRAGMA key = \"x'{}'\";", key);
-    conn.execute_batch(&pragma).expect("apply key");
+    if !is_plain_sqlite(path) {
+        let pragma = format!("PRAGMA key = \"x'{}'\";", key);
+        conn.execute_batch(&pragma).expect("apply key");
+    }
     conn
 }
 
