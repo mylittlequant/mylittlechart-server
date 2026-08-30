@@ -138,10 +138,16 @@ pub async fn download_binary(
     // The Location is relative on purpose: the client stays on whichever edge
     // answered it, and no hostname is baked in.
     //
-    // The filename comes from the manifest's own path, and that path is not
-    // uniform: rows written while the server ran on Windows carry
-    // `./data\binaries\win64\…` while newer ones carry an absolute Linux
-    // path. Split on both separators rather than trusting either.
+    // `file_path` is no longer a path: since the 2026-08-30 publish redesign
+    // (`mlc-opsd`'s `POST /api/release/publish` registering via
+    // `POST /api/admin/register-release`) the control box stores no
+    // artifacts at all, so there is nothing on this box's filesystem for a
+    // path to point at — the column holds just the filename that exists
+    // under each edge's `/opt/mlc/static/dl/{platform}/{version}/`. The
+    // rsplit below is defense in depth against older rows written before
+    // this cutover, which carried a real path (Windows `./data\binaries\…`
+    // or an absolute Linux one) — either shape still yields the right
+    // basename.
     let filename = row
         .file_path
         .rsplit(|c| c == '/' || c == '\\')

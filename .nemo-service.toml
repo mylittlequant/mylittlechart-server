@@ -62,8 +62,8 @@ public = false
 
 [[endpoints]]
 method = "POST"
-path = "/api/admin/upload"
-description = "Upload a new release binary"
+path = "/api/admin/register-release"
+description = "Register a release manifest row (metadata only — filename, sha256, size, notes). The artifact itself is never uploaded here: mlc-opsd (see mylittlechart-server/crates/opsd) uploads and sha256-verifies it on both public edges first, then calls this endpoint. Replaces the old body-accepting /api/admin/upload."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false

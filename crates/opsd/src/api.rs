@@ -61,6 +61,7 @@ pub async fn serve(state: Arc<OpsdState>) -> Result<(), Box<dyn std::error::Erro
         .route("/unlock", post(handle_unlock))
         .route("/box/state", get(handle_box_state))
         .route("/deploy", post(handle_deploy))
+        .route("/release/publish", post(handle_release_publish))
         .route("/backup/now", post(handle_backup_now))
         .route("/backup/pull", post(handle_backup_pull))
         .route("/backup/list", get(handle_backup_list))
@@ -156,6 +157,43 @@ async fn handle_deploy(
     Json(body): Json<DeployBody>,
 ) -> axum::response::Response {
     match crate::deploy::deploy(&state, std::path::Path::new(&body.path)).await {
+        Ok(o) => Json(serde_json::to_value(o).unwrap()).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+fn default_channel() -> String {
+    "dev".to_string()
+}
+
+#[derive(Deserialize)]
+struct PublishBody {
+    /// Local path on the opbox to the release artifact.
+    path: String,
+    platform: String,
+    version: String,
+    #[serde(default = "default_channel")]
+    channel: String,
+    #[serde(default)]
+    release_notes: String,
+    /// Base64-encoded Ed25519 signature over the artifact bytes.
+    #[serde(default)]
+    signature: String,
+}
+
+async fn handle_release_publish(
+    State(state): State<Arc<OpsdState>>,
+    Json(body): Json<PublishBody>,
+) -> axum::response::Response {
+    let req = crate::release::PublishRequest {
+        local: std::path::Path::new(&body.path),
+        platform: &body.platform,
+        version: &body.version,
+        channel: &body.channel,
+        release_notes: &body.release_notes,
+        signature: &body.signature,
+    };
+    match crate::release::publish(&state, req).await {
         Ok(o) => Json(serde_json::to_value(o).unwrap()).into_response(),
         Err(e) => err_response(e),
     }

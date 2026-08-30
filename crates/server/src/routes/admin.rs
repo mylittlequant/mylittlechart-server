@@ -7,11 +7,12 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
-use crate::models::types::{ErrorResponse, PromoteQuery, PromoteResponse, UploadQuery, UploadResponse};
+use crate::models::types::{
+    ErrorResponse, PromoteQuery, PromoteResponse, RegisterReleaseRequest, RegisterReleaseResponse,
+};
 use crate::pathutil::is_safe_path_component;
 use crate::state::AppState;
 
@@ -58,128 +59,111 @@ pub async fn restart(
     Json(serde_json::json!({ "status": "restarting" })).into_response()
 }
 
-/// POST /api/admin/upload?platform=win64&version=0.2.0&release_notes=...
+/// POST /api/admin/register-release
 ///
-/// Requires `Authorization: Bearer {ADMIN_SECRET}` header.
-/// Accepts raw binary body (max 200 MB enforced by middleware).
-/// Computes SHA-256, saves to `data/binaries/{platform}/{version}/`, inserts into DB.
+/// Metadata-only manifest registration. Requires
+/// `Authorization: Bearer {ADMIN_SECRET}` header. The artifact bytes never
+/// reach the control box: since the 2026-08-30 publish redesign,
+/// `mlc-opsd` uploads and sha256-verifies the file on every public edge
+/// before ever calling here — this endpoint's only job is to write the
+/// manifest row (see `mlc-opsd`'s `POST /api/release/publish`, which is the
+/// only intended caller). It replaces the old body-accepting
+/// `POST /api/admin/upload`, which stored artifacts on the control box —
+/// a box that stores nothing now that downloads redirect to the edges.
 ///
-/// NOTE: the query string is parsed only AFTER the bearer check. With
-/// `Query<UploadQuery>` as an extractor, axum rejected unauthenticated
-/// requests with 400 "missing field platform" — leaking the endpoint's
-/// parameter shape to anyone probing it. Now an unauthenticated probe gets
-/// a flat 401 and nothing else.
-pub async fn upload_binary(
+/// NOTE: the JSON body is parsed only AFTER the bearer check — same reason
+/// the old upload route parsed its query string late: an unauthenticated
+/// probe gets a flat 401 and nothing about the endpoint's shape.
+pub async fn register_release(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    uri: axum::http::Uri,
     body: Bytes,
 ) -> Response {
     if let Err(e) = verify_admin_secret(&state, &headers) {
         return e;
     }
 
-    let Query(query) = match Query::<UploadQuery>::try_from_uri(&uri) {
-        Ok(q) => q,
+    let req: RegisterReleaseRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new("Invalid query parameters")),
+                Json(ErrorResponse::new("Invalid JSON body")),
             )
                 .into_response();
         }
     };
 
-    // Issue 2: Validate params — reject path traversal characters before touching the filesystem.
-    if query.platform.is_empty() || query.version.is_empty() {
+    if req.platform.is_empty() || req.version.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new("platform and version are required")),
         )
             .into_response();
     }
-    if !is_safe_path_component(&query.platform) || !is_safe_path_component(&query.version) {
+    if !is_safe_path_component(&req.platform) || !is_safe_path_component(&req.version) {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new("Invalid platform or version format")),
         )
             .into_response();
     }
-    if query.release_notes.len() > 4096 {
+    if !is_safe_path_component(&req.filename) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("Invalid filename format")),
+        )
+            .into_response();
+    }
+    if req.sha256.len() != 64 || !req.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("sha256 must be 64 hex characters")),
+        )
+            .into_response();
+    }
+    if req.file_size == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("file_size must be > 0")),
+        )
+            .into_response();
+    }
+    if req.release_notes.len() > 4096 {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new("release_notes too long (max 4096)")),
         )
             .into_response();
     }
-    if query.signature.len() > 256 {
+    if req.signature.len() > 256 {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new("signature too long (max 256)")),
         )
             .into_response();
     }
-    if query.channel != "stable" && query.channel != "dev" {
+    if req.channel != "stable" && req.channel != "dev" {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new("channel must be 'stable' or 'dev'")),
         )
             .into_response();
     }
-    if body.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new("Empty body")),
-        )
-            .into_response();
-    }
 
-    // Compute SHA-256 of the uploaded bytes.
-    let sha256 = {
-        let mut hasher = Sha256::new();
-        hasher.update(&body);
-        hex::encode(hasher.finalize())
-    };
-
-    let file_size = body.len() as u64;
-
-    // Determine storage path: data/binaries/{platform}/{version}/
-    let dir = PathBuf::from(&state.data_dir)
-        .join("binaries")
-        .join(&query.platform)
-        .join(&query.version);
-
-    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-        tracing::error!("Failed to create binary dir {:?}: {}", dir, e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::new("Failed to create storage directory")),
-        )
-            .into_response();
-    }
-
-    // Filename: mylittlechart-{platform}-{version}.bin (or .exe on win64)
-    let ext = if query.platform.contains("win") { "exe" } else { "bin" };
-    let filename = format!("mylittlechart-{}-{}.{}", query.platform, query.version, ext);
-    let file_path = dir.join(&filename);
-
-    if let Err(e) = tokio::fs::write(&file_path, &body).await {
-        tracing::error!("Failed to write binary {:?}: {}", file_path, e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::new("Failed to write binary to disk")),
-        )
-            .into_response();
-    }
-
-    let file_path_str = file_path.to_string_lossy().into_owned();
     let now = chrono::Utc::now().to_rfc3339();
-    let platform = query.platform.clone();
-    let version = query.version.clone();
-    let release_notes = query.release_notes.clone();
-    let signature = query.signature.clone();
-    let channel = query.channel.clone();
-    let sha256_clone = sha256.clone();
+    let platform = req.platform.clone();
+    let version = req.version.clone();
+    let channel = req.channel.clone();
+    // `file_path` is the column name (unchanged schema) — the value stored
+    // is now just the filename under the edges' static `/dl/` tree, never a
+    // path, since the control box holds no filesystem copy to build a path
+    // to. See `routes::updates::download_binary`, which reads it back that way.
+    let file_path = req.filename.clone();
+    let sha256 = req.sha256.clone();
+    let release_notes = req.release_notes.clone();
+    let signature = req.signature.clone();
+    let file_size = req.file_size;
 
     let db_result = tokio::task::spawn_blocking(move || {
         // `releases` lives in the operational database (2026-08-30 store split).
@@ -189,8 +173,8 @@ pub async fn upload_binary(
             &version,
             &platform,
             &channel,
-            &sha256_clone,
-            &file_path_str,
+            &sha256,
+            &file_path,
             file_size as i64,
             &release_notes,
             &signature,
@@ -202,7 +186,7 @@ pub async fn upload_binary(
     match db_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            tracing::error!("DB error during upload: {}", e);
+            tracing::error!("DB error during release registration: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new("Database insert failed")),
@@ -219,23 +203,23 @@ pub async fn upload_binary(
     }
 
     tracing::info!(
-        "Binary uploaded: platform={} version={} channel={} size={} sha256={} signed={}",
-        query.platform,
-        query.version,
-        query.channel,
-        file_size,
-        sha256,
-        !query.signature.is_empty(),
+        "Release registered: platform={} version={} channel={} filename={} size={} sha256={} signed={}",
+        req.platform,
+        req.version,
+        req.channel,
+        req.filename,
+        req.file_size,
+        req.sha256,
+        !req.signature.is_empty(),
     );
 
-    Json(UploadResponse {
+    Json(RegisterReleaseResponse {
         status: "ok",
-        sha256,
-        file_size,
-        platform: query.platform,
-        version: query.version,
-        signature: query.signature,
-        channel: query.channel,
+        platform: req.platform,
+        version: req.version,
+        channel: req.channel,
+        filename: req.filename,
+        sha256: req.sha256,
     })
     .into_response()
 }
@@ -253,7 +237,7 @@ pub async fn promote(
         return e;
     }
 
-    // Same auth-before-parse rule as upload_binary above.
+    // Same auth-before-parse rule as register_release above.
     let Query(query) = match Query::<PromoteQuery>::try_from_uri(&uri) {
         Ok(q) => q,
         Err(_) => {

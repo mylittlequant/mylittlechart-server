@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::error::OpsdError;
 use crate::ssh::{self, SshSession};
-use crate::state::{OpsdState, UNIT_WHITELIST};
+use crate::state::{EdgeConfig, OpsdState, UNIT_WHITELIST};
 
 #[derive(Debug, Serialize)]
 pub struct BoxStatus {
@@ -63,6 +63,24 @@ pub(crate) async fn connect(state: &Arc<OpsdState>) -> Result<SshSession, OpsdEr
             // Loud audit: a changed host key on the management channel is a
             // security event, not an ordinary failure.
             state.audit("hostkey_mismatch", &e.to_string());
+            Err(OpsdError::Ssh(e))
+        }
+        Err(e) => Err(OpsdError::Ssh(e)),
+    }
+}
+
+/// Same connect + audited-mismatch pattern as [`connect`], against one edge
+/// instead of the control box.
+pub(crate) async fn connect_edge(
+    state: &Arc<OpsdState>,
+    edge: &EdgeConfig,
+) -> Result<SshSession, OpsdError> {
+    let key_pem = std::fs::read(&edge.ssh_key_path)?;
+    let opts = state.edge_ssh_options(edge, &key_pem);
+    match ssh::open_session(&opts).await {
+        Ok(s) => Ok(s),
+        Err(e @ ssh::SshError::HostKeyMismatch { .. }) => {
+            state.audit("edge_hostkey_mismatch", &format!("edge={} {e}", edge.name));
             Err(OpsdError::Ssh(e))
         }
         Err(e) => Err(OpsdError::Ssh(e)),

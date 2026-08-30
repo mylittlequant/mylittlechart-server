@@ -107,22 +107,36 @@ pub fn verdict(
     }
 }
 
-/// Validate the operator-supplied local artifact path. Rejects Windows
-/// binaries (`.exe`) — the box wants a linux musl ELF, and deploying a
-/// Windows build by mistake would take prod down until rollback.
-pub fn validate_local_binary(path: &Path) -> Result<u64, OpsdError> {
+/// Validate that a local artifact exists, is a regular file, and is not
+/// suspiciously small. Shared by [`validate_local_binary`] (the linux musl
+/// server binary this module deploys) and `release::validate_local_artifact`
+/// (client release artifacts across platforms, which — unlike the server
+/// binary — legitimately includes `.exe` on win64).
+pub fn validate_artifact_size(path: &Path) -> Result<u64, OpsdError> {
     let meta = std::fs::metadata(path)
-        .map_err(|e| OpsdError::Remote(format!("binary {}: {e}", path.display())))?;
+        .map_err(|e| OpsdError::Remote(format!("artifact {}: {e}", path.display())))?;
     if !meta.is_file() {
         return Err(OpsdError::Remote(format!("{} is not a file", path.display())));
     }
     if meta.len() < 1024 * 1024 {
         return Err(OpsdError::Remote(format!(
-            "{} is suspiciously small ({} bytes) — not a musl server binary?",
+            "{} is suspiciously small ({} bytes)",
             path.display(),
             meta.len()
         )));
     }
+    Ok(meta.len())
+}
+
+/// Validate the operator-supplied local artifact path for a [`deploy`]
+/// roll-out. Rejects Windows binaries (`.exe`) on top of the shared
+/// [`validate_artifact_size`] checks — the box wants a linux musl ELF, and
+/// deploying a Windows build by mistake would take prod down until rollback.
+/// This rejection is specific to the server binary this module deploys and
+/// must NOT apply to release artifacts (a win64 client release IS an .exe) —
+/// see `release::validate_local_artifact`, which shares the size check only.
+pub fn validate_local_binary(path: &Path) -> Result<u64, OpsdError> {
+    let size = validate_artifact_size(path)?;
     if path
         .extension()
         .and_then(|e| e.to_str())
@@ -134,7 +148,7 @@ pub fn validate_local_binary(path: &Path) -> Result<u64, OpsdError> {
             path.display()
         )));
     }
-    Ok(meta.len())
+    Ok(size)
 }
 
 /// `sha256sum` of a remote path, parsed by [`parse_remote_sha256`].
@@ -207,7 +221,9 @@ pub fn health_cmd() -> String {
     )
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Shared with `release::publish` — one sha256 helper for both artifact
+/// kinds this crate ships to a box.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     hex::encode(h.finalize())

@@ -41,7 +41,7 @@ To stop permanently (no restart): `touch data/stop-server` before sending restar
 |----------|---------|----------|-------|
 | `PORT` | `19200` | No | Listen port |
 | `DATA_DIR` | `./data` | No | DB + binaries root |
-| `ADMIN_SECRET` | `""` | Yes (for upload) | If empty, `/api/admin/upload` returns 503 |
+| `ADMIN_SECRET` | `""` | Yes (for release registration) | If empty, `/api/admin/register-release` returns 503 |
 | `GITHUB_CLIENT_ID` | `""` | For GitHub OAuth | |
 | `GITHUB_CLIENT_SECRET` | `""` | For GitHub OAuth | |
 | `DISCORD_CLIENT_ID` | `""` | For Discord OAuth | |
@@ -61,7 +61,7 @@ To stop permanently (no restart): `touch data/stop-server` before sending restar
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| POST | `/api/admin/upload?platform=X&version=Y&release_notes=Z` | Bearer ADMIN_SECRET | Upload release binary (max 200MB) |
+| POST | `/api/admin/register-release` | Bearer ADMIN_SECRET | Register a release manifest row (JSON: platform, version, channel, filename, sha256, file_size, release_notes, signature). Metadata only — the artifact itself is uploaded to both public edges by `mlc-opsd` (`crates/opsd`) before this is ever called; see "Upload a New Release" below. |
 | POST | `/api/admin/restart` | Bearer ADMIN_SECRET | Trigger graceful shutdown (wrapper auto-restarts) |
 | POST | `/api/heartbeat` | None | Device keep-alive |
 | POST | `/api/telemetry` | Optional Bearer token | Submit usage metrics |
@@ -115,10 +115,7 @@ c:\Users\VA PC\CODING\ML_TRADING\nemo\mylittlechart-server\
 │   ├── setup.sh                  # Server setup script
 │   └── upload-release.sh         # Release upload helper
 ├── data/
-│   ├── mylittlechart.db                # SQLite (WAL mode)
-│   └── binaries/
-│       └── win64/
-│           └── {version}/zengeld-win64-{version}.exe
+│   └── mylittlechart.db                # SQLite (WAL mode) — no release artifacts; see crates/opsd
 └── crates/
     ├── server/                   # Main Axum HTTP server
     │   ├── Cargo.toml
@@ -134,7 +131,7 @@ c:\Users\VA PC\CODING\ML_TRADING\nemo\mylittlechart-server\
     │       │   └── types.rs      # Request/response structs
     │       └── routes/
     │           ├── mod.rs        # api_router() assembly
-    │           ├── admin.rs      # Binary upload
+    │           ├── admin.rs      # Release manifest registration, restart, promote
     │           ├── agent_keys.rs # Agent API key generate/request/confirm/poll/revoke
     │           ├── dashboard.rs  # Admin dashboard routes
     │           ├── device_auth.rs # Device code flow, web sessions
@@ -144,7 +141,11 @@ c:\Users\VA PC\CODING\ML_TRADING\nemo\mylittlechart-server\
     │           ├── sync.rs       # Cloud sync push/pull/changes/delete
     │           ├── tg_login.rs   # Telegram bot login (create token + poll status)
     │           ├── telemetry.rs  # Metrics ingestion
-    │           └── updates.rs    # Version manifest + binary streaming
+    │           └── updates.rs    # Version manifest + edge-redirect download
+    ├── opsd/                     # mlc-opsd — operator daemon: ssh to control box + both
+    │   │                         # public edges; release publish, deploy, unlock, backups
+    │   └── src/
+    │       └── release.rs        # POST /api/release/publish — the only artifact upload path
     └── tg-login-bot/             # Telegram login bot (long-polling)
         ├── Cargo.toml
         └── src/
@@ -153,7 +154,7 @@ c:\Users\VA PC\CODING\ML_TRADING\nemo\mylittlechart-server\
 
 ## Database Tables
 
-- **releases**: `(id, version, platform, sha256, file_path, file_size, release_notes, signature, created_at)` — UNIQUE(version, platform), upsert on conflict; `signature` is a base64-encoded Ed25519 signature over the binary bytes (for OTA code signing)
+- **releases**: `(id, version, platform, channel, sha256, file_path, file_size, release_notes, signature, created_at)` — UNIQUE(version, platform, channel), upsert on conflict. Lives in the operational database (`operational.db`), not the SQLCipher identity one. `file_path` is just the artifact's filename on the public edges (`/opt/mlc/static/dl/{platform}/{version}/{file_path}`) — the control box stores no copy; `signature` is a base64-encoded Ed25519 signature over the binary bytes (for OTA code signing)
 - **devices**: `(device_id PK, device_name, app_version, os, first_seen, last_seen, total_heartbeats)` — updated on each heartbeat
 - **telemetry**: `(id, device_id, user_id, received_at, app_version, os, arch, gpu_name, screen_*, connector_count, window_count, avg_fps, uptime_secs, total_bars, ws_connections)` — append-only, one row per 5-min check-in
 - **users**: `(id, public_id, provider, provider_user_id, display_name, created_at)` — UNIQUE(provider, provider_user_id); `public_id` is a 32-char random hex exposed in APIs instead of sequential `id`. Orphan rows (no linked providers) are auto-cleaned on startup.
@@ -183,13 +184,14 @@ wasm-pack build crates/landing-canvas --target web --out-dir "$(pwd)/web/pkg"
 
 ## Upload a New Release
 
+The control box stores no release artifacts (2026-08-30 publish redesign) — publishing goes through `mlc-opsd` (`crates/opsd`), which uploads the artifact to both public edges, sha256-verifies each, and only then registers the manifest row here. Nothing is registered if either edge fails.
+
 ```bash
-curl -X POST "https://mylittlechart.org/api/admin/upload?platform=win64&version=X.Y.Z&release_notes=..." \
-  -H "Authorization: Bearer <ADMIN_SECRET>" \
-  --data-binary @path/to/binary.exe
+cd deploy
+./upload-release.sh win64 X.Y.Z path/to/binary.exe "release notes" stable
 ```
 
-The server computes SHA-256, saves to `data/binaries/{platform}/{version}/`, and inserts/updates the DB record.
+This is a thin wrapper over `mlc-opsd publish <path> <platform> <version> [channel] [release_notes]`, which itself calls the daemon's own `POST /api/release/publish`. See `crates/opsd/src/release.rs`.
 
 ## Security
 
@@ -251,7 +253,7 @@ Protected endpoints can require clients to present a signed build token proving 
 
 ## OTA Code Signing
 
-Release binaries uploaded via `POST /api/admin/upload` can include an Ed25519 signature over the binary bytes. The signature is stored in the `signature` column of the `releases` table (base64-encoded).
+Release artifacts published via `mlc-opsd publish` (see "Upload a New Release" above) can include an Ed25519 signature over the binary bytes. The signature is stored in the `signature` column of the `releases` table (base64-encoded).
 
 The client (`updater` crate) verifies the signature against the embedded public key before applying an update. This prevents a compromised server or MITM from pushing tampered binaries. Unsigned releases (empty `signature`) are accepted unless the client is built with enforcement enabled.
 

@@ -93,9 +93,6 @@ pub struct AppState {
     /// handlers on edge), but a clear invariant beats a silent `None` deref.
     control_plane: Option<ControlPlane>,
 
-    /// Root directory where runtime data is stored (binaries, DB file, etc.)
-    pub data_dir: String,
-
     /// Secret required for admin endpoints (set via `ADMIN_SECRET` env var).
     pub admin_secret: String,
 
@@ -140,7 +137,6 @@ impl AppState {
     /// site (all route handlers) is forced through `control_plane()` below.
     pub fn new(
         control_plane: Option<ControlPlane>,
-        data_dir: String,
         admin_secret: String,
         github_client_id: String,
         github_client_secret: String,
@@ -158,7 +154,6 @@ impl AppState {
     ) -> Self {
         Self {
             control_plane,
-            data_dir,
             admin_secret,
             github_client_id,
             github_client_secret,

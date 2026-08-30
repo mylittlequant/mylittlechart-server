@@ -14,16 +14,12 @@ use rusqlite::Connection;
 
 use crate::error::OpsdError;
 
-// Defaults describe the box opsd was written for. Every one is overridable by
-// environment, because the fleet stopped being one box on 2026-08-30: the
-// database moved to a control box and these constants kept pointing at the
-// old one, so the hourly pull was archiving a stale snapshot while looking
-// healthy. A backup that silently goes stale is worse than one that is absent.
 // The box opsd operates on is the one holding the database, and on 2026-08-30
 // that stopped being mlc-utah-1: identity moved to the control box and
-// mlc-utah-1 became a pure edge running nginx only. Pointing here at the old
-// box would have kept the hourly pull archiving a snapshot that no longer
-// changes — a backup that silently goes stale, which is worse than none.
+// mlc-utah-1 became a pure edge running nginx only. Every default here is
+// overridable by environment, because leaving them pointing at the old box
+// would have kept the hourly pull archiving a snapshot that no longer changes
+// — a backup that silently goes stale, which is worse than none.
 pub const BOX_HOST: &str = "144.172.97.2";
 pub const BOX_PORT: u16 = 22;
 pub const BOX_USER: &str = "root";
@@ -46,6 +42,11 @@ pub const PUBLIC_HEALTH_URL: &str = "https://mylittlechart.org/health";
 /// Reading the address back from the unit keeps the probe honest through any
 /// future rebind, and falls back to loopback when the unit sets nothing.
 pub const APP_HEALTH_RESOLVE: &str = "H=http://$(systemctl show mlc-server -p Environment --value 2>/dev/null | tr ' ' '\\n' | sed -n 's/^BIND_ADDR=//p' | head -n1 | grep . || echo 127.0.0.1):19200/health; ";
+/// Same address resolution as [`APP_HEALTH_RESOLVE`] but leaving the bare
+/// base URL (no `/health` suffix) in `$B` — for anything that needs to hit a
+/// different route on the app's own port from inside a box ssh session (see
+/// `release::register_release`).
+pub const APP_BASE_RESOLVE: &str = "B=http://$(systemctl show mlc-server -p Environment --value 2>/dev/null | tr ' ' '\\n' | sed -n 's/^BIND_ADDR=//p' | head -n1 | grep . || echo 127.0.0.1):19200; ";
 pub const BIND_ADDR: &str = "127.0.0.1:18360";
 
 /// Effective bind address. `MLC_OPSD_BIND` overrides the default for
@@ -57,7 +58,12 @@ pub fn bind_addr() -> String {
 
 /// Where pulled backups land on the opbox (encrypted at rest). The AES key
 /// stays on C: (`env/backups/backup-key`) — E: alone leaks nothing.
-pub const DEFAULT_BACKUP_PULL_DIR: &str = "E:\\backups\\mlc-utah-1";
+///
+/// Named for the box the snapshots actually come from. It said `mlc-utah-1`
+/// until 2026-08-30, after the database had already moved to the control box —
+/// a directory named after one box while holding another's data is how a
+/// restore gets pointed at the wrong snapshot.
+pub const DEFAULT_BACKUP_PULL_DIR: &str = "E:\\backups\\mlc-c2-1";
 
 /// systemd units opsd is allowed to touch remotely. Anything outside this
 /// list is rejected before a command string is ever built (injection guard).
@@ -75,6 +81,69 @@ pub struct BoxConfig {
     pub canon_env_path: PathBuf,
 }
 
+/// Compile-time defaults for one public edge — nginx-only boxes that serve
+/// static release artifacts from `/opt/mlc/static/dl/`. The control box
+/// stores no artifacts at all (2026-08-30 publish redesign): the files live
+/// only here, on both edges, and `release::publish` refuses to register a
+/// manifest row unless every edge in this list verifies the upload.
+struct EdgeDefault {
+    /// Also the d-watchdog/env directory name and the per-edge env-var and
+    /// hostkey-pin key.
+    name: &'static str,
+    host: &'static str,
+    user: &'static str,
+    /// SSH key file under `env/`, same convention as [`BOX_SSH_KEY`].
+    ssh_key: &'static str,
+}
+
+const EDGE_DEFAULTS: [EdgeDefault; 2] = [
+    EdgeDefault {
+        name: "mlc-utah-1",
+        host: "144.172.97.222",
+        user: "root",
+        ssh_key: "mlc-utah-box",
+    },
+    EdgeDefault {
+        name: "mlc-ams-1",
+        host: "107.189.17.13",
+        user: "root",
+        ssh_key: "mlc-ams-box",
+    },
+];
+
+#[derive(Debug, Clone)]
+pub struct EdgeConfig {
+    pub name: &'static str,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub ssh_key_path: PathBuf,
+}
+
+/// `MLC_EDGE_<NAME>_<FIELD>` — same override idiom as `MLC_BOX_*`, one env
+/// var per field per edge (e.g. `MLC_EDGE_MLC_UTAH_1_HOST`).
+fn edge_env_key(name: &str, field: &str) -> String {
+    format!("MLC_EDGE_{}_{field}", name.to_uppercase().replace('-', "_"))
+}
+
+fn resolve_edges(env_dir: &Path) -> Vec<EdgeConfig> {
+    EDGE_DEFAULTS
+        .iter()
+        .map(|d| EdgeConfig {
+            name: d.name,
+            host: std::env::var(edge_env_key(d.name, "HOST")).unwrap_or_else(|_| d.host.to_string()),
+            port: std::env::var(edge_env_key(d.name, "PORT"))
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(BOX_PORT),
+            user: std::env::var(edge_env_key(d.name, "USER")).unwrap_or_else(|_| d.user.to_string()),
+            ssh_key_path: env_dir.join(
+                std::env::var(edge_env_key(d.name, "SSH_KEY")).unwrap_or_else(|_| d.ssh_key.to_string()),
+            ),
+        })
+        .collect()
+}
+
 /// Live watch-loop counters, shared with `GET /api/watch/state`. The
 /// intervention timestamp is NOT here — it lives in the `kv` table so it
 /// survives daemon restarts.
@@ -88,6 +157,8 @@ pub struct OpsdState {
     pub state_dir: PathBuf,
     pub api_key: String,
     pub box_cfg: BoxConfig,
+    /// Public edges a release publish must land on. See [`EdgeDefault`].
+    pub edges: Vec<EdgeConfig>,
     /// AES-256-GCM key for pulled-backup encryption (opbox only).
     pub backup_key_path: PathBuf,
     /// Pull destination on the opbox.
@@ -112,6 +183,14 @@ fn find_nemo_root(start: &Path) -> Option<PathBuf> {
 }
 
 pub fn resolve_paths() -> Result<(PathBuf, BoxConfig, PathBuf), OpsdError> {
+    let (state_dir, box_cfg, _edges, env_dir) = resolve_paths_with_edges()?;
+    Ok((state_dir, box_cfg, env_dir))
+}
+
+/// Same resolution as [`resolve_paths`], plus the edge targets — split out
+/// so the CLI's `resolve_paths()` call sites (which only ever wanted the box)
+/// don't have to change shape.
+fn resolve_paths_with_edges() -> Result<(PathBuf, BoxConfig, Vec<EdgeConfig>, PathBuf), OpsdError> {
     let root = find_nemo_root(&std::env::current_dir()?)
         .ok_or(OpsdError::NemoRootNotFound)?;
     let env_dir = root.join("env");
@@ -136,7 +215,8 @@ pub fn resolve_paths() -> Result<(PathBuf, BoxConfig, PathBuf), OpsdError> {
         canon_key_path: env_dir.join(&canon_dir).join("sqlcipher.key"),
         canon_env_path: env_dir.join(&canon_dir).join("server.env"),
     };
-    Ok((state_dir, box_cfg, env_dir))
+    let edges = resolve_edges(&env_dir);
+    Ok((state_dir, box_cfg, edges, env_dir))
 }
 
 /// Resolve the git HEAD sha of the repo the daemon was launched from, by
@@ -227,7 +307,7 @@ fn init_db(state_dir: &Path) -> Result<Connection, OpsdError> {
 
 impl OpsdState {
     pub fn load() -> Result<Self, OpsdError> {
-        let (state_dir, box_cfg, env_dir) = resolve_paths()?;
+        let (state_dir, box_cfg, edges, env_dir) = resolve_paths_with_edges()?;
         std::fs::create_dir_all(&state_dir)?;
         let api_key = load_or_generate_api_key(&state_dir)?;
         let db = init_db(&state_dir)?;
@@ -244,6 +324,7 @@ impl OpsdState {
             state_dir,
             api_key,
             box_cfg,
+            edges,
             backup_key_path: env_dir.join("backups").join("backup-key"),
             backup_pull_dir,
             db: Mutex::new(db),
@@ -260,6 +341,23 @@ impl OpsdState {
             user: &self.box_cfg.user,
             key_pem,
             pin_path: self.state_dir.join("known_box_key"),
+        }
+    }
+
+    /// SSH options for one edge, including that edge's own TOFU hostkey pin
+    /// file — pinned independently per edge, so a compromised or rekeyed
+    /// edge cannot borrow the trust already established with another.
+    pub fn edge_ssh_options<'a>(
+        &'a self,
+        edge: &'a EdgeConfig,
+        key_pem: &'a [u8],
+    ) -> crate::ssh::SshOptions<'a> {
+        crate::ssh::SshOptions {
+            host: &edge.host,
+            port: edge.port,
+            user: &edge.user,
+            key_pem,
+            pin_path: self.state_dir.join(format!("known_edge_key_{}", edge.name)),
         }
     }
 
@@ -330,5 +428,26 @@ mod tests {
     #[test]
     fn nemo_root_absent_returns_none() {
         assert_eq!(find_nemo_root(Path::new("/")), None);
+    }
+
+    #[test]
+    fn edge_env_key_format() {
+        assert_eq!(edge_env_key("mlc-utah-1", "HOST"), "MLC_EDGE_MLC_UTAH_1_HOST");
+        assert_eq!(edge_env_key("mlc-ams-1", "SSH_KEY"), "MLC_EDGE_MLC_AMS_1_SSH_KEY");
+    }
+
+    #[test]
+    fn resolve_edges_uses_compiled_defaults() {
+        let env_dir = Path::new("env-dir-does-not-need-to-exist");
+        let edges = resolve_edges(env_dir);
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].name, "mlc-utah-1");
+        assert_eq!(edges[0].host, "144.172.97.222");
+        assert_eq!(edges[0].user, "root");
+        assert_eq!(edges[0].port, BOX_PORT);
+        assert_eq!(edges[0].ssh_key_path, env_dir.join("mlc-utah-box"));
+        assert_eq!(edges[1].name, "mlc-ams-1");
+        assert_eq!(edges[1].host, "107.189.17.13");
+        assert_eq!(edges[1].ssh_key_path, env_dir.join("mlc-ams-box"));
     }
 }

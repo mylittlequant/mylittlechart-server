@@ -6,7 +6,6 @@
 //! version is available.
 
 use axum::{
-    extract::DefaultBodyLimit,
     routing::{delete, get, patch, post},
     Router,
 };
@@ -35,10 +34,7 @@ pub mod updates;
 pub fn control_api_router(state: Arc<AppState>) -> Router {
     Router::new()
         // Admin endpoints — protected by ADMIN_SECRET.
-        .route(
-            "/admin/upload",
-            post(admin::upload_binary).layer(DefaultBodyLimit::max(200 * 1024 * 1024)),
-        )
+        .route("/admin/register-release", post(admin::register_release))
         .route("/admin/restart", post(admin::restart))
         .route("/admin/promote", post(admin::promote))
         // Standard routes (axum default 2MB is fine).

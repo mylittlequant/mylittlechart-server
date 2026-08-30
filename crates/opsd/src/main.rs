@@ -17,6 +17,7 @@ mod backup;
 mod deploy;
 mod error;
 mod ops;
+mod release;
 mod ssh;
 mod state;
 mod watch;
@@ -46,6 +47,17 @@ enum Cmd {
     Logs { unit: Option<String>, lines: Option<u32> },
     /// Deploy a local musl binary to the box with health-verified rollback.
     Deploy { path: String },
+    /// Publish a release artifact: upload to every edge, sha256-verify each,
+    /// then register the manifest on the control box. Nothing is registered
+    /// unless every edge verifies. `channel` defaults to "dev".
+    Publish {
+        path: String,
+        platform: String,
+        version: String,
+        channel: Option<String>,
+        release_notes: Option<String>,
+        signature: Option<String>,
+    },
     /// Trigger an on-demand DB snapshot on the box.
     BackupNow,
     /// Pull the latest box backups to the opbox (encrypted at rest).
@@ -177,6 +189,35 @@ async fn main() -> ExitCode {
                 Ok((s, t)) => print_response(s, &t),
                 Err(e) => {
                     eprintln!("mlc-opsd deploy: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::Publish {
+            path,
+            platform,
+            version,
+            channel,
+            release_notes,
+            signature,
+        } => {
+            match call_api(
+                reqwest::Method::POST,
+                "/release/publish",
+                Some(serde_json::json!({
+                    "path": path,
+                    "platform": platform,
+                    "version": version,
+                    "channel": channel.unwrap_or_else(|| "dev".to_string()),
+                    "release_notes": release_notes.unwrap_or_default(),
+                    "signature": signature.unwrap_or_default(),
+                })),
+            )
+            .await
+            {
+                Ok((s, t)) => print_response(s, &t),
+                Err(e) => {
+                    eprintln!("mlc-opsd publish: {e}");
                     ExitCode::FAILURE
                 }
             }

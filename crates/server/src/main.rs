@@ -18,7 +18,10 @@
 //!   DISCORD_CLIENT_ID      — Discord OAuth app client ID
 //!   DISCORD_CLIENT_SECRET  — Discord OAuth app client secret
 //!   TELEGRAM_BOT_TOKEN     — Telegram bot token for login widget verification
-//!   DATA_DIR               — directory for DB and binaries (default: ./data)
+//!   DATA_DIR               — directory for the databases and hot sync store
+//!                            (default: ./data). No release artifacts live
+//!                            here — those are on the public edges, see
+//!                            routes/admin.rs and routes/updates.rs.
 //!   BUILD_ATTEST_PUBKEY    — hex-encoded Ed25519 public key(s), comma-separated (optional)
 //!   BUILD_ATTEST_ENFORCE   — "true"/"1" to reject unsigned clients (default: false)
 //!   BUILD_ATTEST_MAX_AGE_DAYS — max build age in days (default: 365)
@@ -161,10 +164,11 @@ async fn main() {
     // an edge box has no key to give it).
     let control_plane = match role {
         state::ServerRole::Control => {
-            // Ensure data directories exist.
-            let binaries_dir = format!("{}/binaries", data_dir);
-            std::fs::create_dir_all(&binaries_dir)
-                .expect("Failed to create data/binaries directory");
+            // No `data/binaries` directory here — the control box stores no
+            // release artifacts at all since the 2026-08-30 publish redesign;
+            // they live only on the public edges (see routes/admin.rs and
+            // routes/updates.rs). `data_dir` is still the root for the
+            // database files initialized below.
 
             // Initialize the identity database (SQLCipher, waits for the key).
             let db_path = format!("{}/mylittlechart.db", data_dir);
@@ -216,7 +220,6 @@ async fn main() {
     // Build shared application state.
     let app_state = Arc::new(AppState::new(
         control_plane,
-        data_dir,
         admin_secret,
         github_client_id,
         github_client_secret,

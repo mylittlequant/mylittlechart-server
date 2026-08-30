@@ -102,40 +102,48 @@ pub struct TelemetryResponse {
 }
 
 // ============================================================================
-// Admin upload
+// Admin release registration
 // ============================================================================
 
 fn default_dev_channel() -> String {
     "dev".to_string()
 }
 
-/// Query params for POST /api/admin/upload
+/// Request body for POST /api/admin/register-release.
+///
+/// Metadata only — since the 2026-08-30 publish redesign the artifact bytes
+/// never reach the control box. `mlc-opsd` uploads and sha256-verifies the
+/// file on every public edge first, then calls this endpoint to write the
+/// manifest row. See `routes::admin::register_release`.
 #[derive(Debug, Deserialize)]
-pub struct UploadQuery {
+pub struct RegisterReleaseRequest {
     pub platform: String,
     pub version: String,
-    #[serde(default)]
-    pub release_notes: String,
-    /// Base64-encoded Ed25519 signature over the binary bytes. Optional — empty string if not provided.
-    #[serde(default)]
-    pub signature: String,
     /// Release channel: "stable" or "dev". Defaults to "dev" so local builds don't go to stable.
     #[serde(default = "default_dev_channel")]
     pub channel: String,
-}
-
-/// Response for POST /api/admin/upload
-#[derive(Debug, Serialize)]
-pub struct UploadResponse {
-    pub status: &'static str,
+    /// The artifact's filename under each edge's
+    /// `/opt/mlc/static/dl/{platform}/{version}/` directory — NOT a path.
+    /// This is the exact value stored in `releases.file_path`.
+    pub filename: String,
     pub sha256: String,
     pub file_size: u64,
+    #[serde(default)]
+    pub release_notes: String,
+    /// Base64-encoded Ed25519 signature over the artifact bytes. Optional — empty string if not provided.
+    #[serde(default)]
+    pub signature: String,
+}
+
+/// Response for POST /api/admin/register-release
+#[derive(Debug, Serialize)]
+pub struct RegisterReleaseResponse {
+    pub status: &'static str,
     pub platform: String,
     pub version: String,
-    /// Echoed back from the upload query — allows CI to confirm the server stored the exact signature.
-    pub signature: String,
-    /// Echoed back — confirms which channel the binary was stored under.
     pub channel: String,
+    pub filename: String,
+    pub sha256: String,
 }
 
 // ============================================================================
