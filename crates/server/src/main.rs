@@ -58,6 +58,7 @@ mod build_attest;
 mod db;
 mod entitlements;
 mod models;
+mod opswriter;
 mod pathutil;
 mod routes;
 mod state;
@@ -226,9 +227,40 @@ async fn main() {
                 std::process::exit(1);
             }
 
+            // Second connection to the same operational database file,
+            // owned exclusively by the dedicated writer thread (see
+            // opswriter.rs) — `ops_conn` above stays the read-mostly
+            // connection every other route still locks directly; telemetry
+            // is the one write that now goes through this thread instead,
+            // so it never queues behind a dashboard read or another
+            // device's post on the same mutex.
+            let ops_writer_conn = match rusqlite::Connection::open(&ops_db_path) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::error!("Failed to open the ops-writer connection at {}: {}", ops_db_path, e);
+                    std::process::exit(1);
+                }
+            };
+            // `journal_mode=WAL` is a file-level setting already applied by
+            // `init_ops_db` above, but set again here explicitly rather
+            // than assumed — this is the connection two-connection
+            // contention actually depends on getting right, along with the
+            // busy timeout (see `db::init_ops_db`'s doc comment for why
+            // both connections need one).
+            if let Err(e) = ops_writer_conn
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            {
+                tracing::error!("Failed to configure the ops-writer connection at {}: {}", ops_db_path, e);
+                std::process::exit(1);
+            }
+            let ops_writer =
+                opswriter::OpsWriter::spawn(ops_writer_conn, opswriter::OPS_WRITER_QUEUE_CAPACITY);
+            tracing::info!("Operational database writer thread started");
+
             Some(state::ControlPlane {
                 db: Mutex::new(db_conn),
                 ops_db: Mutex::new(ops_conn),
+                ops_writer,
                 sync_store: crate::syncstore::SyncStore::new(
                     std::path::Path::new(&data_dir).join("sync"),
                 ),

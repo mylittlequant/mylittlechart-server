@@ -79,6 +79,23 @@ pub struct ControlPlane {
     /// stays in `db`.
     pub ops_db: Mutex<rusqlite::Connection>,
 
+    /// The only writer for the operational database, running on its own OS
+    /// thread (see `opswriter.rs`).
+    ///
+    /// Added 2026-09-01: `ops_db` above is a `Mutex<Connection>` shared by
+    /// every route that touches the operational database, writers and
+    /// readers alike — telemetry (by far the highest-rate write, one post
+    /// per device per hour, times every registered device) used to take
+    /// that same lock and await the write before answering, so it queued
+    /// behind every dashboard read holding the mutex and behind every other
+    /// device's post. `ops_writer` owns a second connection to the same
+    /// file, opened independently at boot (see `main.rs`), and every write
+    /// that does not need its result before answering (currently just
+    /// telemetry — see `routes::telemetry`) goes through `enqueue` instead
+    /// of `ops_db.lock()`. `ops_db` itself is now read-mostly; with WAL a
+    /// reader on it never blocks this thread's writes.
+    pub ops_writer: crate::opswriter::OpsWriter,
+
     /// Hot file store for chart-persistence sync categories (see syncstore.rs).
     /// Root is `<data_dir>/sync/`. Cold categories stay in the SQLCipher DB.
     pub sync_store: crate::syncstore::SyncStore,

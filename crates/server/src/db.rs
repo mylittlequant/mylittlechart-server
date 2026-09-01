@@ -461,6 +461,14 @@ pub fn cleanup_orphan_users(conn: &rusqlite::Connection) -> rusqlite::Result<usi
 pub fn init_ops_db(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    // 2026-09-01: a second connection to this same file now exists — the
+    // dedicated `OpsWriter` thread (see `opswriter.rs`) — so this is no
+    // longer the only connection touching the database. WAL already lets
+    // readers and a writer coexist without blocking each other, but two
+    // connections contending for the same page during a checkpoint is
+    // exactly the case a missing busy timeout turns into a bare
+    // `SQLITE_BUSY` error instead of a short, bounded wait.
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
 
     // Same columns and constraints as the identity tables these replace —
     // `releases` here is the already-migrated shape (channel + signature +
