@@ -32,7 +32,7 @@ use rusqlite::{Connection, Error as SqlError};
 
 use crate::db::{
     ProfileSyncInfo, SyncItem, SyncItemMeta, SyncPushItem, SyncPushResult, VALID_SYNC_CATEGORIES,
-    max_item_bytes, SYNC_MAX_ITEMS, SYNC_MAX_TOTAL_BYTES,
+    max_item_bytes, SYNC_MAX_COLD_BYTES, SYNC_MAX_ITEMS, SYNC_MAX_TOTAL_BYTES,
 };
 
 /// Categories routed to the hot file store. Everything chart-persistence:
@@ -305,8 +305,15 @@ pub fn push(
         });
     }
 
-    // Quota across both stores, same limits as before.
-    let (count, _, bytes) = status(conn, store, user_id, device_id, profile_id)?;
+    // Item count is one budget across both stores. Bytes are not: the two
+    // planes hold different things and are worth different amounts of trust.
+    // The hot file store carries the bulk (presets, templates, layouts) and
+    // keeps the 50 MiB figure. The cold plane is three keys inside the
+    // backed-up identity database, and measuring it against a bulk ceiling is
+    // how a 2 KiB working set ended up licensed to grow to 50 MiB of
+    // backup — see `db::SYNC_MAX_COLD_BYTES`.
+    let (count, _, cold_bytes, hot_bytes) =
+        split_status(conn, store, user_id, device_id, profile_id)?;
     if count >= SYNC_MAX_ITEMS {
         return Err(SqlError::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
@@ -315,7 +322,20 @@ pub fn push(
             )),
         ));
     }
-    if bytes >= SYNC_MAX_TOTAL_BYTES {
+    // Each ceiling only stops the plane it belongs to: a full preset store
+    // must not block a vault push, and a full vault must not block presets.
+    let batch_has_cold = items.iter().any(|i| !is_hot(&i.category));
+    let batch_has_hot = items.iter().any(|i| is_hot(&i.category));
+    if batch_has_cold && cold_bytes >= SYNC_MAX_COLD_BYTES {
+        return Err(SqlError::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some(format!(
+                "User {user_id} device '{device_id}' profile '{profile_id}' has reached the identity-plane storage limit ({} KiB)",
+                SYNC_MAX_COLD_BYTES / 1024
+            )),
+        ));
+    }
+    if batch_has_hot && hot_bytes >= SYNC_MAX_TOTAL_BYTES {
         return Err(SqlError::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
             Some(format!(
@@ -405,6 +425,34 @@ pub fn push(
     }
 
     Ok(SyncPushResult { accepted, rejected })
+}
+
+/// `(item_count, cold_bytes, hot_bytes)` with the two planes kept apart.
+///
+/// SQL holds only cold categories and the file store only hot ones, so each
+/// plane's own total is exactly what its own store reports — no filtering by
+/// category is needed or would be correct here. [`status`] is the merged view
+/// this one is built beside, kept because the status endpoint answers with one
+/// figure.
+fn split_status(
+    conn: &Connection,
+    store: &SyncStore,
+    user_id: i64,
+    device_id: &str,
+    profile_id: &str,
+) -> rusqlite::Result<(i64, Option<i64>, i64, i64)> {
+    let (mut count, mut last, cold_bytes) =
+        crate::db::sync_status(conn, user_id, device_id, profile_id)?;
+    let mut hot_bytes = 0i64;
+    let _guard = store.io.lock().unwrap_or_else(|e| e.into_inner());
+    for item in store.read_scope(user_id, device_id, profile_id)? {
+        if !item.deleted {
+            count += 1;
+            hot_bytes += item.content.len() as i64;
+        }
+        last = Some(last.map_or(item.modified_at, |l: i64| l.max(item.modified_at)));
+    }
+    Ok((count, last, cold_bytes, hot_bytes))
 }
 
 /// `(item_count, last_modified_at, quota_used_bytes)` merged over both stores.

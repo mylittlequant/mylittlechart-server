@@ -21,9 +21,6 @@ use axum::{
 };
 use std::sync::Arc;
 
-/// Maximum cloud storage quota per user (50 MiB).
-const SYNC_QUOTA_LIMIT: i64 = 50 * 1024 * 1024;
-
 use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_token};
 use crate::build_attest;
 use crate::models::types::ErrorResponse;
@@ -218,7 +215,10 @@ pub async fn sync_status_handler(
             "item_count": item_count,
             "last_modified": last_modified,
             "quota_used_bytes": quota_used_bytes,
-            "quota_limit_bytes": SYNC_QUOTA_LIMIT,
+            // Read from the module that enforces it. This file used to
+            // carry its own copy of the number, which is how a limit gets
+            // changed in one place and reported from another.
+            "quota_limit_bytes": crate::db::SYNC_MAX_TOTAL_BYTES,
         }))
         .into_response(),
         Ok(Err(e)) => {

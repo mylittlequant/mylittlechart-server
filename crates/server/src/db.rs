@@ -2179,7 +2179,25 @@ pub(crate) fn max_item_bytes(category: &str) -> usize {
     }
 }
 
+/// Maximum total content stored per user in the COLD plane (SQLCipher): 2 MiB.
+///
+/// The cold plane holds exactly three categories — `vault`, `recovery_key`,
+/// `salt` — and it is the identity database, the one that gets backed up.
+/// Measured on production 2026-08-31: 14 rows, 2 360 bytes across seven
+/// accounts, largest single item 376 bytes. Letting that plane share a 50 MiB
+/// ceiling meant the backed-up database could legally be filled with four
+/// orders of magnitude more than the thing it exists to hold.
+///
+/// Not smaller than this, because `vault.enc` is the encrypted container for
+/// every stored exchange key and notification secret, so it grows with use —
+/// just nowhere near megabytes.
+pub(crate) const SYNC_MAX_COLD_BYTES: i64 = 2 * 1024 * 1024;
+
 /// Maximum total content stored per user: 50 MiB.
+///
+/// The bulk figure, and bulk lives in the hot file store — presets,
+/// templates, layouts, watchlists. The cold plane is measured against
+/// [`SYNC_MAX_COLD_BYTES`] instead, not against this.
 pub(crate) const SYNC_MAX_TOTAL_BYTES: i64 = 50 * 1024 * 1024;
 
 /// Maximum number of non-deleted items per user.
