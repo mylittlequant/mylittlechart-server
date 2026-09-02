@@ -32,7 +32,8 @@ use rusqlite::{Connection, Error as SqlError};
 
 use crate::db::{
     ProfileSyncInfo, SyncItem, SyncItemMeta, SyncPushItem, SyncPushResult, VALID_SYNC_CATEGORIES,
-    max_item_bytes, SYNC_MAX_COLD_BYTES, SYNC_MAX_ITEMS, SYNC_MAX_TOTAL_BYTES,
+    max_item_bytes, SYNC_MAX_COLD_BYTES, SYNC_MAX_PRESETS, SYNC_MAX_TEMPLATES,
+    SYNC_MAX_TOTAL_BYTES,
 };
 
 /// Categories routed to the hot file store. Everything chart-persistence:
@@ -57,6 +58,33 @@ pub const HOT_CATEGORIES: &[&str] = &[
 /// Categories that stay in SQLCipher: identity/vault plane, written once in
 /// a lifetime, benefit from transactional consistency with the account.
 pub const COLD_CATEGORIES: &[&str] = &["vault", "recovery_key", "salt"];
+
+/// Categories of which an account holds exactly ONE, by their own shape.
+///
+/// Each of these is "the whole file" on the client: `watchlist` is all of
+/// `watchlists.json`, `window_layout` is every window at once, `vault` is
+/// the entire encrypted container. There is no such thing as a second one,
+/// so a second one is a client bug or an attack, and either way the answer
+/// is to refuse it rather than to let it eat a general item budget.
+///
+/// Nine of the seventeen categories are bounded by this alone — no number to
+/// tune, no tier to consult.
+pub const SINGLETON_CATEGORIES: &[&str] = &[
+    "watchlist",
+    "settings_snapshot",
+    "notification_settings",
+    "window_layout",
+    "indicator_set_manager",
+    "theme",
+    "profile_meta",
+    "vault",
+    "recovery_key",
+    "salt",
+];
+
+pub fn is_singleton(category: &str) -> bool {
+    SINGLETON_CATEGORIES.contains(&category)
+}
 
 pub fn is_hot(category: &str) -> bool {
     HOT_CATEGORIES.contains(&category)
@@ -181,6 +209,29 @@ impl SyncStore {
     fn read_scope(&self, user_id: i64, device_id: &str, profile_id: &str) -> Result<Vec<FileItem>, SqlError> {
         let dir = self.scope_dir(user_id, device_id, profile_id)?;
         Ok(read_tree(&dir))
+    }
+
+    /// Every item the user has, across every device AND every profile.
+    ///
+    /// The quota's unit. `read_scope`/`read_profile` answer "what is stored
+    /// at this address"; this answers "how much does this ACCOUNT hold",
+    /// which is the only question a ceiling can sensibly be asked about —
+    /// devices are addresses, and an account may have any number of them.
+    fn read_user(&self, user_id: i64) -> Result<Vec<FileItem>, SqlError> {
+        let mut out = Vec::new();
+        let udir = self.user_dir(user_id);
+        let Ok(devs) = fs::read_dir(&udir) else {
+            return Ok(out);
+        };
+        for dev in devs.flatten() {
+            let Ok(profs) = fs::read_dir(dev.path()) else {
+                continue;
+            };
+            for prof in profs.flatten() {
+                out.extend(read_tree(&prof.path()));
+            }
+        }
+        Ok(out)
     }
 
     /// All items for one profile across every device of the user.
@@ -312,13 +363,51 @@ pub fn push(
     // backed-up identity database, and measuring it against a bulk ceiling is
     // how a 2 KiB working set ended up licensed to grow to 50 MiB of
     // backup — see `db::SYNC_MAX_COLD_BYTES`.
-    let (count, _, cold_bytes, hot_bytes) =
-        split_status(conn, store, user_id, device_id, profile_id)?;
-    if count >= SYNC_MAX_ITEMS {
+    let usage = account_usage(conn, store, user_id)?;
+    let (cold_bytes, hot_bytes) = (usage.cold_bytes, usage.hot_bytes);
+
+    // A singleton category holds exactly one item per account by its own
+    // shape — `watchlist` IS the whole watchlists file, `vault` IS the whole
+    // container. A second one is a client bug or an attack, and it is refused
+    // here rather than allowed to consume a general item budget. Ten of the
+    // seventeen categories need no number at all because of this.
+    for item in items {
+        if is_singleton(&item.category) && !item.deleted {
+            let taken_by_other = usage
+                .singletons
+                .get(&item.category)
+                .is_some_and(|held| held != &item.sync_id);
+            if taken_by_other {
+                return Err(SqlError::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                    Some(format!(
+                        "User {user_id}: category '{}' holds exactly one item per account",
+                        item.category
+                    )),
+                ));
+            }
+        }
+    }
+
+    // Only presets and templates legitimately grow, so only they are counted.
+    let adding_presets = items.iter().filter(|i| i.category == "preset" && !i.deleted).count() as i64;
+    if adding_presets > 0 && usage.presets >= SYNC_MAX_PRESETS {
         return Err(SqlError::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
             Some(format!(
-                "User {user_id} device '{device_id}' profile '{profile_id}' has reached the sync item limit ({SYNC_MAX_ITEMS} items)"
+                "User {user_id} has reached the preset limit ({SYNC_MAX_PRESETS} across all devices and profiles)"
+            )),
+        ));
+    }
+    let adding_templates = items
+        .iter()
+        .filter(|i| i.category.starts_with("template") && !i.deleted)
+        .count() as i64;
+    if adding_templates > 0 && usage.templates >= SYNC_MAX_TEMPLATES {
+        return Err(SqlError::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some(format!(
+                "User {user_id} has reached the template limit ({SYNC_MAX_TEMPLATES} across all devices and profiles)"
             )),
         ));
     }
@@ -330,7 +419,7 @@ pub fn push(
         return Err(SqlError::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
             Some(format!(
-                "User {user_id} device '{device_id}' profile '{profile_id}' has reached the identity-plane storage limit ({} KiB)",
+                "User {user_id} has reached the identity-plane storage limit ({} KiB across all devices and profiles)",
                 SYNC_MAX_COLD_BYTES / 1024
             )),
         ));
@@ -427,32 +516,60 @@ pub fn push(
     Ok(SyncPushResult { accepted, rejected })
 }
 
-/// `(item_count, cold_bytes, hot_bytes)` with the two planes kept apart.
+/// What the ACCOUNT holds: `(item_count, cold_bytes, hot_bytes)`, the two
+/// planes kept apart, summed over every device and profile.
+///
+/// This is what the quota is checked against. It used to be scoped to one
+/// `(user, device, profile)`, which meant every new device came with a fresh
+/// full allowance — and since `X-Device-Id` is just a client-supplied
+/// header, an account could mint as many allowances as it liked. Devices are
+/// where data lives, not how much of it an account may keep.
 ///
 /// SQL holds only cold categories and the file store only hot ones, so each
 /// plane's own total is exactly what its own store reports — no filtering by
-/// category is needed or would be correct here. [`status`] is the merged view
-/// this one is built beside, kept because the status endpoint answers with one
-/// figure.
-fn split_status(
+/// category is needed or would be correct here. [`status`] stays per-scope:
+/// it answers "what is at this address", a different question.
+fn account_usage(
     conn: &Connection,
     store: &SyncStore,
     user_id: i64,
-    device_id: &str,
-    profile_id: &str,
-) -> rusqlite::Result<(i64, Option<i64>, i64, i64)> {
-    let (mut count, mut last, cold_bytes) =
-        crate::db::sync_status(conn, user_id, device_id, profile_id)?;
-    let mut hot_bytes = 0i64;
-    let _guard = store.io.lock().unwrap_or_else(|e| e.into_inner());
-    for item in store.read_scope(user_id, device_id, profile_id)? {
-        if !item.deleted {
-            count += 1;
-            hot_bytes += item.content.len() as i64;
+) -> rusqlite::Result<AccountUsage> {
+    let (_cold_count, cold_bytes) = crate::db::sync_usage_for_user(conn, user_id)?;
+    let mut u = AccountUsage { cold_bytes, ..Default::default() };
+    for (category, sync_id) in crate::db::sync_cold_ids_for_user(conn, user_id)? {
+        if is_singleton(&category) {
+            u.singletons.insert(category, sync_id);
         }
-        last = Some(last.map_or(item.modified_at, |l: i64| l.max(item.modified_at)));
     }
-    Ok((count, last, cold_bytes, hot_bytes))
+    let _guard = store.io.lock().unwrap_or_else(|e| e.into_inner());
+    for item in store.read_user(user_id)? {
+        if item.deleted {
+            continue;
+        }
+        u.hot_bytes += item.content.len() as i64;
+        match item.category.as_str() {
+            "preset" => u.presets += 1,
+            c if c.starts_with("template") => u.templates += 1,
+            _ => {}
+        }
+        if is_singleton(&item.category) {
+            u.singletons.insert(item.category.clone(), item.sync_id.clone());
+        }
+    }
+    Ok(u)
+}
+
+/// What one account currently holds. The cold plane is counted in bytes only:
+/// every category in it is a singleton, so its count is bounded by shape.
+#[derive(Default)]
+struct AccountUsage {
+    cold_bytes: i64,
+    hot_bytes: i64,
+    presets: i64,
+    templates: i64,
+    /// category → the `sync_id` already stored for it. Lets a push tell
+    /// "updating the one vault I have" apart from "here is a second vault".
+    singletons: std::collections::HashMap<String, String>,
 }
 
 /// `(item_count, last_modified_at, quota_used_bytes)` merged over both stores.

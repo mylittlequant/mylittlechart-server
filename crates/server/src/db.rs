@@ -2173,11 +2173,27 @@ pub(crate) const VALID_SYNC_CATEGORIES: &[&str] = &[
     "profile_meta",
 ];
 
-/// Maximum content size per item (default): 512 KiB.
-const SYNC_MAX_ITEM_BYTES: usize = 512 * 1024;
+// Every figure below was set against measurement, not guessed. Production on
+// 2026-09-02: the entire hot sync store is 105 KiB and the identity database
+// 172 KiB — for ALL accounts together. A heavy real profile set (18 profiles,
+// 76 presets, years of use) syncs to 1.6 MiB once `strip_preset_for_sync` has
+// removed bars, viewports and cached indicator values — 87.6% of what sits on
+// disk never leaves the machine. Synced preset sizes: median 10.9 KiB, p90
+// 29.5 KiB, largest 315 KiB.
 
-/// Maximum content size for preset items: 2 MiB.
-const SYNC_MAX_PRESET_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum content size per item (default): 64 KiB.
+///
+/// Everything that is not a preset is small by construction — a watchlist is
+/// ~1 KiB, a template ~40 bytes, `profile_meta` a two-field object. 64 KiB is
+/// already three orders of magnitude of headroom over any of them.
+const SYNC_MAX_ITEM_BYTES: usize = 64 * 1024;
+
+/// Maximum content size for preset items: 512 KiB.
+///
+/// The largest preset ever measured after stripping is 315 KiB; only two of
+/// 76 exceed 100 KiB. 512 KiB leaves room for a genuinely heavy chart without
+/// leaving room for a 2 MiB one that could only be padding.
+const SYNC_MAX_PRESET_BYTES: usize = 512 * 1024;
 
 /// Per-category size limit.
 pub(crate) fn max_item_bytes(category: &str) -> usize {
@@ -2187,7 +2203,7 @@ pub(crate) fn max_item_bytes(category: &str) -> usize {
     }
 }
 
-/// Maximum total content stored per user in the COLD plane (SQLCipher): 2 MiB.
+/// Maximum total content stored per ACCOUNT in the COLD plane (SQLCipher): 256 KiB.
 ///
 /// The cold plane holds exactly three categories — `vault`, `recovery_key`,
 /// `salt` — and it is the identity database, the one that gets backed up.
@@ -2199,23 +2215,72 @@ pub(crate) fn max_item_bytes(category: &str) -> usize {
 /// Not smaller than this, because `vault.enc` is the encrypted container for
 /// every stored exchange key and notification secret, so it grows with use —
 /// just nowhere near megabytes.
-pub(crate) const SYNC_MAX_COLD_BYTES: i64 = 2 * 1024 * 1024;
+pub(crate) const SYNC_MAX_COLD_BYTES: i64 = 256 * 1024;
 
-/// Maximum total content stored per user: 50 MiB.
+/// Maximum total content stored per ACCOUNT in the hot plane: 8 MiB.
 ///
 /// The bulk figure, and bulk lives in the hot file store — presets,
 /// templates, layouts, watchlists. The cold plane is measured against
 /// [`SYNC_MAX_COLD_BYTES`] instead, not against this.
-pub(crate) const SYNC_MAX_TOTAL_BYTES: i64 = 50 * 1024 * 1024;
+///
+/// Five times the heaviest real account measured, and eighty times the whole
+/// production hot store as it stands. It was 50 MiB, which was never derived
+/// from anything.
+pub(crate) const SYNC_MAX_TOTAL_BYTES: i64 = 8 * 1024 * 1024;
 
-/// Maximum number of non-deleted items per user.
-pub(crate) const SYNC_MAX_ITEMS: i64 = 200;
+/// Maximum number of PRESET items per account.
+///
+/// Presets and templates are the only categories that legitimately grow; the
+/// other ten are singletons bounded by their own shape (see
+/// `syncstore::SINGLETON_CATEGORIES`). The heaviest real account measured
+/// holds 76 presets across 18 profiles.
+pub(crate) const SYNC_MAX_PRESETS: i64 = 100;
+
+/// Maximum number of TEMPLATE items per account, across all five template
+/// categories together.
+pub(crate) const SYNC_MAX_TEMPLATES: i64 = 200;
 
 /// Return `(item_count, last_modified_at, quota_used_bytes)` for the user + profile.
 ///
 /// `item_count` is the number of non-deleted items.
 /// `last_modified_at` is `None` if the user has no items at all.
 /// `quota_used_bytes` is the total byte length of content for non-deleted items.
+/// Cold-plane usage for an ACCOUNT: `(item_count, quota_used_bytes)` summed
+/// over every device and profile the user has.
+///
+/// Quota belongs to the account. `device_id` and `profile_id` say where an
+/// object is stored, not how much the account may store — an account may
+/// have any number of devices, and counting per `(user, device, profile)`
+/// meant each new device handed out a fresh full allowance. Since
+/// `X-Device-Id` is a client-supplied header, that made the ceiling
+/// effectively unbounded for anyone who bothered to vary it.
+/// `(category, sync_id)` for every live cold item the account holds.
+///
+/// The cold plane is entirely singleton categories, so this is what
+/// `syncstore::push` compares against to tell "updating the one vault I have"
+/// apart from "pushing a second vault".
+pub fn sync_cold_ids_for_user(conn: &Connection, user_id: i64) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT category, sync_id FROM sync_items WHERE user_id = ?1 AND deleted = 0",
+    )?;
+    let rows = stmt.query_map(params![user_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+
+pub fn sync_usage_for_user(conn: &Connection, user_id: i64) -> Result<(i64, i64)> {
+    let item_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sync_items WHERE user_id = ?1 AND deleted = 0",
+        params![user_id],
+        |row| row.get(0),
+    )?;
+    let quota_used_bytes: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM sync_items WHERE user_id = ?1 AND deleted = 0",
+        params![user_id],
+        |row| row.get(0),
+    )?;
+    Ok((item_count, quota_used_bytes))
+}
+
 pub fn sync_status(conn: &Connection, user_id: i64, device_id: &str, profile_id: &str) -> Result<(i64, Option<i64>, i64)> {
     let item_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sync_items WHERE user_id = ?1 AND device_id = ?2 AND profile_id = ?3 AND deleted = 0",
@@ -2266,10 +2331,11 @@ pub fn sync_get_changes(conn: &Connection, user_id: i64, device_id: &str, profil
 /// Validation per item:
 /// - `category` must be one of the allowed values.
 /// - `name` must not exceed 128 bytes and must not contain control characters.
-/// - `content` must not exceed 1 MiB.
+/// - `content` is capped by `max_item_bytes(category)` (64 KiB, or 512 KiB
+///   for presets) — checked in `syncstore::push`, not here.
 ///
 /// Quota checks (before any insert):
-/// - Non-deleted items per user must be < `SYNC_MAX_ITEMS`.
+/// - Item counts are enforced per ACCOUNT in `syncstore::push`, not here.
 /// - Total content bytes per user must be < `SYNC_MAX_TOTAL_BYTES`.
 ///
 /// Last-writer-wins: an existing row is only overwritten when the incoming
@@ -2294,20 +2360,13 @@ pub fn sync_push_items(
     }
 
     // --- Quota checks (once, before any inserts) ---
-    let current_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sync_items WHERE user_id = ?1 AND device_id = ?2 AND profile_id = ?3 AND deleted = 0",
-        params![user_id, device_id, profile_id],
-        |row| row.get(0),
-    )?;
-    if current_count >= SYNC_MAX_ITEMS {
-        return Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
-            Some(format!(
-                "User {} device '{}' profile '{}' has reached the sync item limit ({} items)",
-                user_id, device_id, profile_id, SYNC_MAX_ITEMS
-            )),
-        ));
-    }
+    //
+    // No item-count check here any more. This function only ever receives
+    // cold categories (`syncstore::push` routes hot ones to the file store
+    // and hands it only the rest), and every cold category is a singleton
+    // bounded by its own shape — `syncstore::push` refuses a second one
+    // before this is reached. A blanket count was the wrong instrument for a
+    // plane that structurally holds three rows.
 
     let current_bytes: i64 = conn
         .query_row(
