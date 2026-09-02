@@ -28,3 +28,10 @@ dotenvy = { workspace = true }
 tg-login-bot = { path = "../tg-login-bot" }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
+
+# Static musl builds cannot link a system OpenSSL, so the deploy target — and
+# only the deploy target — builds it from source. Features are additive, so
+# this rides on top of the workspace's `bundled-sqlcipher` rather than
+# replacing it.
+[target.'cfg(target_env = "musl")'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }

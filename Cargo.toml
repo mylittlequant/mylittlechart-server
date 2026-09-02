@@ -11,7 +11,26 @@ tower-http = { version = "0.6", features = ["cors", "fs", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl", "backup"] }
+# SQLCipher needs a crypto provider; that provider is OpenSSL. WHICH OpenSSL
+# depends on the target, so the vendored variant is NOT the default here.
+#
+# `bundled-sqlcipher` links the system OpenSSL. That is the right answer
+# everywhere a system OpenSSL exists, including the Windows opbox, where
+# `nemo/.cargo/config.toml` already points OPENSSL_DIR/LIB_DIR/INCLUDE_DIR
+# at C:\Program Files\OpenSSL-Win64.
+#
+# The musl deploy target adds `bundled-sqlcipher-vendored-openssl` on top
+# (see crates/server/Cargo.toml) — a static binary cannot link a system
+# library, so there it genuinely has to build OpenSSL from source.
+#
+# It used to carry the vendored feature unconditionally (bee1802,
+# "vendored openssl for sqlcipher (static musl target)"), which made every
+# host build OpenSSL from source — a deploy-target requirement leaking into
+# every local `cargo check`. On the opbox that fails outright: the only perl
+# is the one shipped with Git for Windows and it has no
+# Locale::Maketext::Simple, so `./Configure` aborts and the server crate
+# could not be type-checked here at all.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher", "backup"] }
 sha2 = "0.10"
 rand = "0.8"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
