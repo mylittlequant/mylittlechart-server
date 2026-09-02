@@ -359,7 +359,7 @@ pub fn push(
     // Item count is one budget across both stores. Bytes are not: the two
     // planes hold different things and are worth different amounts of trust.
     // The hot file store carries the bulk (presets, templates, layouts) and
-    // keeps the 50 MiB figure. The cold plane is three keys inside the
+    // holds `SYNC_MAX_TOTAL_BYTES`. The cold plane is three keys inside the
     // backed-up identity database, and measuring it against a bulk ceiling is
     // how a 2 KiB working set ended up licensed to grow to 50 MiB of
     // backup — see `db::SYNC_MAX_COLD_BYTES`.
@@ -428,7 +428,8 @@ pub fn push(
         return Err(SqlError::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
             Some(format!(
-                "User {user_id} device '{device_id}' profile '{profile_id}' has reached the sync storage limit (50 MiB)"
+                "User {user_id} has reached the sync storage limit ({} MiB across all devices and profiles)",
+                SYNC_MAX_TOTAL_BYTES / (1024 * 1024)
             )),
         ));
     }

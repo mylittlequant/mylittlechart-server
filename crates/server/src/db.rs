@@ -2334,9 +2334,9 @@ pub fn sync_get_changes(conn: &Connection, user_id: i64, device_id: &str, profil
 /// - `content` is capped by `max_item_bytes(category)` (64 KiB, or 512 KiB
 ///   for presets) — checked in `syncstore::push`, not here.
 ///
-/// Quota checks (before any insert):
-/// - Item counts are enforced per ACCOUNT in `syncstore::push`, not here.
-/// - Total content bytes per user must be < `SYNC_MAX_TOTAL_BYTES`.
+/// Quota checks: none. Both the count and the byte ceiling for everything
+/// that reaches this function are enforced per ACCOUNT in `syncstore::push`
+/// before it is called — see the note where the old byte check used to sit.
 ///
 /// Last-writer-wins: an existing row is only overwritten when the incoming
 /// `modified_at` is strictly greater than the stored value.
@@ -2368,22 +2368,17 @@ pub fn sync_push_items(
     // before this is reached. A blanket count was the wrong instrument for a
     // plane that structurally holds three rows.
 
-    let current_bytes: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM sync_items WHERE user_id = ?1 AND device_id = ?2 AND profile_id = ?3",
-            params![user_id, device_id, profile_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    if current_bytes >= SYNC_MAX_TOTAL_BYTES {
-        return Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
-            Some(format!(
-                "User {} device '{}' profile '{}' has reached the sync storage limit (50 MiB)",
-                user_id, device_id, profile_id
-            )),
-        ));
-    }
+    // No byte check here either, for the same reason and one more. This
+    // function only sees cold categories, whose ceiling is
+    // `SYNC_MAX_COLD_BYTES` and is charged to the ACCOUNT in
+    // `syncstore::push`. The check that stood here summed
+    // `WHERE user_id AND device_id AND profile_id` and compared it to
+    // `SYNC_MAX_TOTAL_BYTES` — the hot plane's ceiling, thirty-two times the
+    // cold one — so it was scoped to a device, measured against the wrong
+    // plane, and could only ever fire on the wrong input. Its message named
+    // a limit (50 MiB) that no constant in this crate has held for some time,
+    // which is how it survived: nothing it said could be checked against
+    // anything real.
 
     // --- Per-item upsert with validation ---
     let now = chrono::Utc::now().to_rfc3339();
