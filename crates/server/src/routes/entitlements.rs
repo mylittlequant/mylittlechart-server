@@ -86,10 +86,18 @@ async fn resolve_caller(
 ///
 /// Response:
 /// ```json
-/// { "features": ["archive_proxy", "multi_profile"], "expires_at": 1774903600000 }
+/// {
+///   "features": ["archive_proxy", "multi_profile"],
+///   "expires_at": 1774903600000,
+///   "paid": true,
+///   "paid_until": "2026-10-04T00:00:00Z"
+/// }
 /// ```
 /// `expires_at` is a millisecond Unix timestamp; the client should re-ask
-/// after it passes rather than cache the set indefinitely.
+/// after it passes rather than cache the set indefinitely. `paid` and
+/// `paid_until` say the caller's paid status explicitly, so a client can
+/// show "Free" / "Paid until <date>" without inferring it from a feature
+/// name; `paid_until` is `null` for a free or anonymous caller.
 pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let user_id = match resolve_caller(state.clone(), &headers).await {
         Ok(uid) => uid,
@@ -102,18 +110,20 @@ pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: Heade
         }
     };
 
-    // Anonymous (no credential) never touches the database — false without
-    // a round-trip. An authenticated caller's paid fact still needs one.
-    let is_paid: bool = match user_id {
-        None => false,
+    // Anonymous (no credential) never touches the database — None/false
+    // without a round-trip. An authenticated caller's paid fact still needs
+    // one.
+    let paid_until: Option<String> = match user_id {
+        None => None,
         Some(uid) => {
-            let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
-                let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-                crate::db::user_is_paid(&conn, uid)
-            })
-            .await;
+            let result =
+                tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<String>> {
+                    let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+                    crate::db::user_paid_until(&conn, uid)
+                })
+                .await;
             match result {
-                Ok(Ok(paid)) => paid,
+                Ok(Ok(until)) => until,
                 Ok(Err(e)) => {
                     tracing::error!("DB error checking paid status: {}", e);
                     return (
@@ -132,6 +142,7 @@ pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: Heade
             }
         }
     };
+    let is_paid = paid_until.is_some();
 
     let features = entitlements::resolve_for_user(is_paid);
     let expires_at = chrono::Utc::now().timestamp_millis() + ENTITLEMENTS_TTL_SECS * 1000;
@@ -139,6 +150,8 @@ pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: Heade
     Json(serde_json::json!({
         "features": features.wire_names(),
         "expires_at": expires_at,
+        "paid": is_paid,
+        "paid_until": paid_until,
     }))
     .into_response()
 }

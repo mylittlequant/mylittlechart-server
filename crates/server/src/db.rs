@@ -1295,12 +1295,16 @@ pub fn upsert_release(
 }
 
 /// Get the latest release for a given platform and channel (highest version by created_at).
-/// Whether this account's paid access is currently in effect.
+/// The moment this account's paid access ends, or `None` if it is not
+/// currently paid.
 ///
-/// `paid_until` is a moment, so this is a comparison against now rather than a
-/// stored yes/no: an expired subscription stops granting anything without
-/// anybody having to remember to flip a flag.
-pub fn user_is_paid(conn: &Connection, user_id: i64) -> Result<bool> {
+/// `paid_until` is a moment, so this compares against now rather than
+/// trusting a stored yes/no: an expired subscription stops granting anything
+/// without anybody having to remember to flip a flag. `Some` is returned only
+/// when that moment is still in the future; no row, a `NULL`, and an expired
+/// timestamp all read as `None`. This is the one place that decides what
+/// "paid" means.
+pub fn user_paid_until(conn: &Connection, user_id: i64) -> Result<Option<String>> {
     let until: Option<String> = conn
         .query_row(
             "SELECT paid_until FROM users WHERE id = ?1",
@@ -1309,8 +1313,22 @@ pub fn user_is_paid(conn: &Connection, user_id: i64) -> Result<bool> {
         )
         .optional()?
         .flatten();
-    let Some(until) = until else { return Ok(false) };
-    Ok(until.as_str() > chrono::Utc::now().to_rfc3339().as_str())
+    let Some(until) = until else { return Ok(None) };
+    if until.as_str() > chrono::Utc::now().to_rfc3339().as_str() {
+        Ok(Some(until))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether this account's paid access is currently in effect.
+///
+/// `paid_until` is a moment, so this is a comparison against now rather than a
+/// stored yes/no: an expired subscription stops granting anything without
+/// anybody having to remember to flip a flag. The rule itself lives in
+/// `user_paid_until`; this is just its presence check.
+pub fn user_is_paid(conn: &Connection, user_id: i64) -> Result<bool> {
+    Ok(user_paid_until(conn, user_id)?.is_some())
 }
 
 /// Grant or revoke paid access by writing the moment it ends.
