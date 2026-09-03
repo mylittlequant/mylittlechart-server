@@ -293,12 +293,31 @@ pub async fn web_callback(
                 } else {
                     "Signed in, but the device code was expired or already used — request a new one in the app."
                 };
+                // Closes itself when it was opened as the sign-in popup, and
+                // tells the opener so the app's modal can flip to signed-in
+                // without the user touching anything. Asking someone to close
+                // a window is asking them to finish our job — and it was not
+                // even clear which window was meant (owner, 2026-09-03).
+                //
+                // The line stays for the case the popup was blocked and this
+                // landed in a tab: `window.close()` cannot close a tab the
+                // script did not open, so that reader still needs telling.
                 let html = format!(
                     concat!(
                         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>mylittlechart</title></head>",
                         "<body style=\"background:#0a0f1a;color:#feffee;font-family:sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center\">",
                         "<div><h2 style=\"color:#f4cd63\">Signed in</h2><p>{}</p>",
-                        "<p style=\"opacity:0.6\">You can close this tab.</p></div></body></html>"
+                        "<p id=\"hint\" style=\"opacity:0.6\">You can close this tab.</p></div>",
+                        "<script>(function(){{",
+                        "  try {{ if (window.opener && !window.opener.closed) {{",
+                        "    window.opener.postMessage({{ type: 'mlc-oauth', ok: true }}, '*');",
+                        "  }} }} catch (e) {{}}",
+                        "  if (window.opener) {{",
+                        "    document.getElementById('hint').textContent = 'Returning to mylittlechart…';",
+                        "    setTimeout(function(){{ window.close(); }}, 600);",
+                        "  }}",
+                        "}})();</script>",
+                        "</body></html>"
                     ),
                     note
                 );
