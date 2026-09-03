@@ -162,8 +162,15 @@ async fn handle_deploy(
     }
 }
 
+/// The track a publish lands on when the caller does not say.
+///
+/// `"stable"`, and it has to be: there is exactly one track now (owner,
+/// 2026-09-03 — the client's `dev` channel and its `UPDATE_CHANNEL` override
+/// are gone), so a publish that quietly defaulted to `dev` would register a
+/// manifest row no client ever asks for. An invisible release is worse than a
+/// refused one, because nothing about it looks wrong.
 fn default_channel() -> String {
-    "dev".to_string()
+    "stable".to_string()
 }
 
 #[derive(Deserialize)]
