@@ -1357,6 +1357,57 @@ pub fn promote_release(
     Ok(true)
 }
 
+/// One row of the published-release catalogue, as `GET /api/updates/list`
+/// returns it.
+///
+/// Separate from [`ReleaseRow`] because that one answers "what should this
+/// client install" and deliberately carries the signature; this one answers
+/// "what exists" for a human reading a downloads page, and carries the
+/// platform and the date instead.
+pub struct ReleaseListRow {
+    pub platform: String,
+    pub version: String,
+    pub channel: String,
+    pub sha256: String,
+    pub file_size: i64,
+    pub release_notes: String,
+    pub created_at: String,
+}
+
+/// Every published release, newest first.
+///
+/// The `releases` table is the authoritative record of what is actually on the
+/// edges: `opsd`'s `release::publish` registers a row only after every edge has
+/// received the artifact and verified its sha256, and unwinds what landed if
+/// any edge failed. So a downloads page built from this cannot advertise a file
+/// that is not there — which is exactly what a hand-maintained list does the
+/// first time someone forgets to edit it.
+///
+/// A full scan, deliberately: the table holds one row per (version, platform,
+/// channel) and the whole point is to return all of them. Filtering by channel
+/// happens in SQL so the caller cannot accidentally page through a track it
+/// does not serve.
+pub fn list_releases(conn: &Connection, channel: &str) -> Result<Vec<ReleaseListRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT platform, version, channel, sha256, file_size, release_notes, created_at
+         FROM releases
+         WHERE channel = ?1
+         ORDER BY created_at DESC, platform ASC",
+    )?;
+    let rows = stmt.query_map(params![channel], |row| {
+        Ok(ReleaseListRow {
+            platform: row.get(0)?,
+            version: row.get(1)?,
+            channel: row.get(2)?,
+            sha256: row.get(3)?,
+            file_size: row.get(4)?,
+            release_notes: row.get(5)?,
+            created_at: row.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
 /// A row from the releases table.
 #[derive(Debug, Clone)]
 pub struct ReleaseRow {

@@ -9,8 +9,73 @@ use axum::{
 };
 use std::sync::Arc;
 
-use crate::models::types::{DownloadPath, DownloadQuery, ErrorResponse, LatestQuery, VersionManifest};
+use crate::models::types::{
+    DownloadPath, DownloadQuery, ErrorResponse, LatestQuery, ReleaseListQuery, VersionManifest,
+};
 use crate::state::AppState;
+
+/// GET /api/updates/list?channel=stable
+///
+/// Every published release, newest first, across every platform — what a
+/// downloads page shows as history and as the catalogue of "other platforms".
+///
+/// Reads the same `releases` table `latest` does, which is the authoritative
+/// record of what is on the edges: a row exists only after every edge received
+/// the artifact and verified its sha256. A page built from this cannot offer a
+/// file that is not there, which is the failure mode of a list maintained by
+/// hand.
+pub async fn list_releases(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ReleaseListQuery>,
+) -> Response {
+    let channel = query.channel.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().ops_db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::list_releases(&conn, &channel)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(rows)) => {
+            let items: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|r| {
+                    let download_url = format!(
+                        "https://mylittlechart.org/api/updates/download/{}/{}?channel={}",
+                        r.platform, r.version, r.channel
+                    );
+                    serde_json::json!({
+                        "platform": r.platform,
+                        "version": r.version,
+                        "channel": r.channel,
+                        "sha256": r.sha256,
+                        "file_size": r.file_size,
+                        "release_notes": r.release_notes,
+                        "created_at": r.created_at,
+                        "download_url": download_url,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "releases": items })).into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::error!("DB error in list_releases: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!("join error in list_releases: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Internal error")),
+            )
+                .into_response()
+        }
+    }
+}
 
 /// GET /api/updates/latest?platform=win64
 ///

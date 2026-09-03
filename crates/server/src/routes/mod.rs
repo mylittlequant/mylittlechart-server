@@ -46,6 +46,7 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/heartbeat", post(heartbeat::handle_heartbeat))
         .route("/telemetry", post(telemetry::submit_telemetry))
         .route("/updates/latest", get(updates::get_latest))
+        .route("/updates/list", get(updates::list_releases))
         .route(
             "/updates/download/{platform}/{version}",
             get(updates::download_binary),

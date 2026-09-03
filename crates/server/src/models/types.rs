@@ -42,6 +42,16 @@ pub struct LatestQuery {
     pub channel: String,
 }
 
+/// Query for GET /api/updates/list.
+///
+/// Only the channel, and it is optional. `LatestQuery` cannot serve here: its
+/// `platform` is required, and a catalogue of every platform has none to name.
+#[derive(Debug, Deserialize)]
+pub struct ReleaseListQuery {
+    #[serde(default = "default_stable_channel")]
+    pub channel: String,
+}
+
 /// Response for GET /api/updates/latest — matches VersionManifest in updater client.
 #[derive(Debug, Serialize)]
 pub struct VersionManifest {
