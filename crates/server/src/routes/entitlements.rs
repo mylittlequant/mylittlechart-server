@@ -91,7 +91,7 @@ async fn resolve_caller(
 /// `expires_at` is a millisecond Unix timestamp; the client should re-ask
 /// after it passes rather than cache the set indefinitely.
 pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let user_id = match resolve_caller(state, &headers).await {
+    let user_id = match resolve_caller(state.clone(), &headers).await {
         Ok(uid) => uid,
         Err(_) => {
             return (
@@ -102,7 +102,38 @@ pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: Heade
         }
     };
 
-    let features = entitlements::resolve_for_user(user_id);
+    // Anonymous (no credential) never touches the database — false without
+    // a round-trip. An authenticated caller's paid fact still needs one.
+    let is_paid: bool = match user_id {
+        None => false,
+        Some(uid) => {
+            let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+                let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+                crate::db::user_is_paid(&conn, uid)
+            })
+            .await;
+            match result {
+                Ok(Ok(paid)) => paid,
+                Ok(Err(e)) => {
+                    tracing::error!("DB error checking paid status: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new("Internal error")),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new("Internal error")),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    let features = entitlements::resolve_for_user(is_paid);
     let expires_at = chrono::Utc::now().timestamp_millis() + ENTITLEMENTS_TTL_SECS * 1000;
 
     Json(serde_json::json!({

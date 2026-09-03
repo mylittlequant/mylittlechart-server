@@ -128,7 +128,8 @@ async fn check_profile_entitlement(
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let known = crate::syncstore::known_profile_ids(&conn, &state.control_plane().sync_store, user_id)?;
-        let features = crate::entitlements::resolve_for_user(Some(user_id));
+        let is_paid = crate::db::user_is_paid(&conn, user_id)?;
+        let features = crate::entitlements::resolve_for_user(is_paid);
         Ok(crate::entitlements::profile_write_allowed(&known, &profile_id, &features))
     })
     .await;

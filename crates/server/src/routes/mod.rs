@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crate::state::AppState;
 
+pub mod account;
 pub mod admin;
 pub mod agent_keys;
 pub mod dashboard;
@@ -37,6 +38,7 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/admin/register-release", post(admin::register_release))
         .route("/admin/restart", post(admin::restart))
         .route("/admin/promote", post(admin::promote))
+        .route("/admin/gift-codes", post(admin::mint_gift_codes))
         // Standard routes (axum default 2MB is fine).
         .route("/proxy/entitlement", get(proxy::entitlement))
         // General entitlements probe — superset of /proxy/entitlement, answers
@@ -98,6 +100,8 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/sync/e2e-setup", post(sync::sync_setup_e2e))
         .route("/sync/profiles", get(sync::sync_list_profiles))
         .route("/sync/pull-profile", get(sync::sync_pull_profile))
+        // Gift/trial code redemption (cookie-session or bearer auth, same as sync).
+        .route("/account/redeem", post(account::redeem))
         .with_state(state)
 }
 

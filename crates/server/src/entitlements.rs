@@ -8,10 +8,14 @@
 //! [`free_features`] / [`resolve_for_user`] — there is one mechanism, not
 //! two living side by side.
 //!
-//! There is no billing system yet, so there is no per-user paid source.
-//! [`paid_features_for_user`] is the seam where one will plug in later —
-//! it returns the empty set today and nothing above it needs to change
-//! when it stops doing that.
+//! There is no billing system yet, so paid access today comes only from
+//! `db::user_is_paid` (gift/trial code redemption — see `db.rs`'s
+//! `gift_codes` table and `routes::account::redeem`). [`paid_features`] is
+//! the seam: it takes the already-resolved paid/not-paid fact, not a
+//! `user_id`, so this module never gains a database dependency and its tests
+//! keep running with no database at all. [`resolve_for_user`]'s callers
+//! (`routes/entitlements.rs`, `routes/sync.rs`) are the ones that look up
+//! `db::user_is_paid` and pass the fact in.
 //!
 //! Default posture: with `MLC_FREE_FEATURES` unset, every feature is free
 //! for every caller (anonymous and authenticated alike). That is what makes
@@ -163,31 +167,31 @@ fn parse_free_features(raw: &str) -> FeatureSet {
 // Per-user paid claims (seam — no billing system yet)
 // ============================================================================
 
-/// Per-user paid entitlements beyond the free set.
+/// The entitlements a paid account holds beyond the free set.
 ///
-/// Always empty today — there is no billing system yet. This is the ONE
-/// place a future billing lookup plugs in (a claims table keyed by
-/// `user_id`, or a call to a billing service). Do not invent that schema
-/// here, and do not add a second resolution path beside this function —
-/// every caller of entitlement resolution goes through
-/// [`resolve_for_user`], which calls this.
-fn paid_features_for_user(_user_id: i64) -> FeatureSet {
-    FeatureSet::empty()
+/// Takes the already-resolved fact, not a `user_id` — the caller (currently
+/// `routes/entitlements.rs` and `routes/sync.rs`) is the one that knows how
+/// to ask the database (`db::user_is_paid`), so this module stays free of a
+/// database dependency and its tests keep running without one. Everything
+/// paid grants today; once billing introduces tiers narrower than "every
+/// feature", this is the one place that changes.
+fn paid_features(is_paid: bool) -> FeatureSet {
+    if is_paid {
+        FeatureSet::all()
+    } else {
+        FeatureSet::empty()
+    }
 }
 
 /// Resolve the full feature set for a caller.
 ///
-/// `user_id` is `None` for an anonymous caller (no account) and `Some` for
-/// an authenticated one. Anonymous and authenticated callers both start
-/// from [`free_features`]; an authenticated caller's set additionally
-/// includes whatever [`paid_features_for_user`] grants — nothing, until
-/// billing is wired, so today this is equivalent to `free_features()`
-/// either way.
-pub fn resolve_for_user(user_id: Option<i64>) -> FeatureSet {
+/// `is_paid` is the caller's already-resolved paid/not-paid fact (`false`
+/// for an anonymous caller, who has no account to be paid on) — see
+/// [`paid_features`]. Every caller starts from [`free_features`]; a paid
+/// caller's set additionally includes whatever [`paid_features`] grants.
+pub fn resolve_for_user(is_paid: bool) -> FeatureSet {
     let mut set = free_features();
-    if let Some(uid) = user_id {
-        set.extend_from(&paid_features_for_user(uid));
-    }
+    set.extend_from(&paid_features(is_paid));
     set
 }
 
@@ -258,21 +262,19 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_caller_gets_exactly_the_configured_free_set() {
-        // Anonymous (user_id = None) never consults paid_features_for_user —
-        // its resolved set is exactly whatever MLC_FREE_FEATURES currently
-        // configures, whatever that is in the test environment.
-        assert_eq!(resolve_for_user(None), free_features());
+    fn unpaid_caller_gets_exactly_the_configured_free_set() {
+        // is_paid = false (anonymous, or an authenticated but never-paid
+        // account) never consults paid_features for anything but the empty
+        // set — its resolved set is exactly whatever MLC_FREE_FEATURES
+        // currently configures, whatever that is in the test environment.
+        assert_eq!(resolve_for_user(false), free_features());
     }
 
     #[test]
-    fn resolve_for_user_matches_free_features_today_authenticated_or_not() {
-        // No billing wired yet: an authenticated user's resolved set equals
-        // the anonymous one, because paid_features_for_user is empty.
-        let anon = resolve_for_user(None);
-        let authed = resolve_for_user(Some(42));
-        assert_eq!(anon, authed);
-        assert_eq!(anon, free_features());
+    fn paid_caller_gets_every_feature() {
+        let paid = resolve_for_user(true);
+        assert!(paid.contains(Feature::MultiProfile));
+        assert!(paid.contains(Feature::ArchiveProxy));
     }
 
     #[test]

@@ -191,6 +191,20 @@ pub fn init_db(path: &str) -> Result<Connection> {
             status      TEXT    NOT NULL DEFAULT 'pending',
             user_id     INTEGER
         );
+
+        -- Gift / trial codes: an admin mints one, an account redeems it once
+        -- and gains paid time (see db::mint_gift_codes / db::redeem_gift_code).
+        -- `code` is generated server-side, never accepted from a caller — see
+        -- generate_gift_code. `redeemed_by`/`redeemed_at` stay NULL until the
+        -- single conditional UPDATE in redeem_gift_code claims the row.
+        CREATE TABLE IF NOT EXISTS gift_codes (
+            code         TEXT    PRIMARY KEY,
+            grants_days  INTEGER NOT NULL,
+            note         TEXT    NOT NULL DEFAULT '',
+            created_at   TEXT    NOT NULL,
+            redeemed_by  INTEGER REFERENCES users(id),
+            redeemed_at  TEXT
+        );
     "#)?;
 
     // Safe migration: add signature column to releases if not present. `releases`
@@ -206,6 +220,15 @@ pub fn init_db(path: &str) -> Result<Connection> {
         "ALTER TABLE releases ADD COLUMN channel TEXT NOT NULL DEFAULT 'stable'",
         [],
     );
+    // Safe migration: when this account's paid access ends, RFC3339, NULL for
+    // an account that has never paid.
+    //
+    // A date and not a boolean, because a subscription has an end: a flag would
+    // have to become this the day billing lands, and every reader written
+    // against the flag would have to be found again. `CREATE TABLE IF NOT
+    // EXISTS` above does not add a column to a table that already exists —
+    // only this line does, on a live database.
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN paid_until TEXT", []);
     // Safe migration: add expires_at column to auth_tokens if not present.
     let _ = conn.execute("ALTER TABLE auth_tokens ADD COLUMN expires_at TEXT", []);
     // Safe migration: add device_id column to oauth_states if not present.
@@ -1272,6 +1295,37 @@ pub fn upsert_release(
 }
 
 /// Get the latest release for a given platform and channel (highest version by created_at).
+/// Whether this account's paid access is currently in effect.
+///
+/// `paid_until` is a moment, so this is a comparison against now rather than a
+/// stored yes/no: an expired subscription stops granting anything without
+/// anybody having to remember to flip a flag.
+pub fn user_is_paid(conn: &Connection, user_id: i64) -> Result<bool> {
+    let until: Option<String> = conn
+        .query_row(
+            "SELECT paid_until FROM users WHERE id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(until) = until else { return Ok(false) };
+    Ok(until.as_str() > chrono::Utc::now().to_rfc3339().as_str())
+}
+
+/// Grant or revoke paid access by writing the moment it ends.
+///
+/// `None` revokes. Used by the admin endpoint today and by the billing
+/// webhook once it exists — one writer, so the two cannot disagree about what
+/// paid means.
+pub fn set_user_paid_until(conn: &Connection, user_id: i64, until: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE users SET paid_until = ?1 WHERE id = ?2",
+        params![until, user_id],
+    )?;
+    Ok(())
+}
+
 pub fn get_latest_release(
     conn: &Connection,
     platform: &str,
@@ -1420,6 +1474,150 @@ pub struct ReleaseRow {
     pub signature: String,
     /// Release channel: "stable" or "dev".
     pub channel: String,
+}
+
+// ============================================================================
+// Gift / trial codes
+//
+// An admin mints a code (`mint_gift_codes`); an account redeems it once
+// (`redeem_gift_code`) and its `paid_until` moves forward. This is how a
+// paid account is granted today, ahead of billing, and it stays the vehicle
+// for support-issued gifts/trials once billing exists too.
+// ============================================================================
+
+/// Characters usable in a generated gift code: uppercase letters and digits,
+/// minus the pairs a human misreads over the phone or copying by hand
+/// (`O`/`0`, `I`/`1`). Never accepted from a caller — see [`mint_gift_codes`],
+/// the only producer of a code.
+const GIFT_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// Length of one generated gift code.
+const GIFT_CODE_LEN: usize = 10;
+
+/// Generate one random gift code from [`GIFT_CODE_ALPHABET`]. A collision
+/// with an already-minted code is possible but vanishingly unlikely at this
+/// alphabet size and length (32^10) — [`mint_gift_codes`] still retries on
+/// the rare `PRIMARY KEY` collision rather than trusting uniqueness.
+fn generate_gift_code() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..GIFT_CODE_LEN)
+        .map(|_| GIFT_CODE_ALPHABET[rng.gen_range(0..GIFT_CODE_ALPHABET.len())] as char)
+        .collect()
+}
+
+/// Mint `count` new single-use gift/trial codes, each granting `grants_days`
+/// days of paid access from the moment it is redeemed (see
+/// [`redeem_gift_code`]). `note` is stored for support to see why a batch
+/// was minted — it is never shown to the redeeming account.
+///
+/// Returns the generated codes. This is the only place a gift code is ever
+/// readable: no query anywhere else selects `code` back out of the table, so
+/// a code that already went out cannot be recovered by reading the
+/// database — only reissued as a new one.
+pub fn mint_gift_codes(
+    conn: &Connection,
+    count: u32,
+    grants_days: i64,
+    note: &str,
+    now: &str,
+) -> Result<Vec<String>> {
+    let mut codes = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        loop {
+            let code = generate_gift_code();
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO gift_codes (code, grants_days, note, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![code, grants_days, note, now],
+            )?;
+            if inserted == 1 {
+                codes.push(code);
+                break;
+            }
+            // PRIMARY KEY collision (vanishingly unlikely) — draw another code.
+        }
+    }
+    Ok(codes)
+}
+
+/// Outcome of a gift/trial code redemption attempt.
+pub enum RedeemOutcome {
+    /// Redeemed successfully — carries the account's new `paid_until`.
+    Redeemed(String),
+    /// No `gift_codes` row exists for this code at all.
+    NotFound,
+    /// The code exists but was already claimed (by this account or another).
+    AlreadyUsed,
+}
+
+/// Redeem `code` for `user_id`, extending their paid access.
+///
+/// Single-use under a race: the only state-changing step is the one
+/// conditional `UPDATE gift_codes SET redeemed_by = ?1, redeemed_at = ?2
+/// WHERE code = ?3 AND redeemed_by IS NULL` below. SQLite serialises writers
+/// against the same database, so of two requests racing on the same code at
+/// most one `UPDATE` can match `redeemed_by IS NULL` — the loser sees
+/// `rows_affected() != 1` and is reported [`RedeemOutcome::AlreadyUsed`],
+/// never a second grant. That is why the redemption decision lives entirely
+/// inside this one statement rather than a prior `SELECT redeemed_by`
+/// followed by a separate `UPDATE` (read-then-write): two concurrent readers
+/// could both observe "not yet redeemed" and both then write.
+///
+/// The `grants_days` lookup ahead of the `UPDATE` does not carry that same
+/// race risk: it is immutable once a code is minted (see
+/// [`mint_gift_codes`]), so nothing about it can go stale between the read
+/// and the write — it exists only to size the grant, not to decide whether
+/// one happens.
+///
+/// `paid_until` is extended, not replaced: `max(now, existing paid_until) +
+/// grants_days`, so an account still under an earlier grant gains time
+/// instead of losing whatever was left of it.
+pub fn redeem_gift_code(
+    conn: &Connection,
+    code: &str,
+    user_id: i64,
+    now: &str,
+) -> Result<RedeemOutcome> {
+    let grants_days: Option<i64> = conn
+        .query_row(
+            "SELECT grants_days FROM gift_codes WHERE code = ?1",
+            params![code],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(grants_days) = grants_days else {
+        return Ok(RedeemOutcome::NotFound);
+    };
+
+    // The one statement that decides single-use — see the doc comment above.
+    let rows = conn.execute(
+        "UPDATE gift_codes SET redeemed_by = ?1, redeemed_at = ?2 WHERE code = ?3 AND redeemed_by IS NULL",
+        params![user_id, now, code],
+    )?;
+    if rows != 1 {
+        return Ok(RedeemOutcome::AlreadyUsed);
+    }
+
+    let existing_until: Option<String> = conn
+        .query_row(
+            "SELECT paid_until FROM users WHERE id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let now_dt = chrono::Utc::now();
+    let base = existing_until
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .filter(|dt| *dt > now_dt)
+        .unwrap_or(now_dt);
+    let new_until = (base + chrono::Duration::days(grants_days)).to_rfc3339();
+
+    set_user_paid_until(conn, user_id, Some(&new_until))?;
+
+    Ok(RedeemOutcome::Redeemed(new_until))
 }
 
 // ============================================================================

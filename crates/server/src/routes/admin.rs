@@ -224,6 +224,129 @@ pub async fn register_release(
     .into_response()
 }
 
+/// Request body for POST /api/admin/gift-codes.
+#[derive(serde::Deserialize)]
+pub struct MintGiftCodesRequest {
+    /// Days of paid access each code grants, from the moment it is redeemed.
+    pub days: i64,
+    /// How many codes to mint in this call. Defaults to 1.
+    #[serde(default = "default_gift_code_count")]
+    pub count: u32,
+    /// Why this batch was minted — support needs this, the redeeming
+    /// account never sees it.
+    #[serde(default)]
+    pub note: String,
+}
+
+fn default_gift_code_count() -> u32 {
+    1
+}
+
+/// Response for POST /api/admin/gift-codes.
+#[derive(serde::Serialize)]
+pub struct MintGiftCodesResponse {
+    pub codes: Vec<String>,
+}
+
+/// A typo in `count` (an extra zero, say) should not be able to flood the
+/// table in one call — this is the ceiling on a single mint request.
+const MAX_GIFT_CODES_PER_REQUEST: u32 = 200;
+
+/// POST /api/admin/gift-codes
+///
+/// Mints `count` (default 1) single-use gift/trial codes, each granting
+/// `days` days of paid access from the moment an account redeems it (see
+/// `db::mint_gift_codes`, `db::redeem_gift_code`, and
+/// `routes::account::redeem` for the redemption side). Requires
+/// `Authorization: Bearer {ADMIN_SECRET}`.
+///
+/// Response: `{ "codes": ["AB3D...", ...] }`. This is the only place a
+/// minted code is ever returned — no read path anywhere exposes an existing
+/// code (see `db::mint_gift_codes`'s doc comment), and this response is
+/// never logged in full.
+pub async fn mint_gift_codes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = verify_admin_secret(&state, &headers) {
+        return e;
+    }
+
+    let req: MintGiftCodesRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("Invalid JSON body")),
+            )
+                .into_response();
+        }
+    };
+
+    if req.days <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("days must be > 0")),
+        )
+            .into_response();
+    }
+    if req.count == 0 || req.count > MAX_GIFT_CODES_PER_REQUEST {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(format!(
+                "count must be between 1 and {}",
+                MAX_GIFT_CODES_PER_REQUEST
+            ))),
+        )
+            .into_response();
+    }
+    if req.note.len() > 512 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("note too long (max 512)")),
+        )
+            .into_response();
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let count = req.count;
+    let days = req.days;
+    let note = req.note.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::mint_gift_codes(&conn, count, days, &note, &now)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(codes)) => {
+            // Count and metadata only — never the codes themselves.
+            tracing::info!(
+                "Minted {} gift code(s): days={} note={:?}",
+                codes.len(),
+                days,
+                req.note,
+            );
+            Json(MintGiftCodesResponse { codes }).into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::error!("DB error minting gift codes: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /api/admin/promote?version=0.5.1&platform=win64
 ///
 /// Copies a dev release to stable channel. Binary file is NOT duplicated on disk.
