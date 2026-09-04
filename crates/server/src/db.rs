@@ -1280,11 +1280,39 @@ pub fn upsert_release(
     signature: &str,
     now: &str,
 ) -> Result<()> {
+    // One version, one binary. Re-registering a version whose BYTES have
+    // changed is refused: the updater decides whether a client is current by
+    // comparing version numbers alone, so two different binaries under one
+    // number are one release to every client that looks — and the second
+    // silently replaces the first for everyone who has not updated yet. The
+    // web bundle grew the same guard on 2026-09-04 after the same near-miss;
+    // this is that guard on the artifact side.
+    //
+    // Re-registering the IDENTICAL sha256 stays allowed: that is a retry, or a
+    // republish after an edge lost a file, and it must not be turned into an
+    // error the operator has to work around.
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT sha256 FROM releases WHERE version = ?1 AND platform = ?2 AND channel = ?3",
+            params![version, platform, channel],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(prev) = existing {
+        if prev != sha256 {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                Some(format!(
+                    "release {version} for {platform}/{channel} is already registered with a                      different binary (registered sha256={prev}, offered sha256={sha256}) —                      bump the version instead of replacing what clients already trust"
+                )),
+            ));
+        }
+    }
+
     conn.execute(
         "INSERT INTO releases (version, platform, channel, sha256, file_path, file_size, release_notes, signature, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(version, platform, channel) DO UPDATE SET
-             sha256 = ?4,
              file_path = ?5,
              file_size = ?6,
              release_notes = ?7,

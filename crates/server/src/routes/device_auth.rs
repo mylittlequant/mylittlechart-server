@@ -385,23 +385,45 @@ pub async fn me(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let session_id = match extract_session_id(&headers) {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse::new("Not logged in")),
-            )
-                .into_response();
-        }
-    };
+    // Either credential. This endpoint answered only to a browser's
+    // `session_id` cookie, so a desktop client — which has no cookie and sends
+    // `Authorization: Bearer` — got 401 for a perfectly live token. That is not
+    // an academic gap: the desktop updater probes this endpoint at startup to
+    // find out whether its stored token is still real, read the 401 as "the
+    // server rejected me", and signed the user out on every launch
+    // (owner, 2026-09-04). "Who am I" must accept every way a client can say
+    // who it is; `routes::account::redeem` already resolves both.
+    let session_id = extract_session_id(&headers);
+    let bearer: Option<String> = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| crate::auth::extract_bearer(Some(v)))
+        .map(|s| s.to_owned());
+
+    if session_id.is_none() && bearer.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new("Not logged in")),
+        )
+            .into_response();
+    }
 
     let ua_hash = extract_ua_hash(&headers);
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<MeResponse>> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
-        let user_id = match crate::db::resolve_web_session(&conn, &session_id, &ua_hash)? {
+        let mut resolved: Option<i64> = None;
+        if let Some(ref sid) = session_id {
+            resolved = crate::db::resolve_web_session(&conn, sid, &ua_hash)?;
+        }
+        if resolved.is_none() {
+            if let Some(ref raw) = bearer {
+                let token_hash = crate::auth::hash_token(raw);
+                resolved = crate::db::resolve_token_hash_with_expiry(&conn, &token_hash)?;
+            }
+        }
+        let user_id = match resolved {
             Some(id) => id,
             None => return Ok(None),
         };
