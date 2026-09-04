@@ -130,7 +130,12 @@ fn io_err(e: io::Error) -> SqlError {
 /// vector, so the allowlist is strict: ASCII alnum plus `-_.`, never a
 /// leading dot, never `..`, length-capped. Empty maps to `_` (the legacy
 /// empty device/profile namespace keeps working).
-fn sanitize(component: &str) -> Result<String, SqlError> {
+///
+/// `pub(crate)` so `routes/share.rs` runs screenshot blob-path components
+/// (user_id, token) through the same allowlist even though both are
+/// server-generated and already safe — one sanitizer, no second spelling of
+/// "safe path component".
+pub(crate) fn sanitize(component: &str) -> Result<String, SqlError> {
     if component.is_empty() {
         return Ok("_".to_string());
     }

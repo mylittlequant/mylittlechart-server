@@ -230,6 +230,88 @@ pub fn profile_write_allowed(
     known_profile_ids.len() < FREE_PROFILE_LIMIT || features.contains(Feature::MultiProfile)
 }
 
+// ============================================================================
+// Share-link enforcement rule
+// ============================================================================
+
+/// The two kinds of share link an account can create (see the "Share links"
+/// section in `db.rs` for the storage half).
+///
+/// [`as_str`](ShareKind::as_str) owns the spelling of the `kind` column in
+/// the `share_links` table and of the `kind` field in the public viewer's
+/// JSON — renaming a variant's string is a wire-format change, not a
+/// refactor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareKind {
+    /// A frozen ChartPreset, rendered read-only by the web viewer.
+    Live,
+    /// A stored PNG blob, streamed back verbatim.
+    Screenshot,
+}
+
+impl ShareKind {
+    /// Stable wire/storage name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShareKind::Live => "live",
+            ShareKind::Screenshot => "screenshot",
+        }
+    }
+
+    pub fn from_wire_name(s: &str) -> Option<ShareKind> {
+        match s {
+            "live" => Some(ShareKind::Live),
+            "screenshot" => Some(ShareKind::Screenshot),
+            _ => None,
+        }
+    }
+}
+
+/// Active (non-expired, non-revoked) shares an account may hold at once.
+/// Free limits also apply to anonymous callers, who cannot create shares at
+/// all (creation is authenticated-only) — they exist here so
+/// `GET /api/entitlements` can still state a maximum for them.
+pub const FREE_LIVE_SHARE_LIMIT: u64 = 1;
+pub const PAID_LIVE_SHARE_LIMIT: u64 = 10;
+pub const FREE_SCREENSHOT_SHARE_LIMIT: u64 = 10;
+pub const PAID_SCREENSHOT_SHARE_LIMIT: u64 = 100;
+
+/// Share lifetime in seconds, stamped into `expires_at` at creation. Reading
+/// a share never extends it.
+pub const LIVE_SHARE_TTL_FREE: u64 = 7 * 24 * 60 * 60;
+pub const LIVE_SHARE_TTL_PAID: u64 = 90 * 24 * 60 * 60;
+pub const SCREENSHOT_SHARE_TTL_FREE: u64 = 30 * 24 * 60 * 60;
+pub const SCREENSHOT_SHARE_TTL_PAID: u64 = 365 * 24 * 60 * 60;
+
+/// The active-share ceiling for one kind at one tier.
+pub fn share_limit(kind: ShareKind, is_paid: bool) -> u64 {
+    match (kind, is_paid) {
+        (ShareKind::Live, false) => FREE_LIVE_SHARE_LIMIT,
+        (ShareKind::Live, true) => PAID_LIVE_SHARE_LIMIT,
+        (ShareKind::Screenshot, false) => FREE_SCREENSHOT_SHARE_LIMIT,
+        (ShareKind::Screenshot, true) => PAID_SCREENSHOT_SHARE_LIMIT,
+    }
+}
+
+/// Decide whether creating one more share of `kind` may proceed, given how
+/// many active shares of that kind the account already holds (see
+/// `db::share_usage`). Unlike [`profile_write_allowed`] there is no
+/// grandfathering: every creation counts against the ceiling, and revocation
+/// is how an account makes room again.
+pub fn share_create_allowed(kind: ShareKind, current_count: u64, is_paid: bool) -> bool {
+    current_count < share_limit(kind, is_paid)
+}
+
+/// The lifetime of a new share of `kind` at one tier, in seconds.
+pub fn share_ttl_secs(kind: ShareKind, is_paid: bool) -> u64 {
+    match (kind, is_paid) {
+        (ShareKind::Live, false) => LIVE_SHARE_TTL_FREE,
+        (ShareKind::Live, true) => LIVE_SHARE_TTL_PAID,
+        (ShareKind::Screenshot, false) => SCREENSHOT_SHARE_TTL_FREE,
+        (ShareKind::Screenshot, true) => SCREENSHOT_SHARE_TTL_PAID,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +395,46 @@ mod tests {
         // one of them (the grandfathering case — e.g. the production user
         // with four pre-existing profiles) is not a creation.
         assert!(profile_write_allowed(&known, "prof-b", &features));
+    }
+
+    #[test]
+    fn share_create_allowed_free_tier_boundaries() {
+        // Free: 1 live, 10 screenshots — the boundary count itself is refused.
+        assert!(share_create_allowed(ShareKind::Live, 0, false));
+        assert!(!share_create_allowed(ShareKind::Live, 1, false));
+        assert!(share_create_allowed(ShareKind::Screenshot, 9, false));
+        assert!(!share_create_allowed(ShareKind::Screenshot, 10, false));
+    }
+
+    #[test]
+    fn share_create_allowed_paid_tier_boundaries() {
+        // Paid: 10 live, 100 screenshots.
+        assert!(share_create_allowed(ShareKind::Live, 9, true));
+        assert!(!share_create_allowed(ShareKind::Live, 10, true));
+        assert!(share_create_allowed(ShareKind::Screenshot, 99, true));
+        assert!(!share_create_allowed(ShareKind::Screenshot, 100, true));
+    }
+
+    #[test]
+    fn share_ttl_secs_matches_approved_values() {
+        assert_eq!(share_ttl_secs(ShareKind::Live, false), 7 * 24 * 3600);
+        assert_eq!(share_ttl_secs(ShareKind::Live, true), 90 * 24 * 3600);
+        assert_eq!(share_ttl_secs(ShareKind::Screenshot, false), 30 * 24 * 3600);
+        assert_eq!(share_ttl_secs(ShareKind::Screenshot, true), 365 * 24 * 3600);
+    }
+
+    #[test]
+    fn share_kind_wire_names_roundtrip() {
+        // The `kind` column in db's share_links table stores these exact
+        // spellings — drift here splits the storage from the reader.
+        assert_eq!(ShareKind::from_wire_name("live"), Some(ShareKind::Live));
+        assert_eq!(
+            ShareKind::from_wire_name("screenshot"),
+            Some(ShareKind::Screenshot)
+        );
+        assert_eq!(ShareKind::from_wire_name("bogus"), None);
+        for kind in [ShareKind::Live, ShareKind::Screenshot] {
+            assert_eq!(ShareKind::from_wire_name(kind.as_str()), Some(kind));
+        }
     }
 }

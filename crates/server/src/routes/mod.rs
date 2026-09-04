@@ -6,6 +6,7 @@
 //! version is available.
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{delete, get, patch, post},
     Router,
 };
@@ -24,6 +25,7 @@ pub mod link;
 pub mod oauth;
 pub mod proxy;
 pub mod sessions;
+pub mod share;
 pub mod sync;
 pub mod telemetry;
 pub mod tg_login;
@@ -102,6 +104,22 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/sync/pull-profile", get(sync::sync_pull_profile))
         // Gift/trial code redemption (cookie-session or bearer auth, same as sync).
         .route("/account/redeem", post(account::redeem))
+        // Chart share links. Creation/listing/revoke are authenticated; the
+        // two GETs by token are public — the token is the capability (see
+        // routes/share.rs). `/share/mine` is a static segment, which matchit
+        // prioritises over the `{token}` parameter, so registration order
+        // here carries no meaning.
+        .route("/share/live", post(share::create_live_share))
+        .route(
+            "/share/screenshot",
+            post(share::create_screenshot_share)
+                // PNG bodies — the one route that outgrows axum's default
+                // 2MB body limit (see the note above).
+                .layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route("/share/mine", get(share::list_my_shares))
+        .route("/share/{token}", get(share::get_share).delete(share::delete_share))
+        .route("/share/{token}/png", get(share::get_share_png))
         .with_state(state)
 }
 
@@ -129,4 +147,40 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
 /// db-shaped hole opened today.
 pub fn edge_api_router(_state: Arc<AppState>) -> Router {
     Router::new().route("/proxy/entitlement", get(proxy::entitlement))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The full control route table must register without a conflict panic.
+    /// This is what proves `/share/mine` (static) coexists with
+    /// `/share/{token}` (parameter) and that the GET+DELETE pair on
+    /// `/share/{token}` merges — axum/matchit panics at registration time on
+    /// a genuinely conflicting pair, so building the router once is the whole
+    /// test. `control_plane` is `None`: registration never calls a handler,
+    /// so no database is needed.
+    #[test]
+    fn control_router_registers_without_route_conflicts() {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let state = Arc::new(AppState::new(
+            None,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            shutdown_tx,
+            Vec::new(),
+            false,
+            0,
+            0,
+        ));
+        let _router = control_api_router(state);
+    }
 }

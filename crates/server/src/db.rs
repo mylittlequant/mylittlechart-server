@@ -205,6 +205,28 @@ pub fn init_db(path: &str) -> Result<Connection> {
             redeemed_by  INTEGER REFERENCES users(id),
             redeemed_at  TEXT
         );
+
+        -- Public share links (see the "Share links" section below). Two
+        -- kinds, spelled by entitlements::ShareKind::as_str: 'live' (a frozen
+        -- ChartPreset in `preset_json`, rendered read-only by the web viewer)
+        -- and 'screenshot' (a PNG blob on disk, `blob_path` relative to
+        -- `<data_dir>/share/`). `revoked` flips to 1 on owner delete; a row
+        -- past `expires_at` is dead either way and is reaped by
+        -- cleanup_expired_share_links.
+        CREATE TABLE IF NOT EXISTS share_links (
+            token       TEXT    PRIMARY KEY,
+            user_id     INTEGER NOT NULL REFERENCES users(id),
+            kind        TEXT    NOT NULL,
+            title       TEXT    NOT NULL DEFAULT '',
+            preset_json TEXT    NOT NULL DEFAULT '',
+            blob_path   TEXT    NOT NULL DEFAULT '',
+            blob_bytes  INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT    NOT NULL,
+            expires_at  TEXT    NOT NULL,
+            revoked     INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_share_links_user ON share_links(user_id, kind, revoked);
     "#)?;
 
     // Safe migration: add signature column to releases if not present. `releases`
@@ -1664,6 +1686,212 @@ pub fn redeem_gift_code(
     set_user_paid_until(conn, user_id, Some(&new_until))?;
 
     Ok(RedeemOutcome::Redeemed(new_until))
+}
+
+// ============================================================================
+// Share links
+//
+// An authenticated account publishes one chart either as a 'live' share (the
+// frozen ChartPreset JSON sits in `preset_json`, rendered read-only by the
+// web viewer) or as a 'screenshot' share (the PNG bytes sit on disk under
+// `<data_dir>/share/`, `blob_path` holds the path relative to that root).
+// The kind strings are owned by `entitlements::ShareKind::as_str` — the two
+// spellings must not drift apart. Timestamps are RFC3339, so `expires_at`
+// compares lexicographically (same convention as `users.paid_until`).
+//
+// Limits and TTLs are decided in `entitlements.rs` (`share_create_allowed`,
+// `share_ttl_secs`); this section stores and counts rows, nothing more.
+// ============================================================================
+
+/// One row of the `share_links` table.
+pub struct ShareLinkRow {
+    pub token: String,
+    pub user_id: i64,
+    pub kind: String,
+    pub title: String,
+    pub preset_json: String,
+    /// Path of the PNG blob relative to `<data_dir>/share/` — empty for live
+    /// shares, which carry no file.
+    pub blob_path: String,
+    pub blob_bytes: i64,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+/// Read one query row into a [`ShareLinkRow`]. Column order must match the
+/// SELECT lists below.
+fn share_link_from_row(row: &rusqlite::Row<'_>) -> Result<ShareLinkRow> {
+    Ok(ShareLinkRow {
+        token: row.get(0)?,
+        user_id: row.get(1)?,
+        kind: row.get(2)?,
+        title: row.get(3)?,
+        preset_json: row.get(4)?,
+        blob_path: row.get(5)?,
+        blob_bytes: row.get(6)?,
+        created_at: row.get(7)?,
+        expires_at: row.get(8)?,
+    })
+}
+
+/// Generate one share token: 16 random bytes as 32 lowercase hex characters —
+/// the same scheme as `create_link_token`, so share URLs and link tokens are
+/// indistinguishable in shape.
+fn generate_share_token() -> String {
+    use rand::Rng;
+    let bytes: [u8; 16] = rand::thread_rng().gen();
+    hex::encode(bytes)
+}
+
+/// Create one share link and return its token. `created_at`/`expires_at` are
+/// RFC3339 strings the caller computed (see `entitlements::share_ttl_secs` for
+/// the TTL rule). `blob_path`/`blob_bytes` are empty/0 for a live share; for
+/// a screenshot the caller passes the relative blob path it already derived
+/// from the token… except the token only exists inside this function, so the
+/// caller passes an empty `blob_path` first and stamps the real one with
+/// [`set_share_blob_path`] once the token is known and the file is written.
+///
+/// Retries on the vanishingly unlikely PRIMARY KEY collision, same as
+/// [`mint_gift_codes`].
+pub fn create_share_link(
+    conn: &Connection,
+    user_id: i64,
+    kind: &str,
+    title: &str,
+    preset_json: &str,
+    blob_bytes: i64,
+    created_at: &str,
+    expires_at: &str,
+) -> Result<String> {
+    loop {
+        let token = generate_share_token();
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO share_links (token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8)",
+            params![token, user_id, kind, title, preset_json, blob_bytes, created_at, expires_at],
+        )?;
+        if inserted == 1 {
+            return Ok(token);
+        }
+        // PRIMARY KEY collision (vanishingly unlikely) — draw another token.
+    }
+}
+
+/// Stamp the real blob path onto a freshly created screenshot share (see
+/// [`create_share_link`] for why the path cannot be known at INSERT time).
+pub fn set_share_blob_path(conn: &Connection, token: &str, blob_path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE share_links SET blob_path = ?2 WHERE token = ?1",
+        params![token, blob_path],
+    )?;
+    Ok(())
+}
+
+/// Fetch one share link for public viewing: only a live row comes back —
+/// revoked or past-`expires_at` shares are indistinguishable from unknown
+/// tokens here, so the public route can answer one bare 404 for all three.
+pub fn get_share_link(conn: &Connection, token: &str) -> Result<Option<ShareLinkRow>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.query_row(
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at
+         FROM share_links
+         WHERE token = ?1 AND revoked = 0 AND expires_at > ?2",
+        params![token, now],
+        share_link_from_row,
+    )
+    .optional()
+}
+
+/// Count the caller's active (non-revoked, non-expired) shares of each kind:
+/// (live, screenshot). This is the number the entitlement gate in
+/// `routes/share.rs` compares against `entitlements::share_limit`.
+pub fn share_usage(conn: &Connection, user_id: i64) -> Result<(u64, u64)> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let live: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM share_links WHERE user_id = ?1 AND kind = 'live' AND revoked = 0 AND expires_at > ?2",
+        params![user_id, now],
+        |row| row.get(0),
+    )?;
+    let screenshot: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM share_links WHERE user_id = ?1 AND kind = 'screenshot' AND revoked = 0 AND expires_at > ?2",
+        params![user_id, now],
+        |row| row.get(0),
+    )?;
+    Ok((live as u64, screenshot as u64))
+}
+
+/// List the caller's active shares, newest first — the body of
+/// `GET /api/share/mine`.
+pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLinkRow>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at
+         FROM share_links
+         WHERE user_id = ?1 AND revoked = 0 AND expires_at > ?2
+         ORDER BY created_at DESC",
+    )?;
+    let mut rows = stmt.query(params![user_id, now])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(share_link_from_row(row)?);
+    }
+    Ok(out)
+}
+
+/// Revoke one share link, owner-only: the `user_id` in the WHERE clause is
+/// what makes "someone else's token" answer `false` exactly like "no such
+/// token", so the route can 404 both without leaking existence. Already-
+/// revoked rows likewise answer `false`.
+pub fn revoke_share(conn: &Connection, user_id: i64, token: &str) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE share_links SET revoked = 1 WHERE token = ?1 AND user_id = ?2 AND revoked = 0",
+        params![token, user_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Delete every expired share link (any owner, revoked or not) and return the
+/// `(token, blob_path)` pairs so the caller can unlink the PNG files — the
+/// database cannot reach the filesystem itself. Live shares have an empty
+/// `blob_path`; callers must skip those.
+pub fn cleanup_expired_share_links(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT token, blob_path FROM share_links WHERE expires_at <= ?1",
+    )?;
+    let mut rows = stmt.query(params![now])?;
+    let mut expired = Vec::new();
+    while let Some(row) = rows.next()? {
+        expired.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+    }
+    drop(rows);
+    drop(stmt);
+    conn.execute(
+        "DELETE FROM share_links WHERE expires_at <= ?1",
+        params![now],
+    )?;
+    Ok(expired)
+}
+
+/// The public owner label for a share: `display_name` with a `public_id`
+/// fallback. A dedicated public nick column lands in a later wave — until
+/// then this is the only name a share ever exposes. Returns `None` only when
+/// the user row itself is gone (a share outliving its account).
+pub fn share_owner_label(conn: &Connection, user_id: i64) -> Result<Option<String>> {
+    let row: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT display_name, public_id FROM users WHERE id = ?1",
+            params![user_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(display_name, public_id)| {
+        if !display_name.is_empty() {
+            display_name
+        } else {
+            public_id.unwrap_or_default()
+        }
+    }))
 }
 
 // ============================================================================
@@ -3441,7 +3669,7 @@ pub fn cleanup_stale_devices(conn: &Connection, stale_days: i64) -> rusqlite::Re
 
 #[cfg(test)]
 mod tests {
-    use super::db_key_hex;
+    use super::{Connection, db_key_hex};
 
     #[test]
     fn db_key_hex_parses_hex_raw_and_whitespace() {
@@ -3468,6 +3696,179 @@ mod tests {
         // Empty / whitespace-only input yields no key.
         assert_eq!(db_key_hex(b""), None);
         assert_eq!(db_key_hex(b"  \n"), None);
+    }
+
+    /// The users + share_links halves of the production schema, on top of the
+    /// sync tables `init_test_conn` already builds.
+    fn share_test_conn() -> Connection {
+        let conn = super::init_test_conn();
+        conn.execute_batch(
+            "
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                provider_user_id TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                public_id TEXT,
+                UNIQUE(provider, provider_user_id)
+            );
+
+            CREATE TABLE share_links (
+                token       TEXT    PRIMARY KEY,
+                user_id     INTEGER NOT NULL REFERENCES users(id),
+                kind        TEXT    NOT NULL,
+                title       TEXT    NOT NULL DEFAULT '',
+                preset_json TEXT    NOT NULL DEFAULT '',
+                blob_path   TEXT    NOT NULL DEFAULT '',
+                blob_bytes  INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT    NOT NULL,
+                expires_at  TEXT    NOT NULL,
+                revoked     INTEGER NOT NULL DEFAULT 0
+            );
+            ",
+        )
+        .expect("share test schema");
+        conn
+    }
+
+    fn insert_share_user(conn: &Connection, display_name: &str, public_id: Option<&str>) -> i64 {
+        conn.execute(
+            "INSERT INTO users (provider, provider_user_id, display_name, created_at, public_id)
+             VALUES ('test', ?1, ?2, '2026-01-01T00:00:00+00:00', ?3)",
+            rusqlite::params![display_name, display_name, public_id],
+        )
+        .expect("insert user");
+        conn.last_insert_rowid()
+    }
+
+    fn future_ts() -> String {
+        (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339()
+    }
+
+    fn past_ts() -> String {
+        (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339()
+    }
+
+    #[test]
+    fn share_link_roundtrip_and_owner_only_revoke() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let token = super::create_share_link(&conn, uid, "live", "t", "{}", 0, &now, &future_ts())
+            .expect("create");
+        assert_eq!(token.len(), 32);
+
+        let row = super::get_share_link(&conn, &token).expect("query").expect("row");
+        assert_eq!(row.user_id, uid);
+        assert_eq!(row.kind, "live");
+        assert_eq!(row.blob_path, "");
+
+        // Not the owner — revoke must refuse and the share must stay live.
+        let other = insert_share_user(&conn, "mallory", Some("pub-mallory"));
+        assert!(!super::revoke_share(&conn, other, &token).expect("revoke"));
+        assert!(super::get_share_link(&conn, &token).expect("query").is_some());
+
+        // The owner revokes; the share is then gone from every read path.
+        assert!(super::revoke_share(&conn, uid, &token).expect("revoke"));
+        assert!(super::get_share_link(&conn, &token).expect("query").is_none());
+        // Revoking twice is not a success either.
+        assert!(!super::revoke_share(&conn, uid, &token).expect("revoke"));
+    }
+
+    #[test]
+    fn share_usage_counts_only_active_rows_per_kind() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "bob", Some("pub-bob"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        assert_eq!(super::share_usage(&conn, uid).expect("usage"), (0, 0));
+
+        super::create_share_link(&conn, uid, "live", "l1", "{}", 0, &now, &future_ts())
+            .expect("create");
+        let shot = super::create_share_link(&conn, uid, "screenshot", "s1", "", 42, &now, &future_ts())
+            .expect("create");
+        assert_eq!(super::share_usage(&conn, uid).expect("usage"), (1, 1));
+
+        // Expired and revoked rows stop counting.
+        super::create_share_link(&conn, uid, "live", "l2", "{}", 0, &now, &past_ts())
+            .expect("create");
+        super::revoke_share(&conn, uid, &shot).expect("revoke");
+        assert_eq!(super::share_usage(&conn, uid).expect("usage"), (1, 0));
+    }
+
+    #[test]
+    fn list_share_links_returns_active_newest_first() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "carol", Some("pub-carol"));
+
+        let older = super::create_share_link(
+            &conn, uid, "live", "old", "{}", 0,
+            "2026-01-01T00:00:00+00:00", &future_ts(),
+        )
+        .expect("create");
+        let newer = super::create_share_link(
+            &conn, uid, "screenshot", "new", "", 1,
+            "2026-02-01T00:00:00+00:00", &future_ts(),
+        )
+        .expect("create");
+        super::create_share_link(
+            &conn, uid, "live", "dead", "{}", 0,
+            "2026-03-01T00:00:00+00:00", &past_ts(),
+        )
+        .expect("create");
+
+        let rows = super::list_share_links(&conn, uid).expect("list");
+        let tokens: Vec<&str> = rows.iter().map(|r| r.token.as_str()).collect();
+        assert_eq!(tokens, vec![newer.as_str(), older.as_str()]);
+    }
+
+    #[test]
+    fn cleanup_expired_share_links_deletes_and_reports_blob_paths() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "dave", Some("pub-dave"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let live_expired = super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &past_ts())
+            .expect("create");
+        let shot_expired = super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &past_ts())
+            .expect("create");
+        super::set_share_blob_path(&conn, &shot_expired, &format!("{}/{}.png", uid, shot_expired))
+            .expect("stamp blob path");
+        let alive = super::create_share_link(&conn, uid, "live", "ok", "{}", 0, &now, &future_ts())
+            .expect("create");
+
+        let removed = super::cleanup_expired_share_links(&conn).expect("cleanup");
+        assert_eq!(removed.len(), 2);
+        // Live shares report an empty blob path — nothing to unlink.
+        assert!(removed
+            .iter()
+            .any(|(t, p)| *t == live_expired && p.is_empty()));
+        assert!(removed
+            .iter()
+            .any(|(t, p)| *t == shot_expired && *p == format!("{}/{}.png", uid, shot_expired)));
+
+        assert!(super::get_share_link(&conn, &alive).expect("query").is_some());
+        assert_eq!(super::cleanup_expired_share_links(&conn).expect("cleanup").len(), 0);
+    }
+
+    #[test]
+    fn share_owner_label_prefers_display_name_then_public_id() {
+        let conn = share_test_conn();
+        let named = insert_share_user(&conn, "erin", Some("pub-erin"));
+        let unnamed = insert_share_user(&conn, "", Some("pub-anon"));
+
+        assert_eq!(
+            super::share_owner_label(&conn, named).expect("label").as_deref(),
+            Some("erin")
+        );
+        assert_eq!(
+            super::share_owner_label(&conn, unnamed).expect("label").as_deref(),
+            Some("pub-anon")
+        );
+        // No such user — None, never a fabricated name.
+        assert!(super::share_owner_label(&conn, 99999).expect("label").is_none());
     }
 }
 

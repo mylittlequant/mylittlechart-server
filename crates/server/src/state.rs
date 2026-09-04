@@ -99,6 +99,11 @@ pub struct ControlPlane {
     /// Hot file store for chart-persistence sync categories (see syncstore.rs).
     /// Root is `<data_dir>/sync/`. Cold categories stay in the SQLCipher DB.
     pub sync_store: crate::syncstore::SyncStore,
+
+    /// Root of the screenshot-share blob store, `<data_dir>/share/` (see
+    /// `routes/share.rs`): one PNG per share at `<user_id>/<token>.png`, with
+    /// `share_links.blob_path` holding the path relative to this root.
+    pub share_root: std::path::PathBuf,
 }
 
 /// Shared application state.

@@ -90,7 +90,11 @@ async fn resolve_caller(
 ///   "features": ["archive_proxy", "multi_profile"],
 ///   "expires_at": 1774903600000,
 ///   "paid": true,
-///   "paid_until": "2026-10-04T00:00:00Z"
+///   "paid_until": "2026-10-04T00:00:00Z",
+///   "share_limits": {
+///     "live": { "used": 0, "max": 10 },
+///     "screenshot": { "used": 3, "max": 100 }
+///   }
 /// }
 /// ```
 /// `expires_at` is a millisecond Unix timestamp; the client should re-ask
@@ -98,6 +102,10 @@ async fn resolve_caller(
 /// `paid_until` say the caller's paid status explicitly, so a client can
 /// show "Free" / "Paid until <date>" without inferring it from a feature
 /// name; `paid_until` is `null` for a free or anonymous caller.
+/// `share_limits` reports active-share usage against the tier ceiling per
+/// kind (see `entitlements::share_limit`); anonymous callers get the free
+/// tier maxima with `used: 0` — they cannot create shares at all, but the
+/// numbers are how a client advertises the feature before login.
 pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let user_id = match resolve_caller(state.clone(), &headers).await {
         Ok(uid) => uid,
@@ -110,20 +118,23 @@ pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: Heade
         }
     };
 
-    // Anonymous (no credential) never touches the database — None/false
-    // without a round-trip. An authenticated caller's paid fact still needs
-    // one.
-    let paid_until: Option<String> = match user_id {
-        None => None,
+    // Anonymous (no credential) never touches the database — None/false and
+    // zero usage without a round-trip. An authenticated caller's paid fact
+    // and share usage still need one.
+    let (paid_until, live_used, shot_used): (Option<String>, u64, u64) = match user_id {
+        None => (None, 0, 0),
         Some(uid) => {
-            let result =
-                tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<String>> {
+            let result = tokio::task::spawn_blocking(
+                move || -> rusqlite::Result<(Option<String>, u64, u64)> {
                     let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-                    crate::db::user_paid_until(&conn, uid)
-                })
-                .await;
+                    let until = crate::db::user_paid_until(&conn, uid)?;
+                    let (live, shot) = crate::db::share_usage(&conn, uid)?;
+                    Ok((until, live, shot))
+                },
+            )
+            .await;
             match result {
-                Ok(Ok(until)) => until,
+                Ok(Ok(facts)) => facts,
                 Ok(Err(e)) => {
                     tracing::error!("DB error checking paid status: {}", e);
                     return (
@@ -152,6 +163,16 @@ pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: Heade
         "expires_at": expires_at,
         "paid": is_paid,
         "paid_until": paid_until,
+        "share_limits": {
+            "live": {
+                "used": live_used,
+                "max": entitlements::share_limit(entitlements::ShareKind::Live, is_paid),
+            },
+            "screenshot": {
+                "used": shot_used,
+                "max": entitlements::share_limit(entitlements::ShareKind::Screenshot, is_paid),
+            },
+        },
     }))
     .into_response()
 }

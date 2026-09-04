@@ -18,10 +18,11 @@
 //!   DISCORD_CLIENT_ID      — Discord OAuth app client ID
 //!   DISCORD_CLIENT_SECRET  — Discord OAuth app client secret
 //!   TELEGRAM_BOT_TOKEN     — Telegram bot token for login widget verification
-//!   DATA_DIR               — directory for the databases and hot sync store
-//!                            (default: ./data). No release artifacts live
-//!                            here — those are on the public edges, see
-//!                            routes/admin.rs and routes/updates.rs.
+//!   DATA_DIR               — directory for the databases, the hot sync store
+//!                            and screenshot-share blobs (`share/`, see
+//!                            routes/share.rs; default: ./data). No release
+//!                            artifacts live here — those are on the public
+//!                            edges, see routes/admin.rs and routes/updates.rs.
 //!   BUILD_ATTEST_PUBKEY    — hex-encoded Ed25519 public key(s), comma-separated (optional)
 //!   BUILD_ATTEST_ENFORCE   — "true"/"1" to reject unsigned clients (default: false)
 //!   BUILD_ATTEST_MAX_AGE_DAYS — max build age in days (default: 365)
@@ -264,6 +265,7 @@ async fn main() {
                 sync_store: crate::syncstore::SyncStore::new(
                     std::path::Path::new(&data_dir).join("sync"),
                 ),
+                share_root: std::path::Path::new(&data_dir).join("share"),
             })
         }
         state::ServerRole::Edge => {
@@ -358,22 +360,42 @@ async fn main() {
                     .unwrap_or(0);
                     let orphan_links =
                         crate::db::cleanup_orphan_device_users(&conn, &ops_conn).unwrap_or(0);
+                    // Expired share links: rows go away here, their PNG blobs
+                    // (if any) are unlinked below once the lock is dropped.
+                    let share_blobs =
+                        crate::db::cleanup_expired_share_links(&conn).unwrap_or_default();
                     drop(ops_conn);
                     drop(conn);
 
+                    let mut shares_purged = 0usize;
+                    for (_token, blob_path) in &share_blobs {
+                        shares_purged += 1;
+                        if blob_path.is_empty() {
+                            continue;
+                        }
+                        // blob_path is a string crossing into the filesystem —
+                        // same relative-path guard as the static handler.
+                        if !crate::pathutil::is_safe_relative_path(blob_path) {
+                            continue;
+                        }
+                        if let Err(e) = std::fs::remove_file(cp.share_root.join(blob_path)) {
+                            tracing::warn!("could not unlink share blob {}: {}", blob_path, e);
+                        }
+                    }
+
                     let sync_files =
                         crate::syncstore::cleanup_inactive(&cp.sync_store, 365).unwrap_or(0);
-                    (sessions, tokens, devices, orphan_links, telemetry_purged, profiles_purged, sync, sync_files)
+                    (sessions, tokens, devices, orphan_links, telemetry_purged, profiles_purged, sync, sync_files, shares_purged)
                 })
                 .await;
                 match result {
-                    Ok((_sessions, tokens, devices, orphan_links, telemetry_purged, profiles_purged, sync, sync_files)) => {
-                        if tokens + devices + orphan_links + telemetry_purged + profiles_purged + sync + sync_files > 0 {
+                    Ok((_sessions, tokens, devices, orphan_links, telemetry_purged, profiles_purged, sync, sync_files, shares_purged)) => {
+                        if tokens + devices + orphan_links + telemetry_purged + profiles_purged + sync + sync_files + shares_purged > 0 {
                             tracing::info!(
                                 "Periodic cleanup: {} expired tokens, {} stale devices, {} orphaned device links, \
                                  {} old telemetry rows, {} stale device profiles, {} inactive sync items, \
-                                 {} inactive sync user dirs",
-                                tokens, devices, orphan_links, telemetry_purged, profiles_purged, sync, sync_files
+                                 {} inactive sync user dirs, {} expired share links",
+                                tokens, devices, orphan_links, telemetry_purged, profiles_purged, sync, sync_files, shares_purged
                             );
                         }
                     }
