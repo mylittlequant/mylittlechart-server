@@ -9,16 +9,29 @@
 use std::path::{Path, PathBuf};
 
 /// Returns true only if `s` is a safe single path component: non-empty,
-/// at most 64 chars, and containing only ASCII alphanumeric characters,
-/// dots, hyphens, and underscores.
+/// at most 64 chars, not starting with `.` (refuses every dotfile and
+/// dot-directory — `.env`, `.git`, `.hidden`, `.well-known`, including the
+/// exact components `.` and `..`), and containing only ASCII alphanumeric
+/// characters, dots, hyphens, and underscores elsewhere in the component.
 /// Rejects any form of path traversal characters (`/`, `\`, `%`, etc.).
-/// Callers handling multi-segment paths must additionally reject the exact
-/// components `.` and `..` — see `is_safe_relative_path`.
+/// The one dotfile this server serves at all (`.well-known/security.txt`) is
+/// matched by [`is_well_known_security_txt`] instead, on a fixed route that
+/// never goes through this general-purpose check.
 pub fn is_safe_path_component(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
+        && !s.starts_with('.')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
+/// True only for the one dot-prefixed path this server ever serves:
+/// `.well-known/security.txt` (RFC 9116). Every other dotfile — `.hidden`,
+/// `.well-known/other`, `.env`, etc. — stays refused by
+/// [`is_safe_relative_path`]'s general rule. Callers that need the exception
+/// must check this explicitly rather than loosen the general rule.
+pub fn is_well_known_security_txt(path: &str) -> bool {
+    path == ".well-known/security.txt"
 }
 
 /// Returns true only if `path` is a safe relative path: at most 256 chars,
@@ -101,8 +114,28 @@ mod tests {
         assert!(is_safe_relative_path("robots.txt"));
         assert!(is_safe_relative_path("docs/agent-api"));
         assert!(is_safe_relative_path("docs/agent-api.html"));
-        assert!(is_safe_relative_path(".well-known/assetlinks.json"));
         assert!(is_safe_relative_path("assets/app_v2-final.min.css"));
+    }
+
+    #[test]
+    fn rejects_dot_prefixed_segments_except_the_security_txt_allowlist() {
+        // The general-purpose check refuses every dot-prefixed segment,
+        // `.well-known/security.txt` included — that path is served through
+        // `is_well_known_security_txt`'s dedicated allowlist, never through
+        // this function.
+        assert!(!is_safe_relative_path(".hidden"));
+        assert!(!is_safe_relative_path(".env"));
+        assert!(!is_safe_relative_path(".well-known/other"));
+        assert!(!is_safe_relative_path(".well-known/security.txt"));
+        assert!(!is_safe_relative_path("assets/.hidden"));
+
+        // The allowlist accepts exactly one path and nothing else under
+        // `.well-known/`, nor any other dotfile.
+        assert!(is_well_known_security_txt(".well-known/security.txt"));
+        assert!(!is_well_known_security_txt(".hidden"));
+        assert!(!is_well_known_security_txt(".well-known/other"));
+        assert!(!is_well_known_security_txt("well-known/security.txt"));
+        assert!(!is_well_known_security_txt(".well-known/security.txt/extra"));
     }
 
     #[test]

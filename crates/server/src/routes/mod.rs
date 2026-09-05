@@ -23,6 +23,7 @@ pub mod entitlements;
 pub mod heartbeat;
 pub mod link;
 pub mod oauth;
+pub mod posts;
 pub mod proxy;
 pub mod sessions;
 pub mod share;
@@ -41,6 +42,11 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/admin/restart", post(admin::restart))
         .route("/admin/promote", post(admin::promote))
         .route("/admin/gift-codes", post(admin::mint_gift_codes))
+        .route("/admin/posts", post(posts::admin_upsert_post))
+        .route("/admin/posts/{id}", delete(posts::admin_delete_post))
+        // In-app blog: patch notes and posts (see routes/posts.rs). Public.
+        .route("/posts", get(posts::list_posts))
+        .route("/posts/{id}", get(posts::get_post))
         // Standard routes (axum default 2MB is fine).
         .route("/proxy/entitlement", get(proxy::entitlement))
         // General entitlements probe — superset of /proxy/entitlement, answers
@@ -158,10 +164,12 @@ mod tests {
     /// The full control route table must register without a conflict panic.
     /// This is what proves `/share/mine` (static) coexists with
     /// `/share/{token}` (parameter) and that the GET+DELETE pair on
-    /// `/share/{token}` merges — axum/matchit panics at registration time on
-    /// a genuinely conflicting pair, so building the router once is the whole
-    /// test. `control_plane` is `None`: registration never calls a handler,
-    /// so no database is needed.
+    /// `/share/{token}` merges, and — since the 2026-09-05 in-app blog —
+    /// that `/posts/{id}` and `/admin/posts/{id}` (parameter) coexist with
+    /// the static `/posts` and `/admin/posts` — axum/matchit panics at
+    /// registration time on a genuinely conflicting pair, so building the
+    /// router once is the whole test. `control_plane` is `None`:
+    /// registration never calls a handler, so no database is needed.
     #[test]
     fn control_router_registers_without_route_conflicts() {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -184,5 +192,28 @@ mod tests {
             0,
         ));
         let _router = control_api_router(state);
+    }
+
+    /// `main.rs` merges the blog router (`/blog/posts.json`, `/blog/feed.xml`,
+    /// `/blog/`, `/blog/{id}`) into the top-level app router alongside the
+    /// clean-URL fallback `/{dir}/{page}` — the first literal-prefixed
+    /// multi-segment route this codebase has registered next to that fully
+    /// wildcard pattern. matchit resolves this by segment specificity
+    /// (literal `blog` beats a captured `{dir}`) rather than treating it as
+    /// a conflicting pair, but that is exactly the kind of shape that panics
+    /// at router-build time if wrong — this proves it does not, without
+    /// pulling in `main.rs`'s full boot sequence.
+    #[test]
+    fn literal_prefixed_route_coexists_with_the_double_wildcard_fallback() {
+        async fn stub() -> &'static str {
+            "ok"
+        }
+        let _router: Router = Router::new()
+            .route("/blog/posts.json", get(stub))
+            .route("/blog/feed.xml", get(stub))
+            .route("/blog/", get(stub))
+            .route("/blog/{id}", get(stub))
+            .route("/{page}", get(stub))
+            .route("/{dir}/{page}", get(stub));
     }
 }

@@ -67,6 +67,22 @@ mod syncstore;
 
 use state::AppState;
 
+/// `GET /` → 301 to the app root on the public domain.
+///
+/// The edges proxy the legacy `/home` path to this backend's `/`, which used
+/// to render a marketing landing page (deleted per the 2026-09-05
+/// web-surface-cleanup plan). Redirecting `/` here kills `/home` without
+/// touching the edges' nginx config — nginx is provisioned by hand over ssh
+/// and there is no delivery script for it (see the static-file fallback
+/// further down, which still serves everything else).
+async fn redirect_to_app_root() -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(301)
+        .header("location", "https://mylittlechart.org/")
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
 /// Middleware that injects security headers into every response on the main router.
 async fn security_headers(
     req: axum::extract::Request,
@@ -556,6 +572,44 @@ async fn main() {
         }
     };
 
+    // The one dot-prefixed path this server ever serves:
+    // `.well-known/security.txt` (RFC 9116). The static handler's
+    // `pathutil::is_safe_path_component` refuses every dot-prefixed segment
+    // on principle (see pathutil.rs) — this is a fixed route matched by its
+    // own literal string, not a loosened general rule.
+    let well_known_security_txt = {
+        let dir = static_dir.clone();
+        move || {
+            let dir = dir.clone();
+            async move {
+                const REL: &str = ".well-known/security.txt";
+                // `REL` is a compile-time literal — this check can only ever
+                // pass — kept so the route shares the exact allowlist
+                // spelling the pathutil test exercises, not a second copy of
+                // the string.
+                if !pathutil::is_well_known_security_txt(REL) {
+                    return axum::response::Response::builder()
+                        .status(404)
+                        .header("content-type", "text/plain")
+                        .body(axum::body::Body::from("Not Found"))
+                        .unwrap();
+                }
+                match tokio::fs::read(std::path::Path::new(&dir).join(REL)).await {
+                    Ok(body) => axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/plain; charset=utf-8")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                    Err(_) => axum::response::Response::builder()
+                        .status(404)
+                        .header("content-type", "text/plain")
+                        .body(axum::body::Body::from("Not Found"))
+                        .unwrap(),
+                }
+            }
+        }
+    };
+
     // Dashboard router — localhost only, no auth, control role only: it reads
     // the database directly (routes/dashboard.rs) and an edge process has
     // none. Not binding the listener at all (further down) beats a runtime
@@ -565,6 +619,20 @@ async fn main() {
     let dash_app = (role == state::ServerRole::Control).then(|| {
         axum::Router::new()
             .route("/", axum::routing::get(routes::dashboard::render))
+            .with_state(app_state.clone())
+    });
+
+    // In-app blog: patch notes and posts (see routes/posts.rs) — the
+    // compatibility JSON, the Atom feed, and the server-rendered HTML
+    // mirror. Control role only, same reasoning as `dash_app` above: every
+    // one of these reads `state.control_plane()` directly, which an edge
+    // process does not have.
+    let blog_app = (role == state::ServerRole::Control).then(|| {
+        axum::Router::new()
+            .route("/blog/posts.json", axum::routing::get(routes::posts::compat_posts_json))
+            .route("/blog/feed.xml", axum::routing::get(routes::posts::feed_xml))
+            .route("/blog/", axum::routing::get(routes::posts::blog_index))
+            .route("/blog/{id}", axum::routing::get(routes::posts::blog_single))
             .with_state(app_state.clone())
     });
 
@@ -579,12 +647,30 @@ async fn main() {
         // Kept on every role: it carries no data and is the one thing an
         // edge box must answer for d-watchdog to supervise it at all.
         .route("/health", axum::routing::get(|| async { "ok" }))
+        // Root redirect (see redirect_to_app_root's doc comment) — ahead of
+        // the static fallback so the deleted landing page's index.html, if
+        // it is ever restored on disk by mistake, still cannot answer here.
+        .route("/", axum::routing::get(redirect_to_app_root))
+        .route(
+            "/.well-known/security.txt",
+            axum::routing::get(well_known_security_txt),
+        )
         .nest("/api", api_router)
         // Clean URLs + file serving for subpages (before static fallback)
         .route("/{page}", axum::routing::get(handler_single))
         .route("/{dir}/{page}", axum::routing::get(handler_nested))
         // Static files at root (fallback for index.html, assets, etc.).
-        .fallback_service(static_files)
+        .fallback_service(static_files);
+    // Literal routes (`/blog/posts.json`, `/blog/feed.xml`, `/blog/`) always
+    // win over the `/{dir}/{page}` parameter route and the static fallback
+    // above regardless of merge order — matchit prioritises a static path
+    // segment over a dynamic one — so this merge can happen anywhere ahead
+    // of `.layer(...)` below.
+    let app = match blog_app {
+        Some(blog_app) => app.merge(blog_app),
+        None => app,
+    };
+    let app = app
         .layer(cors)
         .layer(axum::middleware::from_fn(security_headers));
 

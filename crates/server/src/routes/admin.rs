@@ -17,7 +17,10 @@ use crate::pathutil::is_safe_path_component;
 use crate::state::AppState;
 
 /// Verify ADMIN_SECRET from Authorization header. Returns error response if invalid.
-fn verify_admin_secret(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+///
+/// `pub(crate)`: reused by `routes::posts`'s admin endpoints so the bearer
+/// check has exactly one implementation, not a copy per module.
+pub(crate) fn verify_admin_secret(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     if state.admin_secret.is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,

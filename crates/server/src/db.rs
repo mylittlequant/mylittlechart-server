@@ -227,6 +227,31 @@ pub fn init_db(path: &str) -> Result<Connection> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_share_links_user ON share_links(user_id, kind, revoked);
+
+        -- In-app blog (2026-09-05 web-surface-cleanup plan): patch notes and
+        -- posts pushed one at a time by the operator (`POST /api/admin/posts`,
+        -- see routes/posts.rs), replacing the static `web/blog/posts.json`
+        -- that used to be redeployed whole for every entry. `kind` is
+        -- 'patch' or 'post'; `visibility` is 'public' or 'paid' (paid rows
+        -- exist for a future gated forum/post tier — every reader in this
+        -- wave filters to 'public' only, see db::list_posts / db::get_post).
+        -- `body` is plain text, paragraphs separated by a blank line — no
+        -- markdown, same convention the client-side renderers already use.
+        CREATE TABLE IF NOT EXISTS posts (
+            id          TEXT    PRIMARY KEY,
+            kind        TEXT    NOT NULL,
+            version     TEXT,
+            date        TEXT    NOT NULL,
+            title       TEXT    NOT NULL,
+            summary     TEXT    NOT NULL DEFAULT '',
+            body        TEXT    NOT NULL DEFAULT '',
+            url         TEXT    NOT NULL,
+            visibility  TEXT    NOT NULL DEFAULT 'public',
+            created_at  TEXT    NOT NULL,
+            updated_at  TEXT    NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_posts_date ON posts(date DESC, id DESC);
     "#)?;
 
     // Safe migration: add signature column to releases if not present. `releases`
@@ -3859,6 +3884,216 @@ pub fn cleanup_stale_devices(conn: &Connection, stale_days: i64) -> rusqlite::Re
     )
 }
 
+// ============================================================================
+// Posts (in-app blog, 2026-09-05 web-surface-cleanup plan)
+//
+// One post is pushed at a time by an operator script through
+// `POST /api/admin/posts` (see routes/posts.rs) — this replaces the static
+// `web/blog/posts.json` file that used to be redeployed whole for every
+// patch note. Public reads (`GET /api/posts`, the compatibility
+// `GET /blog/posts.json`, and the server-rendered `/blog/*` mirror) only ever
+// see `visibility = 'public'` rows; `'paid'` exists for a future gated
+// forum/post tier and is not read by anything in this wave.
+// ============================================================================
+
+/// One row of the `posts` table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Post {
+    pub id: String,
+    pub kind: String,
+    pub version: Option<String>,
+    pub date: String,
+    pub title: String,
+    pub summary: String,
+    pub body: String,
+    pub url: String,
+    pub visibility: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Read one query row into a [`Post`]. Column order must match the SELECT
+/// lists below.
+fn post_from_row(row: &rusqlite::Row<'_>) -> Result<Post> {
+    Ok(Post {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        version: row.get(2)?,
+        date: row.get(3)?,
+        title: row.get(4)?,
+        summary: row.get(5)?,
+        body: row.get(6)?,
+        url: row.get(7)?,
+        visibility: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+const POST_SELECT_COLUMNS: &str =
+    "id, kind, version, date, title, summary, body, url, visibility, created_at, updated_at";
+
+/// Slug rule for a post `id`: `[a-z0-9][a-z0-9-]{1,80}` — an ASCII lowercase
+/// letter or digit, followed by 1 to 80 further ASCII lowercase
+/// letters/digits/hyphens (2 to 81 characters total). This is also the id's
+/// filesystem- and URL-safety guarantee: it is never percent-decoded or
+/// path-joined, but every reader downstream (routes/posts.rs's HTML mirror,
+/// the Atom feed) assumes this shape rather than re-checking it.
+pub fn is_valid_post_id(id: &str) -> bool {
+    let len = id.chars().count();
+    if !(2..=81).contains(&len) {
+        return false;
+    }
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// `YYYY-MM-DD`, and a real calendar date — not just the right shape (a
+/// syntactically valid but nonexistent date like `2026-02-30` is rejected by
+/// `NaiveDate::parse_from_str` itself). The length check keeps out
+/// non-4-digit years chrono would otherwise still parse.
+pub fn is_valid_post_date(date: &str) -> bool {
+    date.len() == 10 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
+}
+
+/// Why an [`upsert_post`] call was refused before ever touching the database.
+#[derive(Debug)]
+pub enum PostError {
+    /// Fails [`is_valid_post_id`].
+    InvalidId,
+    /// Not exactly `"patch"` or `"post"`.
+    InvalidKind,
+    /// Fails [`is_valid_post_date`].
+    InvalidDate,
+    /// Not exactly `"public"` or `"paid"`.
+    InvalidVisibility,
+    /// The database call itself failed.
+    Db(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for PostError {
+    fn from(e: rusqlite::Error) -> Self {
+        PostError::Db(e)
+    }
+}
+
+/// Insert or update one post by `id`. Validates `id`/`kind`/`date`/
+/// `visibility` before touching the database — `title`/`summary`/`body`/`url`
+/// carry no format constraint beyond what the column types already enforce.
+///
+/// `created_at` is stamped once, at first insert, and never moves; `now` is
+/// written to `updated_at` on every call, insert or update alike — same
+/// convention as [`upsert_device_profile`].
+///
+/// Returns `Ok(true)` if this call created the row, `Ok(false)` if it updated
+/// an existing one.
+pub fn upsert_post(conn: &Connection, post: &Post, now: &str) -> std::result::Result<bool, PostError> {
+    if !is_valid_post_id(&post.id) {
+        return Err(PostError::InvalidId);
+    }
+    if post.kind != "patch" && post.kind != "post" {
+        return Err(PostError::InvalidKind);
+    }
+    if !is_valid_post_date(&post.date) {
+        return Err(PostError::InvalidDate);
+    }
+    if post.visibility != "public" && post.visibility != "paid" {
+        return Err(PostError::InvalidVisibility);
+    }
+
+    let existed: bool = conn
+        .query_row("SELECT 1 FROM posts WHERE id = ?1", params![post.id], |_| Ok(()))
+        .optional()?
+        .is_some();
+
+    conn.execute(
+        "INSERT INTO posts (id, kind, version, date, title, summary, body, url, visibility, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+         ON CONFLICT(id) DO UPDATE SET
+             kind = ?2, version = ?3, date = ?4, title = ?5, summary = ?6,
+             body = ?7, url = ?8, visibility = ?9, updated_at = ?10",
+        params![
+            post.id, post.kind, post.version, post.date, post.title,
+            post.summary, post.body, post.url, post.visibility, now,
+        ],
+    )?;
+
+    Ok(!existed)
+}
+
+/// Fetch one post by `id`. `include_non_public` is `false` for every reader
+/// in this wave (`GET /api/posts/{id}`, the compatibility and HTML routes) —
+/// it exists so a future authenticated/paid reader does not need a second,
+/// near-identical query function.
+pub fn get_post(conn: &Connection, id: &str, include_non_public: bool) -> Result<Option<Post>> {
+    if include_non_public {
+        conn.query_row(
+            &format!("SELECT {} FROM posts WHERE id = ?1", POST_SELECT_COLUMNS),
+            params![id],
+            post_from_row,
+        )
+        .optional()
+    } else {
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM posts WHERE id = ?1 AND visibility = 'public'",
+                POST_SELECT_COLUMNS
+            ),
+            params![id],
+            post_from_row,
+        )
+        .optional()
+    }
+}
+
+/// List public posts, newest first by `(date, id)`, optionally filtered to
+/// one `kind` and paginated with a `(date, id)` keyset cursor: `before`
+/// returns only rows strictly older than that cursor in the `(date DESC, id
+/// DESC)` ordering, so a page boundary that lands mid-day never skips or
+/// repeats a same-day post.
+pub fn list_posts(
+    conn: &Connection,
+    kind: Option<&str>,
+    limit: i64,
+    before: Option<(&str, &str)>,
+) -> Result<Vec<Post>> {
+    let mut sql = format!("SELECT {} FROM posts WHERE visibility = 'public'", POST_SELECT_COLUMNS);
+    let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::new();
+
+    if let Some(k) = kind.as_ref() {
+        sql.push_str(" AND kind = ?");
+        bound.push(k as &dyn rusqlite::ToSql);
+    }
+    if let Some((date, id)) = before.as_ref() {
+        sql.push_str(" AND (date < ? OR (date = ? AND id < ?))");
+        bound.push(date as &dyn rusqlite::ToSql);
+        bound.push(date as &dyn rusqlite::ToSql);
+        bound.push(id as &dyn rusqlite::ToSql);
+    }
+    sql.push_str(" ORDER BY date DESC, id DESC LIMIT ?");
+    bound.push(&limit as &dyn rusqlite::ToSql);
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(bound.as_slice())?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(post_from_row(row)?);
+    }
+    Ok(out)
+}
+
+/// Delete one post by `id`. Returns `true` if a row was deleted, `false` if
+/// no post had that id.
+pub fn delete_post(conn: &Connection, id: &str) -> Result<bool> {
+    let n = conn.execute("DELETE FROM posts WHERE id = ?1", params![id])?;
+    Ok(n > 0)
+}
 
 #[cfg(test)]
 mod tests {
@@ -4279,6 +4514,180 @@ mod tests {
 
         // No such user — empty string, not an error.
         assert_eq!(super::effective_label_for_user(&conn, 99999).expect("label"), "");
+    }
+
+    // ------------------------------------------------------------------
+    // Posts
+    // ------------------------------------------------------------------
+
+    /// Standalone `posts` table — no foreign keys, so this does not need
+    /// `share_test_conn`'s users/share_links schema, just `init_test_conn`'s
+    /// bare in-memory connection.
+    fn posts_test_conn() -> Connection {
+        let conn = super::init_test_conn();
+        conn.execute_batch(
+            "
+            CREATE TABLE posts (
+                id          TEXT    PRIMARY KEY,
+                kind        TEXT    NOT NULL,
+                version     TEXT,
+                date        TEXT    NOT NULL,
+                title       TEXT    NOT NULL,
+                summary     TEXT    NOT NULL DEFAULT '',
+                body        TEXT    NOT NULL DEFAULT '',
+                url         TEXT    NOT NULL,
+                visibility  TEXT    NOT NULL DEFAULT 'public',
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL
+            );
+            CREATE INDEX idx_posts_date ON posts(date DESC, id DESC);
+            ",
+        )
+        .expect("posts test schema");
+        conn
+    }
+
+    fn sample_post(id: &str, kind: &str, date: &str, visibility: &str) -> super::Post {
+        super::Post {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            version: Some("0.5.594".to_string()),
+            date: date.to_string(),
+            title: format!("Title {}", id),
+            summary: "summary".to_string(),
+            body: "para one\n\npara two".to_string(),
+            url: format!("/blog/{}", id),
+            visibility: visibility.to_string(),
+            created_at: "2026-01-01T00:00:00+00:00".to_string(),
+            updated_at: "2026-01-01T00:00:00+00:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn post_id_and_date_validation() {
+        assert!(super::is_valid_post_id("v0-5-594"));
+        assert!(super::is_valid_post_id("ab"));
+        assert!(!super::is_valid_post_id("a")); // too short (needs >= 2 chars)
+        assert!(!super::is_valid_post_id("-abc")); // must not start with '-'
+        assert!(!super::is_valid_post_id("Abc")); // no uppercase
+        assert!(!super::is_valid_post_id("abc_def")); // no underscore
+        assert!(!super::is_valid_post_id(&"a".repeat(82))); // too long
+
+        assert!(super::is_valid_post_date("2026-09-05"));
+        assert!(!super::is_valid_post_date("2026-02-30")); // not a real day
+        assert!(!super::is_valid_post_date("2026/09/05")); // wrong separator
+        assert!(!super::is_valid_post_date("26-09-05")); // wrong year width
+        assert!(!super::is_valid_post_date("2026-09-5")); // wrong day width
+    }
+
+    #[test]
+    fn upsert_post_reports_created_then_updated_and_preserves_created_at() {
+        let conn = posts_test_conn();
+        let post = sample_post("v1", "patch", "2026-09-01", "public");
+
+        assert!(super::upsert_post(&conn, &post, "2026-09-01T00:00:00+00:00").expect("insert"));
+
+        let mut updated = post.clone();
+        updated.title = "New title".to_string();
+        assert!(!super::upsert_post(&conn, &updated, "2026-09-02T00:00:00+00:00").expect("update"));
+
+        let row = super::get_post(&conn, "v1", false).expect("get").expect("row");
+        assert_eq!(row.title, "New title");
+        // created_at is stamped from the first call's `now` and never moves
+        // again; updated_at follows every call's `now` (the `Post` struct's
+        // own created_at/updated_at fields are write-only convenience and
+        // are not what lands in the row — `now` is the single source).
+        assert_eq!(row.created_at, "2026-09-01T00:00:00+00:00");
+        assert_eq!(row.updated_at, "2026-09-02T00:00:00+00:00");
+    }
+
+    #[test]
+    fn upsert_post_rejects_invalid_fields() {
+        let conn = posts_test_conn();
+        let now = "2026-09-01T00:00:00+00:00";
+
+        let bad_id = sample_post("Bad Id!", "patch", "2026-09-01", "public");
+        assert!(matches!(super::upsert_post(&conn, &bad_id, now), Err(super::PostError::InvalidId)));
+
+        let bad_kind = sample_post("v1", "news", "2026-09-01", "public");
+        assert!(matches!(super::upsert_post(&conn, &bad_kind, now), Err(super::PostError::InvalidKind)));
+
+        let bad_date = sample_post("v1", "patch", "not-a-date", "public");
+        assert!(matches!(super::upsert_post(&conn, &bad_date, now), Err(super::PostError::InvalidDate)));
+
+        let bad_visibility = sample_post("v1", "patch", "2026-09-01", "secret");
+        assert!(matches!(
+            super::upsert_post(&conn, &bad_visibility, now),
+            Err(super::PostError::InvalidVisibility)
+        ));
+
+        // None of the rejected calls left a row behind.
+        assert!(super::get_post(&conn, "v1", true).expect("get").is_none());
+    }
+
+    #[test]
+    fn get_post_hides_paid_rows_unless_asked() {
+        let conn = posts_test_conn();
+        let now = "2026-09-01T00:00:00+00:00";
+        super::upsert_post(&conn, &sample_post("paid-1", "post", "2026-09-01", "paid"), now)
+            .expect("insert");
+
+        assert!(super::get_post(&conn, "paid-1", false).expect("get").is_none());
+        assert!(super::get_post(&conn, "paid-1", true).expect("get").is_some());
+    }
+
+    #[test]
+    fn list_posts_orders_newest_first_and_filters_kind_and_visibility() {
+        let conn = posts_test_conn();
+        let now = "2026-09-01T00:00:00+00:00";
+        super::upsert_post(&conn, &sample_post("older", "patch", "2026-09-01", "public"), now)
+            .expect("insert");
+        super::upsert_post(&conn, &sample_post("newer-post", "post", "2026-09-03", "public"), now)
+            .expect("insert");
+        super::upsert_post(&conn, &sample_post("newer-patch", "patch", "2026-09-03", "public"), now)
+            .expect("insert");
+        super::upsert_post(&conn, &sample_post("hidden-paid", "post", "2026-09-04", "paid"), now)
+            .expect("insert");
+
+        // Default: every public post, newest first; same-day rows tie-break
+        // on id DESC ("newer-post" > "newer-patch" lexicographically).
+        let all = super::list_posts(&conn, None, 50, None).expect("list");
+        let ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["newer-post", "newer-patch", "older"]);
+
+        // kind filter.
+        let patches = super::list_posts(&conn, Some("patch"), 50, None).expect("list");
+        let patch_ids: Vec<&str> = patches.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(patch_ids, vec!["newer-patch", "older"]);
+    }
+
+    #[test]
+    fn list_posts_before_cursor_paginates_without_gap_or_repeat() {
+        let conn = posts_test_conn();
+        let now = "2026-09-01T00:00:00+00:00";
+        super::upsert_post(&conn, &sample_post("p1", "post", "2026-09-01", "public"), now).expect("insert");
+        super::upsert_post(&conn, &sample_post("p2", "post", "2026-09-02", "public"), now).expect("insert");
+        super::upsert_post(&conn, &sample_post("p3", "post", "2026-09-03", "public"), now).expect("insert");
+
+        let page1 = super::list_posts(&conn, None, 2, None).expect("list");
+        let page1_ids: Vec<&str> = page1.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(page1_ids, vec!["p3", "p2"]);
+
+        let cursor = page1.last().expect("last of page1");
+        let page2 = super::list_posts(&conn, None, 2, Some((&cursor.date, &cursor.id))).expect("list");
+        let page2_ids: Vec<&str> = page2.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(page2_ids, vec!["p1"]);
+    }
+
+    #[test]
+    fn delete_post_removes_row_and_reports_whether_one_existed() {
+        let conn = posts_test_conn();
+        let now = "2026-09-01T00:00:00+00:00";
+        super::upsert_post(&conn, &sample_post("v1", "patch", "2026-09-01", "public"), now).expect("insert");
+
+        assert!(super::delete_post(&conn, "v1").expect("delete"));
+        assert!(super::get_post(&conn, "v1", true).expect("get").is_none());
+        assert!(!super::delete_post(&conn, "v1").expect("delete again"));
     }
 }
 
