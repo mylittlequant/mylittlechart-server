@@ -312,6 +312,43 @@ pub fn share_ttl_secs(kind: ShareKind, is_paid: bool) -> u64 {
     }
 }
 
+// ============================================================================
+// Hot-plane sync quota rule
+// ============================================================================
+
+/// Paid accounts hold ten times the free hot-plane budget (operator ruling
+/// 2026-08-17, "paid x10 hot"). The hot plane is the file store — presets,
+/// templates, layouts — measured in bytes AND in preset/template counts, and
+/// all three scale together: a byte ceiling alone means nothing while the
+/// item counts stay put (a hundred presets fit in 8 MiB many times over).
+/// The cold identity plane (`db::SYNC_MAX_COLD_BYTES`) is deliberately NOT
+/// scaled — it holds three singletons whose size does not depend on tier.
+pub const PAID_HOT_MULTIPLIER: i64 = 10;
+
+fn tier_scaled(free: i64, is_paid: bool) -> i64 {
+    if is_paid {
+        free * PAID_HOT_MULTIPLIER
+    } else {
+        free
+    }
+}
+
+/// Hot-plane byte ceiling for one tier; the free figure is
+/// `db::SYNC_MAX_TOTAL_BYTES` and its derivation lives there.
+pub fn hot_bytes_limit(is_paid: bool) -> i64 {
+    tier_scaled(crate::db::SYNC_MAX_TOTAL_BYTES, is_paid)
+}
+
+/// Preset-count ceiling for one tier (`db::SYNC_MAX_PRESETS` for free).
+pub fn preset_limit(is_paid: bool) -> i64 {
+    tier_scaled(crate::db::SYNC_MAX_PRESETS, is_paid)
+}
+
+/// Template-count ceiling for one tier (`db::SYNC_MAX_TEMPLATES` for free).
+pub fn template_limit(is_paid: bool) -> i64 {
+    tier_scaled(crate::db::SYNC_MAX_TEMPLATES, is_paid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +473,14 @@ mod tests {
         for kind in [ShareKind::Live, ShareKind::Screenshot] {
             assert_eq!(ShareKind::from_wire_name(kind.as_str()), Some(kind));
         }
+    }
+    #[test]
+    fn hot_limits_are_free_figures_for_free_and_ten_times_for_paid() {
+        assert_eq!(hot_bytes_limit(false), crate::db::SYNC_MAX_TOTAL_BYTES);
+        assert_eq!(preset_limit(false), crate::db::SYNC_MAX_PRESETS);
+        assert_eq!(template_limit(false), crate::db::SYNC_MAX_TEMPLATES);
+        assert_eq!(hot_bytes_limit(true), crate::db::SYNC_MAX_TOTAL_BYTES * 10);
+        assert_eq!(preset_limit(true), crate::db::SYNC_MAX_PRESETS * 10);
+        assert_eq!(template_limit(true), crate::db::SYNC_MAX_TEMPLATES * 10);
     }
 }

@@ -204,22 +204,24 @@ pub async fn sync_status_handler(
     let device_id = extract_device_id_or_default(&headers);
     let profile_id = extract_profile_id_or_default(&headers);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<((i64, Option<i64>, i64), bool)> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::syncstore::status(&conn, &state.control_plane().sync_store, user_id, &device_id, &profile_id)
+        let status = crate::syncstore::status(&conn, &state.control_plane().sync_store, user_id, &device_id, &profile_id)?;
+        let is_paid = crate::db::user_is_paid(&conn, user_id)?;
+        Ok((status, is_paid))
     })
     .await;
 
     match result {
-        Ok(Ok((item_count, last_modified, quota_used_bytes))) => Json(serde_json::json!({
+        Ok(Ok(((item_count, last_modified, quota_used_bytes), is_paid))) => Json(serde_json::json!({
             "has_cloud_data": item_count > 0,
             "item_count": item_count,
             "last_modified": last_modified,
             "quota_used_bytes": quota_used_bytes,
-            // Read from the module that enforces it. This file used to
-            // carry its own copy of the number, which is how a limit gets
-            // changed in one place and reported from another.
-            "quota_limit_bytes": crate::db::SYNC_MAX_TOTAL_BYTES,
+            // Read from the module that decides it, for THIS account's tier.
+            // This file used to carry its own copy of the number, which is
+            // how a limit gets changed in one place and reported from another.
+            "quota_limit_bytes": crate::entitlements::hot_bytes_limit(is_paid),
         }))
         .into_response(),
         Ok(Err(e)) => {
@@ -502,7 +504,10 @@ pub async fn sync_push(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::syncstore::push(&conn, &state.control_plane().sync_store, user_id, &device_id, &profile_id, &db_items)
+        // Tier decides the hot-plane ceilings (x10 for paid) — resolved here,
+        // under the same lock, and passed in as a fact (entitlements doctrine).
+        let is_paid = crate::db::user_is_paid(&conn, user_id)?;
+        crate::syncstore::push(&conn, &state.control_plane().sync_store, user_id, &device_id, &profile_id, &db_items, is_paid)
     })
     .await;
 

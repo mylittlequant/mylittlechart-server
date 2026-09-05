@@ -32,8 +32,7 @@ use rusqlite::{Connection, Error as SqlError};
 
 use crate::db::{
     ProfileSyncInfo, SyncItem, SyncItemMeta, SyncPushItem, SyncPushResult, VALID_SYNC_CATEGORIES,
-    max_item_bytes, SYNC_MAX_COLD_BYTES, SYNC_MAX_PRESETS, SYNC_MAX_TEMPLATES,
-    SYNC_MAX_TOTAL_BYTES,
+    max_item_bytes, SYNC_MAX_COLD_BYTES,
 };
 
 /// Categories routed to the hot file store. Everything chart-persistence:
@@ -346,6 +345,11 @@ impl FileItem {
 /// Push with per-category routing. Hot items go to files, cold items to the
 /// existing SQL upsert. Validation and quota mirror `db::sync_push_items`,
 /// with quota counted across BOTH stores.
+///
+/// `is_paid` is the caller's already-resolved tier (`db::user_is_paid`): the
+/// hot-plane ceilings — bytes, presets, templates — come from
+/// `entitlements::{hot_bytes_limit, preset_limit, template_limit}` and are
+/// ten times larger for a paid account. The cold plane is tier-blind.
 pub fn push(
     conn: &Connection,
     store: &SyncStore,
@@ -353,6 +357,7 @@ pub fn push(
     device_id: &str,
     profile_id: &str,
     items: &[SyncPushItem],
+    is_paid: bool,
 ) -> rusqlite::Result<SyncPushResult> {
     if items.is_empty() {
         return Ok(SyncPushResult {
@@ -364,7 +369,8 @@ pub fn push(
     // Item count is one budget across both stores. Bytes are not: the two
     // planes hold different things and are worth different amounts of trust.
     // The hot file store carries the bulk (presets, templates, layouts) and
-    // holds `SYNC_MAX_TOTAL_BYTES`. The cold plane is three keys inside the
+    // holds `entitlements::hot_bytes_limit` (`SYNC_MAX_TOTAL_BYTES`, x10 for
+    // paid). The cold plane is three keys inside the
     // backed-up identity database, and measuring it against a bulk ceiling is
     // how a 2 KiB working set ended up licensed to grow to 50 MiB of
     // backup — see `db::SYNC_MAX_COLD_BYTES`.
@@ -395,12 +401,13 @@ pub fn push(
     }
 
     // Only presets and templates legitimately grow, so only they are counted.
+    let preset_limit = crate::entitlements::preset_limit(is_paid);
     let adding_presets = items.iter().filter(|i| i.category == "preset" && !i.deleted).count() as i64;
-    if adding_presets > 0 && usage.presets >= SYNC_MAX_PRESETS {
+    if adding_presets > 0 && usage.presets >= preset_limit {
         return Err(SqlError::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
             Some(format!(
-                "User {user_id} has reached the preset limit ({SYNC_MAX_PRESETS} across all devices and profiles)"
+                "User {user_id} has reached the preset limit ({preset_limit} across all devices and profiles)"
             )),
         ));
     }
@@ -408,11 +415,12 @@ pub fn push(
         .iter()
         .filter(|i| i.category.starts_with("template") && !i.deleted)
         .count() as i64;
-    if adding_templates > 0 && usage.templates >= SYNC_MAX_TEMPLATES {
+    let template_limit = crate::entitlements::template_limit(is_paid);
+    if adding_templates > 0 && usage.templates >= template_limit {
         return Err(SqlError::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
             Some(format!(
-                "User {user_id} has reached the template limit ({SYNC_MAX_TEMPLATES} across all devices and profiles)"
+                "User {user_id} has reached the template limit ({template_limit} across all devices and profiles)"
             )),
         ));
     }
@@ -429,12 +437,13 @@ pub fn push(
             )),
         ));
     }
-    if batch_has_hot && hot_bytes >= SYNC_MAX_TOTAL_BYTES {
+    let hot_limit = crate::entitlements::hot_bytes_limit(is_paid);
+    if batch_has_hot && hot_bytes >= hot_limit {
         return Err(SqlError::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
             Some(format!(
                 "User {user_id} has reached the sync storage limit ({} MiB across all devices and profiles)",
-                SYNC_MAX_TOTAL_BYTES / (1024 * 1024)
+                hot_limit / (1024 * 1024)
             )),
         ));
     }
@@ -971,7 +980,7 @@ mod tests {
         let conn = crate::db::init_test_conn();
 
         // Hot item lands as a file, not in SQL.
-        let r = push(&conn, &s, 1, "dev", "prof", &[item("p1", "preset", 100)]).unwrap();
+        let r = push(&conn, &s, 1, "dev", "prof", &[item("p1", "preset", 100)], false).unwrap();
         assert_eq!(r.accepted, 1);
         let p = s.item_path(1, "dev", "prof", "preset", "p1").unwrap();
         assert!(p.is_file());
@@ -981,13 +990,13 @@ mod tests {
         assert_eq!(n, 0);
 
         // Older modified_at does not overwrite (LWW).
-        let r = push(&conn, &s, 1, "dev", "prof", &[item("p1", "preset", 50)]).unwrap();
+        let r = push(&conn, &s, 1, "dev", "prof", &[item("p1", "preset", 50)], false).unwrap();
         assert_eq!(r.accepted, 0);
         let cur = SyncStore::read_file(&p).unwrap();
         assert_eq!(cur.modified_at, 100);
 
         // Newer wins.
-        let r = push(&conn, &s, 1, "dev", "prof", &[item("p1", "preset", 200)]).unwrap();
+        let r = push(&conn, &s, 1, "dev", "prof", &[item("p1", "preset", 200)], false).unwrap();
         assert_eq!(r.accepted, 1);
         let cur = SyncStore::read_file(&p).unwrap();
         assert_eq!(cur.modified_at, 200);
@@ -999,7 +1008,7 @@ mod tests {
         let s = store(&dir);
         let conn = crate::db::init_test_conn();
 
-        let r = push(&conn, &s, 1, "dev", "prof", &[item("v1", "vault", 100)]).unwrap();
+        let r = push(&conn, &s, 1, "dev", "prof", &[item("v1", "vault", 100)], false).unwrap();
         assert_eq!(r.accepted, 1);
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM sync_items", [], |r| r.get(0))
@@ -1014,8 +1023,8 @@ mod tests {
         let s = store(&dir);
         let conn = crate::db::init_test_conn();
 
-        push(&conn, &s, 1, "dev", "prof", &[item("p1", "preset", 100)]).unwrap();
-        push(&conn, &s, 1, "dev", "prof", &[item("v1", "vault", 100)]).unwrap();
+        push(&conn, &s, 1, "dev", "prof", &[item("p1", "preset", 100)], false).unwrap();
+        push(&conn, &s, 1, "dev", "prof", &[item("v1", "vault", 100)], false).unwrap();
 
         let all = pull_all(&conn, &s, 1, "dev", "prof").unwrap();
         assert_eq!(all.len(), 2);
@@ -1040,8 +1049,8 @@ mod tests {
         let s = store(&dir);
         let conn = crate::db::init_test_conn();
 
-        push(&conn, &s, 1, "devA", "prof", &[item("p1", "preset", 100)]).unwrap();
-        push(&conn, &s, 1, "devB", "prof", &[item("p1", "preset", 300)]).unwrap();
+        push(&conn, &s, 1, "devA", "prof", &[item("p1", "preset", 100)], false).unwrap();
+        push(&conn, &s, 1, "devB", "prof", &[item("p1", "preset", 300)], false).unwrap();
         let items = pull_by_profile(&conn, &s, 1, "prof").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].modified_at, 300);
@@ -1055,7 +1064,7 @@ mod tests {
 
         let mut meta = item("pm1", "profile_meta", 100);
         meta.content = br#"{"display_name":"Work"}"#.to_vec();
-        push(&conn, &s, 1, "dev", "prof", &[meta]).unwrap();
+        push(&conn, &s, 1, "dev", "prof", &[meta], false).unwrap();
 
         let profiles = list_profiles(&conn, &s, 1).unwrap();
         let p = profiles.iter().find(|p| p.profile_id == "prof").unwrap();
@@ -1070,9 +1079,9 @@ mod tests {
         let conn = crate::db::init_test_conn();
 
         // "hot-only": lives only as a file-store directory (preset category).
-        push(&conn, &s, 1, "dev", "hot-only", &[item("p1", "preset", 100)]).unwrap();
+        push(&conn, &s, 1, "dev", "hot-only", &[item("p1", "preset", 100)], false).unwrap();
         // "cold-only": lives only in sync_items (vault category).
-        push(&conn, &s, 1, "dev", "cold-only", &[item("v1", "vault", 100)]).unwrap();
+        push(&conn, &s, 1, "dev", "cold-only", &[item("v1", "vault", 100)], false).unwrap();
         // "both": present in both stores — must be counted once, not twice.
         // Cold half uses "salt", not a second "vault": vault/recovery_key/salt
         // are each an account-wide singleton (see SINGLETON_CATEGORIES), so
@@ -1080,8 +1089,8 @@ mod tests {
         // would collide on the singleton guard even though they are legally
         // distinct profiles here — a different singleton category has its own
         // independent slot and exercises the same cold+hot union/dedup path.
-        push(&conn, &s, 1, "dev", "both", &[item("p2", "preset", 100)]).unwrap();
-        push(&conn, &s, 1, "dev", "both", &[item("s1", "salt", 100)]).unwrap();
+        push(&conn, &s, 1, "dev", "both", &[item("p2", "preset", 100)], false).unwrap();
+        push(&conn, &s, 1, "dev", "both", &[item("s1", "salt", 100)], false).unwrap();
 
         let known = known_profile_ids(&conn, &s, 1).unwrap();
         assert_eq!(known.len(), 3);
@@ -1100,7 +1109,7 @@ mod tests {
         let s = store(&dir);
         let conn = crate::db::init_test_conn();
 
-        push(&conn, &s, 1, "dev", "real-profile", &[item("p1", "preset", 100)]).unwrap();
+        push(&conn, &s, 1, "dev", "real-profile", &[item("p1", "preset", 100)], false).unwrap();
         crate::db::sync_set_e2e_params(&conn, 1, "orphan-e2e-only", "0".repeat(32).as_str(), 600_000, None, "2026-01-01T00:00:00Z").unwrap();
 
         let known = known_profile_ids(&conn, &s, 1).unwrap();
@@ -1115,10 +1124,10 @@ mod tests {
         let s = store(&dir);
         let conn = crate::db::init_test_conn();
 
-        push(&conn, &s, 1, "devA", "prof1", &[item("p1", "preset", 100)]).unwrap();
-        push(&conn, &s, 1, "devB", "prof2", &[item("w1", "watchlist", 100)]).unwrap();
+        push(&conn, &s, 1, "devA", "prof1", &[item("p1", "preset", 100)], false).unwrap();
+        push(&conn, &s, 1, "devB", "prof2", &[item("w1", "watchlist", 100)], false).unwrap();
         // A second user's data must survive user 1's purge.
-        push(&conn, &s, 2, "devA", "prof1", &[item("p2", "preset", 100)]).unwrap();
+        push(&conn, &s, 2, "devA", "prof1", &[item("p2", "preset", 100)], false).unwrap();
 
         assert!(s.user_dir(1).is_dir());
         purge_user(&s, 1).unwrap();
@@ -1137,10 +1146,10 @@ mod tests {
         let conn = crate::db::init_test_conn();
 
         // User 1: stale — last write far in the past.
-        push(&conn, &s, 1, "dev", "prof", &[item("p1", "preset", 1_000)]).unwrap();
+        push(&conn, &s, 1, "dev", "prof", &[item("p1", "preset", 1_000)], false).unwrap();
         // User 2: active — last write "now".
         let now_ms = chrono::Utc::now().timestamp_millis();
-        push(&conn, &s, 2, "dev", "prof", &[item("p2", "preset", now_ms)]).unwrap();
+        push(&conn, &s, 2, "dev", "prof", &[item("p2", "preset", now_ms)], false).unwrap();
 
         let removed = cleanup_inactive(&s, 365).unwrap();
         assert_eq!(removed, 1);
@@ -1149,5 +1158,29 @@ mod tests {
 
         // Second pass is a no-op — nothing left to remove.
         assert_eq!(cleanup_inactive(&s, 365).unwrap(), 0);
+    }
+    #[test]
+    fn hot_ceilings_are_ten_times_larger_for_paid() {
+        let dir = TestDir::new();
+        let s = store(&dir);
+        let conn = crate::db::init_test_conn();
+        let free_limit = crate::entitlements::preset_limit(false);
+        // Fill the free preset budget exactly.
+        for i in 0..free_limit {
+            let id = format!("p{i}");
+            let r = push(&conn, &s, 1, "dev", "prof", &[item(&id, "preset", 100)], false).unwrap();
+            assert_eq!(r.accepted, 1, "preset {i} within the free budget");
+        }
+        // One more is refused for a free account...
+        let err = match push(&conn, &s, 1, "dev", "prof", &[item("overflow", "preset", 100)], false) {
+            Err(e) => e,
+            Ok(_) => panic!("free account past its preset ceiling was accepted"),
+        };
+        assert!(err.to_string().contains("preset limit"), "{err}");
+        // ...and accepted for a paid one: same account, same store, only the
+        // tier fact differs — the ceiling is ten times the free figure.
+        let r = push(&conn, &s, 1, "dev", "prof", &[item("overflow", "preset", 100)], true).unwrap();
+        assert_eq!(r.accepted, 1);
+        assert_eq!(crate::entitlements::preset_limit(true), free_limit * 10);
     }
 }
