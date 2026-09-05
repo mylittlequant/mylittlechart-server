@@ -292,6 +292,12 @@ pub struct MeResponse {
     /// Non-sequential public identifier — safe to expose in APIs.
     pub public_id: String,
     pub display_name: String,
+    /// Chosen account nick (see `db::set_nick`), `None` until the user picks
+    /// one — `effective_label` below is what a client should actually show.
+    pub nick: Option<String>,
+    /// The label to show for this account: `nick` if chosen, else
+    /// `display_name`, else `public_id` (see `db::effective_label_for_user`).
+    pub effective_label: String,
     /// Primary provider (kept for backwards compatibility).
     pub provider: String,
     /// All providers linked to this account.

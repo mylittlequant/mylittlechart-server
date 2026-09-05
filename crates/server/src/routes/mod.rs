@@ -104,6 +104,8 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/sync/pull-profile", get(sync::sync_pull_profile))
         // Gift/trial code redemption (cookie-session or bearer auth, same as sync).
         .route("/account/redeem", post(account::redeem))
+        // Account nick change (cookie-session or bearer auth, same as redeem).
+        .route("/account/nick", post(account::set_nick))
         // Chart share links. Creation/listing/revoke are authenticated; the
         // two GETs by token are public — the token is the capability (see
         // routes/share.rs). `/share/mine` is a static segment, which matchit

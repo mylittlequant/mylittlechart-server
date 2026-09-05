@@ -8,6 +8,10 @@
 //! codes this endpoint consumes. Authenticates the same way `/api/sync/*`
 //! does — `session_id` cookie or `Authorization: Bearer` — so a code can be
 //! redeemed from either the web dashboard or the desktop app.
+//!
+//! `POST /api/account/nick` — change the caller's account nick (operator
+//! ruling 2026-09-05). `db::set_nick` holds the validation, uniqueness, and
+//! cooldown logic; see its doc comment. Same authentication as `redeem`.
 
 use axum::{
     extract::State,
@@ -18,7 +22,7 @@ use axum::{
 use std::sync::Arc;
 
 use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_token};
-use crate::db::RedeemOutcome;
+use crate::db::{NickError, RedeemOutcome};
 use crate::models::types::ErrorResponse;
 use crate::state::AppState;
 
@@ -144,6 +148,122 @@ pub async fn redeem(
             .into_response(),
         Ok(Err(e)) => {
             tracing::error!("DB error in account_redeem: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+/// Request body for POST /api/account/nick.
+#[derive(serde::Deserialize)]
+pub struct SetNickRequest {
+    pub nick: String,
+}
+
+/// POST /api/account/nick
+///
+/// Changes the caller's account nick (operator ruling 2026-09-05): on
+/// creation the column stays NULL and the OAuth `display_name` is the
+/// displayed label (see `db::effective_label_for_user`'s fallback chain);
+/// the user may change it to a globally unique (case-insensitive) handle at
+/// most once every 30 days.
+///
+/// Format — 3-24 ASCII characters, letters/digits plus `_`, `-`, `.`,
+/// starting with a letter or digit — is checked here before the database is
+/// ever touched (`db::nick_format_valid`); `db::set_nick` re-checks the same
+/// rule as its own backstop, then enforces the reserved-name list,
+/// uniqueness, and the cooldown.
+///
+/// Response on success: `{ "nick": "...", "effective_label": "..." }`.
+/// `400` invalid format, `409` taken or reserved (distinguished in the
+/// `error` string), `429` rate-limited — that response also carries
+/// `nick_changed_at` and `next_allowed_at` (both RFC3339) alongside `error`.
+pub async fn set_nick(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SetNickRequest>,
+) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(StatusCode::UNAUTHORIZED) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new("Authentication required")),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Internal error")),
+            )
+                .into_response();
+        }
+    };
+
+    let nick = body.nick.trim().to_owned();
+    if !crate::db::nick_format_valid(&nick) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "Nick must be 3-24 characters: letters, digits, '_', '-', '.', starting with a letter or digit",
+            )),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(move || -> Result<(String, String), NickError> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::set_nick(&conn, user_id, &nick)?;
+        // Read back what was actually stored rather than trusting the local
+        // `nick` variable — same read-after-write shape as
+        // `db::redeem_gift_code` returning the computed `paid_until` instead
+        // of echoing the request.
+        let stored_nick = crate::db::nick_for_user(&conn, user_id)?.unwrap_or(nick);
+        let effective_label = crate::db::effective_label_for_user(&conn, user_id)?;
+        Ok((stored_nick, effective_label))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((nick, effective_label))) => {
+            tracing::info!("nick changed: user_id={} nick={}", user_id, nick);
+            Json(serde_json::json!({ "nick": nick, "effective_label": effective_label })).into_response()
+        }
+        Ok(Err(NickError::Invalid)) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("Invalid nick format")),
+        )
+            .into_response(),
+        Ok(Err(NickError::Reserved)) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new("This nick is reserved")),
+        )
+            .into_response(),
+        Ok(Err(NickError::Taken)) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new("This nick is already taken")),
+        )
+            .into_response(),
+        Ok(Err(NickError::RateLimited { changed_at, next_allowed_at })) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Nick can only be changed once every 30 days",
+                "nick_changed_at": changed_at,
+                "next_allowed_at": next_allowed_at,
+            })),
+        )
+            .into_response(),
+        Ok(Err(NickError::Db(e))) => {
+            tracing::error!("DB error in account_set_nick: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new("Database error")),

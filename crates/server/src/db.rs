@@ -323,6 +323,21 @@ pub fn init_db(path: &str) -> Result<Connection> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_public_id ON users(public_id);",
     )?;
 
+    // Safe migration: add the account nick to users (operator ruling
+    // 2026-09-05). NULL means "not chosen" — the displayed label falls back
+    // to display_name, then public_id (see db::effective_label_for_user);
+    // nick is never backfilled from display_name because OAuth display
+    // names are not guaranteed unique. Like paid_until and public_id above,
+    // an existing installation only ever gains these columns through the
+    // ALTERs below — CREATE TABLE users up top is never edited for them.
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN nick TEXT", []);
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN nick_changed_at TEXT", []);
+    // Case-insensitive uniqueness, only enforced once a nick is chosen — must
+    // run after the ALTERs above so the column exists on every installation.
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_nick_lower ON users(LOWER(nick)) WHERE nick IS NOT NULL;",
+    )?;
+
     // Safe migration: add profile_id column to sync_items (for multi-profile scoping).
     let _ = conn.execute("ALTER TABLE sync_items ADD COLUMN profile_id TEXT NOT NULL DEFAULT ''", []);
 
@@ -1095,6 +1110,171 @@ pub fn get_user_public_id(conn: &Connection, user_id: i64) -> Result<String> {
         params![user_id],
         |row| row.get(0),
     )
+}
+
+// ============================================================================
+// Account nicks (operator ruling 2026-09-05)
+//
+// A nick is an account attribute, not a separate identity: on creation the
+// column stays NULL and the account is labeled by its OAuth display_name
+// (see `effective_label_for_user`'s fallback chain). The user may CHANGE it
+// once every `NICK_CHANGE_COOLDOWN_DAYS` to a globally unique (case
+// insensitive) handle via `set_nick`. Never backfilled automatically —
+// OAuth display names collide across accounts, a chosen nick must not.
+// ============================================================================
+
+/// Handles reserved for the project itself — never assignable regardless of
+/// case, checked before the uniqueness lookup so they never need a row in
+/// `users` to be protected.
+const RESERVED_NICKS: &[&str] = &["zengeld", "kosti_x_itsok", "kosti_itsok"];
+
+/// Minimum time between two nick changes on the same account.
+const NICK_CHANGE_COOLDOWN_DAYS: i64 = 30;
+
+/// Format rules for a chosen nick: 3-24 ASCII characters, letters/digits plus
+/// `_`, `-`, `.`, and the first character must be a letter or digit (so a
+/// nick never opens with a separator). Case is preserved in storage —
+/// uniqueness is enforced separately, case-insensitively.
+pub fn nick_format_valid(nick: &str) -> bool {
+    let len = nick.chars().count();
+    if !(3..=24).contains(&len) {
+        return false;
+    }
+    let Some(first) = nick.chars().next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    nick.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Why a nick-change attempt was refused (or the DB call itself failed).
+#[derive(Debug)]
+pub enum NickError {
+    /// Fails [`nick_format_valid`]. `routes::account` validates the format
+    /// before ever calling `set_nick`, so this is a backstop for any other
+    /// caller, not the primary path.
+    Invalid,
+    /// One of [`RESERVED_NICKS`] (case-insensitive).
+    Reserved,
+    /// Already claimed by a different account (case-insensitive).
+    Taken,
+    /// Changed too recently — carries the RFC3339 instant of the last change
+    /// and the RFC3339 instant this account may try again.
+    RateLimited {
+        changed_at: String,
+        next_allowed_at: String,
+    },
+    /// The database call itself failed.
+    Db(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for NickError {
+    fn from(e: rusqlite::Error) -> Self {
+        NickError::Db(e)
+    }
+}
+
+/// Get the chosen nick for a user, if any. `None` both when the user has
+/// never chosen one and when the user row itself is gone.
+pub fn nick_for_user(conn: &Connection, user_id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT nick FROM users WHERE id = ?1",
+            params![user_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// The label to show for a user: chosen nick, then `display_name`, then
+/// `public_id` — same fallback order as [`share_owner_label`]. Empty string
+/// only when the user row itself is gone (an orphaned reference).
+pub fn effective_label_for_user(conn: &Connection, user_id: i64) -> Result<String> {
+    let row: Option<(Option<String>, String, Option<String>)> = conn
+        .query_row(
+            "SELECT nick, display_name, public_id FROM users WHERE id = ?1",
+            params![user_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(row
+        .map(|(nick, display_name, public_id)| {
+            nick.filter(|n| !n.is_empty())
+                .or_else(|| Some(display_name).filter(|d| !d.is_empty()))
+                .or(public_id)
+                .unwrap_or_default()
+        })
+        .unwrap_or_default())
+}
+
+/// Change `user_id`'s nick to `nick`, enforcing format, reserved names,
+/// global case-insensitive uniqueness, and the 30-day change cooldown.
+///
+/// Uniqueness is decided twice, deliberately: the `SELECT ... WHERE
+/// LOWER(nick) = ...` pre-check below gives the common case a clear
+/// [`NickError::Taken`] without ever reaching the database's own error path
+/// (same pattern as [`link_provider_to_user`]'s existing-owner check); the
+/// `idx_users_nick_lower` unique index is the actual guarantee under a race
+/// between two callers claiming the same nick at once — the loser's `UPDATE`
+/// hits the index and is mapped to `Taken` here too, rather than surfaced as
+/// a raw constraint error.
+pub fn set_nick(conn: &Connection, user_id: i64, nick: &str) -> Result<(), NickError> {
+    if !nick_format_valid(nick) {
+        return Err(NickError::Invalid);
+    }
+    let lower = nick.to_lowercase();
+    if RESERVED_NICKS.contains(&lower.as_str()) {
+        return Err(NickError::Reserved);
+    }
+
+    let now = chrono::Utc::now();
+    let changed_at: Option<String> = conn
+        .query_row(
+            "SELECT nick_changed_at FROM users WHERE id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(ref changed_at_str) = changed_at {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(changed_at_str) {
+            let next_allowed = dt.with_timezone(&chrono::Utc) + chrono::Duration::days(NICK_CHANGE_COOLDOWN_DAYS);
+            if next_allowed > now {
+                return Err(NickError::RateLimited {
+                    changed_at: changed_at_str.clone(),
+                    next_allowed_at: next_allowed.to_rfc3339(),
+                });
+            }
+        }
+    }
+
+    let taken_by_other: bool = conn
+        .query_row(
+            "SELECT 1 FROM users WHERE LOWER(nick) = ?1 AND id != ?2",
+            params![lower, user_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if taken_by_other {
+        return Err(NickError::Taken);
+    }
+
+    let result = conn.execute(
+        "UPDATE users SET nick = ?1, nick_changed_at = ?2 WHERE id = ?3",
+        params![nick, now.to_rfc3339(), user_id],
+    );
+    match result {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
+            Err(NickError::Taken)
+        }
+        Err(e) => Err(NickError::Db(e)),
+    }
 }
 
 /// Get all provider identities linked to a user.
@@ -1873,25 +2053,20 @@ pub fn cleanup_expired_share_links(conn: &Connection) -> Result<Vec<(String, Str
     Ok(expired)
 }
 
-/// The public owner label for a share: `display_name` with a `public_id`
-/// fallback. A dedicated public nick column lands in a later wave — until
-/// then this is the only name a share ever exposes. Returns `None` only when
-/// the user row itself is gone (a share outliving its account).
+/// The public owner label for a share: chosen nick, then `display_name`,
+/// then `public_id` — [`effective_label_for_user`]'s fallback chain, the one
+/// name a share ever exposes. Returns `None` only when the user row itself
+/// is gone (a share outliving its account); wraps rather than duplicates the
+/// chain so the two can never drift apart.
 pub fn share_owner_label(conn: &Connection, user_id: i64) -> Result<Option<String>> {
-    let row: Option<(String, Option<String>)> = conn
-        .query_row(
-            "SELECT display_name, public_id FROM users WHERE id = ?1",
-            params![user_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    Ok(row.map(|(display_name, public_id)| {
-        if !display_name.is_empty() {
-            display_name
-        } else {
-            public_id.unwrap_or_default()
-        }
-    }))
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM users WHERE id = ?1", params![user_id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(None);
+    }
+    Ok(Some(effective_label_for_user(conn, user_id)?))
 }
 
 // ============================================================================
@@ -3312,8 +3487,12 @@ pub fn list_sessions_for_user(
 
 /// Delete all identity-database data for a user and the user row itself.
 ///
-/// Cascade order: sync_e2e_params → sync_items → auth_tokens → device_users →
-/// user_providers → web_sessions → users.
+/// Cascade order: share_links → sync_e2e_params → sync_items → auth_tokens →
+/// device_users → user_providers → web_sessions → users. `share_links` must
+/// go first: its `user_id` is `REFERENCES users(id)` and production runs
+/// with `PRAGMA foreign_keys=ON` (see `init_db`) — leaving it out of the
+/// cascade, as this function used to, made the final `DELETE FROM users`
+/// itself fail for any account that had ever created a share.
 ///
 /// `device_metrics` is NOT in this cascade — it moved to the operational
 /// database in the 2026-08-30 store split, so it is a separate statement
@@ -3325,8 +3504,22 @@ pub fn list_sessions_for_user(
 /// cross-database or filesystem reach on its own; the caller is where the
 /// two-database nature of a full account deletion is meant to be visible.
 ///
-/// Returns the number of rows deleted from `users` (1 on success, 0 if user not found).
-pub fn delete_account(conn: &Connection, user_id: i64) -> Result<usize> {
+/// Returns `(rows deleted from users, screenshot blob paths to unlink)` — 1
+/// and the deleted account's screenshot-share blobs on success, `(0, _)` if
+/// the user was not found. Live shares (empty `blob_path`) are never
+/// included. Same reasoning as the sync files above: this function cannot
+/// reach the filesystem, so the caller unlinks each path under
+/// `ControlPlane::share_root` once the lock is dropped — the same pattern
+/// `cleanup_expired_share_links` uses for the periodic reaper.
+pub fn delete_account(conn: &Connection, user_id: i64) -> Result<(usize, Vec<String>)> {
+    let blob_paths: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT blob_path FROM share_links WHERE user_id = ?1 AND blob_path != ''",
+        )?;
+        let rows = stmt.query_map(params![user_id], |row| row.get::<_, String>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    conn.execute("DELETE FROM share_links WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM sync_e2e_params WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM sync_items WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM auth_tokens WHERE user_id = ?1", params![user_id])?;
@@ -3334,7 +3527,7 @@ pub fn delete_account(conn: &Connection, user_id: i64) -> Result<usize> {
     conn.execute("DELETE FROM user_providers WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM web_sessions WHERE user_id = ?1", params![user_id])?;
     let n = conn.execute("DELETE FROM users WHERE id = ?1", params![user_id])?;
-    Ok(n)
+    Ok((n, blob_paths))
 }
 
 /// Delete `device_metrics` rows for a user from the **operational** database
@@ -3699,11 +3892,18 @@ mod tests {
     }
 
     /// The users + share_links halves of the production schema, on top of the
-    /// sync tables `init_test_conn` already builds.
+    /// sync tables `init_test_conn` already builds — plus the four other
+    /// tables `db::delete_account`'s cascade touches (auth_tokens,
+    /// device_users, user_providers, web_sessions), so that cascade can be
+    /// tested end to end. `PRAGMA foreign_keys=ON` matches production
+    /// (`init_db`) so a wrong cascade order fails the test the same way it
+    /// would fail in production, instead of silently passing in-memory.
     fn share_test_conn() -> Connection {
         let conn = super::init_test_conn();
         conn.execute_batch(
             "
+            PRAGMA foreign_keys=ON;
+
             CREATE TABLE users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 provider TEXT NOT NULL,
@@ -3711,8 +3911,11 @@ mod tests {
                 display_name TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 public_id TEXT,
+                nick TEXT,
+                nick_changed_at TEXT,
                 UNIQUE(provider, provider_user_id)
             );
+            CREATE UNIQUE INDEX idx_users_nick_lower ON users(LOWER(nick)) WHERE nick IS NOT NULL;
 
             CREATE TABLE share_links (
                 token       TEXT    PRIMARY KEY,
@@ -3725,6 +3928,36 @@ mod tests {
                 created_at  TEXT    NOT NULL,
                 expires_at  TEXT    NOT NULL,
                 revoked     INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE auth_tokens (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE device_users (
+                device_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                linked_at TEXT NOT NULL,
+                PRIMARY KEY(device_id, user_id)
+            );
+
+            CREATE TABLE user_providers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                provider TEXT NOT NULL,
+                provider_user_id TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                linked_at TEXT NOT NULL,
+                UNIQUE(provider, provider_user_id)
+            );
+
+            CREATE TABLE web_sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
             );
             ",
         )
@@ -3869,6 +4102,183 @@ mod tests {
         );
         // No such user — None, never a fabricated name.
         assert!(super::share_owner_label(&conn, 99999).expect("label").is_none());
+    }
+
+    #[test]
+    fn delete_account_cascades_share_links_and_returns_blob_paths() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "gina", Some("pub-gina"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &future_ts())
+            .expect("create live");
+        let shot = super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &future_ts())
+            .expect("create screenshot");
+        let blob_path = format!("{}/{}.png", uid, shot);
+        super::set_share_blob_path(&conn, &shot, &blob_path).expect("stamp blob path");
+
+        assert_eq!(super::share_usage(&conn, uid).expect("usage before"), (1, 1));
+
+        let (deleted, blob_paths) = super::delete_account(&conn, uid).expect("delete account");
+        assert_eq!(deleted, 1);
+        assert_eq!(blob_paths, vec![blob_path]);
+        // The rows are gone, not just unreachable — foreign_keys=ON above
+        // means a leftover row referencing the deleted user would already
+        // have failed the `DELETE FROM users` statement.
+        assert_eq!(super::share_usage(&conn, uid).expect("usage after"), (0, 0));
+    }
+
+    // ------------------------------------------------------------------
+    // Account nicks (operator ruling 2026-09-05)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn nick_format_valid_boundaries() {
+        assert!(super::nick_format_valid("abc"));
+        assert!(super::nick_format_valid(&"a".repeat(24)));
+        assert!(!super::nick_format_valid("ab"));
+        assert!(!super::nick_format_valid(&"a".repeat(25)));
+        assert!(!super::nick_format_valid("-abc"));
+        assert!(!super::nick_format_valid("_abc"));
+        assert!(!super::nick_format_valid("abc def"));
+        assert!(!super::nick_format_valid("abc!"));
+        assert!(super::nick_format_valid("a1_b-c.d"));
+    }
+
+    #[test]
+    fn set_nick_happy_path() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+
+        super::set_nick(&conn, uid, "Al1ce").expect("set nick");
+
+        assert_eq!(
+            super::nick_for_user(&conn, uid).expect("nick").as_deref(),
+            Some("Al1ce")
+        );
+        assert_eq!(
+            super::effective_label_for_user(&conn, uid).expect("label"),
+            "Al1ce"
+        );
+    }
+
+    #[test]
+    fn set_nick_uniqueness_is_case_insensitive() {
+        let conn = share_test_conn();
+        let a = insert_share_user(&conn, "alice", Some("pub-alice"));
+        let b = insert_share_user(&conn, "bob", Some("pub-bob"));
+
+        super::set_nick(&conn, a, "Foo").expect("first claim");
+        match super::set_nick(&conn, b, "foo") {
+            Err(super::NickError::Taken) => {}
+            other => panic!("expected Taken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_nick_rejects_reserved_names_case_insensitively() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+
+        for reserved in ["ZenGeld", "Kosti_X_ItsOK", "KOSTI_ITSOK"] {
+            match super::set_nick(&conn, uid, reserved) {
+                Err(super::NickError::Reserved) => {}
+                other => panic!("expected Reserved for {reserved}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_nick_rejects_invalid_formats() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+
+        let too_long = "a".repeat(25);
+        for bad in ["ab", too_long.as_str(), "bad char!", "_leading"] {
+            match super::set_nick(&conn, uid, bad) {
+                Err(super::NickError::Invalid) => {}
+                other => panic!("expected Invalid for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_nick_rate_limits_second_change_within_30_days() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+
+        super::set_nick(&conn, uid, "first").expect("first change");
+        match super::set_nick(&conn, uid, "second") {
+            Err(super::NickError::RateLimited { .. }) => {}
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        // The rejected attempt must not have touched the stored nick.
+        assert_eq!(
+            super::nick_for_user(&conn, uid).expect("nick").as_deref(),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn set_nick_allows_change_after_cooldown_elapsed() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+
+        super::set_nick(&conn, uid, "first").expect("first change");
+        // Back-date nick_changed_at past the 30-day cooldown.
+        let past = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        conn.execute(
+            "UPDATE users SET nick_changed_at = ?1 WHERE id = ?2",
+            rusqlite::params![past, uid],
+        )
+        .expect("backdate nick_changed_at");
+
+        super::set_nick(&conn, uid, "second").expect("change after cooldown");
+        assert_eq!(
+            super::nick_for_user(&conn, uid).expect("nick").as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn share_owner_label_prefers_nick_over_display_name() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "erin", Some("pub-erin"));
+
+        super::set_nick(&conn, uid, "erin_nick").expect("set nick");
+
+        assert_eq!(
+            super::share_owner_label(&conn, uid).expect("label").as_deref(),
+            Some("erin_nick")
+        );
+    }
+
+    #[test]
+    fn effective_label_for_user_fallback_chain() {
+        let conn = share_test_conn();
+        let named = insert_share_user(&conn, "frank", Some("pub-frank"));
+        let anon = insert_share_user(&conn, "", Some("pub-anon2"));
+
+        // No nick yet — falls back to display_name.
+        assert_eq!(
+            super::effective_label_for_user(&conn, named).expect("label"),
+            "frank"
+        );
+        // No nick, empty display_name — falls back to public_id.
+        assert_eq!(
+            super::effective_label_for_user(&conn, anon).expect("label"),
+            "pub-anon2"
+        );
+
+        // Nick set — wins over display_name.
+        super::set_nick(&conn, named, "franknick").expect("set nick");
+        assert_eq!(
+            super::effective_label_for_user(&conn, named).expect("label"),
+            "franknick"
+        );
+
+        // No such user — empty string, not an error.
+        assert_eq!(super::effective_label_for_user(&conn, 99999).expect("label"), "");
     }
 }
 

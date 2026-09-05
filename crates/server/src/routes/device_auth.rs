@@ -429,13 +429,14 @@ pub async fn me(
         };
 
         let mut stmt = conn.prepare(
-            "SELECT display_name, provider, COALESCE(public_id, '') FROM users WHERE id = ?1 LIMIT 1",
+            "SELECT display_name, provider, COALESCE(public_id, ''), nick FROM users WHERE id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query(rusqlite::params![user_id])?;
         if let Some(row) = rows.next()? {
             let display_name: String = row.get(0)?;
             let primary_provider: String = row.get(1)?;
             let public_id: String = row.get(2)?;
+            let nick: Option<String> = row.get(3)?;
 
             // Fetch all linked providers.
             let linked = crate::db::get_providers_for_user(&conn, user_id)?;
@@ -444,10 +445,14 @@ pub async fn me(
                 .map(|(p, _pid, dn)| ProviderInfo { provider: p, display_name: dn })
                 .collect();
 
+            let effective_label = crate::db::effective_label_for_user(&conn, user_id)?;
+
             Ok(Some(MeResponse {
                 user_id,
                 public_id,
                 display_name,
+                nick,
+                effective_label,
                 provider: primary_provider,
                 providers,
             }))

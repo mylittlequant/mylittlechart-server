@@ -1074,8 +1074,14 @@ mod tests {
         // "cold-only": lives only in sync_items (vault category).
         push(&conn, &s, 1, "dev", "cold-only", &[item("v1", "vault", 100)]).unwrap();
         // "both": present in both stores — must be counted once, not twice.
+        // Cold half uses "salt", not a second "vault": vault/recovery_key/salt
+        // are each an account-wide singleton (see SINGLETON_CATEGORIES), so
+        // two vault pushes for the same user_id under different profile_ids
+        // would collide on the singleton guard even though they are legally
+        // distinct profiles here — a different singleton category has its own
+        // independent slot and exercises the same cold+hot union/dedup path.
         push(&conn, &s, 1, "dev", "both", &[item("p2", "preset", 100)]).unwrap();
-        push(&conn, &s, 1, "dev", "both", &[item("v2", "vault", 100)]).unwrap();
+        push(&conn, &s, 1, "dev", "both", &[item("s1", "salt", 100)]).unwrap();
 
         let known = known_profile_ids(&conn, &s, 1).unwrap();
         assert_eq!(known.len(), 3);

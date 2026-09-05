@@ -371,16 +371,19 @@ pub async fn delete_account(
             crate::db::delete_account(&conn, user_id)
         };
         // The account row lives in identity; its telemetry lives in the
-        // operational database (2026-08-30 store split) and its hot-plane
-        // sync files live on disk (SQLCipher never sees them — see
-        // syncstore.rs). All three are separate statements against separate
-        // stores, deliberately visible here rather than hidden inside one
-        // cascade function. Only run them when the account row actually
-        // deleted; log-and-continue rather than fail the whole request if a
-        // side store is already clean (idempotent by design — a retried
-        // delete, or a user who never wrote telemetry/hot items).
-        if let Ok(n) = outcome {
-            if n > 0 {
+        // operational database (2026-08-30 store split), its hot-plane sync
+        // files live on disk (SQLCipher never sees them — see
+        // syncstore.rs), and its screenshot-share blobs live under
+        // share_root (SQLCipher never sees those either — see
+        // routes/share.rs). All four are separate statements/filesystem
+        // calls against separate stores, deliberately visible here rather
+        // than hidden inside one cascade function. Only run them when the
+        // account row actually deleted; log-and-continue rather than fail
+        // the whole request if a side store is already clean (idempotent by
+        // design — a retried delete, or a user who never wrote
+        // telemetry/hot items/shares).
+        if let Ok((n, blob_paths)) = &outcome {
+            if *n > 0 {
                 let ops_conn = cp.ops_db.lock().unwrap_or_else(|e| e.into_inner());
                 if let Err(e) = crate::db::delete_account_telemetry(&ops_conn, user_id) {
                     tracing::error!("Failed to delete operational telemetry for user {}: {}", user_id, e);
@@ -389,9 +392,20 @@ pub async fn delete_account(
                 if let Err(e) = crate::syncstore::purge_user(&cp.sync_store, user_id) {
                     tracing::error!("Failed to purge sync files for user {}: {}", user_id, e);
                 }
+                // Screenshot blobs: same relative-path guard as the static
+                // handler and the periodic reaper (main.rs) — never trust a
+                // stored path to stay inside share_root without re-checking it.
+                for rel in blob_paths {
+                    if !crate::pathutil::is_safe_relative_path(rel) {
+                        continue;
+                    }
+                    if let Err(e) = std::fs::remove_file(cp.share_root.join(rel)) {
+                        tracing::warn!("could not unlink share blob {}: {}", rel, e);
+                    }
+                }
             }
         }
-        outcome
+        outcome.map(|(n, _)| n)
     })
     .await;
 
