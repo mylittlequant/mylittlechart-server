@@ -97,6 +97,13 @@ description = "Push cloud sync changes from client"
 auth = "bearer"
 public = false
 
+[[endpoints]]
+method = "POST"
+path = "/api/share/{token}/clone"
+description = "Clone a live chart share into the caller's own preset (rights v1). Requires the `clone` right on the token (owner, or the share was created with clone_allowed=true); indicators the caller has no vendor grant for are stripped and listed in the response. 403 without the right, 400 for a screenshot token, 404 for unknown/revoked/expired."
+auth = "bearer"
+public = false
+
 [[manage_actions]]
 id = "graceful_restart"
 label = "Graceful Restart"

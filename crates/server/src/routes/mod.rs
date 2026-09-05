@@ -129,6 +129,9 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/share/mine", get(share::list_my_shares))
         .route("/share/{token}", get(share::get_share).delete(share::delete_share))
         .route("/share/{token}/png", get(share::get_share_png))
+        // Clone-with-strip (rights v1): auth required, needs the `clone`
+        // right on the token (see routes/share.rs's module doc).
+        .route("/share/{token}/clone", post(share::clone_share))
         // Paid in-app forum (entitlements::Feature::Forum) — every route
         // authed AND paid, no public GET of any kind (see routes/forum.rs).
         .route(

@@ -228,6 +228,52 @@ pub fn init_db(path: &str) -> Result<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_share_links_user ON share_links(user_id, kind, revoked);
 
+        -- Chart/indicator/strategy rights v1 (docs/mlc/plans/native-share-
+        -- viewer-and-chart-rights-2026-09-06.md §2-3, docs/mlc/plans/
+        -- social-sharing-access-gates-and-agent-control-2026-09-05.md §2). A
+        -- grant that is NOT a share link: nick-to-nick or vendor-to-user,
+        -- keyed by object id rather than a bearer token. `grantee_user_id`
+        -- NULL means public. Nothing reads this table yet in v1 — a live
+        -- share's own `read`/`clone` come from `share_links.clone_allowed`
+        -- (see the ALTER below and `db::effective_rights`) — it exists now so
+        -- the shape never needs to change once non-link grants are wired in.
+        CREATE TABLE IF NOT EXISTS object_grants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            object_kind TEXT NOT NULL,   -- 'chart'|'indicator'|'strategy'|'template'
+            object_id TEXT NOT NULL,
+            owner_user_id INTEGER NOT NULL REFERENCES users(id),
+            grantee_user_id INTEGER REFERENCES users(id),  -- NULL = public
+            right TEXT NOT NULL,
+            expires_at TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        -- Minimal vendor model for strip-on-clone (plan §3, routes/share.rs
+        -- clone_share). A `type_id` present here is a user-published
+        -- indicator with an owner; a `type_id` absent is a built-in `mli`
+        -- script and is never stripped (see db::indicator_should_strip).
+        CREATE TABLE IF NOT EXISTS published_indicators (
+            type_id TEXT PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL REFERENCES users(id),
+            visibility TEXT NOT NULL DEFAULT 'private',
+            created_at TEXT NOT NULL
+        );
+
+        -- A vendor's grant of one published indicator to one recipient,
+        -- optionally TTL'd (`expires_at` NULL = no expiry). clone_share keeps
+        -- an indicator whose type_id has no `published_indicators` row, or
+        -- whose owner IS the recipient, or that has a live row here.
+        CREATE TABLE IF NOT EXISTS indicator_grants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type_id TEXT NOT NULL REFERENCES published_indicators(type_id),
+            grantee_user_id INTEGER NOT NULL REFERENCES users(id),
+            expires_at TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_indicator_grants_type_grantee
+            ON indicator_grants(type_id, grantee_user_id);
+
         -- In-app blog (2026-09-05 web-surface-cleanup plan): patch notes and
         -- posts pushed one at a time by the operator (`POST /api/admin/posts`,
         -- see routes/posts.rs), replacing the static `web/blog/posts.json`
@@ -349,6 +395,14 @@ pub fn init_db(path: &str) -> Result<Connection> {
     let _ = conn.execute("ALTER TABLE link_tokens ADD COLUMN auth_token TEXT NOT NULL DEFAULT ''", []);
     // Safe migration: add display_name column to sync_items.
     let _ = conn.execute("ALTER TABLE sync_items ADD COLUMN display_name TEXT NOT NULL DEFAULT ''", []);
+    // Safe migration: add clone_allowed column to share_links (rights v1, see
+    // docs/mlc/plans/native-share-viewer-and-chart-rights-2026-09-06.md §2).
+    // 0 = unchanged behaviour for every row created before this column
+    // existed; chosen explicitly at creation time from here on
+    // (CreateLiveShareRequest.clone_allowed, routes/share.rs). Like
+    // paid_until above, CREATE TABLE share_links up top is never edited for
+    // this column — only this ALTER adds it, on a live database.
+    let _ = conn.execute("ALTER TABLE share_links ADD COLUMN clone_allowed INTEGER NOT NULL DEFAULT 0", []);
     // One-time cleanup: remove device_users entries where device_id doesn't exist
     // in the devices table (old profile_id entries from pre-v0.2.11 bug).
     // `devices` lives in the operational database now (2026-08-30 store
@@ -1970,6 +2024,9 @@ pub struct ShareLinkRow {
     pub blob_bytes: i64,
     pub created_at: String,
     pub expires_at: String,
+    /// Rights v1 (see `effective_rights`): true when the owner opted this
+    /// link into the `clone` right at creation time.
+    pub clone_allowed: bool,
 }
 
 /// Read one query row into a [`ShareLinkRow`]. Column order must match the
@@ -1985,6 +2042,7 @@ fn share_link_from_row(row: &rusqlite::Row<'_>) -> Result<ShareLinkRow> {
         blob_bytes: row.get(6)?,
         created_at: row.get(7)?,
         expires_at: row.get(8)?,
+        clone_allowed: row.get::<_, i64>(9)? != 0,
     })
 }
 
@@ -2004,6 +2062,9 @@ fn generate_share_token() -> String {
 /// from the token… except the token only exists inside this function, so the
 /// caller passes an empty `blob_path` first and stamps the real one with
 /// [`set_share_blob_path`] once the token is known and the file is written.
+/// `clone_allowed` is the owner's rights-v1 choice at creation time (see
+/// `effective_rights`) — always `false` for a screenshot share today, since
+/// only a live share carries a preset to clone.
 ///
 /// Retries on the vanishingly unlikely PRIMARY KEY collision, same as
 /// [`mint_gift_codes`].
@@ -2016,13 +2077,14 @@ pub fn create_share_link(
     blob_bytes: i64,
     created_at: &str,
     expires_at: &str,
+    clone_allowed: bool,
 ) -> Result<String> {
     loop {
         let token = generate_share_token();
         let inserted = conn.execute(
-            "INSERT OR IGNORE INTO share_links (token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8)",
-            params![token, user_id, kind, title, preset_json, blob_bytes, created_at, expires_at],
+            "INSERT OR IGNORE INTO share_links (token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9)",
+            params![token, user_id, kind, title, preset_json, blob_bytes, created_at, expires_at, clone_allowed as i64],
         )?;
         if inserted == 1 {
             return Ok(token);
@@ -2047,7 +2109,7 @@ pub fn set_share_blob_path(conn: &Connection, token: &str, blob_path: &str) -> R
 pub fn get_share_link(conn: &Connection, token: &str) -> Result<Option<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.query_row(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed
          FROM share_links
          WHERE token = ?1 AND revoked = 0 AND expires_at > ?2",
         params![token, now],
@@ -2079,7 +2141,7 @@ pub fn share_usage(conn: &Connection, user_id: i64) -> Result<(u64, u64)> {
 pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed
          FROM share_links
          WHERE user_id = ?1 AND revoked = 0 AND expires_at > ?2
          ORDER BY created_at DESC",
@@ -2141,6 +2203,80 @@ pub fn share_owner_label(conn: &Connection, user_id: i64) -> Result<Option<Strin
         return Ok(None);
     }
     Ok(Some(effective_label_for_user(conn, user_id)?))
+}
+
+// ============================================================================
+// Rights v1 (docs/mlc/plans/native-share-viewer-and-chart-rights-2026-09-06.md
+// §2-3, docs/mlc/plans/social-sharing-access-gates-and-agent-control-
+// 2026-09-05.md §2)
+// ============================================================================
+
+/// Effective rights `row` grants to `caller` (`None` = anonymous). `conn` is
+/// unused today — `object_grants` covers non-link grants and is not
+/// consulted for a share link's own rights — but stays part of the signature
+/// so a future non-link contribution (e.g. an `object_grants` row on the same
+/// chart) does not have to change every call site.
+///
+/// `read` always accompanies a fetched row (a revoked or expired one is never
+/// fetched at all — see `get_share_link`). `clone` is present when the owner
+/// opted the link in at creation (`row.clone_allowed`) or `caller` IS the
+/// owner. The owner additionally always gets `edit` — implicit, not stored:
+/// co-editing itself is out of scope for v1 (plan §4), but the right already
+/// being in the set means the rights list needs no revisit once it lands.
+pub fn effective_rights(_conn: &Connection, row: &ShareLinkRow, caller: Option<i64>) -> Vec<&'static str> {
+    let is_owner = caller == Some(row.user_id);
+    let mut rights = vec!["read"];
+    if row.clone_allowed || is_owner {
+        rights.push("clone");
+    }
+    if is_owner {
+        rights.push("edit");
+    }
+    rights
+}
+
+/// The `owner_user_id` of a published indicator `type_id`, or `None` if it is
+/// a built-in `mli` script — never published, never gated, never stripped
+/// (see `indicator_should_strip`). `visibility` is stored on the table (see
+/// its DDL) but not consulted by v1's strip decision (plan §3: ownership +
+/// grant only), so it is not projected here.
+pub fn published_indicator_owner(conn: &Connection, type_id: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT owner_user_id FROM published_indicators WHERE type_id = ?1",
+        params![type_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Does `recipient` hold a live (unexpired, `expires_at` NULL = no expiry)
+/// `indicator_grants` row for `type_id`?
+pub fn indicator_grant_is_live(conn: &Connection, type_id: &str, recipient: i64) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM indicator_grants
+             WHERE type_id = ?1 AND grantee_user_id = ?2 AND (expires_at IS NULL OR expires_at > ?3)
+             LIMIT 1",
+            params![type_id, recipient, now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// Should `type_id` be stripped from a clone for `recipient` (plan §3)? A
+/// built-in indicator (no `published_indicators` row) is never stripped; a
+/// published one strips unless `recipient` is its owner or holds a live
+/// [`indicator_grant_is_live`] row.
+pub fn indicator_should_strip(conn: &Connection, type_id: &str, recipient: i64) -> Result<bool> {
+    let Some(owner_user_id) = published_indicator_owner(conn, type_id)? else {
+        return Ok(false);
+    };
+    if owner_user_id == recipient {
+        return Ok(false);
+    }
+    Ok(!indicator_grant_is_live(conn, type_id, recipient)?)
 }
 
 // ============================================================================
@@ -2352,16 +2488,20 @@ pub fn cleanup_tg_login_tokens(conn: &Connection) -> Result<usize> {
 // Agent key requests
 // ============================================================================
 
-/// A row from the `agent_key_requests` table.
+/// A row from the `agent_key_requests` table, as exposed to callers.
+///
+/// `user_id` and `claimed_key` (the raw key stored temporarily between
+/// confirm and claim) live on the table but are deliberately NOT projected
+/// here: `routes::agent_keys::get_agent_key_info` must never echo the raw key
+/// back over this read path, and no caller needs `user_id` off this struct —
+/// `poll_agent_key_request` reads `claimed_key` with its own direct query
+/// instead, precisely so this struct can stay free of it.
 #[derive(Debug, Clone)]
 pub struct AgentKeyRequestRow {
     pub code: String,
     pub label: String,
     pub permissions: String,
-    pub user_id: Option<i64>,
     pub status: String,
-    /// The raw key stored temporarily between confirm and claim.
-    pub claimed_key: Option<String>,
     pub created_at: String,
     pub expires_at: String,
 }
@@ -2393,7 +2533,7 @@ pub fn create_agent_key_request(
 /// Get an agent key request by code. Returns `None` if not found.
 pub fn get_agent_key_request(conn: &Connection, code: &str) -> Result<Option<AgentKeyRequestRow>> {
     let mut stmt = conn.prepare(
-        "SELECT code, label, permissions, user_id, status, claimed_key, created_at, expires_at
+        "SELECT code, label, permissions, status, created_at, expires_at
          FROM agent_key_requests WHERE code = ?1",
     )?;
     let mut rows = stmt.query(params![code])?;
@@ -2402,11 +2542,9 @@ pub fn get_agent_key_request(conn: &Connection, code: &str) -> Result<Option<Age
             code: row.get(0)?,
             label: row.get(1)?,
             permissions: row.get(2)?,
-            user_id: row.get(3)?,
-            status: row.get(4)?,
-            claimed_key: row.get(5)?,
-            created_at: row.get(6)?,
-            expires_at: row.get(7)?,
+            status: row.get(3)?,
+            created_at: row.get(4)?,
+            expires_at: row.get(5)?,
         }))
     } else {
         Ok(None)
@@ -2527,15 +2665,6 @@ pub fn poll_agent_key_request(
         Some(s) => Ok(Some((s, None))),
         None => Ok(None),
     }
-}
-
-/// Mark an agent key request as 'claimed' explicitly (used after poll delivers the key).
-pub fn claim_agent_key_request(conn: &Connection, code: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE agent_key_requests SET status = 'claimed' WHERE code = ?1",
-        params![code],
-    )?;
-    Ok(())
 }
 
 /// Clear the raw key from `claimed_key` after it has been delivered to the agent.
@@ -2722,34 +2851,6 @@ pub fn list_key_hashes_for_sync(
     Ok(entries)
 }
 
-/// List active key hashes for a user (token_hash, permissions, label).
-/// Used by the terminal sync endpoint.
-pub fn list_user_keys(
-    conn: &Connection,
-    user_id: i64,
-) -> Result<Vec<(String, String, String, String, Option<String>, Option<String>)>> {
-    let mut stmt = conn.prepare(
-        "SELECT token_hash, label, permissions, initiated_by, last_used_at, last_ip
-         FROM auth_tokens
-         WHERE user_id = ?1
-           AND (expires_at IS NULL OR expires_at > datetime('now'))
-         ORDER BY created_at DESC",
-    )?;
-    let mut rows = stmt.query(params![user_id])?;
-    let mut keys = Vec::new();
-    while let Some(row) = rows.next()? {
-        keys.push((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-        ));
-    }
-    Ok(keys)
-}
-
 /// Revoke (delete) a key by hash prefix. The prefix must be at least 8 chars.
 ///
 /// Returns:
@@ -2794,34 +2895,6 @@ pub fn revoke_key(
         }
         _ => Ok(DeleteKeyOutcome::AmbiguousPrefix),
     }
-}
-
-/// Update the last_used_at and last_ip for a token hash.
-pub fn update_key_usage(
-    conn: &Connection,
-    token_hash: &str,
-    now: &str,
-    ip: &str,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE auth_tokens SET last_used_at = ?1, last_ip = ?2 WHERE token_hash = ?3",
-        params![now, ip, token_hash],
-    )?;
-    Ok(())
-}
-
-/// Batch-update last_used_at and last_ip for multiple token hashes in one lock acquisition.
-pub fn batch_update_usage(
-    conn: &Connection,
-    updates: &[(&str, &str, &str)],
-) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "UPDATE auth_tokens SET last_used_at = ?1, last_ip = ?2 WHERE token_hash = ?3",
-    )?;
-    for (token_hash, last_used_at, last_ip) in updates {
-        stmt.execute(params![last_used_at, last_ip, token_hash])?;
-    }
-    Ok(())
 }
 
 /// Update `last_used_at` and `last_ip` for multiple keys identified by hash prefix.
@@ -3252,32 +3325,6 @@ pub fn sync_pull_all(conn: &Connection, user_id: i64, device_id: &str, profile_i
         });
     }
     Ok(items)
-}
-
-/// Return one item by `sync_id`, scoped to `user_id`. Returns `None` if not found.
-pub fn sync_pull_item(conn: &Connection, user_id: i64, sync_id: &str) -> Result<Option<SyncItem>> {
-    let mut stmt = conn.prepare(
-        "SELECT sync_id, user_id, category, name, content, checksum, modified_at, deleted, created_at
-         FROM sync_items
-         WHERE sync_id = ?1 AND user_id = ?2
-         LIMIT 1",
-    )?;
-    let mut rows = stmt.query(params![sync_id, user_id])?;
-    if let Some(row) = rows.next()? {
-        Ok(Some(SyncItem {
-            sync_id: row.get(0)?,
-            user_id: row.get(1)?,
-            category: row.get(2)?,
-            name: row.get(3)?,
-            content: row.get(4)?,
-            checksum: row.get(5)?,
-            modified_at: row.get(6)?,
-            deleted: row.get::<_, i64>(7)? != 0,
-            created_at: row.get(8)?,
-        }))
-    } else {
-        Ok(None)
-    }
 }
 
 /// Soft-delete one item (tombstone). Clears content to reclaim space.
@@ -4530,7 +4577,8 @@ mod tests {
                 blob_bytes  INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT    NOT NULL,
                 expires_at  TEXT    NOT NULL,
-                revoked     INTEGER NOT NULL DEFAULT 0
+                revoked     INTEGER NOT NULL DEFAULT 0,
+                clone_allowed INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE auth_tokens (
@@ -4615,7 +4663,7 @@ mod tests {
         let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        let token = super::create_share_link(&conn, uid, "live", "t", "{}", 0, &now, &future_ts())
+        let token = super::create_share_link(&conn, uid, "live", "t", "{}", 0, &now, &future_ts(), false)
             .expect("create");
         assert_eq!(token.len(), 32);
 
@@ -4644,14 +4692,14 @@ mod tests {
 
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (0, 0));
 
-        super::create_share_link(&conn, uid, "live", "l1", "{}", 0, &now, &future_ts())
+        super::create_share_link(&conn, uid, "live", "l1", "{}", 0, &now, &future_ts(), false)
             .expect("create");
-        let shot = super::create_share_link(&conn, uid, "screenshot", "s1", "", 42, &now, &future_ts())
+        let shot = super::create_share_link(&conn, uid, "screenshot", "s1", "", 42, &now, &future_ts(), false)
             .expect("create");
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (1, 1));
 
         // Expired and revoked rows stop counting.
-        super::create_share_link(&conn, uid, "live", "l2", "{}", 0, &now, &past_ts())
+        super::create_share_link(&conn, uid, "live", "l2", "{}", 0, &now, &past_ts(), false)
             .expect("create");
         super::revoke_share(&conn, uid, &shot).expect("revoke");
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (1, 0));
@@ -4664,17 +4712,17 @@ mod tests {
 
         let older = super::create_share_link(
             &conn, uid, "live", "old", "{}", 0,
-            "2026-01-01T00:00:00+00:00", &future_ts(),
+            "2026-01-01T00:00:00+00:00", &future_ts(), false,
         )
         .expect("create");
         let newer = super::create_share_link(
             &conn, uid, "screenshot", "new", "", 1,
-            "2026-02-01T00:00:00+00:00", &future_ts(),
+            "2026-02-01T00:00:00+00:00", &future_ts(), false,
         )
         .expect("create");
         super::create_share_link(
             &conn, uid, "live", "dead", "{}", 0,
-            "2026-03-01T00:00:00+00:00", &past_ts(),
+            "2026-03-01T00:00:00+00:00", &past_ts(), false,
         )
         .expect("create");
 
@@ -4689,13 +4737,14 @@ mod tests {
         let uid = insert_share_user(&conn, "dave", Some("pub-dave"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        let live_expired = super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &past_ts())
+        let live_expired = super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &past_ts(), false)
             .expect("create");
-        let shot_expired = super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &past_ts())
-            .expect("create");
+        let shot_expired =
+            super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &past_ts(), false)
+                .expect("create");
         super::set_share_blob_path(&conn, &shot_expired, &format!("{}/{}.png", uid, shot_expired))
             .expect("stamp blob path");
-        let alive = super::create_share_link(&conn, uid, "live", "ok", "{}", 0, &now, &future_ts())
+        let alive = super::create_share_link(&conn, uid, "live", "ok", "{}", 0, &now, &future_ts(), false)
             .expect("create");
 
         let removed = super::cleanup_expired_share_links(&conn).expect("cleanup");
@@ -4736,9 +4785,9 @@ mod tests {
         let uid = insert_share_user(&conn, "gina", Some("pub-gina"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &future_ts())
+        super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &future_ts(), false)
             .expect("create live");
-        let shot = super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &future_ts())
+        let shot = super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &future_ts(), false)
             .expect("create screenshot");
         let blob_path = format!("{}/{}.png", uid, shot);
         super::set_share_blob_path(&conn, &shot, &blob_path).expect("stamp blob path");

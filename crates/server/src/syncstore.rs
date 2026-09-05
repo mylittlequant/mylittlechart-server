@@ -54,10 +54,6 @@ pub const HOT_CATEGORIES: &[&str] = &[
     "profile_meta",
 ];
 
-/// Categories that stay in SQLCipher: identity/vault plane, written once in
-/// a lifetime, benefit from transactional consistency with the account.
-pub const COLD_CATEGORIES: &[&str] = &["vault", "recovery_key", "salt"];
-
 /// Categories of which an account holds exactly ONE, by their own shape.
 ///
 /// Each of these is "the whole file" on the client: `watchlist` is all of
