@@ -18,10 +18,11 @@
 //! `db::user_is_paid` and pass the fact in.
 //!
 //! Default posture: with `MLC_FREE_FEATURES` unset, every feature is free
-//! for every caller (anonymous and authenticated alike). That is what makes
-//! shipping this module inert on a production deployment with no new env
-//! var set — flipping a paywall later means removing one name from that
-//! list, nothing more.
+//! for every caller (anonymous and authenticated alike) EXCEPT
+//! [`Feature::Forum`], which is never free — see that variant's doc comment.
+//! That is what makes shipping this module inert on a production deployment
+//! with no new env var set — flipping a paywall later means removing one
+//! name from that list, nothing more.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -49,18 +50,36 @@ pub enum Feature {
     /// Use of `/archive-proxy` beyond the free must-proxy catalog. See
     /// `routes/proxy.rs`.
     ArchiveProxy,
+    /// The paid-only in-app forum — threads and replies between accounts,
+    /// authors shown by [`crate::db::effective_label_for_user`] (see
+    /// `routes/forum.rs` and the "Forum" section in `db.rs`).
+    ///
+    /// Unlike every other feature, this one is NEVER granted by
+    /// [`free_features`] — not even in the unset-env default that grants
+    /// everything else. Owner ruling 2026-09-05
+    /// (`docs/mlc/plans/users-paid-features-scope-2026-09-05.md` §4): the
+    /// forum is a communication surface between accounts, closed to paid
+    /// accounts (paid = trusted alpha testers) from day one, and must never
+    /// open "by accident" through an env var. See [`free_features`]'s
+    /// unconditional strip of this variant.
+    Forum,
 }
 
 impl Feature {
     /// Every feature that exists. Used as the default free set (see
-    /// [`free_features`]) so an unconfigured deployment grants everything.
-    const ALL: [Feature; 2] = [Feature::MultiProfile, Feature::ArchiveProxy];
+    /// [`free_features`]) so an unconfigured deployment grants everything
+    /// EXCEPT [`Feature::Forum`], which [`free_features`] strips back out
+    /// regardless of this default.
+    const ALL: [Feature; 3] = [Feature::MultiProfile, Feature::ArchiveProxy, Feature::Forum];
 
-    /// Stable wire name — also the spelling accepted in `MLC_FREE_FEATURES`.
+    /// Stable wire name — also the spelling accepted in `MLC_FREE_FEATURES`
+    /// (though `MLC_FREE_FEATURES=forum` is parsed and then discarded — see
+    /// [`free_features`]).
     fn as_str(self) -> &'static str {
         match self {
             Feature::MultiProfile => "multi_profile",
             Feature::ArchiveProxy => "archive_proxy",
+            Feature::Forum => "forum",
         }
     }
 
@@ -68,6 +87,7 @@ impl Feature {
         match s {
             "multi_profile" => Some(Feature::MultiProfile),
             "archive_proxy" => Some(Feature::ArchiveProxy),
+            "forum" => Some(Feature::Forum),
             _ => None,
         }
     }
@@ -105,6 +125,13 @@ impl FeatureSet {
         self.0.insert(feature);
     }
 
+    /// Remove `feature` from this set, if present. Used by [`free_features`]
+    /// to strip [`Feature::Forum`] back out regardless of how the rest of
+    /// the set was built.
+    fn remove(&mut self, feature: Feature) {
+        self.0.remove(&feature);
+    }
+
     /// Merge `other`'s features into this set.
     fn extend_from(&mut self, other: &FeatureSet) {
         self.0.extend(other.0.iter().copied());
@@ -131,12 +158,27 @@ impl FeatureSet {
 const FREE_FEATURES_ENV: &str = "MLC_FREE_FEATURES";
 
 /// The features granted to every caller with no paid claim, read from
-/// [`FREE_FEATURES_ENV`]. Unset or empty defaults to [`FeatureSet::all`].
+/// [`FREE_FEATURES_ENV`]. Unset or empty defaults to [`FeatureSet::all`],
+/// minus [`Feature::Forum`] — see [`without_forum`].
 pub fn free_features() -> FeatureSet {
-    match std::env::var(FREE_FEATURES_ENV) {
+    let set = match std::env::var(FREE_FEATURES_ENV) {
         Ok(raw) => parse_free_features(&raw),
         Err(_) => FeatureSet::all(),
-    }
+    };
+    without_forum(set)
+}
+
+/// Strip [`Feature::Forum`] out of `set`, unconditionally.
+///
+/// Applied to EVERY branch of [`free_features`] — the unset-env default
+/// (which would otherwise be [`FeatureSet::all`], forum included) and an
+/// explicit `MLC_FREE_FEATURES` that happens to name `forum` alike. The
+/// forum is closed to paid accounts from day one (see [`Feature::Forum`]'s
+/// doc comment) and must never open through an env var, misconfigured or
+/// not — [`paid_features`] is the only path that ever grants it.
+fn without_forum(mut set: FeatureSet) -> FeatureSet {
+    set.remove(Feature::Forum);
+    set
 }
 
 /// Parse a comma-separated feature list. Unknown tokens are logged and
@@ -355,10 +397,39 @@ mod tests {
 
     #[test]
     fn feature_set_all_holds_every_variant() {
-        // `MLC_FREE_FEATURES` unset falls straight to `FeatureSet::all()`
-        // (see `free_features()`) — this is the default-inert posture.
+        // `FeatureSet::all()` feeds both `paid_features(true)` and the
+        // unset-env branch of `free_features()` (before `without_forum`
+        // strips `Forum` back out — see that function) — it must hold every
+        // variant that exists, `Forum` included.
         assert!(FeatureSet::all().contains(Feature::MultiProfile));
         assert!(FeatureSet::all().contains(Feature::ArchiveProxy));
+        assert!(FeatureSet::all().contains(Feature::Forum));
+    }
+
+    #[test]
+    fn without_forum_strips_it_even_when_explicitly_configured_free() {
+        // Parsing accepts the `forum` token like any other wire name…
+        let configured = parse_free_features("forum,multi_profile");
+        assert!(configured.contains(Feature::Forum));
+        // …but `free_features()` never keeps it, whichever branch produced
+        // the set (see `without_forum`'s doc comment).
+        assert!(!without_forum(configured).contains(Feature::Forum));
+    }
+
+    #[test]
+    fn forum_is_never_free_by_default() {
+        // No test in this module ever sets `MLC_FREE_FEATURES` — this
+        // exercises `free_features()`'s real unset-env default end to end.
+        assert!(!free_features().contains(Feature::Forum));
+    }
+
+    #[test]
+    fn forum_is_paid_only_in_resolve_for_user() {
+        // The pair `GET /api/entitlements` relies on: an unpaid/anonymous
+        // caller's resolved set never lists "forum"; a paid caller's always
+        // does.
+        assert!(!resolve_for_user(false).contains(Feature::Forum));
+        assert!(resolve_for_user(true).contains(Feature::Forum));
     }
 
     #[test]
@@ -370,7 +441,9 @@ mod tests {
 
     #[test]
     fn parse_free_features_ignores_unknown_tokens() {
-        let set = parse_free_features("multi_profile, bogus_feature ,,archive_proxy");
+        // All three real feature names recognised, `bogus_feature` and the
+        // empty token both silently skipped.
+        let set = parse_free_features("multi_profile, bogus_feature ,,archive_proxy,forum");
         assert_eq!(set, FeatureSet::all());
     }
 
@@ -394,6 +467,7 @@ mod tests {
         let paid = resolve_for_user(true);
         assert!(paid.contains(Feature::MultiProfile));
         assert!(paid.contains(Feature::ArchiveProxy));
+        assert!(paid.contains(Feature::Forum));
     }
 
     #[test]

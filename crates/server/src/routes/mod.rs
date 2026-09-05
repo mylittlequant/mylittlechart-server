@@ -20,6 +20,7 @@ pub mod agent_keys;
 pub mod dashboard;
 pub mod device_auth;
 pub mod entitlements;
+pub mod forum;
 pub mod heartbeat;
 pub mod link;
 pub mod oauth;
@@ -128,6 +129,19 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/share/mine", get(share::list_my_shares))
         .route("/share/{token}", get(share::get_share).delete(share::delete_share))
         .route("/share/{token}/png", get(share::get_share_png))
+        // Paid in-app forum (entitlements::Feature::Forum) — every route
+        // authed AND paid, no public GET of any kind (see routes/forum.rs).
+        .route(
+            "/forum/threads",
+            get(forum::list_threads).post(forum::create_thread),
+        )
+        .route(
+            "/forum/threads/{id}",
+            get(forum::get_thread).delete(forum::delete_thread),
+        )
+        .route("/forum/threads/{id}/replies", post(forum::create_reply))
+        .route("/forum/replies/{id}", delete(forum::delete_reply))
+        .route("/admin/forum/hide", post(forum::admin_hide))
         .with_state(state)
 }
 
@@ -168,8 +182,13 @@ mod tests {
     /// that `/posts/{id}` and `/admin/posts/{id}` (parameter) coexist with
     /// the static `/posts` and `/admin/posts` — axum/matchit panics at
     /// registration time on a genuinely conflicting pair, so building the
-    /// router once is the whole test. `control_plane` is `None`:
-    /// registration never calls a handler, so no database is needed.
+    /// router once is the whole test. Since the same day's paid forum: the
+    /// GET+DELETE pair on `/forum/threads/{id}` merges the same way
+    /// `/share/{token}` does, and `/forum/threads/{id}/replies` (two
+    /// parameter-then-literal segments) coexists with the single-parameter
+    /// `/forum/threads/{id}` and the separate `/forum/replies/{id}`.
+    /// `control_plane` is `None`: registration never calls a handler, so no
+    /// database is needed.
     #[test]
     fn control_router_registers_without_route_conflicts() {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);

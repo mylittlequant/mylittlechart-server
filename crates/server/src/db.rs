@@ -252,6 +252,55 @@ pub fn init_db(path: &str) -> Result<Connection> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_posts_date ON posts(date DESC, id DESC);
+
+        -- In-app forum (2026-09-05 users-paid-features scope doc §4): a
+        -- communication surface BETWEEN accounts (threads + replies, links to
+        -- shared charts), gated to paid accounts only via
+        -- entitlements::Feature::Forum — never free, never public (see
+        -- routes/forum.rs). `hidden` is moderation: a thread/reply the author
+        -- deleted themselves, or an admin hid — a hidden row is never
+        -- physically deleted, because a reply's thread must survive even
+        -- once every OTHER row referencing it (a reply, or the author's own
+        -- account) is gone. Authors display via `effective_label_for_user`
+        -- (nick -> display_name -> public_id), or "deleted user" once that
+        -- account itself is gone (see db::forum_author_label).
+        --
+        -- `author_user_id` is deliberately NOT `REFERENCES users(id)`, unlike
+        -- every other user-owned table in this file: forum content must
+        -- outlive the account that created it (see `delete_account`, which
+        -- hides — never deletes — a deleted account's forum rows so that
+        -- other users' replies keep their thread). `PRAGMA foreign_keys=ON`
+        -- (above) enforces a real REFERENCES clause immediately and
+        -- non-deferred, so a hard FK here would make `DELETE FROM users`
+        -- fail the moment that account had ever posted once. `thread_id` on
+        -- `forum_replies`, by contrast, DOES reference `forum_threads(id)`
+        -- safely: threads are likewise never deleted, only hidden.
+        CREATE TABLE IF NOT EXISTS forum_threads (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            author_user_id INTEGER NOT NULL,
+            title          TEXT    NOT NULL,
+            body           TEXT    NOT NULL,
+            created_at     TEXT    NOT NULL,
+            updated_at     TEXT    NOT NULL,
+            last_reply_at  TEXT,
+            reply_count    INTEGER NOT NULL DEFAULT 0,
+            hidden         INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_forum_threads_visible
+            ON forum_threads(hidden, last_reply_at DESC, id DESC);
+
+        CREATE TABLE IF NOT EXISTS forum_replies (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id      INTEGER NOT NULL REFERENCES forum_threads(id),
+            author_user_id INTEGER NOT NULL,
+            body           TEXT    NOT NULL,
+            created_at     TEXT    NOT NULL,
+            hidden         INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_forum_replies_thread
+            ON forum_replies(thread_id, hidden, id);
     "#)?;
 
     // Safe migration: add signature column to releases if not present. `releases`
@@ -3519,6 +3568,15 @@ pub fn list_sessions_for_user(
 /// cascade, as this function used to, made the final `DELETE FROM users`
 /// itself fail for any account that had ever created a share.
 ///
+/// Forum content (`forum_threads`/`forum_replies`) is NOT in this cascade at
+/// all: it is HIDDEN, not deleted, one statement per table before the rest
+/// of the cascade runs, and — unlike every table above — it carries no
+/// foreign key to `users` (see the CREATE TABLE comment in `init_db`), so it
+/// cannot block the final `DELETE FROM users` regardless of ordering. A
+/// thread the deleted account started keeps every other account's replies;
+/// `db::forum_author_label` reports "deleted user" for the gone account
+/// either way.
+///
 /// `device_metrics` is NOT in this cascade — it moved to the operational
 /// database in the 2026-08-30 store split, so it is a separate statement
 /// against a separate connection now: `delete_account_telemetry`, below. The
@@ -3545,6 +3603,17 @@ pub fn delete_account(conn: &Connection, user_id: i64) -> Result<(usize, Vec<Str
         rows.filter_map(|r| r.ok()).collect()
     };
     conn.execute("DELETE FROM share_links WHERE user_id = ?1", params![user_id])?;
+    // Forum rows are hidden, never deleted — see this function's doc
+    // comment. No foreign key exists from these tables to `users`, so this
+    // can run in any order relative to the `DELETE FROM users` below.
+    conn.execute(
+        "UPDATE forum_threads SET hidden = 1 WHERE author_user_id = ?1",
+        params![user_id],
+    )?;
+    conn.execute(
+        "UPDATE forum_replies SET hidden = 1 WHERE author_user_id = ?1",
+        params![user_id],
+    )?;
     conn.execute("DELETE FROM sync_e2e_params WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM sync_items WHERE user_id = ?1", params![user_id])?;
     conn.execute("DELETE FROM auth_tokens WHERE user_id = ?1", params![user_id])?;
@@ -4095,6 +4164,304 @@ pub fn delete_post(conn: &Connection, id: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+// ============================================================================
+// Forum (paid in-app communication, 2026-09-05 users-paid-features scope §4)
+//
+// A thread (`forum_threads`) carries a title + body and belongs to one
+// author; a reply (`forum_replies`) belongs to one thread and one author.
+// Both are gated at the route layer by `entitlements::Feature::Forum` (see
+// routes/forum.rs) — nothing in this section itself checks paid status.
+// `hidden` is moderation, applied by the author to their own row or by an
+// admin to any row (see `hide_thread`/`hide_reply`); a hidden row is filtered
+// out of every list/get here, never physically removed. See the CREATE
+// TABLE comment in `init_db` for why `author_user_id` carries no foreign key
+// to `users`.
+// ============================================================================
+
+/// One row of the `forum_threads` table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForumThread {
+    pub id: i64,
+    pub author_user_id: i64,
+    pub title: String,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_reply_at: Option<String>,
+    pub reply_count: i64,
+    pub hidden: bool,
+}
+
+/// One row of the `forum_replies` table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForumReply {
+    pub id: i64,
+    pub thread_id: i64,
+    pub author_user_id: i64,
+    pub body: String,
+    pub created_at: String,
+    pub hidden: bool,
+}
+
+/// Read one query row into a [`ForumThread`]. Column order must match the
+/// SELECT lists below.
+fn forum_thread_from_row(row: &rusqlite::Row<'_>) -> Result<ForumThread> {
+    Ok(ForumThread {
+        id: row.get(0)?,
+        author_user_id: row.get(1)?,
+        title: row.get(2)?,
+        body: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        last_reply_at: row.get(6)?,
+        reply_count: row.get(7)?,
+        hidden: row.get::<_, i64>(8)? != 0,
+    })
+}
+
+const FORUM_THREAD_SELECT_COLUMNS: &str =
+    "id, author_user_id, title, body, created_at, updated_at, last_reply_at, reply_count, hidden";
+
+/// Read one query row into a [`ForumReply`]. Column order must match the
+/// SELECT lists below.
+fn forum_reply_from_row(row: &rusqlite::Row<'_>) -> Result<ForumReply> {
+    Ok(ForumReply {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        author_user_id: row.get(2)?,
+        body: row.get(3)?,
+        created_at: row.get(4)?,
+        hidden: row.get::<_, i64>(5)? != 0,
+    })
+}
+
+const FORUM_REPLY_SELECT_COLUMNS: &str = "id, thread_id, author_user_id, body, created_at, hidden";
+
+/// Title length rule for a thread: 3-120 characters (`chars`, not bytes —
+/// this is a human-facing length limit, unlike [`is_valid_forum_body`]).
+pub fn is_valid_forum_title(title: &str) -> bool {
+    (3..=120).contains(&title.chars().count())
+}
+
+/// Body length rule for a thread or a reply: 1-8192 BYTES — this bounds the
+/// row size, which is what storage and the wire pay for, so it is measured
+/// in bytes rather than characters.
+pub fn is_valid_forum_body(body: &str) -> bool {
+    (1..=8192).contains(&body.len())
+}
+
+/// Why a [`create_thread`] or [`create_reply`] call was refused before ever
+/// touching the database.
+#[derive(Debug)]
+pub enum ForumError {
+    /// Fails [`is_valid_forum_title`]. Threads only — replies have no title.
+    InvalidTitle,
+    /// Fails [`is_valid_forum_body`].
+    InvalidBody,
+    /// The database call itself failed.
+    Db(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for ForumError {
+    fn from(e: rusqlite::Error) -> Self {
+        ForumError::Db(e)
+    }
+}
+
+/// Create one thread. Validates `title`/`body` before touching the database.
+/// Returns the new thread's id.
+pub fn create_thread(
+    conn: &Connection,
+    author_user_id: i64,
+    title: &str,
+    body: &str,
+    now: &str,
+) -> std::result::Result<i64, ForumError> {
+    if !is_valid_forum_title(title) {
+        return Err(ForumError::InvalidTitle);
+    }
+    if !is_valid_forum_body(body) {
+        return Err(ForumError::InvalidBody);
+    }
+    conn.execute(
+        "INSERT INTO forum_threads (author_user_id, title, body, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)",
+        params![author_user_id, title, body, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Fetch one visible (non-hidden) thread by id, or `None` if it does not
+/// exist or is hidden — the two are indistinguishable here on purpose, same
+/// posture as [`get_share_link`].
+pub fn get_thread(conn: &Connection, thread_id: i64) -> Result<Option<ForumThread>> {
+    conn.query_row(
+        &format!(
+            "SELECT {} FROM forum_threads WHERE id = ?1 AND hidden = 0",
+            FORUM_THREAD_SELECT_COLUMNS
+        ),
+        params![thread_id],
+        forum_thread_from_row,
+    )
+    .optional()
+}
+
+/// List visible threads ordered by last activity — `COALESCE(last_reply_at,
+/// created_at)` — newest first, then `id DESC` as the tie-break, optionally
+/// paginated with a `(last_activity, id)` keyset cursor: `before` returns
+/// only rows strictly older than that cursor in this ordering, matching
+/// [`list_posts`]'s `(date, id)` cursor shape.
+pub fn list_threads(
+    conn: &Connection,
+    limit: i64,
+    before: Option<(&str, i64)>,
+) -> Result<Vec<ForumThread>> {
+    let activity_expr = "COALESCE(last_reply_at, created_at)";
+    let mut sql = format!(
+        "SELECT {}, {} AS last_activity FROM forum_threads WHERE hidden = 0",
+        FORUM_THREAD_SELECT_COLUMNS, activity_expr
+    );
+    let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::new();
+
+    if let Some((activity, id)) = before.as_ref() {
+        sql.push_str(&format!(
+            " AND ({activity_expr} < ? OR ({activity_expr} = ? AND id < ?))",
+            activity_expr = activity_expr
+        ));
+        bound.push(activity as &dyn rusqlite::ToSql);
+        bound.push(activity as &dyn rusqlite::ToSql);
+        bound.push(id as &dyn rusqlite::ToSql);
+    }
+    sql.push_str(" ORDER BY last_activity DESC, id DESC LIMIT ?");
+    bound.push(&limit as &dyn rusqlite::ToSql);
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(bound.as_slice())?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(forum_thread_from_row(row)?);
+    }
+    Ok(out)
+}
+
+/// Create one reply under `thread_id` and bump that thread's `reply_count`
+/// and `last_reply_at`/`updated_at` to `now`. Validates `body` before
+/// touching the database. Does NOT check that `thread_id` exists or is
+/// visible — the route calls [`get_thread`] first (404 if missing/hidden)
+/// so this function stays a plain write. Returns the new reply's id.
+pub fn create_reply(
+    conn: &Connection,
+    thread_id: i64,
+    author_user_id: i64,
+    body: &str,
+    now: &str,
+) -> std::result::Result<i64, ForumError> {
+    if !is_valid_forum_body(body) {
+        return Err(ForumError::InvalidBody);
+    }
+    conn.execute(
+        "INSERT INTO forum_replies (thread_id, author_user_id, body, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![thread_id, author_user_id, body, now],
+    )?;
+    let reply_id = conn.last_insert_rowid();
+    conn.execute(
+        "UPDATE forum_threads
+         SET reply_count = reply_count + 1, last_reply_at = ?2, updated_at = ?2
+         WHERE id = ?1",
+        params![thread_id, now],
+    )?;
+    Ok(reply_id)
+}
+
+/// List visible replies to `thread_id`, oldest first.
+pub fn list_replies(conn: &Connection, thread_id: i64) -> Result<Vec<ForumReply>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM forum_replies WHERE thread_id = ?1 AND hidden = 0 ORDER BY id ASC",
+        FORUM_REPLY_SELECT_COLUMNS
+    ))?;
+    let mut rows = stmt.query(params![thread_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(forum_reply_from_row(row)?);
+    }
+    Ok(out)
+}
+
+/// Hide one thread. `owner_user_id = Some(uid)` requires `uid` to be the
+/// thread's author (the self-service `DELETE /api/forum/threads/{id}`
+/// route); `None` hides unconditionally (the admin route, which has already
+/// checked `verify_admin_secret`). Already-hidden and unknown ids both
+/// return `false` — same "no distinguishable states" posture as
+/// [`revoke_share`].
+pub fn hide_thread(conn: &Connection, thread_id: i64, owner_user_id: Option<i64>) -> Result<bool> {
+    let n = match owner_user_id {
+        Some(uid) => conn.execute(
+            "UPDATE forum_threads SET hidden = 1 WHERE id = ?1 AND author_user_id = ?2 AND hidden = 0",
+            params![thread_id, uid],
+        )?,
+        None => conn.execute(
+            "UPDATE forum_threads SET hidden = 1 WHERE id = ?1 AND hidden = 0",
+            params![thread_id],
+        )?,
+    };
+    Ok(n > 0)
+}
+
+/// Hide one reply. Same `owner_user_id` contract as [`hide_thread`].
+pub fn hide_reply(conn: &Connection, reply_id: i64, owner_user_id: Option<i64>) -> Result<bool> {
+    let n = match owner_user_id {
+        Some(uid) => conn.execute(
+            "UPDATE forum_replies SET hidden = 1 WHERE id = ?1 AND author_user_id = ?2 AND hidden = 0",
+            params![reply_id, uid],
+        )?,
+        None => conn.execute(
+            "UPDATE forum_replies SET hidden = 1 WHERE id = ?1 AND hidden = 0",
+            params![reply_id],
+        )?,
+    };
+    Ok(n > 0)
+}
+
+/// Count of threads `user_id` has created with `created_at` strictly after
+/// `since` (an RFC3339 instant) — the input to the 1-thread-per-60-seconds
+/// rate limit in `routes/forum.rs`. Counts hidden rows too: a hidden thread
+/// still happened and still counts against the window.
+pub fn threads_created_since(conn: &Connection, user_id: i64, since: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM forum_threads WHERE author_user_id = ?1 AND created_at > ?2",
+        params![user_id, since],
+        |row| row.get(0),
+    )
+}
+
+/// Count of replies `user_id` has created with `created_at` strictly after
+/// `since` — the input to the 10-replies-per-60-seconds rate limit. Same
+/// "hidden still counts" rule as [`threads_created_since`].
+pub fn replies_created_since(conn: &Connection, user_id: i64, since: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM forum_replies WHERE author_user_id = ?1 AND created_at > ?2",
+        params![user_id, since],
+        |row| row.get(0),
+    )
+}
+
+/// The label to show for a forum author: [`effective_label_for_user`]'s
+/// nick -> display_name -> public_id chain, or `"deleted user"` once that
+/// account is gone. `forum_threads`/`forum_replies` deliberately carry no
+/// foreign key to `users` (see the CREATE TABLE comment in `init_db`), so a
+/// hidden row surviving its author's `delete_account` still needs something
+/// to display here rather than the empty string
+/// [`effective_label_for_user`] returns for a gone user.
+pub fn forum_author_label(conn: &Connection, user_id: i64) -> Result<String> {
+    let label = effective_label_for_user(conn, user_id)?;
+    Ok(if label.is_empty() {
+        "deleted user".to_string()
+    } else {
+        label
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Connection, db_key_hex};
@@ -4129,8 +4496,9 @@ mod tests {
     /// The users + share_links halves of the production schema, on top of the
     /// sync tables `init_test_conn` already builds — plus the four other
     /// tables `db::delete_account`'s cascade touches (auth_tokens,
-    /// device_users, user_providers, web_sessions), so that cascade can be
-    /// tested end to end. `PRAGMA foreign_keys=ON` matches production
+    /// device_users, user_providers, web_sessions) and the two forum tables
+    /// it hides rows in (forum_threads, forum_replies), so that cascade can
+    /// be tested end to end. `PRAGMA foreign_keys=ON` matches production
     /// (`init_db`) so a wrong cascade order fails the test the same way it
     /// would fail in production, instead of silently passing in-memory.
     fn share_test_conn() -> Connection {
@@ -4193,6 +4561,29 @@ mod tests {
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL
+            );
+
+            -- Deliberately NOT REFERENCES users(id) on author_user_id —
+            -- matches production (see the CREATE TABLE comment in init_db).
+            CREATE TABLE forum_threads (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                author_user_id INTEGER NOT NULL,
+                title          TEXT    NOT NULL,
+                body           TEXT    NOT NULL,
+                created_at     TEXT    NOT NULL,
+                updated_at     TEXT    NOT NULL,
+                last_reply_at  TEXT,
+                reply_count    INTEGER NOT NULL DEFAULT 0,
+                hidden         INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE forum_replies (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id      INTEGER NOT NULL REFERENCES forum_threads(id),
+                author_user_id INTEGER NOT NULL,
+                body           TEXT    NOT NULL,
+                created_at     TEXT    NOT NULL,
+                hidden         INTEGER NOT NULL DEFAULT 0
             );
             ",
         )
@@ -4361,6 +4752,52 @@ mod tests {
         // means a leftover row referencing the deleted user would already
         // have failed the `DELETE FROM users` statement.
         assert_eq!(super::share_usage(&conn, uid).expect("usage after"), (0, 0));
+    }
+
+    #[test]
+    fn delete_account_hides_forum_rows_and_preserves_others_replies() {
+        let conn = share_test_conn();
+        let author = insert_share_user(&conn, "harry", Some("pub-harry"));
+        let replier = insert_share_user(&conn, "iris", Some("pub-iris"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let thread_id = super::create_thread(&conn, author, "Deleted author's thread", "body", &now)
+            .expect("create thread");
+        super::create_reply(&conn, thread_id, replier, "still here", &now).expect("create reply");
+
+        // No foreign key means the deletion itself does not fail — that is
+        // the point of the CREATE TABLE deviation this test exercises.
+        let (deleted, _) = super::delete_account(&conn, author).expect("delete account");
+        assert_eq!(deleted, 1);
+
+        // The thread is hidden — invisible to every ordinary reader…
+        assert!(super::get_thread(&conn, thread_id).expect("get").is_none());
+        assert!(super::list_threads(&conn, 50, None).expect("list").is_empty());
+        // …but the row itself, and `iris`'s reply under it, both survive.
+        let raw_hidden: i64 = conn
+            .query_row(
+                "SELECT hidden FROM forum_threads WHERE id = ?1",
+                rusqlite::params![thread_id],
+                |row| row.get(0),
+            )
+            .expect("raw thread row");
+        assert_eq!(raw_hidden, 1);
+        let reply_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM forum_replies WHERE thread_id = ?1",
+                rusqlite::params![thread_id],
+                |row| row.get(0),
+            )
+            .expect("raw reply count");
+        assert_eq!(reply_count, 1);
+
+        // The author's label now falls back to "deleted user".
+        assert_eq!(
+            super::forum_author_label(&conn, author).expect("label"),
+            "deleted user"
+        );
+        // The replier's own account is untouched.
+        assert_eq!(super::forum_author_label(&conn, replier).expect("label"), "iris");
     }
 
     // ------------------------------------------------------------------
@@ -4688,6 +5125,224 @@ mod tests {
         assert!(super::delete_post(&conn, "v1").expect("delete"));
         assert!(super::get_post(&conn, "v1", true).expect("get").is_none());
         assert!(!super::delete_post(&conn, "v1").expect("delete again"));
+    }
+
+    // ------------------------------------------------------------------
+    // Forum
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn forum_validation_boundaries() {
+        assert!(super::is_valid_forum_title("abc"));
+        assert!(super::is_valid_forum_title(&"a".repeat(120)));
+        assert!(!super::is_valid_forum_title("ab"));
+        assert!(!super::is_valid_forum_title(&"a".repeat(121)));
+
+        assert!(super::is_valid_forum_body("a"));
+        assert!(super::is_valid_forum_body(&"a".repeat(8192)));
+        assert!(!super::is_valid_forum_body(""));
+        assert!(!super::is_valid_forum_body(&"a".repeat(8193)));
+    }
+
+    #[test]
+    fn create_thread_rejects_invalid_title_and_body() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "jack", Some("pub-jack"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        assert!(matches!(
+            super::create_thread(&conn, uid, "ab", "body", &now),
+            Err(super::ForumError::InvalidTitle)
+        ));
+        assert!(matches!(
+            super::create_thread(&conn, uid, "a valid title", "", &now),
+            Err(super::ForumError::InvalidBody)
+        ));
+        assert!(super::list_threads(&conn, 50, None).expect("list").is_empty());
+    }
+
+    #[test]
+    fn create_reply_rejects_invalid_body() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "kate", Some("pub-kate"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let thread_id = super::create_thread(&conn, uid, "a valid title", "body", &now).expect("create");
+
+        assert!(matches!(
+            super::create_reply(&conn, thread_id, uid, "", &now),
+            Err(super::ForumError::InvalidBody)
+        ));
+        assert!(super::list_replies(&conn, thread_id).expect("list").is_empty());
+    }
+
+    #[test]
+    fn create_reply_bumps_thread_count_and_last_activity() {
+        let conn = share_test_conn();
+        let author = insert_share_user(&conn, "leo", Some("pub-leo"));
+        let replier = insert_share_user(&conn, "mia", Some("pub-mia"));
+        let created = "2026-09-01T00:00:00+00:00";
+        let thread_id =
+            super::create_thread(&conn, author, "a valid title", "body", created).expect("create");
+
+        let before = super::get_thread(&conn, thread_id).expect("get").expect("row");
+        assert_eq!(before.reply_count, 0);
+        assert_eq!(before.last_reply_at, None);
+
+        let replied_at = "2026-09-02T00:00:00+00:00";
+        super::create_reply(&conn, thread_id, replier, "first reply", replied_at).expect("reply");
+
+        let after = super::get_thread(&conn, thread_id).expect("get").expect("row");
+        assert_eq!(after.reply_count, 1);
+        assert_eq!(after.last_reply_at.as_deref(), Some(replied_at));
+        assert_eq!(after.updated_at, replied_at);
+
+        let replies = super::list_replies(&conn, thread_id).expect("list");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].author_user_id, replier);
+        assert_eq!(replies[0].body, "first reply");
+    }
+
+    #[test]
+    fn list_replies_returns_visible_rows_oldest_first() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "nina", Some("pub-nina"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let thread_id = super::create_thread(&conn, uid, "a valid title", "body", &now).expect("create");
+
+        super::create_reply(&conn, thread_id, uid, "one", "2026-09-01T00:00:00+00:00").expect("r1");
+        let hidden_id =
+            super::create_reply(&conn, thread_id, uid, "two", "2026-09-02T00:00:00+00:00").expect("r2");
+        super::create_reply(&conn, thread_id, uid, "three", "2026-09-03T00:00:00+00:00").expect("r3");
+
+        assert!(super::hide_reply(&conn, hidden_id, Some(uid)).expect("hide"));
+
+        let visible = super::list_replies(&conn, thread_id).expect("list");
+        let bodies: Vec<&str> = visible.iter().map(|r| r.body.as_str()).collect();
+        assert_eq!(bodies, vec!["one", "three"]);
+    }
+
+    #[test]
+    fn list_threads_orders_by_last_activity_and_paginates() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "oscar", Some("pub-oscar"));
+
+        // t1: created early, never replied to — sorts by created_at.
+        let t1 = super::create_thread(&conn, uid, "thread one", "body", "2026-09-01T00:00:00+00:00")
+            .expect("t1");
+        // t2: created after t1 but replied to even later — sorts by last_reply_at.
+        let t2 = super::create_thread(&conn, uid, "thread two", "body", "2026-09-02T00:00:00+00:00")
+            .expect("t2");
+        // t3: created after both, no replies.
+        let t3 = super::create_thread(&conn, uid, "thread three", "body", "2026-09-03T00:00:00+00:00")
+            .expect("t3");
+        super::create_reply(&conn, t2, uid, "bump", "2026-09-10T00:00:00+00:00").expect("reply");
+
+        // Newest activity first: t2 (bumped to 09-10) > t3 (created 09-03) > t1 (created 09-01).
+        let all = super::list_threads(&conn, 50, None).expect("list");
+        let ids: Vec<i64> = all.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![t2, t3, t1]);
+
+        // Pagination: page of 2, then the remainder via the cursor.
+        let page1 = super::list_threads(&conn, 2, None).expect("page1");
+        let page1_ids: Vec<i64> = page1.iter().map(|t| t.id).collect();
+        assert_eq!(page1_ids, vec![t2, t3]);
+
+        let cursor_thread = page1.last().expect("last of page1");
+        let cursor_activity = cursor_thread
+            .last_reply_at
+            .clone()
+            .unwrap_or_else(|| cursor_thread.created_at.clone());
+        let page2 = super::list_threads(&conn, 2, Some((&cursor_activity, cursor_thread.id)))
+            .expect("page2");
+        let page2_ids: Vec<i64> = page2.iter().map(|t| t.id).collect();
+        assert_eq!(page2_ids, vec![t1]);
+    }
+
+    #[test]
+    fn hide_thread_is_owner_only_unless_admin() {
+        let conn = share_test_conn();
+        let owner = insert_share_user(&conn, "paul", Some("pub-paul"));
+        let other = insert_share_user(&conn, "quinn", Some("pub-quinn"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let thread_id = super::create_thread(&conn, owner, "a valid title", "body", &now).expect("create");
+
+        // Not the owner — refused, thread stays visible.
+        assert!(!super::hide_thread(&conn, thread_id, Some(other)).expect("hide"));
+        assert!(super::get_thread(&conn, thread_id).expect("get").is_some());
+
+        // The owner hides their own thread.
+        assert!(super::hide_thread(&conn, thread_id, Some(owner)).expect("hide"));
+        assert!(super::get_thread(&conn, thread_id).expect("get").is_none());
+
+        // Hiding an already-hidden thread is not a fresh success either.
+        assert!(!super::hide_thread(&conn, thread_id, Some(owner)).expect("hide again"));
+
+        // The admin path (None) hides unconditionally — exercised on a fresh thread.
+        let thread2 = super::create_thread(&conn, owner, "another title", "body", &now).expect("create");
+        assert!(super::hide_thread(&conn, thread2, None).expect("admin hide"));
+        assert!(super::get_thread(&conn, thread2).expect("get").is_none());
+    }
+
+    #[test]
+    fn hide_reply_is_owner_only_unless_admin() {
+        let conn = share_test_conn();
+        let owner = insert_share_user(&conn, "rex", Some("pub-rex"));
+        let other = insert_share_user(&conn, "sam", Some("pub-sam"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let thread_id = super::create_thread(&conn, owner, "a valid title", "body", &now).expect("create");
+        let reply_id = super::create_reply(&conn, thread_id, owner, "reply body", &now).expect("reply");
+
+        assert!(!super::hide_reply(&conn, reply_id, Some(other)).expect("hide"));
+        assert!(super::hide_reply(&conn, reply_id, Some(owner)).expect("hide"));
+        assert_eq!(super::list_replies(&conn, thread_id).expect("list").len(), 0);
+
+        let reply2 = super::create_reply(&conn, thread_id, owner, "reply two", &now).expect("reply2");
+        assert!(super::hide_reply(&conn, reply2, None).expect("admin hide"));
+        assert_eq!(super::list_replies(&conn, thread_id).expect("list").len(), 0);
+    }
+
+    #[test]
+    fn threads_and_replies_created_since_count_only_the_window() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "tara", Some("pub-tara"));
+
+        super::create_thread(&conn, uid, "old thread", "body", "2026-09-01T00:00:00+00:00")
+            .expect("old");
+        super::create_thread(&conn, uid, "new thread", "body", "2026-09-05T00:00:30+00:00")
+            .expect("new");
+
+        let since = "2026-09-05T00:00:00+00:00";
+        assert_eq!(
+            super::threads_created_since(&conn, uid, since).expect("count"),
+            1
+        );
+
+        let thread_id = super::create_thread(&conn, uid, "reply target", "body", since).expect("t");
+        for i in 0..3 {
+            super::create_reply(
+                &conn,
+                thread_id,
+                uid,
+                "r",
+                &format!("2026-09-05T00:0{}:00+00:00", i),
+            )
+            .expect("reply");
+        }
+        assert_eq!(
+            super::replies_created_since(&conn, uid, "2026-09-05T00:01:00+00:00").expect("count"),
+            1
+        );
+    }
+
+    #[test]
+    fn forum_author_label_falls_back_to_deleted_user() {
+        let conn = share_test_conn();
+        assert_eq!(
+            super::forum_author_label(&conn, 424242).expect("label"),
+            "deleted user"
+        );
+        let uid = insert_share_user(&conn, "uma", Some("pub-uma"));
+        assert_eq!(super::forum_author_label(&conn, uid).expect("label"), "uma");
     }
 }
 
