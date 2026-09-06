@@ -6,25 +6,28 @@
 //! ([`open_identity_db_readonly`]) so a coding mistake here cannot become a
 //! write.
 //!
-//! # Why a second process reads the SAME SQLCipher-encrypted file, keyed
-//! # differently from the server
+//! # Why this crate opens its OWN connection instead of sharing one
 //!
 //! `mylittlechart-server`'s `db::read_sqlcipher_key` deletes the tmpfs key
 //! file after its one read at boot (that function's own doc comment: "the
 //! tmpfs file is deleted after this call, so it can only ever be read once
-//! per boot") — a second process racing to read the same file gets
-//! nothing, by design. This daemon therefore takes its OWN copy of the
-//! same key material via the `MLC_DB_KEY_HEX` environment variable instead
-//! (see `config.rs`), which whatever starts this process must set from the
-//! same secret the server's tmpfs delivery uses.
+//! per boot") — a second, independent process racing to read the same file
+//! gets nothing, by design. This crate's two run modes get the key
+//! material two different ways (see `lib.rs`'s module doc for both):
 //!
-//! This is strictly MORE exposure than the tmpfs handoff: an env var stays
-//! readable from this process's own environment (e.g. `/proc/<pid>/environ`
-//! on Linux) for as long as it runs, where the tmpfs file existed for one
-//! read only. Documented here rather than hidden, per the task's explicit
-//! call-out — a future iteration could instead have the server push the
-//! key to this daemon over a private channel at boot, but that is not what
-//! this step builds.
+//! - **Standalone binary** (`main.rs`): takes its OWN copy of the key via
+//!   the `MLC_DB_KEY_HEX` environment variable (see `config.rs`), which
+//!   whatever starts the process must set from the same secret the
+//!   server's tmpfs delivery uses. This is strictly MORE exposure than the
+//!   tmpfs handoff — an env var stays readable from this process's own
+//!   environment (e.g. `/proc/<pid>/environ` on Linux) for as long as it
+//!   runs, where the tmpfs file existed for one read only.
+//! - **Embedded in `mylittlechart-server`** (the deployed mode): the
+//!   server hands over the SAME `key_hex` it already read at boot, in
+//!   process memory — no second tmpfs file, no second env var.
+//!   [`crate::run`] still opens its own `SQLITE_OPEN_READ_ONLY` connection
+//!   from it rather than sharing the server's writer connection, and
+//!   zeroizes its copy of the key immediately after that connection opens.
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Result};
 

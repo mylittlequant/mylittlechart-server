@@ -1,108 +1,85 @@
-//! `mlc-alert-daemon` — server-side evaluation loop for account-wide Price
-//! alerts (plan `docs/mlc/plans/alerts-account-wide-and-telegram-delivery-
-//! 2026-09-06.md` §3 "Server evaluation — Price-source only", §6 step 4).
+//! `mlc-alert-daemon` — standalone-binary entry point for the evaluation
+//! loop this crate's library half (`lib.rs`) implements.
 //!
-//! Reads `alerts`-category sync items read-only from the identity database
-//! `mylittlechart-server` owns (`identity_db.rs`), runs a stateless
-//! price-crossing check (`crossing.rs`) against a per-alert in-memory
-//! cache (`eval.rs`), and delivers a Telegram DM (`telegram.rs`) via the
-//! same `mylittlechart_login_bot` identity `routes/tg_login.rs` already
-//! resolves `tg_user_id` for — paid accounts with a linked Telegram
-//! identity only (`gate.rs`). This process never writes to the identity
-//! database; it keeps its own bookkeeping (`alert_daemon.db`, `store.rs`)
-//! as the single writer for that one small file.
-//!
-//! Sibling binary to `mylittlechart-server` (`dig2pay-server` precedent) —
-//! NOT embedded in the server process, so closing that process (or this
-//! one) never silently drops the other's duties.
+//! This binary is the ORIGINAL, standalone-process shape: a sibling to
+//! `mylittlechart-server`, reading its own copy of the SQLCipher key from
+//! `MLC_DB_KEY_HEX`. It still works for local runs and manual testing, but
+//! it is NOT how this crate is deployed — see `lib.rs`'s module doc for why
+//! (the deploy box keeps no SQLCipher key on disk after boot) and for the
+//! embedded-in-`mylittlechart-server` mode that replaces it in production.
 //!
 //! Configuration via environment variables:
 //!   MLC_DATA_DIR           — directory holding `mylittlechart.db` (opened
 //!                            read-only) and this daemon's own
 //!                            `alert_daemon.db` (default: `./data`). MUST
 //!                            be the same directory `mylittlechart-server`'s
-//!                            own `DATA_DIR` points at — this process never
-//!                            creates the identity database, only opens it.
+//!                            own `DATA_DIR` points at.
 //!   MLC_DB_KEY_HEX         — the SQLCipher key for `mylittlechart.db` (64
-//!                            hex chars, or raw key bytes). NOTE: this is
-//!                            NOT the tmpfs handoff `db::read_sqlcipher_key`
-//!                            uses on the main server — that file is
-//!                            deleted after its one read at server boot, so
-//!                            a second process cannot race it for the same
-//!                            key. Whatever starts this daemon must inject
-//!                            its own copy of the same key material through
-//!                            this env var instead — see `identity_db.rs`'s
-//!                            module doc for the exposure trade-off that
-//!                            implies.
+//!                            hex chars, or raw key bytes). See `lib.rs`'s
+//!                            module doc for why this process needs its own
+//!                            copy rather than racing the server's one-time
+//!                            tmpfs read.
 //!   TELEGRAM_BOT_TOKEN     — same bot token `mylittlechart-server` uses
 //!                            for `tg-login-bot` (`mylittlechart_login_bot`)
 //!                            — one bot, one identity plane, one delivery
 //!                            channel.
+//!   MLC_ALERT_POLL_SECS    — evaluation cycle interval in seconds (default: 30)
 //!   BIND_ADDR              — health endpoint bind address (default: 127.0.0.1)
 //!   MLC_ALERT_DAEMON_PORT  — health endpoint port (default: 19210)
-//!   MLC_ALERT_POLL_SECS    — evaluation cycle interval in seconds (default: 30)
 
-mod alert_item;
-mod config;
-mod crossing;
-mod eval;
-mod gate;
-mod health;
-mod identity_db;
-mod price_source;
-mod store;
-mod telegram;
-
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
+use axum::extract::State;
 use axum::routing::get;
-use axum::Router;
-use tokio::sync::Mutex;
+use axum::{Json, Router};
 
-use config::Config;
-use eval::EvalState;
-use health::Counters;
-use price_source::PriceCache;
+use mlc_alert_daemon::{DaemonConfig, DaemonStats, HealthBody};
+
+const DEFAULT_PORT: u16 = 19210;
+const DEFAULT_BIND_ADDR: &str = "127.0.0.1";
+
+async fn health_handler(State(stats): State<Arc<DaemonStats>>) -> Json<HealthBody> {
+    Json(stats.snapshot())
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let config = Config::from_env()?;
+    let config = DaemonConfig::from_env()?;
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
+    let port: u16 = std::env::var("MLC_ALERT_DAEMON_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+
     tracing::info!(
         "mlc-alert-daemon starting: identity_db={} store_db={} poll_secs={} bind={}:{}",
         config.identity_db_path,
         config.store_db_path,
         config.poll_interval.as_secs(),
-        config.bind_addr,
-        config.port
+        bind_addr,
+        port
     );
 
-    let identity_conn = identity_db::open_identity_db_readonly(&config.identity_db_path, &config.db_key_hex)?;
-    let store_conn = store::open_store(&config.store_db_path)?;
+    let stats = Arc::new(DaemonStats::default());
 
-    let counters = Arc::new(Counters::default());
-
-    let state = Arc::new(EvalState {
-        identity_conn: Mutex::new(identity_conn),
-        store_conn: Mutex::new(store_conn),
-        http: reqwest::Client::builder().timeout(Duration::from_secs(15)).build()?,
-        // A refetch floor shorter than the evaluation cycle would only add
-        // network calls the cycle can never observe; this simply mirrors
-        // the poll interval.
-        price_cache: Mutex::new(PriceCache::new(config.poll_interval)),
-        prev_price: Mutex::new(HashMap::new()),
-        telegram_bot_token: config.telegram_bot_token.clone(),
-        counters: counters.clone(),
+    // A local shutdown channel, tripped by Ctrl-C — this standalone binary
+    // has no shared shutdown broadcast to bridge into, unlike the embedded
+    // mode inside `mylittlechart-server`.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("mlc-alert-daemon: shutdown signal received");
+            let _ = shutdown_tx.send(true);
+        }
     });
 
-    let eval_task = tokio::spawn(eval::run_forever(state, config.poll_interval));
+    let eval_task = tokio::spawn(mlc_alert_daemon::run(config, shutdown_rx, stats.clone()));
 
-    let app = Router::new().route("/health", get(health::health_handler)).with_state(counters);
+    let app = Router::new().route("/health", get(health_handler)).with_state(stats);
 
-    let addr = format!("{}:{}", config.bind_addr, config.port);
+    let addr = format!("{bind_addr}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("mlc-alert-daemon health endpoint listening on {addr}");
 
@@ -112,8 +89,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::error!("health server exited: {e}");
             }
         }
-        _ = eval_task => {
-            tracing::error!("evaluation loop exited unexpectedly");
+        res = eval_task => {
+            match res {
+                Ok(Ok(())) => tracing::info!("evaluation loop stopped"),
+                Ok(Err(e)) => tracing::error!("evaluation loop failed: {e}"),
+                Err(e) => tracing::error!("evaluation loop task panicked: {e}"),
+            }
         }
     }
 

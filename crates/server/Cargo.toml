@@ -26,6 +26,7 @@ tokio-util = { workspace = true }
 subtle = { workspace = true }
 dotenvy = { workspace = true }
 tg-login-bot = { path = "../tg-login-bot" }
+mlc-alert-daemon = { path = "../mlc-alert-daemon" }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 

@@ -13,7 +13,7 @@ docs = "mylittlechart-server/docs/"
 [[endpoints]]
 method = "GET"
 path = "/health"
-description = "Health check"
+description = "Health check. {status, alert_daemon: {enabled, checked, fired, delivered, skipped_unpaid, skipped_unlinked, last_cycle_at}} — the alert_daemon object reports the embedded mlc-alert-daemon evaluation loop (MLC_ALERT_DAEMON=1, default off); enabled=false with zeroed counters when the toggle is off or on an edge-role process. d-watchdog itself only checks the status code, not this body."
 auth = "none"
 public = true
 

@@ -2,7 +2,7 @@
 name = "mlc-alert-daemon"
 kind = "daemon"
 display_name = "MLC Alert Daemon"
-description = "Server-side evaluation loop for mylittlechart.org account-wide Price alerts. Reads `alerts`-category sync items read-only from mylittlechart-server's identity database (never writes to it), checks price crossings against a public REST last-price fetch (Binance/Bybit), and delivers a Telegram DM via the mylittlechart_login_bot identity to paid + tg-linked accounts only. NOT registered in d-watchdog yet (owner rule 2026-09-06 — manifest only; deploy is the same opsd binary-swap flow mylittlechart-server uses, see the plan doc below, until a follow-up wires supervision)."
+description = "Server-side evaluation loop for mylittlechart.org account-wide Price alerts. Reads `alerts`-category sync items read-only from mylittlechart-server's identity database (never writes to it), checks price crossings against a public REST last-price fetch (Binance/Bybit), and delivers a Telegram DM via the mylittlechart_login_bot identity to paid + tg-linked accounts only. Ships as a LIBRARY embedded in mylittlechart-server's own process (`MLC_ALERT_DAEMON=1`, default off) — the box that runs the server keeps no SQLCipher key on disk after boot, so a separate process could never get one; the server hands over the key it already read instead. This crate's own `[[bin]]` below is the original standalone-process shape, kept for local dev/manual runs only; it is NOT what is deployed and is NOT registered in d-watchdog."
 
 [links]
 local_url = "http://127.0.0.1:19210"
@@ -11,7 +11,7 @@ docs = "docs/mlc/plans/alerts-account-wide-and-telegram-delivery-2026-09-06.md"
 [[endpoints]]
 method = "GET"
 path = "/health"
-description = "Process health + cumulative evaluation counters since start: {status, checked, fired, delivered, skipped_unpaid, skipped_unlinked}."
+description = "Standalone-binary mode ONLY (see [service].description) — process health + cumulative evaluation counters since start: {status, checked, fired, delivered, skipped_unpaid, skipped_unlinked, last_cycle_at}. The embedded mode's counters ride on mylittlechart-server's own /health under an `alert_daemon` object instead — see mylittlechart-server/.nemo-service.toml."
 auth = "none"
 public = false
 

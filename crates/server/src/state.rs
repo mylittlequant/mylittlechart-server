@@ -1,6 +1,8 @@
 //! Shared application state passed through axum via `Arc<AppState>`.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use serde::Serialize;
 
 /// Which role this process plays in the production topology.
 ///
@@ -178,6 +180,30 @@ pub struct AppState {
     /// Controlled by `MLC_TELEMETRY_DAILY_CAP` env var (default: 48), read
     /// once at boot next to `MLC_TELEMETRY_RETENTION_DAYS`.
     pub telemetry_daily_cap: i64,
+
+    /// Counters for the embedded `mlc-alert-daemon` evaluation loop (see
+    /// `main.rs`'s `MLC_ALERT_DAEMON` gate) — `Some` once that loop has been
+    /// spawned (control role, toggle on), `None` otherwise (edge role, or
+    /// the toggle left off, which is the default). Read only through
+    /// [`AppState::alert_daemon_health`], never matched on directly, so
+    /// `/health` has exactly one place that decides what an absent daemon
+    /// reports.
+    alert_daemon_stats: Option<Arc<mlc_alert_daemon::DaemonStats>>,
+}
+
+/// `alert_daemon` object in `/health`'s JSON body (see `main.rs`'s health
+/// handler). Mirrors `mlc_alert_daemon::HealthBody`'s counters, plus the
+/// `enabled` flag this embedding call site controls — the daemon crate
+/// itself has no notion of "disabled", only "not running".
+#[derive(Serialize)]
+pub struct AlertDaemonHealth {
+    pub enabled: bool,
+    pub checked: u64,
+    pub fired: u64,
+    pub delivered: u64,
+    pub skipped_unpaid: u64,
+    pub skipped_unlinked: u64,
+    pub last_cycle_at: Option<i64>,
 }
 
 impl AppState {
@@ -202,6 +228,7 @@ impl AppState {
         build_attest_enforce: bool,
         build_attest_max_age_secs: u64,
         telemetry_daily_cap: i64,
+        alert_daemon_stats: Option<Arc<mlc_alert_daemon::DaemonStats>>,
     ) -> Self {
         Self {
             control_plane,
@@ -220,6 +247,37 @@ impl AppState {
             build_attest_enforce,
             build_attest_max_age_secs,
             telemetry_daily_cap,
+            alert_daemon_stats,
+        }
+    }
+
+    /// Snapshot of the embedded alert daemon's counters for `/health`.
+    /// `enabled: false` with every counter at zero when `MLC_ALERT_DAEMON`
+    /// was not set at boot — the loop never ran, so there is nothing else
+    /// to report.
+    pub fn alert_daemon_health(&self) -> AlertDaemonHealth {
+        match &self.alert_daemon_stats {
+            Some(stats) => {
+                let body = stats.snapshot();
+                AlertDaemonHealth {
+                    enabled: true,
+                    checked: body.checked,
+                    fired: body.fired,
+                    delivered: body.delivered,
+                    skipped_unpaid: body.skipped_unpaid,
+                    skipped_unlinked: body.skipped_unlinked,
+                    last_cycle_at: body.last_cycle_at,
+                }
+            }
+            None => AlertDaemonHealth {
+                enabled: false,
+                checked: 0,
+                fired: 0,
+                delivered: 0,
+                skipped_unpaid: 0,
+                skipped_unlinked: 0,
+                last_cycle_at: None,
+            },
         }
     }
 

@@ -14,7 +14,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 
 use rusqlite::Connection;
 use tokio::sync::Mutex;
@@ -22,7 +21,7 @@ use tokio::sync::Mutex;
 use crate::alert_item::{AlertItemWire, ConditionWire};
 use crate::crossing;
 use crate::gate::{self, Gate};
-use crate::health::Counters;
+use crate::health::DaemonStats;
 use crate::identity_db;
 use crate::price_source::PriceCache;
 use crate::store;
@@ -32,7 +31,7 @@ use crate::telegram;
 /// lifetime. `identity_conn`/`store_conn` use `tokio::sync::Mutex` (never
 /// `std::sync::Mutex`) because both are held across `.await` points inside
 /// `run_once`/`evaluate_one` (the HTTP price fetch and Telegram send).
-pub struct EvalState {
+pub(crate) struct EvalState {
     pub identity_conn: Mutex<Connection>,
     pub store_conn: Mutex<Connection>,
     pub http: reqwest::Client,
@@ -46,23 +45,14 @@ pub struct EvalState {
     /// fires (see [`evaluate_one`]).
     pub prev_price: Mutex<HashMap<String, f64>>,
     pub telegram_bot_token: String,
-    pub counters: Arc<Counters>,
+    pub counters: Arc<DaemonStats>,
 }
 
-/// Runs the evaluation cycle forever, once per `poll_interval`. Never
-/// returns; a failed cycle is logged and the loop continues at the next
-/// tick — a transient database or network hiccup must not end the process.
-pub async fn run_forever(state: Arc<EvalState>, poll_interval: Duration) {
-    let mut ticker = tokio::time::interval(poll_interval);
-    loop {
-        ticker.tick().await;
-        if let Err(e) = run_once(&state).await {
-            tracing::error!("alert evaluation cycle failed: {e}");
-        }
-    }
-}
-
-async fn run_once(state: &EvalState) -> rusqlite::Result<()> {
+/// Runs one evaluation cycle over every candidate account. Errors surface
+/// to the caller (`crate::run`'s ticker loop), which logs them and
+/// continues at the next tick — a transient database or network hiccup
+/// must not end the process.
+pub(crate) async fn run_once(state: &EvalState) -> rusqlite::Result<()> {
     let user_ids = {
         let conn = state.identity_conn.lock().await;
         identity_db::candidate_user_ids(&conn)?

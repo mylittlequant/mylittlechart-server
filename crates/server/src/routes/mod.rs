@@ -252,6 +252,7 @@ mod tests {
             false,
             0,
             0,
+            None,
         ));
         let _router = control_api_router(state);
     }

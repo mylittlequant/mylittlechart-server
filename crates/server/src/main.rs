@@ -48,6 +48,22 @@
 //!                            Edge never opens a database — it boots with no
 //!                            control plane and mounts only the stateless
 //!                            subset (see routes::edge_api_router).
+//!   MLC_ALERT_DAEMON       — "1" to run the `mlc-alert-daemon` account-wide
+//!                            price-alert evaluation loop as a background
+//!                            task on this process's own tokio runtime
+//!                            (control role only). Default off, so this
+//!                            deploy stays inert until the toggle is set.
+//!                            The loop opens its OWN read-only SQLCipher
+//!                            connection to `mylittlechart.db`, keyed from
+//!                            the SAME `key_hex` this process already read
+//!                            for its own databases — see
+//!                            `mlc_alert_daemon`'s crate-level doc for why a
+//!                            separate process cannot get that key at all
+//!                            (the box keeps no copy of it on disk after
+//!                            boot).
+//!   MLC_ALERT_POLL_SECS    — alert-evaluation cycle interval in seconds
+//!                            for the above (default: 30). Ignored when
+//!                            `MLC_ALERT_DAEMON` is off.
 
 use std::sync::{Arc, Mutex};
 
@@ -83,6 +99,26 @@ async fn redirect_to_app_root() -> axum::response::Response {
         .header("location", "https://mylittlechart.org/")
         .body(axum::body::Body::empty())
         .unwrap()
+}
+
+/// `GET /health` body — the liveness probe d-watchdog polls, extended
+/// (2026-09-06) with the embedded alert daemon's counters (see this file's
+/// module doc for `MLC_ALERT_DAEMON`). d-watchdog itself only checks the
+/// status code, never the body, so widening this from the old plain-text
+/// `"ok"` response cannot break its healthcheck.
+#[derive(serde::Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    alert_daemon: state::AlertDaemonHealth,
+}
+
+async fn health_handler(
+    axum::extract::State(app_state): axum::extract::State<Arc<AppState>>,
+) -> axum::Json<HealthResponse> {
+    axum::Json(HealthResponse {
+        status: "ok",
+        alert_daemon: app_state.alert_daemon_health(),
+    })
 }
 
 /// Middleware that injects security headers into every response on the main router.
@@ -201,11 +237,18 @@ async fn main() {
         build_attest_max_age_secs / 86400
     );
 
+    // Shared shutdown channel: one signal fans out to both servers, admin
+    // restart, AND (below) the embedded alert daemon. Created here, ahead of
+    // the control-plane match, so the daemon's shutdown bridge can subscribe
+    // to it while still inside that match arm.
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
     // Control plane (database + hot sync store) — control role only. An edge
     // process must never open a database: no wait on the SQLCipher key at
     // `MLC_DBKEY_PATH`, no data directory, no migrations (`db::init_db`'s
     // `wait_for_db_key` loop would otherwise block edge boot forever, since
     // an edge box has no key to give it).
+    let mut alert_daemon_stats: Option<Arc<mlc_alert_daemon::DaemonStats>> = None;
     let control_plane = match role {
         state::ServerRole::Control => {
             // No `data/binaries` directory here — the control box stores no
@@ -295,6 +338,53 @@ async fn main() {
                 opswriter::OpsWriter::spawn(ops_writer_conn, opswriter::OPS_WRITER_QUEUE_CAPACITY);
             tracing::info!("Operational database writer thread started");
 
+            // Embedded alert-evaluation daemon (see this file's module doc
+            // for `MLC_ALERT_DAEMON`, and `mlc_alert_daemon`'s crate doc for
+            // why this runs inside the server process rather than as a
+            // sibling binary). `key_hex` is moved into `daemon_cfg` here —
+            // its last use on this process was the two `init_*_db` calls
+            // above — and `mlc_alert_daemon::run` zeroizes its copy right
+            // after opening its own read-only connection with it.
+            let alert_daemon_enabled =
+                std::env::var("MLC_ALERT_DAEMON").map(|v| v == "1").unwrap_or(false);
+            if alert_daemon_enabled {
+                let poll_secs: u64 = std::env::var("MLC_ALERT_POLL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30);
+                let daemon_cfg = mlc_alert_daemon::DaemonConfig {
+                    identity_db_path: db_path.clone(),
+                    store_db_path: format!("{}/alert_daemon.db", data_dir),
+                    db_key_hex: key_hex,
+                    telegram_bot_token: telegram_bot_token.clone(),
+                    poll_interval: std::time::Duration::from_secs(poll_secs),
+                };
+
+                // Bridges the shared broadcast shutdown signal into the
+                // `watch`-based one `mlc_alert_daemon::run` expects — a
+                // dedicated channel rather than reusing `shutdown_tx`
+                // directly, since that is a `broadcast::Sender<()>` and
+                // `run` wants a `watch::Receiver<bool>`.
+                let (daemon_shutdown_tx, daemon_shutdown_rx) = tokio::sync::watch::channel(false);
+                let mut bridge_rx = shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    let _ = bridge_rx.recv().await;
+                    let _ = daemon_shutdown_tx.send(true);
+                });
+
+                let stats = Arc::new(mlc_alert_daemon::DaemonStats::default());
+                let run_stats = stats.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = mlc_alert_daemon::run(daemon_cfg, daemon_shutdown_rx, run_stats).await {
+                        tracing::error!("alert daemon exited: {}", e);
+                    }
+                });
+                alert_daemon_stats = Some(stats);
+                tracing::info!("Alert daemon enabled (poll_secs={})", poll_secs);
+            } else {
+                tracing::info!("Alert daemon disabled (MLC_ALERT_DAEMON not set)");
+            }
+
             Some(state::ControlPlane {
                 db: Mutex::new(db_conn),
                 social: Mutex::new(social_conn),
@@ -311,9 +401,6 @@ async fn main() {
             None
         }
     };
-
-    // Shared shutdown channel: one signal fans out to both servers + admin restart.
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
     // Build shared application state.
     let app_state = Arc::new(AppState::new(
@@ -333,6 +420,7 @@ async fn main() {
         build_attest_enforce,
         build_attest_max_age_secs,
         telemetry_daily_cap,
+        alert_daemon_stats,
     ));
 
     // Start the Telegram login bot (background task) — control role only.
@@ -658,6 +746,13 @@ async fn main() {
             .with_state(app_state.clone())
     });
 
+    // `/health` as its own tiny state-carrying router (see `health_handler`)
+    // — built ahead of the `/api` router below, which otherwise consumes
+    // `app_state` by value.
+    let health_app = axum::Router::new()
+        .route("/health", axum::routing::get(health_handler))
+        .with_state(app_state.clone());
+
     // Assemble the full router. `/api` mounts the role-appropriate route
     // table — see `routes::control_api_router` / `routes::edge_api_router`.
     let api_router = match role {
@@ -665,10 +760,6 @@ async fn main() {
         state::ServerRole::Edge => routes::edge_api_router(app_state),
     };
     let app = axum::Router::new()
-        // Liveness probe for d-watchdog (root-level, before /{page} catch-all).
-        // Kept on every role: it carries no data and is the one thing an
-        // edge box must answer for d-watchdog to supervise it at all.
-        .route("/health", axum::routing::get(|| async { "ok" }))
         // Root redirect (see redirect_to_app_root's doc comment) — ahead of
         // the static fallback so the deleted landing page's index.html, if
         // it is ever restored on disk by mistake, still cannot answer here.
@@ -683,15 +774,16 @@ async fn main() {
         .route("/{dir}/{page}", axum::routing::get(handler_nested))
         // Static files at root (fallback for index.html, assets, etc.).
         .fallback_service(static_files);
-    // Literal routes (`/blog/posts.json`, `/blog/feed.xml`, `/blog/`) always
-    // win over the `/{dir}/{page}` parameter route and the static fallback
-    // above regardless of merge order — matchit prioritises a static path
-    // segment over a dynamic one — so this merge can happen anywhere ahead
-    // of `.layer(...)` below.
+    // Literal routes (`/blog/posts.json`, `/blog/feed.xml`, `/blog/`, and
+    // `/health` below) always win over the `/{dir}/{page}` parameter route
+    // and the static fallback above regardless of merge order — matchit
+    // prioritises a static path segment over a dynamic one — so these
+    // merges can happen anywhere ahead of `.layer(...)` below.
     let app = match blog_app {
         Some(blog_app) => app.merge(blog_app),
         None => app,
     };
+    let app = app.merge(health_app);
     let app = app
         .layer(cors)
         .layer(axum::middleware::from_fn(security_headers));
