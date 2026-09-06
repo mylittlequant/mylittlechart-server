@@ -115,7 +115,10 @@ impl PriceCache {
 fn is_futures(account_type: &str) -> bool {
     matches!(
         account_type.to_ascii_lowercase().as_str(),
-        "futures" | "futurescross" | "futuresisolated" | "futures_cross" | "futures_isolated" | "fc" | "fi"
+        // "f" / "fi" are what the client actually sends: mlc-core's
+        // `AccountType::as_label()` → FuturesCross = "F", FuturesIsolated = "FI"
+        // (the sync item carries `account_type().as_label()`).
+        "futures" | "futurescross" | "futuresisolated" | "futures_cross" | "futures_isolated" | "f" | "fc" | "fi"
     )
 }
 
