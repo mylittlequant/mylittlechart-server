@@ -57,6 +57,7 @@ use tower_http::services::ServeDir;
 mod auth;
 mod build_attest;
 mod db;
+mod dm_db;
 mod entitlements;
 mod models;
 mod opswriter;

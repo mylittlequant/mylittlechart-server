@@ -19,6 +19,7 @@ pub mod admin;
 pub mod agent_keys;
 pub mod dashboard;
 pub mod device_auth;
+pub mod dm;
 pub mod entitlements;
 pub mod forum;
 pub mod forum_v2;
@@ -168,6 +169,22 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
             "/admin/forum/roles/{user_id}",
             axum::routing::put(forum_v2::admin_set_role).delete(forum_v2::admin_remove_role),
         )
+        // Direct messages (paid, end-to-end encrypted — see routes/dm.rs).
+        // Every route is authed AND paid; no public GET of any kind.
+        .route(
+            "/dm/identity",
+            axum::routing::put(dm::publish_identity),
+        )
+        .route("/dm/identity/{label}", get(dm::get_identity))
+        .route(
+            "/dm/conversations",
+            get(dm::list_conversations).post(dm::create_conversation),
+        )
+        .route(
+            "/dm/conversations/{id}/messages",
+            get(dm::list_messages).post(dm::create_message),
+        )
+        .route("/dm/conversations/{id}/read", post(dm::mark_read))
         .with_state(state)
 }
 

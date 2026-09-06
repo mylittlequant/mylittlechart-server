@@ -176,6 +176,55 @@ auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
 
+[[endpoints]]
+method = "PUT"
+path = "/api/dm/identity"
+description = "Direct messages (paid, E2E — see dm_db.rs/routes/dm.rs): publish or rotate the caller's X25519 DM public key. {public_key_b64} -> {fingerprint}. Server stores the public key only; DM contents are never visible to it."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/dm/identity/{public_id_or_nick}"
+description = "Direct messages: a user's published DM public key, fingerprint, and label. 404 if the label names no user or the user never published a key."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/dm/conversations"
+description = "Direct messages: {with: public_id_or_nick} -> existing or new conversation {id, peer{label,public_id,fingerprint}}. Both accounts must be paid (403 naming which side is not)."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/dm/conversations"
+description = "Direct messages: the caller's conversations, with peer label, last_message_at, and unread_count."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/dm/conversations/{id}/messages"
+description = "Direct messages: send a sealed message {nonce_b64,ciphertext_b64} -> {id,created_at}. Sender must be a party; the other party must currently be paid; ciphertext capped at 16 KiB; rate-limited per sender per rolling day (429 retry_after_secs)."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/dm/conversations/{id}/messages"
+description = "Direct messages: page through ciphertext rows (after=,limit=) for a conversation the caller is a party to. Contents are opaque to the server — see dm_db.rs's module doc."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/dm/conversations/{id}/read"
+description = "Direct messages: {up_to_id} marks the peer's messages up to that id as read for the caller."
+auth = "bearer"
+public = false
+
 [[manage_actions]]
 id = "graceful_restart"
 label = "Graceful Restart"
