@@ -21,6 +21,7 @@ pub mod dashboard;
 pub mod device_auth;
 pub mod entitlements;
 pub mod forum;
+pub mod forum_v2;
 pub mod heartbeat;
 pub mod link;
 pub mod oauth;
@@ -145,6 +146,28 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/forum/threads/{id}/replies", post(forum::create_reply))
         .route("/forum/replies/{id}", delete(forum::delete_reply))
         .route("/admin/forum/hide", post(forum::admin_hide))
+        // Forum engine v2 (public boards, role-gated read/write — see
+        // routes/forum_v2.rs). Additive: v1's `/forum/*` routes above are
+        // untouched.
+        .route("/forum/boards", get(forum_v2::list_boards))
+        .route(
+            "/forum/boards/{slug}/threads",
+            get(forum_v2::list_board_threads).post(forum_v2::create_board_thread),
+        )
+        .route("/forum/v2/threads/{id}", get(forum_v2::get_thread))
+        .route("/forum/v2/threads/{id}/replies", post(forum_v2::create_reply))
+        .route("/forum/v2/threads/{id}/moderate", post(forum_v2::moderate_thread))
+        .route("/forum/v2/replies/{id}", delete(forum_v2::delete_reply))
+        .route("/forum/search", get(forum_v2::search))
+        .route("/admin/forum/boards", post(forum_v2::admin_create_board))
+        .route(
+            "/admin/forum/boards/{id}",
+            patch(forum_v2::admin_update_board).delete(forum_v2::admin_delete_board),
+        )
+        .route(
+            "/admin/forum/roles/{user_id}",
+            axum::routing::put(forum_v2::admin_set_role).delete(forum_v2::admin_remove_role),
+        )
         .with_state(state)
 }
 

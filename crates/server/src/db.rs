@@ -54,21 +54,37 @@ fn wait_for_db_key(path: &str) -> String {
     }
 }
 
-/// Initialize the database and create all tables.
-pub fn init_db(path: &str) -> Result<Connection> {
+/// Read the SQLCipher key once at boot (waiting on the tmpfs key file — see
+/// [`wait_for_db_key`] — then deleting it), as a hex string suitable for
+/// `PRAGMA key = "x'...'"`.
+///
+/// Split out of [`init_db`] (2026-09-06, social-plane storage split) so
+/// `main.rs` can read the key exactly once and hand the same `key_hex` to
+/// both [`init_db`] (identity) and `social_db::init_social_db` (social) —
+/// the tmpfs file is deleted after this call, so it can only ever be read
+/// once per boot.
+pub fn read_sqlcipher_key() -> String {
     let key_path =
         std::env::var("MLC_DBKEY_PATH").unwrap_or_else(|_| DEFAULT_DBKEY_PATH.to_string());
     let key_hex = wait_for_db_key(&key_path);
 
+    // The key now lives only in process memory — remove the tmpfs file. Done
+    // here (not in `init_db`) since this is the one place the path is known
+    // and this is the only read of it for the whole boot — both `init_db`
+    // and `social_db::init_social_db` reuse the returned `key_hex`.
+    if let Err(e) = std::fs::remove_file(&key_path) {
+        tracing::warn!("Failed to remove database key file {}: {}", key_path, e);
+    }
+    key_hex
+}
+
+/// Initialize the identity database and create all tables. `key_hex` is the
+/// SQLCipher key, already read via [`read_sqlcipher_key`].
+pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
 
     // SQLCipher: the key must be the very first statement on the connection.
     conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key_hex))?;
-
-    // The key now lives only in process memory — remove the tmpfs file.
-    if let Err(e) = std::fs::remove_file(&key_path) {
-        tracing::warn!("Failed to remove database key file {}: {}", key_path, e);
-    }
 
     // Enable WAL mode for better concurrent read performance.
     if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {

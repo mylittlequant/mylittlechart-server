@@ -104,6 +104,78 @@ description = "Clone a live chart share into the caller's own preset (rights v1)
 auth = "bearer"
 public = false
 
+[[endpoints]]
+method = "GET"
+path = "/api/forum/boards"
+description = "Forum v2: boards the caller can read, by class (public/user/paid/moderator/admin — see social_db.rs). Public boards are visible to anonymous callers."
+auth = "optional"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/forum/boards/{slug}/threads"
+description = "Forum v2: paged thread list on one board (limit=, before=). 404 if the board does not exist or the caller's class cannot read it."
+auth = "optional"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/forum/boards/{slug}/threads"
+description = "Forum v2: create a thread on a board. Requires the board's write class (401 signed-out, 403 insufficient class, 429 rate-limited)."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/forum/v2/threads/{id}"
+description = "Forum v2: one thread plus its replies as a nested tree. Hidden replies are omitted unless the caller is a moderator/admin."
+auth = "optional"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/forum/v2/threads/{id}/replies"
+description = "Forum v2: reply to a thread, optionally nested via parent_reply_id. Requires the board's write class; refused on a locked thread unless the caller is a moderator/admin."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/forum/v2/replies/{id}"
+description = "Forum v2: hide one's own reply, or any reply if the caller is a moderator/admin."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/forum/search"
+description = "Forum v2: FTS5 full-text search over threads and replies (q=, optional board= slug), restricted to boards the caller can read."
+auth = "optional"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/forum/v2/threads/{id}/moderate"
+description = "Forum v2: moderator/admin only (forum_roles, not ADMIN_SECRET) — {action: hide|unhide|lock|unlock|pin|unpin|move, board?}."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/admin/forum/boards"
+description = "Forum v2 admin: create a board {slug, title, description?, read_class, write_class, position?}."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "PUT"
+path = "/api/admin/forum/roles/{user_id}"
+description = "Forum v2 admin: grant a role {role: moderator|admin} to a user_id."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
 [[manage_actions]]
 id = "graceful_restart"
 label = "Graceful Restart"

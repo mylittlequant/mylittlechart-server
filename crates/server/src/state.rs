@@ -79,6 +79,15 @@ pub struct ControlPlane {
     /// stays in `db`.
     pub ops_db: Mutex<rusqlite::Connection>,
 
+    /// Social-plane SQLCipher connection: forum-v2 boards/threads/replies/
+    /// roles (see `social_db.rs`). Same key as `db` above, different file
+    /// (`social.db`) — the 2026-09-06 storage split
+    /// (`docs/mlc/plans/social-sharing-access-gates-and-agent-control-2026-
+    /// 09-05.md` §5): the identity database keeps only users and their
+    /// vaults, everything social lives here instead. One writer, same
+    /// blocking-mutex idiom as `db` — reach it through [`ControlPlane::social_conn`].
+    pub social: Mutex<rusqlite::Connection>,
+
     /// The only writer for the operational database, running on its own OS
     /// thread (see `opswriter.rs`).
     ///
@@ -104,6 +113,16 @@ pub struct ControlPlane {
     /// `routes/share.rs`): one PNG per share at `<user_id>/<token>.png`, with
     /// `share_links.blob_path` holding the path relative to this root.
     pub share_root: std::path::PathBuf,
+}
+
+impl ControlPlane {
+    /// Lock and return the social-plane connection (see the `social` field's
+    /// doc comment). The one accessor `routes::forum_v2` uses instead of
+    /// spelling out `.social.lock().unwrap_or_else(|e| e.into_inner())` at
+    /// every call site.
+    pub fn social_conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.social.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Shared application state.

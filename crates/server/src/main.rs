@@ -62,6 +62,7 @@ mod models;
 mod opswriter;
 mod pathutil;
 mod routes;
+mod social_db;
 mod state;
 mod syncstore;
 
@@ -212,9 +213,14 @@ async fn main() {
             // routes/updates.rs). `data_dir` is still the root for the
             // database files initialized below.
 
-            // Initialize the identity database (SQLCipher, waits for the key).
+            // Read the SQLCipher key once — both the identity and social
+            // databases use it (see `db::read_sqlcipher_key`'s doc comment;
+            // the tmpfs key file is deleted after this call).
+            let key_hex = db::read_sqlcipher_key();
+
+            // Initialize the identity database (SQLCipher).
             let db_path = format!("{}/mylittlechart.db", data_dir);
-            let db_conn = match db::init_db(&db_path) {
+            let db_conn = match db::init_db(&db_path, &key_hex) {
                 Ok(conn) => conn,
                 Err(e) => {
                     tracing::error!("Failed to initialize database at {}: {}", db_path, e);
@@ -222,6 +228,20 @@ async fn main() {
                 }
             };
             tracing::info!("Database initialized at {}", db_path);
+
+            // Initialize the social database (SQLCipher, same key, separate
+            // file — 2026-09-06 storage split, see social_db.rs's module
+            // doc). Forum-v2 boards/threads/replies/roles live here; the
+            // identity database above keeps only users and their vaults.
+            let social_db_path = format!("{}/social.db", data_dir);
+            let social_conn = match social_db::init_social_db(&social_db_path, &key_hex) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::error!("Failed to initialize social database at {}: {}", social_db_path, e);
+                    std::process::exit(1);
+                }
+            };
+            tracing::info!("Social database initialized at {}", social_db_path);
 
             // Initialize the operational database (plain SQLite, no key wait —
             // see state::ControlPlane::ops_db). Then run the one-time move of
@@ -276,6 +296,7 @@ async fn main() {
 
             Some(state::ControlPlane {
                 db: Mutex::new(db_conn),
+                social: Mutex::new(social_conn),
                 ops_db: Mutex::new(ops_conn),
                 ops_writer,
                 sync_store: crate::syncstore::SyncStore::new(
