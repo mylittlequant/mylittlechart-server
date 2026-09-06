@@ -1,0 +1,28 @@
+[package]
+name = "mlc-alert-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mlc-alert-daemon"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true }
+reqwest = { workspace = true }
+hex = { workspace = true }
+
+# Static musl builds cannot link a system OpenSSL, so the deploy target — and
+# only the deploy target — builds it from source. Features are additive, so
+# this rides on top of the workspace's `bundled-sqlcipher` rather than
+# replacing it. Mirrors `crates/server/Cargo.toml`'s identical block — this
+# daemon opens the SAME SQLCipher-encrypted identity database, read-only.
+[target.'cfg(target_env = "musl")'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }

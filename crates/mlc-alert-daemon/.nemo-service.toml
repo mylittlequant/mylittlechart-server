@@ -1,0 +1,25 @@
+[service]
+name = "mlc-alert-daemon"
+kind = "daemon"
+display_name = "MLC Alert Daemon"
+description = "Server-side evaluation loop for mylittlechart.org account-wide Price alerts. Reads `alerts`-category sync items read-only from mylittlechart-server's identity database (never writes to it), checks price crossings against a public REST last-price fetch (Binance/Bybit), and delivers a Telegram DM via the mylittlechart_login_bot identity to paid + tg-linked accounts only. NOT registered in d-watchdog yet (owner rule 2026-09-06 — manifest only; deploy is the same opsd binary-swap flow mylittlechart-server uses, see the plan doc below, until a follow-up wires supervision)."
+
+[links]
+local_url = "http://127.0.0.1:19210"
+docs = "docs/mlc/plans/alerts-account-wide-and-telegram-delivery-2026-09-06.md"
+
+[[endpoints]]
+method = "GET"
+path = "/health"
+description = "Process health + cumulative evaluation counters since start: {status, checked, fired, delivered, skipped_unpaid, skipped_unlinked}."
+auth = "none"
+public = false
+
+[health]
+endpoint = "/health"
+
+[dependencies]
+# Reads mylittlechart-server's identity database (mylittlechart.db)
+# read-only — never writes to it. Delivers via the same Telegram bot
+# mylittlechart-server's tg-login-bot uses (TELEGRAM_BOT_TOKEN).
+upstream = ["mylittlechart-server"]

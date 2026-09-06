@@ -3016,6 +3016,10 @@ pub struct SyncPushItem {
 /// Allowed sync categories. Any other value is rejected.
 pub(crate) const VALID_SYNC_CATEGORIES: &[&str] = &[
     "preset",
+    // Account-wide alert definitions (A3): the client pushes its alerts.json
+    // items here; mlc-alert-daemon reads them read-only for server-side
+    // price-alert evaluation. Shape: crates/mlc-alert-daemon/src/alert_item.rs.
+    "alerts",
     "watchlist",
     "template",
     "template_primitive",
