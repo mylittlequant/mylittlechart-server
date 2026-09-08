@@ -190,6 +190,19 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
             axum::routing::put(forum_v2::admin_set_role_by_nick)
                 .delete(forum_v2::admin_remove_role_by_nick),
         )
+        // Forum v2 trusted standing (`Class::Trusted` — owner ruling
+        // 2026-09-09, plan §5). Same static/parameter/by-nick coexistence as
+        // the role CRUD directly above.
+        .route("/admin/forum/trusted", get(forum_v2::admin_list_trusted))
+        .route(
+            "/admin/forum/trusted/{user_id}",
+            axum::routing::put(forum_v2::admin_set_trusted).delete(forum_v2::admin_remove_trusted),
+        )
+        .route(
+            "/admin/forum/trusted/by-nick/{nick}",
+            axum::routing::put(forum_v2::admin_set_trusted_by_nick)
+                .delete(forum_v2::admin_remove_trusted_by_nick),
+        )
         // Direct messages (paid, end-to-end encrypted — see routes/dm.rs).
         // Every route is authed AND paid; no public GET of any kind.
         .route(

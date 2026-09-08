@@ -68,10 +68,10 @@ pub(crate) fn create_social_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         -- Reference table of caller classes (plan §4: "roles are a
-        -- server-side table, not code paths"). The RANK of these five names
+        -- server-side table, not code paths"). The RANK of these six names
         -- is fixed in `Class`'s enum declaration order below, not in this
         -- table — this table is metadata (name + description) for an admin
-        -- UI, not the source of truth for ordering. Adding a sixth class
+        -- UI, not the source of truth for ordering. Adding a seventh class
         -- still needs a code change to `Class` — the plan's promise that "a
         -- new class never needs a code change" is about moderation
         -- permissions attached to `forum_roles` rows, not about widening the
@@ -83,11 +83,24 @@ pub(crate) fn create_social_schema(conn: &Connection) -> Result<()> {
 
         -- One managed role per account: 'moderator' or 'admin'. Absence of a
         -- row means neither — the account's classes are whatever
-        -- `caller_classes` derives from signed-in/paid alone. See `Role`.
+        -- `caller_classes` derives from signed-in/paid/trusted alone. See
+        -- `Role`.
         CREATE TABLE IF NOT EXISTS forum_roles (
             user_id    INTEGER PRIMARY KEY,
             role       TEXT NOT NULL,
             granted_at TEXT NOT NULL
+        );
+
+        -- One row = the account holds `Class::Trusted` standing ("paid with
+        -- standing" — owner ruling, `docs/mlc/plans/community-modal-and-
+        -- forum-ladder-2026-09-09.md` §5): a flag an admin grants, additive
+        -- to whatever `is_paid` alone would give. Absence of a row means not
+        -- trusted. `note` is an optional free-text reason for the grant (an
+        -- operator's own record — never shown to other callers).
+        CREATE TABLE IF NOT EXISTS forum_trusted (
+            user_id    INTEGER PRIMARY KEY,
+            granted_at TEXT NOT NULL,
+            note       TEXT
         );
 
         -- A board's `read_class`/`write_class` name a row in `forum_classes`
@@ -184,6 +197,7 @@ pub(crate) fn create_social_schema(conn: &Connection) -> Result<()> {
         ("public", "Anyone, including signed-out visitors"),
         ("user", "Any signed-in account"),
         ("paid", "Signed-in accounts with paid access"),
+        ("trusted", "Paid accounts holding admin-granted trusted standing"),
         ("moderator", "Accounts holding the moderator role"),
         ("admin", "Accounts holding the admin role"),
     ] {
@@ -193,19 +207,27 @@ pub(crate) fn create_social_schema(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Seeded boards (plan §"Seeded boards (idempotent)") — `INSERT OR IGNORE`
+    // so re-running this on an existing database only fills in slugs that
+    // are still missing; an existing board's title/read_class/write_class
+    // (and, for `general`/`paid`, `position`) are never touched by this loop.
     let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT OR IGNORE INTO forum_boards
-            (slug, title, description, read_class, write_class, position, created_at)
-         VALUES ('general', 'General', 'Open discussion.', 'public', 'paid', 0, ?1)",
-        params![now],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO forum_boards
-            (slug, title, description, read_class, write_class, position, created_at)
-         VALUES ('paid', 'Paid', 'Paid-only discussion.', 'paid', 'paid', 1, ?1)",
-        params![now],
-    )?;
+    for (slug, title, description, read_class, write_class, position) in [
+        ("announcements", "Announcements", "Project news, posted by the team.", Class::Public, Class::Admin, 0),
+        ("general", "General", "Open discussion.", Class::Public, Class::Paid, 1),
+        ("members", "Members", "Any signed-in account can post here.", Class::User, Class::User, 2),
+        ("paid", "Paid", "Paid-only discussion.", Class::Paid, Class::Paid, 3),
+        ("trusted", "Trusted", "Paid accounts holding trusted standing.", Class::Trusted, Class::Trusted, 4),
+        ("staff", "Staff", "Moderators and admins.", Class::Moderator, Class::Moderator, 5),
+        ("admins", "Admins", "Admins only.", Class::Admin, Class::Admin, 6),
+    ] {
+        conn.execute(
+            "INSERT OR IGNORE INTO forum_boards
+                (slug, title, description, read_class, write_class, position, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![slug, title, description, read_class, write_class, position, now],
+        )?;
+    }
 
     Ok(())
 }
@@ -214,28 +236,50 @@ pub(crate) fn create_social_schema(conn: &Connection) -> Result<()> {
 // Class — the caller-class ladder (plan §4)
 // ============================================================================
 
-/// A caller class, ranked by declaration order: `Public < User < Paid <
-/// Moderator < Admin`. `can_read`/`can_write` compare a board's required
-/// class against a caller's held classes with `>=` on this order, so a
-/// moderator or admin automatically satisfies every board's gate without a
-/// special case.
+/// A caller class, ranked by declaration order (owner ruling 2026-09-09,
+/// `docs/mlc/plans/community-modal-and-forum-ladder-2026-09-09.md` §5):
+/// `Public < User < Paid < Trusted < Moderator < Admin`. [`can_read`]/
+/// [`can_write`] compare a board's required class against a caller's held
+/// classes by [`rank`](Class::rank), so a moderator or admin automatically
+/// satisfies every board's gate without a special case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Class {
     Public,
     User,
     Paid,
+    /// Paid "with standing" — an admin-granted flag ([`forum_trusted`
+    /// admin routes](set_trusted)/`social_db::is_trusted`), not automatic
+    /// from `is_paid` alone.
+    Trusted,
     Moderator,
     Admin,
 }
 
 impl Class {
-    /// Stable wire/storage name — also the five rows seeded into
+    /// Numeric rank on the ladder, `0` (least) to `5` (most) — the value
+    /// [`can_read`]/[`can_write`]/[`is_moderator_or_admin`] compare with
+    /// `>=`. Written out explicitly (not `self as u8`) so the ladder's order
+    /// stays a single obvious source of truth next to [`as_str`](Class::as_str)/
+    /// [`from_wire_name`](Class::from_wire_name).
+    pub fn rank(self) -> u8 {
+        match self {
+            Class::Public => 0,
+            Class::User => 1,
+            Class::Paid => 2,
+            Class::Trusted => 3,
+            Class::Moderator => 4,
+            Class::Admin => 5,
+        }
+    }
+
+    /// Stable wire/storage name — also the six rows seeded into
     /// `forum_classes`.
     pub fn as_str(self) -> &'static str {
         match self {
             Class::Public => "public",
             Class::User => "user",
             Class::Paid => "paid",
+            Class::Trusted => "trusted",
             Class::Moderator => "moderator",
             Class::Admin => "admin",
         }
@@ -246,10 +290,17 @@ impl Class {
             "public" => Some(Class::Public),
             "user" => Some(Class::User),
             "paid" => Some(Class::Paid),
+            "trusted" => Some(Class::Trusted),
             "moderator" => Some(Class::Moderator),
             "admin" => Some(Class::Admin),
             _ => None,
         }
+    }
+
+    /// Every class name, ladder order — the list a 400 refusal on an invalid
+    /// `read_class`/`write_class` shows the caller.
+    pub fn all_wire_names() -> &'static [&'static str] {
+        &["public", "user", "paid", "trusted", "moderator", "admin"]
     }
 }
 
@@ -353,55 +404,129 @@ pub fn list_roles(conn: &Connection) -> Result<Vec<RoleRow>> {
     Ok(out)
 }
 
-/// Resolve the caller's classes: `[Public]` for an anonymous caller, `+User`
-/// once signed in, `+Paid` if `is_paid` (already resolved by the route via
-/// `db::user_is_paid` on the identity connection — same shape
-/// `entitlements::resolve_for_user` already takes, and for the same reason:
-/// it keeps this module's tests running against `conn_social` alone, with no
-/// identity-database fixture at all), and `+Moderator`/`+Admin` from a
-/// `forum_roles` row on `conn_social` — the one piece of this that DOES live
-/// in the social database, per the storage split (plan §5).
-///
-/// Deviates from the plan's sketched `fn caller_classes(conn_identity,
-/// caller) -> Vec<Class>` signature: `forum_roles` lives in `social.db`, not
-/// identity, so a real implementation needs `conn_social`, not
-/// `conn_identity` — and once a database connection is threaded through, the
-/// already-resolved-fact shape below (matching `entitlements.rs`'s own
-/// documented reasoning) is the better fit than a second live query this
-/// module would otherwise have to make against a table it does not own.
-pub fn caller_classes(conn_social: &Connection, caller: Option<i64>, is_paid: bool) -> Vec<Class> {
-    let mut classes = vec![Class::Public];
-    let Some(user_id) = caller else {
-        return classes;
-    };
-    classes.push(Class::User);
-    if is_paid {
-        classes.push(Class::Paid);
-    }
-    if let Ok(Some(role)) = role_for_user(conn_social, user_id) {
-        classes.push(match role {
-            Role::Moderator => Class::Moderator,
-            Role::Admin => Class::Admin,
+/// Grant `user_id` trusted standing ([`Class::Trusted`]) — upsert, same
+/// idiom as [`set_role`]: a second call just replaces `note`/`granted_at`.
+pub fn set_trusted(conn: &Connection, user_id: i64, note: Option<&str>, now: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO forum_trusted (user_id, granted_at, note) VALUES (?1, ?2, ?3)
+         ON CONFLICT(user_id) DO UPDATE SET granted_at = excluded.granted_at, note = excluded.note",
+        params![user_id, now, note],
+    )?;
+    Ok(())
+}
+
+/// Revoke `user_id`'s trusted standing, if any. Returns whether a row was
+/// removed.
+pub fn remove_trusted(conn: &Connection, user_id: i64) -> Result<bool> {
+    let n = conn.execute("DELETE FROM forum_trusted WHERE user_id = ?1", params![user_id])?;
+    Ok(n > 0)
+}
+
+/// Whether `user_id` holds a `forum_trusted` row.
+pub fn is_trusted(conn: &Connection, user_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM forum_trusted WHERE user_id = ?1", params![user_id], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// One row returned by [`list_trusted`] — `routes::forum_v2::admin_list_trusted`
+/// resolves `nick` from the identity connection per row, same cross-database
+/// discipline as [`RoleRow`].
+pub struct TrustedRow {
+    pub user_id: i64,
+    pub granted_at: String,
+    pub note: Option<String>,
+}
+
+/// Every managed `forum_trusted` row, ordered by user id ascending.
+pub fn list_trusted(conn: &Connection) -> Result<Vec<TrustedRow>> {
+    let mut stmt = conn.prepare("SELECT user_id, granted_at, note FROM forum_trusted ORDER BY user_id ASC")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(TrustedRow {
+            user_id: row.get(0)?,
+            granted_at: row.get(1)?,
+            note: row.get(2)?,
         });
     }
-    classes
+    Ok(out)
+}
+
+/// Resolve the caller's classes as the full cumulative ladder up to their
+/// rank (plan §5: "cumulative, one rank per account") — `[Public]` for an
+/// anonymous caller; otherwise every class from `Public` up to
+/// `max(User, Paid if is_paid, Trusted if a `forum_trusted` row exists, the
+/// class a `forum_roles` row maps to)`. `is_paid` is already resolved by the
+/// route via `db::user_is_paid` on the identity connection — same shape
+/// `entitlements::resolve_for_user` already takes, and for the same reason:
+/// it keeps this module's tests running against `conn_social` alone, with no
+/// identity-database fixture at all. `forum_trusted`/`forum_roles` both live
+/// on `conn_social` — the pieces of this that DO live in the social
+/// database, per the storage split (plan §5).
+///
+/// Cumulative means a moderator or admin's classes include `Paid`/`Trusted`
+/// even when the account itself is not paid or not flagged trusted — the
+/// plan's own framing ("a moderator can read/write everything up to rank
+/// 4") makes the ladder's rank the single source of truth, not a per-class
+/// flag union.
+///
+/// Deviates from the plan's sketched `fn caller_classes(conn_identity,
+/// caller) -> Vec<Class>` signature: `forum_trusted`/`forum_roles` live in
+/// `social.db`, not identity, so a real implementation needs `conn_social`,
+/// not `conn_identity` — and once a database connection is threaded through,
+/// the already-resolved-fact shape below (matching `entitlements.rs`'s own
+/// documented reasoning) is the better fit than a second live query this
+/// module would otherwise have to make against tables it does not own.
+pub fn caller_classes(conn_social: &Connection, caller: Option<i64>, is_paid: bool) -> Vec<Class> {
+    let Some(user_id) = caller else {
+        return vec![Class::Public];
+    };
+
+    let mut rank = Class::User.rank();
+    if is_paid {
+        rank = rank.max(Class::Paid.rank());
+    }
+    if is_trusted(conn_social, user_id).unwrap_or(false) {
+        rank = rank.max(Class::Trusted.rank());
+    }
+    if let Ok(Some(role)) = role_for_user(conn_social, user_id) {
+        let role_class = match role {
+            Role::Moderator => Class::Moderator,
+            Role::Admin => Class::Admin,
+        };
+        rank = rank.max(role_class.rank());
+    }
+
+    [Class::Public, Class::User, Class::Paid, Class::Trusted, Class::Moderator, Class::Admin]
+        .into_iter()
+        .filter(|c| c.rank() <= rank)
+        .collect()
+}
+
+/// Highest rank held anywhere in `classes` — `0` (`Public`) for an empty
+/// slice, which should not happen since [`caller_classes`] always includes
+/// at least `Public`.
+fn caller_rank(classes: &[Class]) -> u8 {
+    classes.iter().map(|c| c.rank()).max().unwrap_or(0)
 }
 
 /// Whether `classes` reaches or exceeds `board`'s read gate.
 pub fn can_read(board: &Board, classes: &[Class]) -> bool {
-    classes.iter().any(|c| *c >= board.read_class)
+    caller_rank(classes) >= board.read_class.rank()
 }
 
 /// Whether `classes` reaches or exceeds `board`'s write gate.
 pub fn can_write(board: &Board, classes: &[Class]) -> bool {
-    classes.iter().any(|c| *c >= board.write_class)
+    caller_rank(classes) >= board.write_class.rank()
 }
 
 /// Whether `classes` holds moderation permission (moderator = hide/unhide/
 /// lock/pin/move within a board and delete any reply; admin = everything —
-/// see [`Class`]'s rank, which already makes `Admin` satisfy this).
+/// see [`Class::rank`], which already makes `Admin` satisfy this).
 pub fn is_moderator_or_admin(classes: &[Class]) -> bool {
-    classes.iter().any(|c| *c >= Class::Moderator)
+    caller_rank(classes) >= Class::Moderator.rank()
 }
 
 // ============================================================================
@@ -1060,19 +1185,37 @@ mod tests {
     fn class_rank_orders_public_below_admin() {
         assert!(Class::Public < Class::User);
         assert!(Class::User < Class::Paid);
-        assert!(Class::Paid < Class::Moderator);
+        assert!(Class::Paid < Class::Trusted);
+        assert!(Class::Trusted < Class::Moderator);
         assert!(Class::Moderator < Class::Admin);
     }
 
     #[test]
+    fn class_rank_values_match_ladder_position() {
+        assert_eq!(Class::Public.rank(), 0);
+        assert_eq!(Class::User.rank(), 1);
+        assert_eq!(Class::Paid.rank(), 2);
+        assert_eq!(Class::Trusted.rank(), 3);
+        assert_eq!(Class::Moderator.rank(), 4);
+        assert_eq!(Class::Admin.rank(), 5);
+    }
+
+    #[test]
     fn class_wire_names_roundtrip() {
-        for c in [Class::Public, Class::User, Class::Paid, Class::Moderator, Class::Admin] {
+        for c in [
+            Class::Public,
+            Class::User,
+            Class::Paid,
+            Class::Trusted,
+            Class::Moderator,
+            Class::Admin,
+        ] {
             assert_eq!(Class::from_wire_name(c.as_str()), Some(c));
         }
         assert_eq!(Class::from_wire_name("bogus"), None);
     }
 
-    // ---- caller_classes ----
+    // ---- caller_classes: cumulative ladder for each rank ----
 
     #[test]
     fn caller_classes_anonymous_is_public_only() {
@@ -1096,18 +1239,44 @@ mod tests {
     }
 
     #[test]
-    fn caller_classes_role_row_adds_moderator_or_admin() {
+    fn caller_classes_trusted_row_adds_trusted() {
+        let conn = test_conn();
+        set_trusted(&conn, 2, Some("owner grant"), "2026-09-09T00:00:00+00:00").expect("set trusted");
+        assert_eq!(
+            caller_classes(&conn, Some(2), true),
+            vec![Class::Public, Class::User, Class::Paid, Class::Trusted]
+        );
+        // Trusted without paid: rank is still Trusted (3), which sits above
+        // Paid (2) on the ladder, so the cumulative list includes Paid too.
+        assert_eq!(
+            caller_classes(&conn, Some(2), false),
+            vec![Class::Public, Class::User, Class::Paid, Class::Trusted]
+        );
+    }
+
+    #[test]
+    fn caller_classes_role_row_is_cumulative_through_moderator_and_admin() {
         let conn = test_conn();
         set_role(&conn, 7, Role::Moderator, "2026-09-06T00:00:00+00:00").expect("set role");
+        // A moderator's classes reach every rank up to Moderator (4), even
+        // though this account is neither paid nor flagged trusted — the
+        // ladder's rank, not a per-class flag union, is the source of truth.
         assert_eq!(
             caller_classes(&conn, Some(7), false),
-            vec![Class::Public, Class::User, Class::Moderator]
+            vec![Class::Public, Class::User, Class::Paid, Class::Trusted, Class::Moderator]
         );
 
         set_role(&conn, 8, Role::Admin, "2026-09-06T00:00:00+00:00").expect("set role");
         assert_eq!(
             caller_classes(&conn, Some(8), true),
-            vec![Class::Public, Class::User, Class::Paid, Class::Admin]
+            vec![
+                Class::Public,
+                Class::User,
+                Class::Paid,
+                Class::Trusted,
+                Class::Moderator,
+                Class::Admin
+            ]
         );
     }
 
@@ -1151,6 +1320,66 @@ mod tests {
         assert!(is_moderator_or_admin(&[Class::Public, Class::User, Class::Admin]));
     }
 
+    // ---- ladder scenarios from the plan's owner-approved test list ----
+
+    #[test]
+    fn moderator_reads_staff_but_not_admins() {
+        let conn = test_conn();
+        let staff = get_board_by_slug(&conn, "staff").expect("query").expect("staff board seeded");
+        let admins = get_board_by_slug(&conn, "admins").expect("query").expect("admins board seeded");
+        let moderator_classes =
+            vec![Class::Public, Class::User, Class::Paid, Class::Trusted, Class::Moderator];
+        assert!(can_read(&staff, &moderator_classes));
+        assert!(!can_read(&admins, &moderator_classes));
+    }
+
+    #[test]
+    fn trusted_paid_user_writes_trusted_and_paid_boards() {
+        let conn = test_conn();
+        let trusted_board = get_board_by_slug(&conn, "trusted").expect("query").expect("trusted board seeded");
+        let paid_board = get_board_by_slug(&conn, "paid").expect("query").expect("paid board seeded");
+        let trusted_paid_classes = vec![Class::Public, Class::User, Class::Paid, Class::Trusted];
+        assert!(can_write(&trusted_board, &trusted_paid_classes));
+        assert!(can_write(&paid_board, &trusted_paid_classes));
+    }
+
+    #[test]
+    fn admin_only_write_on_announcements_refuses_a_paid_caller() {
+        let conn = test_conn();
+        let announcements =
+            get_board_by_slug(&conn, "announcements").expect("query").expect("announcements board seeded");
+        let paid_classes = vec![Class::Public, Class::User, Class::Paid];
+        assert!(can_read(&announcements, &paid_classes));
+        assert!(!can_write(&announcements, &paid_classes));
+    }
+
+    // ---- seed idempotency ----
+
+    #[test]
+    fn seed_boards_is_idempotent_and_never_overwrites_existing_rows() {
+        let conn = test_conn();
+        // Re-running the seed (as every boot does) must not duplicate rows
+        // or change an existing board's title/classes.
+        create_social_schema(&conn).expect("schema re-run");
+        let boards = list_boards(&conn).expect("list boards");
+        assert_eq!(boards.len(), 7);
+
+        let expected: &[(&str, Class, Class)] = &[
+            ("announcements", Class::Public, Class::Admin),
+            ("general", Class::Public, Class::Paid),
+            ("members", Class::User, Class::User),
+            ("paid", Class::Paid, Class::Paid),
+            ("trusted", Class::Trusted, Class::Trusted),
+            ("staff", Class::Moderator, Class::Moderator),
+            ("admins", Class::Admin, Class::Admin),
+        ];
+        for (slug, read_class, write_class) in expected {
+            let board = boards.iter().find(|b| b.slug == *slug).unwrap_or_else(|| panic!("{slug} board seeded"));
+            assert_eq!(board.read_class, *read_class, "{slug} read_class");
+            assert_eq!(board.write_class, *write_class, "{slug} write_class");
+        }
+    }
+
     // ---- tree assembly ----
 
     #[test]
@@ -1192,7 +1421,7 @@ mod tests {
     fn schema_seeds_classes_and_boards_and_fts5_is_queryable() {
         let conn = test_conn();
         let boards = list_boards(&conn).expect("list boards");
-        assert_eq!(boards.len(), 2);
+        assert_eq!(boards.len(), 7);
         let general = boards.iter().find(|b| b.slug == "general").expect("general board");
         assert_eq!(general.read_class, Class::Public);
         assert_eq!(general.write_class, Class::Paid);

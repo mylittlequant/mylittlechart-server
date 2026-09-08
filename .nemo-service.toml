@@ -122,7 +122,7 @@ public = true
 [[endpoints]]
 method = "GET"
 path = "/api/forum/boards"
-description = "Forum v2: boards the caller can read, by class (public/user/paid/moderator/admin — see social_db.rs). Public boards are visible to anonymous callers."
+description = "Forum v2: boards the caller can read, by class (public/user/paid/trusted/moderator/admin — see social_db.rs). Public boards are visible to anonymous callers."
 auth = "optional"
 public = true
 
@@ -178,7 +178,7 @@ public = false
 [[endpoints]]
 method = "POST"
 path = "/api/admin/forum/boards"
-description = "Forum v2 admin: create a board {slug, title, description?, read_class, write_class, position?}."
+description = "Forum v2 admin: create a board {slug, title, description?, read_class, write_class, position?}. read_class/write_class must be one of public|user|paid|trusted|moderator|admin (400 with the list otherwise)."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -211,6 +211,46 @@ public = false
 method = "DELETE"
 path = "/api/admin/forum/roles/by-nick/{nick}"
 description = "Forum v2 admin: same revoke as DELETE .../roles/{user_id}, addressed by nick. 404 {\"error\":\"no user with that nick\"} when absent."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/admin/forum/trusted"
+description = "Forum v2 admin: every forum_trusted row {user_id, nick, note, granted_at} (Class::Trusted, owner ruling 2026-09-09 — 'paid with standing'), nick resolved from the identity database."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "PUT"
+path = "/api/admin/forum/trusted/{user_id}"
+description = "Forum v2 admin: grant Class::Trusted standing to a user_id. Body {note: \"...\"} optional, may be omitted entirely. Idempotent (a second grant replaces note/granted_at)."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/admin/forum/trusted/{user_id}"
+description = "Forum v2 admin: revoke Class::Trusted standing from a user_id. 404 if the account was not trusted."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "PUT"
+path = "/api/admin/forum/trusted/by-nick/{nick}"
+description = "Forum v2 admin: same grant as PUT .../trusted/{user_id}, addressed by nick (case-insensitive, exact match). 404 {\"error\":\"no user with that nick\"} when absent."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/admin/forum/trusted/by-nick/{nick}"
+description = "Forum v2 admin: same revoke as DELETE .../trusted/{user_id}, addressed by nick. 404 {\"error\":\"no user with that nick\"} when absent."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false

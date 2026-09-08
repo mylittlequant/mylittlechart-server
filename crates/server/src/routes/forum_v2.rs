@@ -42,14 +42,28 @@
 //!                                                       insensitive, exact match).
 //!  - `DELETE /admin/forum/roles/by-nick/{nick}`       — ADMIN_SECRET: revoke it,
 //!                                                       addressed by nick.
+//!  - `GET    /admin/forum/trusted`                    — ADMIN_SECRET: every
+//!                                                       `forum_trusted` row,
+//!                                                       nick resolved.
+//!  - `PUT    /admin/forum/trusted/{user_id}`          — ADMIN_SECRET: grant
+//!                                                       `Class::Trusted`
+//!                                                       standing (body
+//!                                                       `{"note": "…"}`,
+//!                                                       optional, may be
+//!                                                       omitted entirely).
+//!  - `DELETE /admin/forum/trusted/{user_id}`          — ADMIN_SECRET: revoke it.
+//!  - `PUT    /admin/forum/trusted/by-nick/{nick}`     — ADMIN_SECRET: same
+//!                                                       grant, addressed by nick.
+//!  - `DELETE /admin/forum/trusted/by-nick/{nick}`     — ADMIN_SECRET: same
+//!                                                       revoke, addressed by nick.
 //!
-//! Board CRUD and role CRUD are ADMIN_SECRET-gated (same bearer as every
-//! other `/api/admin/*` route, including v1's `POST /admin/forum/hide`) —
-//! they are operator actions, not something a `forum_roles` admin row grants
-//! by itself. The per-thread `/moderate` action, by contrast, is gated by
-//! the CALLER's own classes (`social_db::is_moderator_or_admin`): a signed-in
-//! account holding a `forum_roles` row can moderate without ever touching
-//! `ADMIN_SECRET`.
+//! Board CRUD, role CRUD, and trusted-standing CRUD are all ADMIN_SECRET-gated
+//! (same bearer as every other `/api/admin/*` route, including v1's `POST
+//! /admin/forum/hide`) — they are operator actions, not something a
+//! `forum_roles`/`forum_trusted` row grants by itself. The per-thread
+//! `/moderate` action, by contrast, is gated by the CALLER's own classes
+//! (`social_db::is_moderator_or_admin`): a signed-in account holding a
+//! `forum_roles` row can moderate without ever touching `ADMIN_SECRET`.
 
 use axum::{
     body::Bytes,
@@ -227,12 +241,19 @@ fn board_json(b: &social_db::Board) -> serde_json::Value {
 /// anonymous caller gets `{"classes": ["public"], "roles": [], "label":
 /// null, "public_id": null}`, not a 401.
 ///
-/// `roles` names the [`social_db::Role`] rows this caller actually holds via
-/// [`social_db::caller_classes`] — at most one entry today, since a
-/// `forum_roles` row is one managed role per account (`social_db::set_role`
-/// upserts, it does not accumulate). `classes` is the full ladder the caller
-/// satisfies (`public`, plus `user`/`paid`/`moderator`/`admin` as earned) —
-/// what `social_db::can_read`/`can_write` compare a board's gate against.
+/// `roles` names the literal `forum_roles` row this caller holds
+/// ([`social_db::role_for_user`], queried directly — NOT derived from
+/// `classes` below): at most one entry, since a `forum_roles` row is one
+/// managed role per account (`social_db::set_role` upserts, it does not
+/// accumulate). `classes` is the full CUMULATIVE ladder the caller satisfies
+/// (`public`, plus every rank up to and including `user`/`paid`/`trusted`/
+/// `moderator`/`admin` as earned — see [`social_db::caller_classes`]'s doc
+/// comment on why this is cumulative) — what `social_db::can_read`/
+/// `can_write` compare a board's gate against. The two are deliberately
+/// different shapes: an admin's `classes` reaches all the way to `admin`
+/// (including the intermediate `moderator` rank, for gating), but `roles`
+/// still names only the one row this account actually holds (`["admin"]`,
+/// never `["moderator", "admin"]`).
 ///
 /// Moderation permission table — MUST match [`moderate_thread`]'s action
 /// arms exactly, since the client gates its moderation UI off this route's
@@ -265,35 +286,42 @@ pub async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         Ok(c) => c,
         Err(e) => return e,
     };
-    let roles: Vec<&'static str> = classes.iter().filter(|c| **c >= Class::Moderator).map(|c| c.as_str()).collect();
     let classes_json: Vec<&'static str> = classes.iter().map(|c| c.as_str()).collect();
 
     let Some(user_id) = caller else {
         return Json(serde_json::json!({
             "classes": classes_json,
-            "roles": roles,
+            "roles": Vec::<&'static str>::new(),
             "label": serde_json::Value::Null,
             "public_id": serde_json::Value::Null,
         }))
         .into_response();
     };
 
-    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(String, Option<String>)> {
+    type MeIdentity = (Option<social_db::Role>, String, Option<String>);
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<MeIdentity> {
+        let social_conn = state.control_plane().social_conn();
+        let role = social_db::role_for_user(&social_conn, user_id)?;
+        drop(social_conn);
+
         let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let label = db::effective_label_for_user(&identity_conn, user_id)?;
         let public_id = db::get_user_public_id(&identity_conn, user_id).ok();
-        Ok((label, public_id))
+        Ok((role, label, public_id))
     })
     .await;
 
     match result {
-        Ok(Ok((label, public_id))) => Json(serde_json::json!({
-            "classes": classes_json,
-            "roles": roles,
-            "label": label,
-            "public_id": public_id,
-        }))
-        .into_response(),
+        Ok(Ok((role, label, public_id))) => {
+            let roles: Vec<&'static str> = role.map(|r| vec![r.as_str()]).unwrap_or_default();
+            Json(serde_json::json!({
+                "classes": classes_json,
+                "roles": roles,
+                "label": label,
+                "public_id": public_id,
+            }))
+            .into_response()
+        }
         Ok(Err(e)) => {
             tracing::error!("DB error resolving forum_v2 caller identity: {}", e);
             internal_error()
@@ -877,7 +905,7 @@ pub struct AdminCreateBoardRequest {
 
 fn parse_class_field(name: &str, raw: &str) -> Result<Class, Response> {
     Class::from_wire_name(raw)
-        .ok_or_else(|| bad_request(&format!("{name} must be one of public|user|paid|moderator|admin")))
+        .ok_or_else(|| bad_request(&format!("{name} must be one of {}", Class::all_wire_names().join("|"))))
 }
 
 pub async fn admin_create_board(
@@ -1249,4 +1277,236 @@ pub async fn admin_remove_role_by_nick(
         Err(e) => return e,
     };
     remove_role_for_user(state, user_id).await
+}
+
+// ============================================================================
+// Admin: trusted-standing CRUD (bearer ADMIN_SECRET) — `Class::Trusted`
+// (owner ruling 2026-09-09, plan §5: "paid with standing", a flag an admin
+// grants). Same shape as the role CRUD above: numeric-id routes plus a
+// by-nick pair, one shared DB call per direction so there is exactly one
+// call to `social_db::set_trusted`/`remove_trusted`, not a copy per route.
+// ============================================================================
+
+#[derive(serde::Deserialize, Default)]
+pub struct AdminSetTrustedRequest {
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Parse the optional `PUT .../trusted/*` request body: an empty body (the
+/// common case — the plan's `{"note": "…"}` is explicitly optional) means no
+/// note, without ever handing an empty byte slice to `serde_json` (which
+/// would refuse it as invalid JSON).
+fn parse_trusted_body(body: &Bytes) -> Result<AdminSetTrustedRequest, Response> {
+    if body.is_empty() {
+        return Ok(AdminSetTrustedRequest::default());
+    }
+    serde_json::from_slice(body).map_err(|_| bad_request("Invalid JSON body"))
+}
+
+/// Grant trusted standing to `user_id` — the DB half shared by the numeric-id
+/// route (`admin_set_trusted`) and the by-nick route
+/// (`admin_set_trusted_by_nick`).
+async fn set_trusted_for_user(state: Arc<AppState>, user_id: i64, note: Option<String>) -> Response {
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
+        let conn = state.control_plane().social_conn();
+        social_db::set_trusted(&conn, user_id, note.as_deref(), &chrono::Utc::now().to_rfc3339())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error setting forum trusted standing: {}", e);
+            internal_error()
+        }
+        Err(_) => internal_error(),
+    }
+}
+
+/// Revoke `user_id`'s trusted standing, if any — the DB half shared by the
+/// numeric-id route (`admin_remove_trusted`) and the by-nick route
+/// (`admin_remove_trusted_by_nick`).
+async fn remove_trusted_for_user(state: Arc<AppState>, user_id: i64) -> Response {
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+        let conn = state.control_plane().social_conn();
+        social_db::remove_trusted(&conn, user_id)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error removing forum trusted standing: {}", e);
+            internal_error()
+        }
+        Err(_) => internal_error(),
+    }
+}
+
+/// PUT /api/admin/forum/trusted/{user_id}
+///
+/// Body `{"note": "…"}`, optional (an empty body grants with no note — see
+/// [`parse_trusted_body`]). Idempotent: a second grant just replaces
+/// `note`/`granted_at` (`social_db::set_trusted` upserts).
+pub async fn admin_set_trusted(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(user_id): Path<i64>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
+        return e;
+    }
+    let req = match parse_trusted_body(&body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    set_trusted_for_user(state, user_id, req.note).await
+}
+
+/// DELETE /api/admin/forum/trusted/{user_id}
+pub async fn admin_remove_trusted(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(user_id): Path<i64>,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
+        return e;
+    }
+
+    remove_trusted_for_user(state, user_id).await
+}
+
+/// PUT /api/admin/forum/trusted/by-nick/{nick}
+///
+/// Same grant as `admin_set_trusted`, addressed by nick. 404
+/// `{"error":"no user with that nick"}` when the nick names no account.
+pub async fn admin_set_trusted_by_nick(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(nick): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
+        return e;
+    }
+    let req = match parse_trusted_body(&body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let user_id = match resolve_nick_to_user_id(state.clone(), nick).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return no_such_nick(),
+        Err(e) => return e,
+    };
+    set_trusted_for_user(state, user_id, req.note).await
+}
+
+/// DELETE /api/admin/forum/trusted/by-nick/{nick}
+///
+/// Same revoke as `admin_remove_trusted`, addressed by nick. 404
+/// `{"error":"no user with that nick"}` when the nick names no account.
+pub async fn admin_remove_trusted_by_nick(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(nick): Path<String>,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
+        return e;
+    }
+
+    let user_id = match resolve_nick_to_user_id(state.clone(), nick).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return no_such_nick(),
+        Err(e) => return e,
+    };
+    remove_trusted_for_user(state, user_id).await
+}
+
+/// GET /api/admin/forum/trusted
+///
+/// Every managed `forum_trusted` row, with `nick` resolved from the identity
+/// connection per row — same cross-database discipline as
+/// `admin_list_roles`: the social connection is locked, read, and dropped
+/// before the identity connection is ever locked.
+pub async fn admin_list_trusted(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
+        return e;
+    }
+
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<(social_db::TrustedRow, Option<String>)>> {
+        let conn = state.control_plane().social_conn();
+        let trusted = social_db::list_trusted(&conn)?;
+        drop(conn);
+
+        let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::with_capacity(trusted.len());
+        for row in trusted {
+            let nick = db::nick_for_user(&identity_conn, row.user_id)?;
+            out.push((row, nick));
+        }
+        Ok(out)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({
+            "trusted": rows
+                .into_iter()
+                .map(|(row, nick)| serde_json::json!({
+                    "user_id": row.user_id,
+                    "nick": nick,
+                    "note": row.note,
+                    "granted_at": row.granted_at,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error listing forum trusted standing: {}", e);
+            internal_error()
+        }
+        Err(_) => internal_error(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `parse_class_field` accepts every ladder wire name, including the new
+    /// `trusted` rank (plan §5), and refuses an unknown one with a message
+    /// naming the valid set — the 400 body an operator misconfiguring
+    /// `POST/PATCH /admin/forum/boards*` actually sees.
+    #[test]
+    fn parse_class_field_accepts_every_ladder_name_and_lists_them_on_refusal() {
+        for (raw, expected) in [
+            ("public", Class::Public),
+            ("user", Class::User),
+            ("paid", Class::Paid),
+            ("trusted", Class::Trusted),
+            ("moderator", Class::Moderator),
+            ("admin", Class::Admin),
+        ] {
+            assert_eq!(parse_class_field("read_class", raw).map_err(|_| ()), Ok(expected));
+        }
+
+        let resp = parse_class_field("write_class", "bogus").expect_err("bogus class must be refused");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }
