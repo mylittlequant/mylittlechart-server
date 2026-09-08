@@ -329,6 +329,30 @@ pub fn remove_role(conn: &Connection, user_id: i64) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// One row returned by [`list_roles`] — `routes::forum_v2::admin_list_roles`
+/// resolves `nick` from the identity connection per row (this module stores
+/// only `user_id`, per the cross-database rule above).
+pub struct RoleRow {
+    pub user_id: i64,
+    pub role: Role,
+    pub granted_at: String,
+}
+
+/// Every managed `forum_roles` row, ordered by user id ascending.
+pub fn list_roles(conn: &Connection) -> Result<Vec<RoleRow>> {
+    let mut stmt = conn.prepare("SELECT user_id, role, granted_at FROM forum_roles ORDER BY user_id ASC")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(RoleRow {
+            user_id: row.get(0)?,
+            role: row.get(1)?,
+            granted_at: row.get(2)?,
+        });
+    }
+    Ok(out)
+}
+
 /// Resolve the caller's classes: `[Public]` for an anonymous caller, `+User`
 /// once signed in, `+Paid` if `is_paid` (already resolved by the route via
 /// `db::user_is_paid` on the identity connection — same shape

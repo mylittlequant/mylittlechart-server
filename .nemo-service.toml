@@ -77,6 +77,14 @@ auth_env = "ADMIN_SECRET"
 public = false
 
 [[endpoints]]
+method = "GET"
+path = "/api/admin/users"
+description = "Case-insensitive substring search over an account's nick and display name (q=, required, max 50 rows, ordered by user id). Resolves a nick to the numeric id PUT /api/admin/forum/roles/{user_id} requires."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
 method = "POST"
 path = "/api/auth/device-code"
 description = "Start device authorization flow — returns device code"
@@ -176,9 +184,33 @@ auth_env = "ADMIN_SECRET"
 public = false
 
 [[endpoints]]
+method = "GET"
+path = "/api/admin/forum/roles"
+description = "Forum v2 admin: every granted role row {user_id, nick, role, granted_at}, nick resolved from the identity database."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
 method = "PUT"
 path = "/api/admin/forum/roles/{user_id}"
 description = "Forum v2 admin: grant a role {role: moderator|admin} to a user_id."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "PUT"
+path = "/api/admin/forum/roles/by-nick/{nick}"
+description = "Forum v2 admin: same grant as PUT .../roles/{user_id}, addressed by nick (case-insensitive, exact match). 404 {\"error\":\"no user with that nick\"} when absent."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/admin/forum/roles/by-nick/{nick}"
+description = "Forum v2 admin: same revoke as DELETE .../roles/{user_id}, addressed by nick. 404 {\"error\":\"no user with that nick\"} when absent."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false

@@ -2,11 +2,12 @@
 
 use axum::{
     body::Bytes,
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Extension, Query, State},
+    http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
@@ -16,17 +17,47 @@ use crate::models::types::{
 use crate::pathutil::is_safe_path_component;
 use crate::state::AppState;
 
-/// Verify ADMIN_SECRET from Authorization header. Returns error response if invalid.
+/// The one answer every admin route gives on ANY refusal — `ADMIN_SECRET`
+/// unset at boot, a missing bearer, a malformed one, or a wrong one: exactly
+/// what an unmatched path under `/api` gets from axum's own routing (see
+/// `routes::control_api_router`, mounted via `.nest("/api", ...)` in
+/// `main.rs` — a path that does not match anything registered there never
+/// reaches the outer router's static-file fallback; it is answered by this
+/// nested `Router`'s own built-in "no route matched" handler, which is
+/// `StatusCode::NOT_FOUND` with an empty body and no extra headers). Mirrored
+/// byte-for-byte here rather than re-derived so an operator scanning for the
+/// admin surface — wrong secret, right secret, or no secret at all — cannot
+/// tell any of those apart from a path that was never registered.
+fn admin_not_found() -> Response {
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// Verify ADMIN_SECRET from the Authorization header.
 ///
-/// `pub(crate)`: reused by `routes::posts`'s admin endpoints so the bearer
-/// check has exactly one implementation, not a copy per module.
-pub(crate) fn verify_admin_secret(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+/// On any failure the caller gets [`admin_not_found`] — never a 401 or a 503
+/// that would confirm an admin route exists at all. Every refusal is logged
+/// server-side with the request path and peer address (never the presented
+/// token, whether it's wrong or entirely absent).
+///
+/// The comparison itself is constant-time (`subtle::ConstantTimeEq`, already
+/// a workspace dependency — no new one added for this).
+///
+/// `pub(crate)`: reused by `routes::posts`/`routes::forum`/
+/// `routes::forum_v2`'s admin endpoints so the bearer check has exactly one
+/// implementation, not a copy per module.
+pub(crate) fn verify_admin_secret(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    peer: Option<SocketAddr>,
+) -> Result<(), Response> {
     if state.admin_secret.is_empty() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::new("Admin endpoint disabled")),
-        )
-            .into_response());
+        tracing::warn!(
+            path = %uri.path(),
+            peer = ?peer,
+            "admin route refused: ADMIN_SECRET is not configured"
+        );
+        return Err(admin_not_found());
     }
 
     let auth = headers
@@ -36,12 +67,37 @@ pub(crate) fn verify_admin_secret(state: &AppState, headers: &HeaderMap) -> Resu
 
     match auth {
         Some(token) if token.as_bytes().ct_eq(state.admin_secret.as_bytes()).into() => Ok(()),
-        _ => Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse::new("Invalid or missing admin secret")),
-        )
-            .into_response()),
+        _ => {
+            tracing::warn!(
+                path = %uri.path(),
+                peer = ?peer,
+                "admin route refused: invalid or missing bearer"
+            );
+            Err(admin_not_found())
+        }
     }
+}
+
+/// Unwrap the peer-address extractor into a plain `SocketAddr` for
+/// `verify_admin_secret` — `None` when the listener was not served through
+/// `into_make_service_with_connect_info` (see `main.rs`), which
+/// `verify_admin_secret` treats as "peer unknown", not a reason to refuse.
+///
+/// Wrapped as `Option<Extension<ConnectInfo<SocketAddr>>>` rather than the
+/// more obvious `Option<Extension<ConnectInfo<SocketAddr>>>`: `ConnectInfo` itself has
+/// no `OptionalFromRequestParts` impl (only `Extension`, `MatchedPath`, and
+/// `Path` do, as of axum 0.8), so the bare `Option<ConnectInfo<_>>` shape
+/// fails to implement `FromRequestParts` at all. `ConnectInfo`'s own
+/// (non-optional) extractor is itself implemented as an `Extension` lookup
+/// under the hood, so reaching for `Extension` directly, wrapped in
+/// `Option`, reads the exact same request-extensions slot without ever
+/// panicking or 500ing when it is absent.
+///
+/// `pub(crate)`: every admin handler across `routes::posts`/`routes::forum`/
+/// `routes::forum_v2` unwraps its own extractor through this, same reuse
+/// reason as `verify_admin_secret` itself.
+pub(crate) fn peer_addr(peer: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<SocketAddr> {
+    peer.map(|Extension(ConnectInfo(addr))| addr)
 }
 
 /// POST /api/admin/restart
@@ -51,8 +107,10 @@ pub(crate) fn verify_admin_secret(state: &AppState, headers: &HeaderMap) -> Resu
 pub async fn restart(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
 ) -> Response {
-    if let Err(e) = verify_admin_secret(&state, &headers) {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
         return e;
     }
 
@@ -76,13 +134,16 @@ pub async fn restart(
 ///
 /// NOTE: the JSON body is parsed only AFTER the bearer check — same reason
 /// the old upload route parsed its query string late: an unauthenticated
-/// probe gets a flat 401 and nothing about the endpoint's shape.
+/// probe gets a bare 404 (see `verify_admin_secret`) and nothing about the
+/// endpoint's shape.
 pub async fn register_release(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = verify_admin_secret(&state, &headers) {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
         return e;
     }
 
@@ -270,9 +331,11 @@ const MAX_GIFT_CODES_PER_REQUEST: u32 = 200;
 pub async fn mint_gift_codes(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = verify_admin_secret(&state, &headers) {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
         return e;
     }
 
@@ -357,9 +420,10 @@ pub async fn mint_gift_codes(
 pub async fn promote(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    uri: axum::http::Uri,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
 ) -> Response {
-    if let Err(e) = verify_admin_secret(&state, &headers) {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
         return e;
     }
 
@@ -417,6 +481,78 @@ pub async fn promote(
             .into_response(),
         Ok(Err(e)) => {
             tracing::error!("DB error during promote: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+/// Query parameters for GET /api/admin/users.
+#[derive(serde::Deserialize)]
+pub struct AdminUsersQuery {
+    pub q: Option<String>,
+}
+
+/// GET /api/admin/users?q=<text>
+///
+/// Case-insensitive substring search over an account's chosen nick and
+/// display name (`db::search_users`, at most 50 rows, ordered by user id
+/// ascending) — the read half of resolving a nick to the numeric id
+/// `PUT /api/admin/forum/roles/{user_id}` requires; nothing on the API
+/// resolves that today. `paid_until` rides along because it lives on the
+/// same `users` row this query already reads. Requires
+/// `Authorization: Bearer {ADMIN_SECRET}`.
+pub async fn list_users(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+) -> Response {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
+        return e;
+    }
+
+    // Same auth-before-parse rule as register_release/promote above.
+    let Query(query) = match Query::<AdminUsersQuery>::try_from_uri(&uri) {
+        Ok(q) => q,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("Invalid query parameters")),
+            )
+                .into_response();
+        }
+    };
+
+    let q = match query.q.as_deref().map(str::trim) {
+        Some(q) if !q.is_empty() => q.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("q is required")),
+            )
+                .into_response();
+        }
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::search_users(&conn, &q)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(users)) => Json(serde_json::json!({ "users": users })).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error searching admin users: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new("Database error")),

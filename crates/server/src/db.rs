@@ -1334,6 +1334,22 @@ pub fn nick_for_user(conn: &Connection, user_id: i64) -> Result<Option<String>> 
         .flatten())
 }
 
+/// Resolve a nick to its `user_id`, case-insensitively, exact match — the
+/// reverse of [`nick_for_user`]. Built for the by-nick admin role routes
+/// (`routes::forum_v2::admin_set_role_by_nick`/`admin_remove_role_by_nick`):
+/// an operator addressing a role grant by nick instead of the numeric id
+/// `PUT /api/admin/forum/roles/{user_id}` otherwise requires. `None` when no
+/// account has that nick (case-insensitively) — [`nick_for_user`]'s
+/// `idx_users_nick_lower` unique index guarantees at most one match.
+pub fn user_id_for_nick(conn: &Connection, nick: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM users WHERE LOWER(nick) = LOWER(?1)",
+        params![nick],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 /// The label to show for a user: chosen nick, then `display_name`, then
 /// `public_id` — same fallback order as [`share_owner_label`]. Empty string
 /// only when the user row itself is gone (an orphaned reference).
@@ -1419,6 +1435,60 @@ pub fn set_nick(conn: &Connection, user_id: i64, nick: &str) -> Result<(), NickE
         }
         Err(e) => Err(NickError::Db(e)),
     }
+}
+
+/// One row returned by [`search_users`] — an operator-facing nick/label
+/// lookup, not the client-facing identity shapes above.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdminUserRow {
+    pub user_id: i64,
+    pub nick: Option<String>,
+    /// `display_name`, or `None` when the column is empty — same
+    /// "empty means nothing to show" rule [`effective_label_for_user`]
+    /// applies to its own fallback chain.
+    pub label: Option<String>,
+    pub created_at: String,
+    pub paid_until: Option<String>,
+}
+
+/// Cap on `search_users`' result set — an operator resolving a nick to an
+/// id needs a handful of candidates, not the whole table.
+const ADMIN_USER_SEARCH_LIMIT: i64 = 50;
+
+/// Case-insensitive substring search over `nick` and `display_name`,
+/// ordered by `id` ascending, capped at [`ADMIN_USER_SEARCH_LIMIT`] rows.
+/// Built for `GET /api/admin/users?q=`: an operator script resolving a nick
+/// to the numeric id `PUT /api/admin/forum/roles/{user_id}` requires.
+pub fn search_users(conn: &Connection, q: &str) -> Result<Vec<AdminUserRow>> {
+    let q_lower = q.to_lowercase();
+    // Escape LIKE metacharacters to prevent wildcard injection (same idiom
+    // as `revoke_key`'s hash-prefix search above).
+    let escaped = q_lower
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let like_pattern = format!("%{}%", escaped);
+
+    let mut stmt = conn.prepare(
+        "SELECT id, nick, display_name, created_at, paid_until
+         FROM users
+         WHERE LOWER(nick) LIKE ?1 ESCAPE '\\' OR LOWER(display_name) LIKE ?1 ESCAPE '\\'
+         ORDER BY id ASC
+         LIMIT ?2",
+    )?;
+    let mut rows = stmt.query(params![like_pattern, ADMIN_USER_SEARCH_LIMIT])?;
+    let mut users = Vec::new();
+    while let Some(row) = rows.next()? {
+        let display_name: String = row.get(2)?;
+        users.push(AdminUserRow {
+            user_id: row.get(0)?,
+            nick: row.get(1)?,
+            label: Some(display_name).filter(|d| !d.is_empty()),
+            created_at: row.get(3)?,
+            paid_until: row.get(4)?,
+        });
+    }
+    Ok(users)
 }
 
 /// Get all provider identities linked to a user.

@@ -857,7 +857,18 @@ async fn main() {
         let _ = main_shutdown_rx.recv().await;
     };
     // A 30-second hard timeout prevents a stuck connection from blocking deploys.
-    let main_serve = axum::serve(main_listener, app).with_graceful_shutdown(main_shutdown);
+    //
+    // `into_make_service_with_connect_info` (rather than passing `app`
+    // directly) is what makes `ConnectInfo<SocketAddr>` extractable in
+    // handlers — `routes::admin::verify_admin_secret` logs the peer address
+    // on every refusal (see its doc comment), and that address has to come
+    // from somewhere: this is the one place it is threaded onto every
+    // connection this listener accepts.
+    let main_serve = axum::serve(
+        main_listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(main_shutdown);
 
     // Run the main server, plus the dashboard when this is a control process.
     // Both drain when the shutdown signal fires.

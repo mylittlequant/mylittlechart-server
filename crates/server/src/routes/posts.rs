@@ -31,11 +31,12 @@
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Extension, Path, Query, State},
+    http::{HeaderMap, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
     Json,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::db::{Post, PostError};
@@ -244,14 +245,17 @@ fn default_post_visibility() -> String {
 ///
 /// Requires `Authorization: Bearer {ADMIN_SECRET}`, checked before the body
 /// is ever parsed — same rule `admin::register_release` documents: an
-/// unauthenticated probe gets a flat 401 and nothing about the endpoint's
-/// shape. Upserts by `id`; answers `{"id": ..., "created": bool}`.
+/// unauthenticated probe gets a bare 404 (see `admin::verify_admin_secret`)
+/// and nothing about the endpoint's shape. Upserts by `id`; answers
+/// `{"id": ..., "created": bool}`.
 pub async fn admin_upsert_post(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = super::admin::verify_admin_secret(&state, &headers) {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
         return e;
     }
 
@@ -299,9 +303,11 @@ pub async fn admin_upsert_post(
 pub async fn admin_delete_post(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(e) = super::admin::verify_admin_secret(&state, &headers) {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
         return e;
     }
 

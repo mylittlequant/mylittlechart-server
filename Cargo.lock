@@ -1549,6 +1549,7 @@ dependencies = [
  "tg-login-bot",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

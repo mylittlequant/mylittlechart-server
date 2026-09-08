@@ -36,3 +36,10 @@ base64 = { workspace = true }
 # replacing it.
 [target.'cfg(target_env = "musl")'.dependencies]
 rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
+
+# Test-only: drives a built `Router` through a request with `ServiceExt::oneshot`
+# (see routes/mod.rs's admin-gate tests). Already resolved transitively via axum
+# itself (see Cargo.lock) — this only makes it directly nameable, no new crate
+# enters the dependency graph.
+[dev-dependencies]
+tower = { version = "0.5", default-features = false, features = ["util"] }

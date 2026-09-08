@@ -45,6 +45,11 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/admin/restart", post(admin::restart))
         .route("/admin/promote", post(admin::promote))
         .route("/admin/gift-codes", post(admin::mint_gift_codes))
+        // Static, not `/admin/users/{id}` — see this file's `//!` note near
+        // the tests module on static-vs-parameter coexistence; nothing here
+        // collides with it either way, since no `/admin/users/{...}` route
+        // exists.
+        .route("/admin/users", get(admin::list_users))
         .route("/admin/posts", post(posts::admin_upsert_post))
         .route("/admin/posts/{id}", delete(posts::admin_delete_post))
         // In-app blog: patch notes and posts (see routes/posts.rs). Public.
@@ -166,9 +171,24 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
             "/admin/forum/boards/{id}",
             patch(forum_v2::admin_update_board).delete(forum_v2::admin_delete_board),
         )
+        // Static, coexists with the parameterized `/admin/forum/roles/{user_id}`
+        // right below the same way `/admin/users` coexists above.
+        .route("/admin/forum/roles", get(forum_v2::admin_list_roles))
         .route(
             "/admin/forum/roles/{user_id}",
             axum::routing::put(forum_v2::admin_set_role).delete(forum_v2::admin_remove_role),
+        )
+        // Literal `by-nick` segment under the same `/admin/forum/roles/`
+        // prefix as the `{user_id}` parameter directly above — matchit
+        // resolves a literal segment over a parameter at the same tree
+        // depth (proven by `control_router_registers_without_route_conflicts`
+        // below, the same way `/share/mine` coexists with `/share/{token}`),
+        // so this is not the shadowing case the static-vs-parameter note
+        // above warns about.
+        .route(
+            "/admin/forum/roles/by-nick/{nick}",
+            axum::routing::put(forum_v2::admin_set_role_by_nick)
+                .delete(forum_v2::admin_remove_role_by_nick),
         )
         // Direct messages (paid, end-to-end encrypted — see routes/dm.rs).
         // Every route is authed AND paid; no public GET of any kind.
@@ -279,5 +299,144 @@ mod tests {
             .route("/blog/{id}", get(stub))
             .route("/{page}", get(stub))
             .route("/{dir}/{page}", get(stub));
+    }
+
+    /// Build a control-role `AppState` with `control_plane: None` and the
+    /// given `ADMIN_SECRET` — every field this admin-gate test suite varies
+    /// is `admin_secret`, the rest are the same placeholders
+    /// `control_router_registers_without_route_conflicts` above uses.
+    fn admin_gate_test_state(admin_secret: &str) -> Arc<AppState> {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        Arc::new(AppState::new(
+            None,
+            admin_secret.to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            shutdown_tx,
+            Vec::new(),
+            false,
+            0,
+            0,
+            None,
+        ))
+    }
+
+    /// `verify_admin_secret`'s refusal (no bearer at all, here) must be
+    /// byte-for-byte the same response axum's own routing gives an unmatched
+    /// path under this router — same status, same headers, same (empty)
+    /// body. This is what makes the admin surface invisible from outside: a
+    /// probe cannot tell "this route exists but the secret is wrong" apart
+    /// from "this route was never registered" (see
+    /// `routes::admin::verify_admin_secret`'s doc comment).
+    #[tokio::test]
+    async fn unauthenticated_admin_route_is_indistinguishable_from_an_unknown_path() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let router = control_api_router(admin_gate_test_state("s3cr3t"));
+
+        let unknown = router
+            .clone()
+            .oneshot(
+                Request::get("/admin/this-route-does-not-exist")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("Router::call is infallible");
+        let admin_no_auth = router
+            .oneshot(
+                Request::post("/admin/restart")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("Router::call is infallible");
+
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(unknown.status(), admin_no_auth.status());
+
+        // `content-length` is excluded on purpose: axum's own top-level
+        // `RouteFuture` wrapper (routing/route.rs, `set_content_length`)
+        // inserts it for any MATCHED route regardless of what the handler
+        // answers — `/admin/restart` gets one because it IS registered,
+        // while a path matching nothing never reaches a `Route` at all and
+        // skips that wrapper entirely. Both become `content-length: 0` the
+        // moment either response is actually serialized over HTTP/1.1 (a
+        // complete zero-byte body always gets one), so this is an
+        // axum-internal dispatch artifact invisible to a real prober, not a
+        // live discriminator — every other header (there are none here) and
+        // the body still have to match exactly, which the asserts below do.
+        let mut unknown_headers = unknown.headers().clone();
+        let mut admin_headers = admin_no_auth.headers().clone();
+        unknown_headers.remove(axum::http::header::CONTENT_LENGTH);
+        admin_headers.remove(axum::http::header::CONTENT_LENGTH);
+        assert_eq!(unknown_headers, admin_headers);
+
+        let unknown_body = to_bytes(unknown.into_body(), usize::MAX)
+            .await
+            .expect("read unknown-path body");
+        let admin_body = to_bytes(admin_no_auth.into_body(), usize::MAX)
+            .await
+            .expect("read admin-refusal body");
+        assert_eq!(unknown_body, admin_body);
+        assert!(unknown_body.is_empty());
+    }
+
+    /// A wrong (but well-formed) bearer gets the exact same 404 as a missing
+    /// one — the refusal shape does not vary with how wrong the caller is.
+    #[tokio::test]
+    async fn admin_route_refuses_with_404_on_wrong_bearer() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let router = control_api_router(admin_gate_test_state("s3cr3t"));
+
+        let resp = router
+            .oneshot(
+                Request::post("/admin/restart")
+                    .header("Authorization", "Bearer wrong-secret")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("Router::call is infallible");
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `ADMIN_SECRET` unset at boot must still refuse with the same 404 —
+    /// never a 503 that would confirm the route exists, and never accepting
+    /// an empty bearer just because the configured secret is also empty
+    /// (the empty-secret check in `verify_admin_secret` runs before the
+    /// token comparison ever could).
+    #[tokio::test]
+    async fn admin_route_refuses_with_404_when_admin_secret_is_unset() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let router = control_api_router(admin_gate_test_state(""));
+
+        let resp = router
+            .oneshot(
+                Request::post("/admin/restart")
+                    .header("Authorization", "Bearer ")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("Router::call is infallible");
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

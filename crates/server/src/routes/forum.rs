@@ -25,11 +25,12 @@
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{ConnectInfo, Extension, Path, Query, State},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_token};
@@ -580,9 +581,11 @@ pub struct AdminHideRequest {
 pub async fn admin_hide(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = super::admin::verify_admin_secret(&state, &headers) {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
         return e;
     }
 

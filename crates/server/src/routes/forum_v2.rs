@@ -33,8 +33,15 @@
 //!  - `PATCH  /admin/forum/boards/{id}`                — ADMIN_SECRET: partial update.
 //!  - `DELETE /admin/forum/boards/{id}`                — ADMIN_SECRET: delete (refuses
 //!                                                       a board that still has threads).
+//!  - `GET    /admin/forum/roles`                      — ADMIN_SECRET: every managed
+//!                                                       role row, nick resolved.
 //!  - `PUT    /admin/forum/roles/{user_id}`            — ADMIN_SECRET: grant a role.
 //!  - `DELETE /admin/forum/roles/{user_id}`            — ADMIN_SECRET: revoke it.
+//!  - `PUT    /admin/forum/roles/by-nick/{nick}`       — ADMIN_SECRET: grant a role,
+//!                                                       addressed by nick (case-
+//!                                                       insensitive, exact match).
+//!  - `DELETE /admin/forum/roles/by-nick/{nick}`       — ADMIN_SECRET: revoke it,
+//!                                                       addressed by nick.
 //!
 //! Board CRUD and role CRUD are ADMIN_SECRET-gated (same bearer as every
 //! other `/api/admin/*` route, including v1's `POST /admin/forum/hide`) —
@@ -46,12 +53,13 @@
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{ConnectInfo, Extension, Path, Query, State},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_token};
@@ -872,8 +880,14 @@ fn parse_class_field(name: &str, raw: &str) -> Result<Class, Response> {
         .ok_or_else(|| bad_request(&format!("{name} must be one of public|user|paid|moderator|admin")))
 }
 
-pub async fn admin_create_board(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Err(e) = super::admin::verify_admin_secret(&state, &headers) {
+pub async fn admin_create_board(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
         return e;
     }
     let req: AdminCreateBoardRequest = match serde_json::from_slice(&body) {
@@ -933,10 +947,12 @@ pub struct AdminUpdateBoardRequest {
 pub async fn admin_update_board(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Path(id): Path<i64>,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = super::admin::verify_admin_secret(&state, &headers) {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
         return e;
     }
     let req: AdminUpdateBoardRequest = match serde_json::from_slice(&body) {
@@ -979,8 +995,14 @@ pub async fn admin_update_board(
     }
 }
 
-pub async fn admin_delete_board(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<i64>) -> Response {
-    if let Err(e) = super::admin::verify_admin_secret(&state, &headers) {
+pub async fn admin_delete_board(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
         return e;
     }
 
@@ -1010,23 +1032,10 @@ pub struct AdminSetRoleRequest {
     pub role: String,
 }
 
-pub async fn admin_set_role(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(user_id): Path<i64>,
-    body: Bytes,
-) -> Response {
-    if let Err(e) = super::admin::verify_admin_secret(&state, &headers) {
-        return e;
-    }
-    let req: AdminSetRoleRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(_) => return bad_request("Invalid JSON body"),
-    };
-    let Some(role) = social_db::Role::from_wire_name(&req.role) else {
-        return bad_request("role must be 'moderator' or 'admin'");
-    };
-
+/// Grant `role` to `user_id` — the DB half shared by the numeric-id route
+/// (`admin_set_role`) and the by-nick route (`admin_set_role_by_nick`), so
+/// there is exactly one call to `social_db::set_role`, not a copy per route.
+async fn set_role_for_user(state: Arc<AppState>, user_id: i64, role: social_db::Role) -> Response {
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
         let conn = state.control_plane().social_conn();
         social_db::set_role(&conn, user_id, role, &chrono::Utc::now().to_rfc3339())
@@ -1043,11 +1052,10 @@ pub async fn admin_set_role(
     }
 }
 
-pub async fn admin_remove_role(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(user_id): Path<i64>) -> Response {
-    if let Err(e) = super::admin::verify_admin_secret(&state, &headers) {
-        return e;
-    }
-
+/// Revoke `user_id`'s role, if any — the DB half shared by the numeric-id
+/// route (`admin_remove_role`) and the by-nick route
+/// (`admin_remove_role_by_nick`).
+async fn remove_role_for_user(state: Arc<AppState>, user_id: i64) -> Response {
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
         let conn = state.control_plane().social_conn();
         social_db::remove_role(&conn, user_id)
@@ -1063,4 +1071,182 @@ pub async fn admin_remove_role(State(state): State<Arc<AppState>>, headers: Head
         }
         Err(_) => internal_error(),
     }
+}
+
+/// 404 body for the by-nick role routes when `nick` names no account — the
+/// one place this API ever answers with this specific message, distinct
+/// from the bare 404s elsewhere (this IS meant to be distinguishable: it is
+/// behind the ADMIN_SECRET gate already, an operator script needs to tell
+/// "no such nick" apart from a routing 404).
+fn no_such_nick() -> Response {
+    (StatusCode::NOT_FOUND, Json(ErrorResponse::new("no user with that nick"))).into_response()
+}
+
+/// Resolve `nick` to a `user_id` on the identity connection, case-
+/// insensitively, exact match (not substring — see `db::user_id_for_nick`).
+async fn resolve_nick_to_user_id(state: Arc<AppState>, nick: String) -> Result<Option<i64>, Response> {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        db::user_id_for_nick(&conn, &nick)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(id)) => Ok(id),
+        Ok(Err(e)) => {
+            tracing::error!("DB error resolving nick for admin role route: {}", e);
+            Err(internal_error())
+        }
+        Err(_) => Err(internal_error()),
+    }
+}
+
+pub async fn admin_set_role(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(user_id): Path<i64>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
+        return e;
+    }
+    let req: AdminSetRoleRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return bad_request("Invalid JSON body"),
+    };
+    let Some(role) = social_db::Role::from_wire_name(&req.role) else {
+        return bad_request("role must be 'moderator' or 'admin'");
+    };
+
+    set_role_for_user(state, user_id, role).await
+}
+
+/// PUT /api/admin/forum/roles/by-nick/{nick}
+///
+/// Same grant as `admin_set_role`, addressed by nick instead of a numeric
+/// id — an operator script resolves `GET /api/admin/users?q=` to a
+/// candidate first, but for the common case of an already-known, unique
+/// nick this skips that round trip. 404 `{"error":"no user with that
+/// nick"}` when the nick names no account; case-insensitive, exact match
+/// (see `db::user_id_for_nick`).
+pub async fn admin_set_role_by_nick(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(nick): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
+        return e;
+    }
+    let req: AdminSetRoleRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return bad_request("Invalid JSON body"),
+    };
+    let Some(role) = social_db::Role::from_wire_name(&req.role) else {
+        return bad_request("role must be 'moderator' or 'admin'");
+    };
+
+    let user_id = match resolve_nick_to_user_id(state.clone(), nick).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return no_such_nick(),
+        Err(e) => return e,
+    };
+    set_role_for_user(state, user_id, role).await
+}
+
+/// GET /api/admin/forum/roles
+///
+/// Every managed `forum_roles` row, with `nick` resolved from the identity
+/// connection per row: the social connection is locked, read, and dropped
+/// before the identity connection is ever locked (same discipline as
+/// `list_board_threads`/`get_thread`/`search` above). Requires
+/// `Authorization: Bearer {ADMIN_SECRET}`.
+pub async fn admin_list_roles(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
+        return e;
+    }
+
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<(social_db::RoleRow, Option<String>)>> {
+        let conn = state.control_plane().social_conn();
+        let roles = social_db::list_roles(&conn)?;
+        drop(conn);
+
+        let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::with_capacity(roles.len());
+        for role in roles {
+            let nick = db::nick_for_user(&identity_conn, role.user_id)?;
+            out.push((role, nick));
+        }
+        Ok(out)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({
+            "roles": rows
+                .into_iter()
+                .map(|(role, nick)| serde_json::json!({
+                    "user_id": role.user_id,
+                    "nick": nick,
+                    "role": role.role.as_str(),
+                    "granted_at": role.granted_at,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error listing forum roles: {}", e);
+            internal_error()
+        }
+        Err(_) => internal_error(),
+    }
+}
+
+pub async fn admin_remove_role(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(user_id): Path<i64>,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
+        return e;
+    }
+
+    remove_role_for_user(state, user_id).await
+}
+
+/// DELETE /api/admin/forum/roles/by-nick/{nick}
+///
+/// Same revoke as `admin_remove_role`, addressed by nick. 404
+/// `{"error":"no user with that nick"}` when the nick names no account
+/// (distinct from the plain 404 `admin_remove_role` gives for "nick exists,
+/// no role row" — the nick lookup and the role removal are two different
+/// "not found"s, and this tells them apart).
+pub async fn admin_remove_role_by_nick(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(nick): Path<String>,
+) -> Response {
+    if let Err(e) = super::admin::verify_admin_secret(&state, &headers, &uri, super::admin::peer_addr(peer)) {
+        return e;
+    }
+
+    let user_id = match resolve_nick_to_user_id(state.clone(), nick).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return no_such_nick(),
+        Err(e) => return e,
+    };
+    remove_role_for_user(state, user_id).await
 }
