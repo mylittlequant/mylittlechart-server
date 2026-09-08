@@ -79,7 +79,15 @@ public = false
 [[endpoints]]
 method = "GET"
 path = "/api/admin/users"
-description = "Case-insensitive substring search over an account's nick and display name (q=, required, max 50 rows, ordered by user id). Resolves a nick to the numeric id PUT /api/admin/forum/roles/{user_id} requires."
+description = "Case-insensitive substring search over an account's nick and display name (q=, required, max 50 rows, ordered by user id). Resolves a nick to the numeric id PUT /api/admin/forum/roles/{user_id} requires. Each row also carries providers (every linked provider name, sorted), has_email (any linked identity captured a verified email), and telegram_id (the account's telegram provider_user_id, if any)."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/admin/users/merge"
+description = "Fold a duplicate account (from) into its survivor (into) — identity-merge decisions 4-6 (docs/mlc/plans/identity-merge-2026-09-09.md). Body {from, into, dry_run, keep_vault: \"into\"|\"from\"|null}. 400 when from==into or either id does not exist; 409 {error:\"hard conflicts\",conflicts:[...]} when a vault/recovery_key/salt singleton or a sync_e2e_params row is held by both accounts, or both hold a dm_identity_keys row, unless keep_vault names the survivor (the loser's conflicting rows are archived to <data_dir>/merge-archive/ before deletion, never silently dropped). dry_run:true returns the same summary a real merge would write and touches nothing. Response body is the MergeSummary JSON itself (row counts per table, conflicts, hot-plane file counts)."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false

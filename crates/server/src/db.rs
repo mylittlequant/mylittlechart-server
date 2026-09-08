@@ -363,6 +363,22 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_forum_replies_thread
             ON forum_replies(thread_id, hidden, id);
+
+        -- Audit trail for `POST /api/admin/users/merge` (docs/mlc/plans/
+        -- identity-merge-2026-09-09.md decision 4) — one row per merge,
+        -- `summary_json` the full `account_merge::MergeSummary` (counts per
+        -- table, conflicts, hot-plane file counts). `from_user_id`/
+        -- `into_user_id` deliberately carry no FK: by the time this row is
+        -- written `from_user_id` no longer exists in `users` (the merge's
+        -- whole point), same reasoning `forum_threads.author_user_id`
+        -- already documents for outliving an account.
+        CREATE TABLE IF NOT EXISTS account_merges (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_user_id  INTEGER NOT NULL,
+            into_user_id  INTEGER NOT NULL,
+            ts            TEXT    NOT NULL,
+            summary_json  TEXT    NOT NULL
+        );
     "#)?;
 
     // Safe migration: add signature column to releases if not present. `releases`
@@ -434,6 +450,20 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         INSERT OR IGNORE INTO user_providers (user_id, provider, provider_user_id, display_name, linked_at)
         SELECT id, provider, provider_user_id, display_name, created_at FROM users;
     ");
+
+    // Safe migration: per-identity email (docs/mlc/plans/identity-merge-2026-09-09.md
+    // decision 1). Filled/refreshed at every sign-in and explicit link (see
+    // `upsert_user` / `link_provider_to_user`); NULL/0 for identities recorded
+    // before this column existed, and for providers that structurally cannot
+    // supply one (Twitter/X, Telegram). The partial index only covers
+    // verified rows — auto-attach (decision 2, `user_id_by_verified_email`)
+    // must never match on an unverified claim.
+    let _ = conn.execute("ALTER TABLE user_providers ADD COLUMN email TEXT", []);
+    let _ = conn.execute("ALTER TABLE user_providers ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0", []);
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_user_providers_email_verified
+            ON user_providers(LOWER(email)) WHERE email_verified = 1;",
+    )?;
 
     // Safe migration: add encrypted_master_key column to sync_e2e_params if not present.
     let _ = conn.execute("ALTER TABLE sync_e2e_params ADD COLUMN encrypted_master_key BLOB DEFAULT NULL", []);
@@ -617,18 +647,60 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Delete users who have no entries in `user_providers`.
+/// Delete users who have no entries in `user_providers`, plus the subtler
+/// shape the pre-fix `finish_oauth` device-merge branch used to leave behind
+/// (docs/mlc/plans/identity-merge-2026-09-09.md decision 3): a `users` row
+/// whose ONLY `user_providers` row is its own automatic self-mirror (the
+/// `(provider, provider_user_id)` matches the `users` row itself), holding no
+/// `auth_tokens`, `web_sessions`, `device_users`, `sync_items`, `share_links`,
+/// or forum authorship — nothing will ever resolve to it again, but it isn't
+/// "no providers at all" so the first rule alone misses it.
 ///
 /// These orphan rows are sometimes left behind when a merge or link operation
 /// moves all provider identities to a canonical user account without removing
 /// the now-empty source row from `users`.
 ///
-/// Returns the number of deleted rows.
+/// Returns the total number of deleted rows across both rules.
 pub fn cleanup_orphan_users(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
-    conn.execute(
+    let no_providers = conn.execute(
         "DELETE FROM users WHERE id NOT IN (SELECT DISTINCT user_id FROM user_providers)",
         [],
-    )
+    )?;
+
+    // The self-referencing shape: find the candidate ids first, then delete
+    // each one's self-mirror `user_providers` row before the `users` row
+    // itself — `PRAGMA foreign_keys=ON` (see `init_db`) refuses `DELETE FROM
+    // users` while a `user_providers` row still references it, and this
+    // shape by definition has exactly one such row.
+    let candidate_ids: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT u.id FROM users u
+             WHERE (SELECT COUNT(*) FROM user_providers up WHERE up.user_id = u.id) = 1
+               AND EXISTS (
+                   SELECT 1 FROM user_providers up
+                   WHERE up.user_id = u.id
+                     AND up.provider = u.provider
+                     AND up.provider_user_id = u.provider_user_id
+               )
+               AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE user_id = u.id)
+               AND NOT EXISTS (SELECT 1 FROM web_sessions WHERE user_id = u.id)
+               AND NOT EXISTS (SELECT 1 FROM device_users WHERE user_id = u.id)
+               AND NOT EXISTS (SELECT 1 FROM sync_items WHERE user_id = u.id)
+               AND NOT EXISTS (SELECT 1 FROM share_links WHERE user_id = u.id)
+               AND NOT EXISTS (SELECT 1 FROM forum_threads WHERE author_user_id = u.id)
+               AND NOT EXISTS (SELECT 1 FROM forum_replies WHERE author_user_id = u.id)",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+        rows
+    };
+
+    let mut self_referencing = 0;
+    for id in candidate_ids {
+        conn.execute("DELETE FROM user_providers WHERE user_id = ?1", params![id])?;
+        self_referencing += conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+    }
+
+    Ok(no_providers + self_referencing)
 }
 
 // ============================================================================
@@ -1163,13 +1235,31 @@ pub fn insert_device_metrics(
 // Users & tokens
 // ============================================================================
 
-/// Upsert a user by provider + provider_user_id.
+/// Split an optional `(email, verified)` pair into the `(Option<&str>, i64)`
+/// shape every `user_providers` write below binds — `None` maps to `(NULL, 0)`.
+fn email_bind_params(email: Option<(&str, bool)>) -> (Option<&str>, i64) {
+    match email {
+        Some((addr, verified)) => (Some(addr), verified as i64),
+        None => (None, 0),
+    }
+}
+
+/// Upsert a user by provider + provider_user_id, and keep that identity's
+/// `user_providers` self-mirror row in sync in the same call (previously this
+/// only happened via the once-per-boot backfill in `init_db`, which left a
+/// freshly created account's own identity invisible to
+/// `user_id_for_identity`/`user_id_by_verified_email` until the next
+/// restart). `email` is `Some((address, verified))` when the provider
+/// reported one this sign-in; `None` leaves a previously stored email
+/// untouched rather than clearing it.
+///
 /// Returns the user's internal id.
 pub fn upsert_user(
     conn: &Connection,
     provider: &str,
     provider_user_id: &str,
     display_name: &str,
+    email: Option<(&str, bool)>,
     now: &str,
 ) -> Result<i64> {
     // Generate a public_id for new users (ignored on conflict — existing rows keep theirs).
@@ -1190,6 +1280,19 @@ pub fn upsert_user(
         params![provider, provider_user_id],
         |row| row.get(0),
     )?;
+
+    let (email_addr, email_verified) = email_bind_params(email);
+    conn.execute(
+        "INSERT INTO user_providers (user_id, provider, provider_user_id, display_name, linked_at, email, email_verified)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(provider, provider_user_id) DO UPDATE SET
+             display_name = ?4,
+             linked_at = ?5,
+             email = COALESCE(?6, email),
+             email_verified = CASE WHEN ?6 IS NOT NULL THEN ?7 ELSE email_verified END",
+        params![id, provider, provider_user_id, display_name, now, email_addr, email_verified],
+    )?;
+
     Ok(id)
 }
 
@@ -1197,33 +1300,33 @@ pub fn upsert_user(
 /// Used when a logged-in user adds a new provider from the dashboard.
 ///
 /// Guards:
-/// - If the provider identity is already linked to the same user, just updates display_name.
+/// - If the provider identity is already linked to the same user, just updates display_name/email.
 /// - If the provider identity is already linked to a *different* user, returns a constraint error.
 /// - Never touches the `users` table.
+///
+/// `email` is `Some((address, verified))` when the provider reported one this
+/// sign-in/link; `None` leaves a previously stored email untouched.
 pub fn link_provider_to_user(
     conn: &Connection,
     user_id: i64,
     provider: &str,
     provider_user_id: &str,
     display_name: &str,
+    email: Option<(&str, bool)>,
     now: &str,
 ) -> Result<()> {
-    // Check if this provider identity is already linked to any user.
-    let existing_owner: Option<i64> = conn
-        .query_row(
-            "SELECT user_id FROM user_providers WHERE provider = ?1 AND provider_user_id = ?2",
-            params![provider, provider_user_id],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let existing_owner = user_id_for_identity(conn, provider, provider_user_id)?;
+    let (email_addr, email_verified) = email_bind_params(email);
 
     if let Some(owner_id) = existing_owner {
         if owner_id == user_id {
-            // Already linked to this user — just update display_name.
+            // Already linked to this user — just refresh display_name/email.
             conn.execute(
-                "UPDATE user_providers SET display_name = ?1, linked_at = ?2 \
-                 WHERE user_id = ?3 AND provider = ?4 AND provider_user_id = ?5",
-                params![display_name, now, user_id, provider, provider_user_id],
+                "UPDATE user_providers SET display_name = ?1, linked_at = ?2,
+                     email = COALESCE(?3, email),
+                     email_verified = CASE WHEN ?3 IS NOT NULL THEN ?4 ELSE email_verified END
+                 WHERE user_id = ?5 AND provider = ?6 AND provider_user_id = ?7",
+                params![display_name, now, email_addr, email_verified, user_id, provider, provider_user_id],
             )?;
             return Ok(());
         } else {
@@ -1240,11 +1343,104 @@ pub fn link_provider_to_user(
 
     // Not linked yet — insert new row.
     conn.execute(
-        "INSERT INTO user_providers (user_id, provider, provider_user_id, display_name, linked_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![user_id, provider, provider_user_id, display_name, now],
+        "INSERT INTO user_providers (user_id, provider, provider_user_id, display_name, linked_at, email, email_verified) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![user_id, provider, provider_user_id, display_name, now, email_addr, email_verified],
     )?;
     Ok(())
+}
+
+/// The account id already holding this exact `(provider, provider_user_id)`
+/// identity, if any. Authoritative immediately after `upsert_user`/
+/// `link_provider_to_user` write it — see those functions' doc comments.
+fn user_id_for_identity(conn: &Connection, provider: &str, provider_user_id: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT user_id FROM user_providers WHERE provider = ?1 AND provider_user_id = ?2",
+        params![provider, provider_user_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Every account id already holding this VERIFIED email on some provider
+/// identity, ordered ascending (the lowest id is the auto-attach target —
+/// docs/mlc/plans/identity-merge-2026-09-09.md decision 2). `email_lower`
+/// must already be lower-cased by the caller — the index
+/// (`idx_user_providers_email_verified`) is built on `LOWER(email)` and a
+/// case-mismatched literal would defeat it.
+pub fn user_id_by_verified_email(conn: &Connection, email_lower: &str) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT user_id FROM user_providers
+         WHERE LOWER(email) = ?1 AND email_verified = 1
+         ORDER BY user_id ASC",
+    )?;
+    let ids = stmt
+        .query_map(params![email_lower], |row| row.get(0))?
+        .collect::<Result<Vec<i64>>>()?;
+    Ok(ids)
+}
+
+/// Resolve or create the account a freshly-authenticated provider identity
+/// belongs to — the auto-attach decision every non-explicit-link OAuth path
+/// makes (`web_callback`, `telegram_web_callback`, `finish_oauth`, the
+/// Telegram-bot login poll). See
+/// docs/mlc/plans/identity-merge-2026-09-09.md decisions 2–3.
+///
+/// Order:
+/// 1. The identity is already KNOWN (a `user_providers` row exists for
+///    `(provider, provider_user_id)`) — resolves to its own owner regardless
+///    of `device_id`; only display_name/email are refreshed.
+/// 2. UNKNOWN identity, `device_id` non-empty and already linked
+///    (`device_users`) to an account — the identity attaches to that account
+///    directly. This is the device-flow-orphan fix (decision 3): no `users`
+///    row is ever created for an identity that turns out to belong to an
+///    already-linked device, so there is nothing left to reassign tokens away
+///    from and nothing left to clean up afterward.
+/// 3. UNKNOWN identity, no device match, but the provider reported a VERIFIED
+///    email that already belongs to one or more accounts — attaches to the
+///    lowest id (`user_id_by_verified_email`), logging a `warn` naming the
+///    other candidate ids when more than one exists (pre-existing
+///    duplicates the admin merge folds together later).
+/// 4. Otherwise: a brand new account (`upsert_user`).
+pub fn resolve_or_create_user(
+    conn: &Connection,
+    provider: &str,
+    provider_user_id: &str,
+    display_name: &str,
+    email: Option<(&str, bool)>,
+    device_id: &str,
+    now: &str,
+) -> Result<i64> {
+    if let Some(owner) = user_id_for_identity(conn, provider, provider_user_id)? {
+        link_provider_to_user(conn, owner, provider, provider_user_id, display_name, email, now)?;
+        return Ok(owner);
+    }
+
+    if !device_id.is_empty() {
+        if let Some(existing) = get_user_for_device(conn, device_id)? {
+            link_provider_to_user(conn, existing, provider, provider_user_id, display_name, email, now)?;
+            return Ok(existing);
+        }
+    }
+
+    if let Some((addr, true)) = email {
+        let lower = addr.to_lowercase();
+        let candidates = user_id_by_verified_email(conn, &lower)?;
+        if let Some((lowest, others)) = candidates.split_first() {
+            if !others.is_empty() {
+                let other_ids = others.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+                tracing::warn!(
+                    "Verified email match for {}:{} found {} existing accounts (attaching to \
+                     lowest id={}, also present on: {})",
+                    provider, provider_user_id, candidates.len(), lowest, other_ids
+                );
+            }
+            link_provider_to_user(conn, *lowest, provider, provider_user_id, display_name, email, now)?;
+            return Ok(*lowest);
+        }
+    }
+
+    upsert_user(conn, provider, provider_user_id, display_name, email, now)
 }
 
 /// Get the `public_id` for a user. Returns an error if not found.
@@ -1449,6 +1645,18 @@ pub struct AdminUserRow {
     pub label: Option<String>,
     pub created_at: String,
     pub paid_until: Option<String>,
+    /// Every provider linked to this account (`user_providers.provider`),
+    /// deduplicated and sorted — an account can hold more than one identity
+    /// on the same provider (e.g. two Google accounts), so this is a set of
+    /// names, not a one-per-provider list.
+    pub providers: Vec<String>,
+    /// Whether ANY linked identity has captured a verified email
+    /// (docs/mlc/plans/identity-merge-2026-09-09.md decision 1).
+    pub has_email: bool,
+    /// The `provider_user_id` of this account's `telegram` `user_providers`
+    /// row, if any — who the operator can reach through the Telegram login
+    /// bot. `None` when no Telegram identity is linked.
+    pub telegram_id: Option<String>,
 }
 
 /// Cap on `search_users`' result set — an operator resolving a nick to an
@@ -1458,7 +1666,10 @@ const ADMIN_USER_SEARCH_LIMIT: i64 = 50;
 /// Case-insensitive substring search over `nick` and `display_name`,
 /// ordered by `id` ascending, capped at [`ADMIN_USER_SEARCH_LIMIT`] rows.
 /// Built for `GET /api/admin/users?q=`: an operator script resolving a nick
-/// to the numeric id `PUT /api/admin/forum/roles/{user_id}` requires.
+/// to the numeric id `PUT /api/admin/forum/roles/{user_id}` requires; also
+/// surfaces each account's linked providers, whether a verified email was
+/// ever captured, and its Telegram id (if any) — one extra query against
+/// `user_providers` for the whole matched set, not one per row.
 pub fn search_users(conn: &Connection, q: &str) -> Result<Vec<AdminUserRow>> {
     let q_lower = q.to_lowercase();
     // Escape LIKE metacharacters to prevent wildcard injection (same idiom
@@ -1486,8 +1697,54 @@ pub fn search_users(conn: &Connection, q: &str) -> Result<Vec<AdminUserRow>> {
             label: Some(display_name).filter(|d| !d.is_empty()),
             created_at: row.get(3)?,
             paid_until: row.get(4)?,
+            providers: Vec::new(),
+            has_email: false,
+            telegram_id: None,
         });
     }
+    if users.is_empty() {
+        return Ok(users);
+    }
+
+    let ids: Vec<i64> = users.iter().map(|u| u.user_id).collect();
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let provider_sql = format!(
+        "SELECT user_id, provider, provider_user_id, email, email_verified
+         FROM user_providers WHERE user_id IN ({placeholders}) ORDER BY user_id ASC, linked_at ASC"
+    );
+    let mut provider_stmt = conn.prepare(&provider_sql)?;
+    let bound: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let mut provider_rows = provider_stmt.query(bound.as_slice())?;
+
+    use std::collections::HashMap;
+    let mut providers_by_user: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut has_email_by_user: HashMap<i64, bool> = HashMap::new();
+    let mut telegram_id_by_user: HashMap<i64, String> = HashMap::new();
+    while let Some(row) = provider_rows.next()? {
+        let user_id: i64 = row.get(0)?;
+        let provider: String = row.get(1)?;
+        let provider_user_id: String = row.get(2)?;
+        let email: Option<String> = row.get(3)?;
+        let email_verified: i64 = row.get(4)?;
+
+        providers_by_user.entry(user_id).or_default().push(provider.clone());
+        if email.is_some() && email_verified != 0 {
+            has_email_by_user.insert(user_id, true);
+        }
+        if provider == "telegram" {
+            telegram_id_by_user.entry(user_id).or_insert(provider_user_id);
+        }
+    }
+
+    for u in users.iter_mut() {
+        let mut names = providers_by_user.remove(&u.user_id).unwrap_or_default();
+        names.sort();
+        names.dedup();
+        u.providers = names;
+        u.has_email = has_email_by_user.contains_key(&u.user_id);
+        u.telegram_id = telegram_id_by_user.remove(&u.user_id);
+    }
+
     Ok(users)
 }
 
@@ -1666,16 +1923,6 @@ pub fn get_devices_for_user(conn: &Connection, user_id: i64) -> Result<Vec<Strin
         devices.push(row.get(0)?);
     }
     Ok(devices)
-}
-
-/// Reassign all auth_tokens from `from_user_id` to `to_user_id`.
-/// Used during device-merge to consolidate identities under one account.
-pub fn reassign_auth_tokens(conn: &Connection, from_user_id: i64, to_user_id: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE auth_tokens SET user_id = ?1 WHERE user_id = ?2",
-        params![to_user_id, from_user_id],
-    )?;
-    Ok(())
 }
 
 // ============================================================================
@@ -4653,6 +4900,7 @@ mod tests {
                 public_id TEXT,
                 nick TEXT,
                 nick_changed_at TEXT,
+                paid_until TEXT,
                 UNIQUE(provider, provider_user_id)
             );
             CREATE UNIQUE INDEX idx_users_nick_lower ON users(LOWER(nick)) WHERE nick IS NOT NULL;
@@ -4691,8 +4939,12 @@ mod tests {
                 provider_user_id TEXT NOT NULL,
                 display_name TEXT NOT NULL DEFAULT '',
                 linked_at TEXT NOT NULL,
+                email TEXT,
+                email_verified INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(provider, provider_user_id)
             );
+            CREATE INDEX idx_user_providers_email_verified
+                ON user_providers(LOWER(email)) WHERE email_verified = 1;
 
             CREATE TABLE web_sessions (
                 session_id TEXT PRIMARY KEY,
@@ -4937,6 +5189,225 @@ mod tests {
         );
         // The replier's own account is untouched.
         assert_eq!(super::forum_author_label(&conn, replier).expect("label"), "iris");
+    }
+
+    // ------------------------------------------------------------------
+    // Identity merge — email capture, auto-attach, device-flow orphan fix
+    // (docs/mlc/plans/identity-merge-2026-09-09.md decisions 1-3)
+    // ------------------------------------------------------------------
+
+    /// Read back `(email, email_verified)` for one `user_providers` row.
+    fn provider_email(conn: &Connection, provider: &str, provider_user_id: &str) -> (Option<String>, bool) {
+        conn.query_row(
+            "SELECT email, email_verified FROM user_providers WHERE provider = ?1 AND provider_user_id = ?2",
+            rusqlite::params![provider, provider_user_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .expect("provider row")
+    }
+
+    fn user_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .expect("count")
+    }
+
+    #[test]
+    fn upsert_user_persists_email_per_provider_shape() {
+        let conn = share_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let uid = super::upsert_user(&conn, "github", "gh1", "alice", Some(("alice@example.com", true)), &now)
+            .expect("upsert");
+        assert_eq!(
+            provider_email(&conn, "github", "gh1"),
+            (Some("alice@example.com".to_string()), true)
+        );
+
+        // A subsequent sign-in that reports no email leaves the stored one alone.
+        let uid2 = super::upsert_user(&conn, "github", "gh1", "alice", None, &now).expect("upsert again");
+        assert_eq!(uid, uid2);
+        assert_eq!(
+            provider_email(&conn, "github", "gh1"),
+            (Some("alice@example.com".to_string()), true)
+        );
+
+        // A later unverified email refreshes both fields (still the same identity row).
+        super::upsert_user(&conn, "github", "gh1", "alice", Some(("alice2@example.com", false)), &now)
+            .expect("upsert refresh");
+        assert_eq!(
+            provider_email(&conn, "github", "gh1"),
+            (Some("alice2@example.com".to_string()), false)
+        );
+    }
+
+    #[test]
+    fn resolve_or_create_user_attaches_unknown_identity_on_verified_email_match() {
+        let conn = share_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let existing = super::upsert_user(&conn, "google", "g1", "Alice", Some(("alice@example.com", true)), &now)
+            .expect("seed account");
+        let before = user_count(&conn);
+
+        // A different provider identity, same verified email (case-insensitive) — attaches, no new user.
+        let resolved = super::resolve_or_create_user(
+            &conn, "discord", "d1", "alice#0001", Some(("Alice@Example.com", true)), "", &now,
+        )
+        .expect("resolve");
+        assert_eq!(resolved, existing);
+        assert_eq!(user_count(&conn), before, "no new users row should have been created");
+        assert_eq!(
+            conn.query_row(
+                "SELECT user_id FROM user_providers WHERE provider = 'discord' AND provider_user_id = 'd1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("linked row"),
+            existing
+        );
+    }
+
+    #[test]
+    fn resolve_or_create_user_does_not_attach_on_unverified_or_absent_email() {
+        let conn = share_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let existing = super::upsert_user(&conn, "google", "g2", "Bob", Some(("bob@example.com", true)), &now)
+            .expect("seed account");
+
+        // Same email, but NOT verified — must not attach.
+        let unverified = super::resolve_or_create_user(
+            &conn, "discord", "d2", "bob#0002", Some(("bob@example.com", false)), "", &now,
+        )
+        .expect("resolve unverified");
+        assert_ne!(unverified, existing);
+
+        // No email at all — must not attach.
+        let no_email = super::resolve_or_create_user(&conn, "twitter", "t2", "@bob", None, "", &now)
+            .expect("resolve no email");
+        assert_ne!(no_email, existing);
+        assert_ne!(no_email, unverified);
+    }
+
+    #[test]
+    fn resolve_or_create_user_known_identity_resolves_to_its_own_user_and_refreshes_email() {
+        let conn = share_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let owner = super::upsert_user(&conn, "github", "gh3", "carol", None, &now).expect("seed owner");
+        let other = super::upsert_user(&conn, "google", "g3", "dave", None, &now).expect("seed other");
+
+        // `other`'s device is already linked to `other` — a KNOWN identity must
+        // still resolve to its own owner regardless of device linkage.
+        super::link_device_user(&conn, "device-x", other, &now).expect("link device");
+
+        let resolved = super::resolve_or_create_user(
+            &conn, "github", "gh3", "carol", Some(("carol@example.com", true)), "device-x", &now,
+        )
+        .expect("resolve known identity");
+        assert_eq!(resolved, owner);
+        assert_ne!(resolved, other);
+        assert_eq!(
+            provider_email(&conn, "github", "gh3"),
+            (Some("carol@example.com".to_string()), true)
+        );
+    }
+
+    #[test]
+    fn resolve_or_create_user_device_flow_no_longer_orphans() {
+        let conn = share_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let existing = super::upsert_user(&conn, "github", "gh4", "erin", None, &now).expect("seed account");
+        super::link_device_user(&conn, "device-y", existing, &now).expect("link device");
+        let before = user_count(&conn);
+
+        // A brand new identity signs in on a device already linked to `existing`
+        // — must attach directly, never create a throwaway `users` row.
+        let resolved = super::resolve_or_create_user(
+            &conn, "discord", "d4", "erin#0004", None, "device-y", &now,
+        )
+        .expect("resolve on known device");
+        assert_eq!(resolved, existing);
+        assert_eq!(user_count(&conn), before, "device-flow attach must not create a new users row");
+        assert_eq!(
+            conn.query_row(
+                "SELECT user_id FROM user_providers WHERE provider = 'discord' AND provider_user_id = 'd4'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("linked row"),
+            existing
+        );
+    }
+
+    #[test]
+    fn search_users_reports_providers_email_and_telegram_id() {
+        let conn = share_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // frank: github (verified email) + telegram — multi-provider account.
+        let frank = super::upsert_user(&conn, "github", "gh9", "frank", Some(("frank@example.com", true)), &now)
+            .expect("seed frank");
+        super::link_provider_to_user(&conn, frank, "telegram", "tg-frank", "@frank", None, &now)
+            .expect("link telegram");
+
+        // gina: discord only, no email ever captured.
+        let gina = super::upsert_user(&conn, "discord", "d9", "gina", None, &now).expect("seed gina");
+
+        let rows = super::search_users(&conn, "fra").expect("search frank");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user_id, frank);
+        assert_eq!(rows[0].providers, vec!["github".to_string(), "telegram".to_string()]);
+        assert!(rows[0].has_email);
+        assert_eq!(rows[0].telegram_id.as_deref(), Some("tg-frank"));
+
+        let rows = super::search_users(&conn, "gina").expect("search gina");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user_id, gina);
+        assert_eq!(rows[0].providers, vec!["discord".to_string()]);
+        assert!(!rows[0].has_email);
+        assert_eq!(rows[0].telegram_id, None);
+    }
+
+    #[test]
+    fn cleanup_orphan_users_removes_self_referencing_orphan_shape_only() {
+        let conn = share_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // A: a live account with an auth token — must survive.
+        let a = super::upsert_user(&conn, "github", "a1", "alive", None, &now).expect("seed a");
+        conn.execute(
+            "INSERT INTO auth_tokens (token_hash, user_id, created_at) VALUES ('tok-a', ?1, ?2)",
+            rusqlite::params![a, now],
+        )
+        .expect("insert token");
+
+        // B: the exact orphan shape the pre-fix finish_oauth device-merge
+        // branch left behind — one self-mirror user_providers row, nothing
+        // else anywhere. Must be removed.
+        let b = super::upsert_user(&conn, "github", "b1", "orphan", None, &now).expect("seed b");
+
+        // C: same self-mirror shape as B, but still holds a live token —
+        // must survive despite having exactly one (self) provider row.
+        let c = super::upsert_user(&conn, "github", "c1", "token-holder", None, &now).expect("seed c");
+        conn.execute(
+            "INSERT INTO auth_tokens (token_hash, user_id, created_at) VALUES ('tok-c', ?1, ?2)",
+            rusqlite::params![c, now],
+        )
+        .expect("insert token");
+
+        // D: no user_providers row at all (the plain pre-existing orphan rule) — must be removed.
+        let d = super::upsert_user(&conn, "github", "d1", "no-providers", None, &now).expect("seed d");
+        conn.execute("DELETE FROM user_providers WHERE user_id = ?1", rusqlite::params![d])
+            .expect("strip providers");
+
+        let removed = super::cleanup_orphan_users(&conn).expect("cleanup");
+        assert_eq!(removed, 2, "exactly B (self-referencing) and D (no providers) should be removed");
+
+        let remaining: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT id FROM users ORDER BY id").expect("prepare");
+            stmt.query_map([], |row| row.get(0)).expect("query").collect::<rusqlite::Result<Vec<i64>>>().expect("rows")
+        };
+        assert_eq!(remaining, vec![a, c]);
+        assert!(!remaining.contains(&b));
+        assert!(!remaining.contains(&d));
     }
 
     // ------------------------------------------------------------------

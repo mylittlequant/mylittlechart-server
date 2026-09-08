@@ -1,4 +1,8 @@
-//! Admin endpoints — protected by ADMIN_SECRET bearer token.
+//! Admin endpoints — protected by ADMIN_SECRET bearer token. Includes
+//! `GET /admin/users` (search, with each row's linked providers/email/
+//! Telegram id) and `POST /admin/users/merge` (fold a duplicate account into
+//! its survivor — see `merge_users`' own doc comment and `account_merge.rs`
+//! for the full contract and per-table order).
 
 use axum::{
     body::Bytes,
@@ -508,8 +512,13 @@ pub struct AdminUsersQuery {
 /// ascending) — the read half of resolving a nick to the numeric id
 /// `PUT /api/admin/forum/roles/{user_id}` requires; nothing on the API
 /// resolves that today. `paid_until` rides along because it lives on the
-/// same `users` row this query already reads. Requires
-/// `Authorization: Bearer {ADMIN_SECRET}`.
+/// same `users` row this query already reads. Each row also carries
+/// `providers` (every linked provider name, deduplicated and sorted),
+/// `has_email` (whether any linked identity captured a verified email —
+/// docs/mlc/plans/identity-merge-2026-09-09.md decision 1), and
+/// `telegram_id` (the `provider_user_id` of the account's `telegram`
+/// identity, if any — who the operator can reach through the Telegram
+/// login bot). Requires `Authorization: Bearer {ADMIN_SECRET}`.
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -564,5 +573,135 @@ pub async fn list_users(
             Json(ErrorResponse::new("Internal error")),
         )
             .into_response(),
+    }
+}
+
+/// JSON body for `POST /api/admin/users/merge`.
+#[derive(serde::Deserialize)]
+pub struct MergeUsersRequest {
+    pub from: i64,
+    pub into: i64,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub keep_vault: Option<String>,
+}
+
+/// POST /api/admin/users/merge
+///
+/// Fold `from` into `into` — one person's several OAuth-identity accounts
+/// becoming one (docs/mlc/plans/identity-merge-2026-09-09.md decisions 4-6;
+/// implementation and exact per-table order in `account_merge.rs`). Body
+/// `{"from": <id>, "into": <id>, "dry_run": bool, "keep_vault":
+/// "into"|"from"|null}`. 400 when `from == into` or either names no
+/// existing account; 409 `{"error":"hard conflicts","conflicts":[…]}` when a
+/// `vault`/`recovery_key`/`salt` singleton or a `sync_e2e_params` row is held
+/// by BOTH accounts for the same key, or both hold a `dm_identity_keys`
+/// row — unless `keep_vault` names the survivor, in which case the loser's
+/// conflicting rows are archived (not silently dropped) to
+/// `<data_dir>/merge-archive/<from>-into-<into>-<ts>.json` before deletion.
+/// `dry_run: true` returns the same summary shape a real merge would write
+/// (row counts per table, conflicts, hot-plane files that would move or
+/// collide) and writes nothing — `keep_vault` has no effect on a dry run.
+/// The response body on success is the `MergeSummary` JSON itself, not
+/// wrapped in another envelope. Requires `Authorization: Bearer
+/// {ADMIN_SECRET}`.
+///
+/// Static, not `/admin/users/{id}` — coexists with the static `/admin/users`
+/// above the same way `/admin/forum/roles/by-nick/{nick}` coexists with
+/// `/admin/forum/roles/{user_id}` (see routes/mod.rs's registration comment
+/// for this route).
+pub async fn merge_users(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
+        return e;
+    }
+
+    let req: MergeUsersRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Invalid JSON body"))).into_response();
+        }
+    };
+
+    if req.from == req.into {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("from and into must be different user ids")),
+        )
+            .into_response();
+    }
+
+    let keep_vault = match req.keep_vault.as_deref() {
+        None => None,
+        Some(s) => match crate::account_merge::KeepVault::from_wire(s) {
+            Some(k) => Some(k),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new("keep_vault must be \"into\" or \"from\"")),
+                )
+                    .into_response();
+            }
+        },
+    };
+
+    let from = req.from;
+    let into = req.into;
+    let dry_run = req.dry_run;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let control = state.control_plane();
+        if dry_run {
+            crate::account_merge::plan(&control.db, &control.social, &control.sync_store, from, into)
+        } else {
+            crate::account_merge::execute(
+                &control.db,
+                &control.social,
+                &control.sync_store,
+                &control.data_dir,
+                from,
+                into,
+                keep_vault,
+            )
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(summary)) => Json(summary).into_response(),
+        Ok(Err(crate::account_merge::MergeError::SameUser)) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("from and into must be different user ids")),
+        )
+            .into_response(),
+        Ok(Err(crate::account_merge::MergeError::UserNotFound { side, user_id })) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(format!("{side} user {user_id} does not exist"))),
+        )
+            .into_response(),
+        Ok(Err(crate::account_merge::MergeError::Conflicts(conflicts))) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "hard conflicts", "conflicts": conflicts })),
+        )
+            .into_response(),
+        Ok(Err(crate::account_merge::MergeError::Db(e))) => {
+            tracing::error!("DB error in account merge: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Database error"))).into_response()
+        }
+        Ok(Err(crate::account_merge::MergeError::Io(e))) => {
+            tracing::error!("IO error in account merge: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Filesystem error"))).into_response()
+        }
+        Ok(Err(crate::account_merge::MergeError::Serde(e))) => {
+            tracing::error!("Serialization error in account merge: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response(),
     }
 }

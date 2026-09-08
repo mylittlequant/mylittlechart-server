@@ -140,6 +140,8 @@ pub async fn poll_tg_login(
                 let session_expires =
                     (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
 
+                // Telegram cannot yield an email at all — see
+                // docs/mlc/plans/identity-merge-2026-09-09.md decision 1.
                 let user_id = if let Some(existing_uid) = link_user_id {
                     // Link-provider flow: attach TG identity to existing account.
                     crate::db::link_provider_to_user(
@@ -148,22 +150,16 @@ pub async fn poll_tg_login(
                         "telegram",
                         &tg_user_id,
                         &display_name,
+                        None,
                         &now,
                     )?;
                     existing_uid
                 } else {
-                    // Normal login: upsert the user then record the provider link.
-                    let uid = crate::db::upsert_user(
-                        &conn,
-                        "telegram",
-                        &tg_user_id,
-                        &display_name,
-                        &now,
-                    )?;
-                    crate::db::link_provider_to_user(
-                        &conn, uid, "telegram", &tg_user_id, &display_name, &now,
-                    )?;
-                    uid
+                    // Normal login: resolve to an existing account (known
+                    // identity) or create a new one.
+                    crate::db::resolve_or_create_user(
+                        &conn, "telegram", &tg_user_id, &display_name, None, "", &now,
+                    )?
                 };
 
                 let session_id = crate::db::create_web_session(

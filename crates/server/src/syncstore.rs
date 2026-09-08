@@ -759,6 +759,160 @@ pub fn purge_user(store: &SyncStore, user_id: i64) -> rusqlite::Result<()> {
     }
 }
 
+/// Outcome of [`merge_user_into`] — how many hot-plane files landed in the
+/// survivor's tree untouched vs. collided with an existing file at the same
+/// `<device>/<profile>/<category>/<sync_id>.json` path and were archived
+/// instead (docs/mlc/plans/identity-merge-2026-09-09.md decision 4's
+/// filesystem step: "move file by file without overwriting").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HotMergeSummary {
+    pub moved: usize,
+    pub archived: usize,
+}
+
+/// Move every hot-plane file under `<root>/<from>/…` into `<root>/<into>/…`,
+/// preserving its `<device>/<profile>/<category>/<sync_id>.json` path. A file
+/// that would collide with one already at that path under `into` is instead
+/// moved to `archive_dir/<device>/<profile>/<category>/<sync_id>.json` —
+/// never overwritten, never dropped. `archive_dir` is the caller's already
+/// timestamped `<data_dir>/merge-archive/<from>-into-<into>-<ts>/` (see
+/// `account_merge::execute`); this function does not construct or stamp it.
+///
+/// `fs::rename` (not copy+delete) throughout: `from`'s tree and
+/// `archive_dir` are expected to sit on the same filesystem as `into`'s tree
+/// (both under the same `<data_dir>/sync/`), so a rename is atomic and cheap
+/// — no partial file is ever left on either side of a single item's move.
+///
+/// Idempotent in the same sense [`purge_user`] is: a missing or already-empty
+/// `from` directory (nothing to move, or a retried merge) is success with a
+/// zero summary, not an error. `from`'s directory tree is removed once every
+/// file under it has been moved somewhere.
+pub fn merge_user_into(
+    store: &SyncStore,
+    from: i64,
+    into: i64,
+    archive_dir: &Path,
+) -> io::Result<HotMergeSummary> {
+    let _guard = store.io.lock().unwrap_or_else(|e| e.into_inner());
+    let from_dir = store.user_dir(from);
+    let into_dir = store.user_dir(into);
+    let mut summary = HotMergeSummary::default();
+
+    if !from_dir.is_dir() {
+        return Ok(summary);
+    }
+
+    let Ok(dev_entries) = fs::read_dir(&from_dir) else {
+        return Ok(summary);
+    };
+    for dev_entry in dev_entries.flatten() {
+        let dev_name = dev_entry.file_name();
+        let dev_path = dev_entry.path();
+        let Ok(prof_entries) = fs::read_dir(&dev_path) else {
+            continue;
+        };
+        for prof_entry in prof_entries.flatten() {
+            let prof_name = prof_entry.file_name();
+            let prof_path = prof_entry.path();
+            let Ok(cat_entries) = fs::read_dir(&prof_path) else {
+                continue;
+            };
+            for cat_entry in cat_entries.flatten() {
+                let cat_name = cat_entry.file_name();
+                let cat_path = cat_entry.path();
+                let Ok(file_entries) = fs::read_dir(&cat_path) else {
+                    continue;
+                };
+                for file_entry in file_entries.flatten() {
+                    let file_path = file_entry.path();
+                    if !file_path.is_file() {
+                        continue;
+                    }
+                    let file_name = file_entry.file_name();
+                    let rel = Path::new(&dev_name).join(&prof_name).join(&cat_name).join(&file_name);
+
+                    let dest = into_dir.join(&rel);
+                    if dest.exists() {
+                        let archived_at = archive_dir.join(&rel);
+                        if let Some(parent) = archived_at.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::rename(&file_path, &archived_at)?;
+                        summary.archived += 1;
+                    } else {
+                        if let Some(parent) = dest.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::rename(&file_path, &dest)?;
+                        summary.moved += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Every file has been moved somewhere (into `into`'s tree or the
+    // archive) — only empty directories remain under `from`.
+    let _ = fs::remove_dir_all(&from_dir);
+    Ok(summary)
+}
+
+/// Read-only preview of what [`merge_user_into`] would do — same walk, same
+/// collision rule, but no `fs::rename`/`fs::create_dir_all`/`fs::remove_dir_all`
+/// call anywhere. Used by `account_merge::plan` (`dry_run: true` must predict
+/// the exact `moved`/`archived` counts a real run would produce, and must
+/// touch nothing on disk to do it).
+pub fn preview_merge_user_into(store: &SyncStore, from: i64, into: i64) -> io::Result<HotMergeSummary> {
+    let _guard = store.io.lock().unwrap_or_else(|e| e.into_inner());
+    let from_dir = store.user_dir(from);
+    let into_dir = store.user_dir(into);
+    let mut summary = HotMergeSummary::default();
+
+    if !from_dir.is_dir() {
+        return Ok(summary);
+    }
+
+    let Ok(dev_entries) = fs::read_dir(&from_dir) else {
+        return Ok(summary);
+    };
+    for dev_entry in dev_entries.flatten() {
+        let dev_path = dev_entry.path();
+        let Ok(prof_entries) = fs::read_dir(&dev_path) else {
+            continue;
+        };
+        for prof_entry in prof_entries.flatten() {
+            let prof_path = prof_entry.path();
+            let Ok(cat_entries) = fs::read_dir(&prof_path) else {
+                continue;
+            };
+            for cat_entry in cat_entries.flatten() {
+                let cat_path = cat_entry.path();
+                let Ok(file_entries) = fs::read_dir(&cat_path) else {
+                    continue;
+                };
+                for file_entry in file_entries.flatten() {
+                    let file_path = file_entry.path();
+                    if !file_path.is_file() {
+                        continue;
+                    }
+                    // `file_path` was built by walking `from_dir` itself, so
+                    // this can only fail if the filesystem changed under us
+                    // mid-walk — skip rather than panic on that race.
+                    let Ok(rel) = file_path.strip_prefix(&from_dir) else {
+                        continue;
+                    };
+                    if into_dir.join(rel).exists() {
+                        summary.archived += 1;
+                    } else {
+                        summary.moved += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(summary)
+}
+
 /// Delete hot-store files for users who haven't synced in `inactive_days` days.
 ///
 /// Counterpart to `db::cleanup_inactive_sync_data` for the hot plane: that
@@ -1178,5 +1332,87 @@ mod tests {
         let r = push(&conn, &s, 1, "dev", "prof", &[item("overflow", "preset", 100)], true).unwrap();
         assert_eq!(r.accepted, 1);
         assert_eq!(crate::entitlements::preset_limit(true), free_limit * 10);
+    }
+
+    // ------------------------------------------------------------------
+    // merge_user_into (identity merge, decision 4's filesystem step)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn merge_user_into_moves_non_colliding_files_and_removes_the_source_tree() {
+        let dir = TestDir::new();
+        let s = store(&dir);
+        let conn = crate::db::init_test_conn();
+        push(&conn, &s, 7, "dev-a", "prof-x", &[item("p1", "preset", 100)], false).unwrap();
+        push(&conn, &s, 7, "dev-b", "prof-y", &[item("t1", "theme", 100)], false).unwrap();
+
+        let archive_dir = dir.0.join("archive");
+        let summary = merge_user_into(&s, 7, 1, &archive_dir).expect("merge");
+        assert_eq!(summary, HotMergeSummary { moved: 2, archived: 0 });
+
+        assert!(s.item_path(1, "dev-a", "prof-x", "preset", "p1").unwrap().is_file());
+        assert!(s.item_path(1, "dev-b", "prof-y", "theme", "t1").unwrap().is_file());
+        assert!(!s.user_dir(7).is_dir(), "the loser's tree must be gone once every file has moved");
+        assert!(!archive_dir.is_dir(), "no collision means no archive directory is even created");
+    }
+
+    #[test]
+    fn merge_user_into_archives_a_colliding_file_without_overwriting_the_survivors() {
+        let dir = TestDir::new();
+        let s = store(&dir);
+        let conn = crate::db::init_test_conn();
+        // Both accounts hold a `p1` preset under the exact same device/profile
+        // scope — the collision case the plan requires archiving, not overwriting.
+        push(&conn, &s, 1, "dev-a", "prof-x", &[item("p1", "preset", 100)], false).unwrap();
+        push(&conn, &s, 7, "dev-a", "prof-x", &[item("p1", "preset", 999)], false).unwrap();
+        let survivor_path = s.item_path(1, "dev-a", "prof-x", "preset", "p1").unwrap();
+        let survivor_before = SyncStore::read_file(&survivor_path).unwrap();
+        assert_eq!(survivor_before.modified_at, 100);
+
+        let archive_dir = dir.0.join("archive");
+        let summary = merge_user_into(&s, 7, 1, &archive_dir).expect("merge");
+        assert_eq!(summary, HotMergeSummary { moved: 0, archived: 1 });
+
+        // The survivor's own file is untouched — never overwritten.
+        let survivor_after = SyncStore::read_file(&survivor_path).unwrap();
+        assert_eq!(survivor_after.modified_at, 100);
+        // The loser's colliding file was archived, not dropped.
+        let archived_path = archive_dir.join("dev-a").join("prof-x").join("preset").join("p1.json");
+        let archived = SyncStore::read_file(&archived_path).unwrap();
+        assert_eq!(archived.modified_at, 999);
+        assert!(!s.user_dir(7).is_dir());
+    }
+
+    #[test]
+    fn merge_user_into_missing_source_tree_is_a_no_op() {
+        let dir = TestDir::new();
+        let s = store(&dir);
+        let archive_dir = dir.0.join("archive");
+        let summary = merge_user_into(&s, 42, 1, &archive_dir).expect("merge on empty tree");
+        assert_eq!(summary, HotMergeSummary::default());
+    }
+
+    #[test]
+    fn preview_merge_user_into_predicts_the_real_run_and_touches_nothing() {
+        let dir = TestDir::new();
+        let s = store(&dir);
+        let conn = crate::db::init_test_conn();
+        push(&conn, &s, 1, "dev-a", "prof-x", &[item("p1", "preset", 100)], false).unwrap();
+        push(&conn, &s, 7, "dev-a", "prof-x", &[item("p1", "preset", 999)], false).unwrap(); // collides
+        push(&conn, &s, 7, "dev-b", "prof-y", &[item("t1", "theme", 100)], false).unwrap(); // does not
+
+        let preview = preview_merge_user_into(&s, 7, 1).expect("preview");
+        assert_eq!(preview, HotMergeSummary { moved: 1, archived: 1 });
+
+        // Nothing on disk moved — the source tree, the survivor's file, and
+        // the (non-existent) archive directory are all exactly as before.
+        assert!(s.user_dir(7).is_dir(), "preview must not remove the source tree");
+        assert!(s.item_path(7, "dev-a", "prof-x", "preset", "p1").unwrap().is_file());
+        assert!(s.item_path(7, "dev-b", "prof-y", "theme", "t1").unwrap().is_file());
+        assert!(!dir.0.join("archive").exists());
+
+        // The real run must land on the exact same counts.
+        let real = merge_user_into(&s, 7, 1, &dir.0.join("archive")).expect("merge");
+        assert_eq!(real, preview);
     }
 }

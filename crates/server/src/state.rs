@@ -115,6 +115,14 @@ pub struct ControlPlane {
     /// `routes/share.rs`): one PNG per share at `<user_id>/<token>.png`, with
     /// `share_links.blob_path` holding the path relative to this root.
     pub share_root: std::path::PathBuf,
+
+    /// The server's data directory (`DATA_DIR`, default `./data`) — the
+    /// parent `sync_store`'s and `share_root`'s roots both live under.
+    /// Needed directly (not re-derived from either) by
+    /// `account_merge::execute`, which writes `<data_dir>/merge-archive/…`
+    /// for a refused-conflict's exported rows and for a hot-plane filesystem
+    /// collision — see docs/mlc/plans/identity-merge-2026-09-09.md decision 5.
+    pub data_dir: std::path::PathBuf,
 }
 
 impl ControlPlane {

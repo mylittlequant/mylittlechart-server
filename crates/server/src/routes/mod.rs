@@ -50,6 +50,12 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         // collides with it either way, since no `/admin/users/{...}` route
         // exists.
         .route("/admin/users", get(admin::list_users))
+        // Static two-segment path under the same `/admin/users` prefix —
+        // coexists with the single-segment `/admin/users` directly above the
+        // same way `/admin/forum/roles/by-nick/{nick}` coexists with
+        // `/admin/forum/roles/{user_id}` further down (proven by
+        // `control_router_registers_without_route_conflicts` below).
+        .route("/admin/users/merge", post(admin::merge_users))
         .route("/admin/posts", post(posts::admin_upsert_post))
         .route("/admin/posts/{id}", delete(posts::admin_delete_post))
         // In-app blog: patch notes and posts (see routes/posts.rs). Public.

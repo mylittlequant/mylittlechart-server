@@ -106,7 +106,7 @@ pub async fn authorize(
     let auth_url = match provider.as_str() {
         "github" => {
             format!(
-                "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&scope=read:user",
+                "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&scope=read:user%20user:email",
                 urlencoding_simple(&state.github_client_id),
                 urlencoding_simple(&redirect_uri),
                 state_param,
@@ -114,7 +114,7 @@ pub async fn authorize(
         }
         "discord" => {
             format!(
-                "https://discord.com/api/oauth2/authorize?client_id={}&redirect_uri={}&response_type=code&scope=identify&state={}",
+                "https://discord.com/api/oauth2/authorize?client_id={}&redirect_uri={}&response_type=code&scope=identify%20email&state={}",
                 urlencoding_simple(&state.discord_client_id),
                 urlencoding_simple(&redirect_uri),
                 state_param,
@@ -122,7 +122,7 @@ pub async fn authorize(
         }
         "google" => {
             format!(
-                "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope=openid%20profile&state={}&access_type=offline&prompt=consent",
+                "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope=openid%20profile%20email&state={}&access_type=offline&prompt=consent",
                 urlencoding_simple(&state.google_client_id),
                 urlencoding_simple(&redirect_uri),
                 state_param,
@@ -222,7 +222,7 @@ pub async fn web_callback(
     }
 
     // --- Exchange code for provider identity ---
-    let (provider_name, provider_user_id, display_name) =
+    let (provider_name, provider_user_id, display_name, email) =
         match exchange_code_for_identity(&state, &provider, &query.code, &redirect_uri, state_param.as_deref()).await {
             Ok(t) => t,
             Err(resp) => return resp,
@@ -239,18 +239,21 @@ pub async fn web_callback(
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(i64, String)> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let email_ref = email.as_ref().map(|(addr, verified)| (addr.as_str(), *verified));
 
         let user_id = if let Some(existing_uid) = link_user_id {
             // Link flow: add this provider to the existing account.
             crate::db::link_provider_to_user(
-                &conn, existing_uid, &provider_name, &provider_user_id, &display_name, &now,
+                &conn, existing_uid, &provider_name, &provider_user_id, &display_name, email_ref, &now,
             )?;
             existing_uid
         } else {
-            // Normal login flow: upsert user and ensure user_providers is populated.
-            let uid = crate::db::upsert_user(&conn, &provider_name, &provider_user_id, &display_name, &now)?;
-            crate::db::link_provider_to_user(&conn, uid, &provider_name, &provider_user_id, &display_name, &now)?;
-            uid
+            // Normal login flow: resolve to an existing account (known
+            // identity, device match, or verified-email auto-attach) or
+            // create a new one — see db::resolve_or_create_user.
+            crate::db::resolve_or_create_user(
+                &conn, &provider_name, &provider_user_id, &display_name, email_ref, "", &now,
+            )?
         };
 
         let session_id = crate::db::create_web_session(&conn, user_id, &now, &session_expires_at, &ua_hash)?;
@@ -349,14 +352,18 @@ pub async fn web_callback(
     }
 }
 
-/// Exchange an OAuth authorization code for (provider_name, provider_user_id, display_name).
+/// Exchange an OAuth authorization code for (provider_name, provider_user_id,
+/// display_name, email). `email` is `Some((address, verified))` when the
+/// provider reported one this sign-in (see
+/// docs/mlc/plans/identity-merge-2026-09-09.md decision 1) — GitHub and
+/// Discord can, Google can, Twitter/X cannot (`None` unconditionally there).
 async fn exchange_code_for_identity(
     state: &Arc<AppState>,
     provider: &str,
     code: &str,
     redirect_uri: &str,
     state_param: Option<&str>,
-) -> Result<(String, String, String), Response> {
+) -> Result<(String, String, String, Option<(String, bool)>), Response> {
     let http = build_http_client().map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new(e))).into_response()
     })?;
@@ -402,8 +409,9 @@ async fn exchange_code_for_identity(
                 .await
                 .map_err(|e| e)?;
 
+            let email = fetch_github_primary_verified_email(&http, &access_token, user.id).await;
             let display_name = user.name.unwrap_or(user.login);
-            Ok(("github".to_string(), user.id.to_string(), display_name))
+            Ok(("github".to_string(), user.id.to_string(), display_name, email))
         }
         "discord" => {
             #[derive(serde::Deserialize)]
@@ -435,13 +443,20 @@ async fn exchange_code_for_identity(
             })?;
 
             #[derive(serde::Deserialize)]
-            struct DiscordUser { id: String, username: String, global_name: Option<String> }
+            struct DiscordUser {
+                id: String,
+                username: String,
+                global_name: Option<String>,
+                email: Option<String>,
+                verified: Option<bool>,
+            }
             let user: DiscordUser = fetch_json(&http, "https://discord.com/api/v10/users/@me", &access_token, None)
                 .await
                 .map_err(|e| e)?;
 
+            let email = discord_email(&user.email, user.verified);
             let display_name = user.global_name.unwrap_or(user.username);
-            Ok(("discord".to_string(), user.id, display_name))
+            Ok(("discord".to_string(), user.id, display_name, email))
         }
         "google" => {
             #[derive(serde::Deserialize)]
@@ -478,14 +493,20 @@ async fn exchange_code_for_identity(
             })?;
 
             #[derive(serde::Deserialize)]
-            struct GoogleUser { sub: String, name: Option<String>, email: Option<String> }
+            struct GoogleUser {
+                sub: String,
+                name: Option<String>,
+                email: Option<String>,
+                email_verified: Option<bool>,
+            }
             let user: GoogleUser = fetch_json(&http, "https://www.googleapis.com/oauth2/v3/userinfo", &access_token, None)
                 .await
                 .map_err(|e| e)?;
 
+            let email = user.email.clone().map(|addr| (addr, user.email_verified.unwrap_or(false)));
             let display_name = user.name.or(user.email)
                 .unwrap_or_else(|| format!("google:{}", &user.sub[..8.min(user.sub.len())]));
-            Ok(("google".to_string(), user.sub, display_name))
+            Ok(("google".to_string(), user.sub, display_name, email))
         }
         "twitter" => {
             let code_verifier = match state_param {
@@ -539,7 +560,10 @@ async fn exchange_code_for_identity(
                 (StatusCode::BAD_GATEWAY, Json(ErrorResponse::new("No user data in Twitter response"))).into_response()
             })?;
             let display_name = format!("@{}", user.username);
-            Ok(("twitter".to_string(), user.id, display_name))
+            // Twitter/X cannot yield a verified email (see the plan's provider
+            // table) — its identities attach only through an explicit link or
+            // an admin merge.
+            Ok(("twitter".to_string(), user.id, display_name, None))
         }
         _ => Err((
             StatusCode::BAD_REQUEST,
@@ -706,17 +730,20 @@ pub async fn telegram_web_callback(
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(i64, String)> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
 
+        // Telegram cannot yield an email at all (widget/Bot API expose none) —
+        // see docs/mlc/plans/identity-merge-2026-09-09.md decision 1.
         let user_id = if let Some(existing_uid) = link_user_id {
             // Link flow: add Telegram identity to existing account.
             crate::db::link_provider_to_user(
-                &conn, existing_uid, "telegram", &provider_user_id, &display_name, &now,
+                &conn, existing_uid, "telegram", &provider_user_id, &display_name, None, &now,
             )?;
             existing_uid
         } else {
-            // Normal login flow: upsert user and ensure user_providers is populated.
-            let uid = crate::db::upsert_user(&conn, "telegram", &provider_user_id, &display_name, &now)?;
-            crate::db::link_provider_to_user(&conn, uid, "telegram", &provider_user_id, &display_name, &now)?;
-            uid
+            // Normal login flow: resolve to an existing account (known
+            // identity or device match) or create a new one.
+            crate::db::resolve_or_create_user(
+                &conn, "telegram", &provider_user_id, &display_name, None, "", &now,
+            )?
         };
 
         let session_id = crate::db::create_web_session(&conn, user_id, &now, &session_expires_at, &ua_hash)?;
@@ -787,7 +814,8 @@ pub async fn telegram_callback(
     };
 
     let device_id = req.device_id.as_deref().unwrap_or("");
-    finish_oauth(state, "telegram", &req.id, &display_name, device_id).await
+    // Telegram cannot yield an email at all (widget/Bot API expose none).
+    finish_oauth(state, "telegram", &req.id, &display_name, None, device_id).await
 }
 
 // ============================================================================
@@ -863,9 +891,11 @@ async fn github_callback(state: Arc<AppState>, req: OAuthCallbackRequest) -> Res
         Err(e) => return e,
     };
 
+    let email = fetch_github_primary_verified_email(&http, &access_token, user.id).await;
     let display_name = user.name.unwrap_or_else(|| user.login.clone());
     let device_id = req.device_id.as_deref().unwrap_or("");
-    finish_oauth(state, "github", &user.id.to_string(), &display_name, device_id).await
+    let email_ref = email.as_ref().map(|(addr, verified)| (addr.as_str(), *verified));
+    finish_oauth(state, "github", &user.id.to_string(), &display_name, email_ref, device_id).await
 }
 
 async fn discord_callback(state: Arc<AppState>, req: OAuthCallbackRequest) -> Response {
@@ -928,6 +958,8 @@ async fn discord_callback(state: Arc<AppState>, req: OAuthCallbackRequest) -> Re
         id: String,
         username: String,
         global_name: Option<String>,
+        email: Option<String>,
+        verified: Option<bool>,
     }
 
     let user: DiscordUser = match fetch_json(&http, "https://discord.com/api/v10/users/@me", &access_token, None).await {
@@ -935,9 +967,11 @@ async fn discord_callback(state: Arc<AppState>, req: OAuthCallbackRequest) -> Re
         Err(e) => return e,
     };
 
+    let email = discord_email(&user.email, user.verified);
     let display_name = user.global_name.unwrap_or_else(|| user.username.clone());
     let device_id = req.device_id.as_deref().unwrap_or("");
-    finish_oauth(state, "discord", &user.id, &display_name, device_id).await
+    let email_ref = email.as_ref().map(|(addr, verified)| (addr.as_str(), *verified));
+    finish_oauth(state, "discord", &user.id, &display_name, email_ref, device_id).await
 }
 
 async fn google_callback(state: Arc<AppState>, req: OAuthCallbackRequest) -> Response {
@@ -1002,6 +1036,7 @@ async fn google_callback(state: Arc<AppState>, req: OAuthCallbackRequest) -> Res
         sub: String,
         name: Option<String>,
         email: Option<String>,
+        email_verified: Option<bool>,
     }
 
     let user: GoogleUser = match fetch_json(&http, "https://www.googleapis.com/oauth2/v3/userinfo", &access_token, None).await {
@@ -1009,12 +1044,14 @@ async fn google_callback(state: Arc<AppState>, req: OAuthCallbackRequest) -> Res
         Err(e) => return e,
     };
 
+    let email = user.email.clone().map(|addr| (addr, user.email_verified.unwrap_or(false)));
     let display_name = user
         .name
         .or(user.email)
         .unwrap_or_else(|| format!("google:{}", &user.sub[..8.min(user.sub.len())]));
     let device_id = req.device_id.as_deref().unwrap_or("");
-    finish_oauth(state, "google", &user.sub, &display_name, device_id).await
+    let email_ref = email.as_ref().map(|(addr, verified)| (addr.as_str(), *verified));
+    finish_oauth(state, "google", &user.sub, &display_name, email_ref, device_id).await
 }
 
 async fn twitter_callback(state: Arc<AppState>, req: OAuthCallbackRequest) -> Response {
@@ -1109,7 +1146,8 @@ async fn twitter_callback(state: Arc<AppState>, req: OAuthCallbackRequest) -> Re
 
     let display_name = format!("@{}", user.username);
     let device_id = req.device_id.as_deref().unwrap_or("");
-    finish_oauth(state, "twitter", &user.id, &display_name, device_id).await
+    // Twitter/X cannot yield a verified email (see the plan's provider table).
+    finish_oauth(state, "twitter", &user.id, &display_name, None, device_id).await
 }
 
 // ============================================================================
@@ -1118,15 +1156,24 @@ async fn twitter_callback(state: Arc<AppState>, req: OAuthCallbackRequest) -> Re
 
 /// Upsert user, create token (expires in 30 days), link device, return `OAuthCallbackResponse`.
 ///
-/// Device-merge logic: if `device_id` is non-empty and the device already has a linked
-/// user, we reuse that existing user rather than creating a new row.  This prevents one
-/// physical device from accumulating multiple accounts across providers.  All new auth
-/// tokens are issued under the canonical (existing) `user_id`.
+/// Device-merge logic: if `device_id` is non-empty and already belongs to an
+/// existing account, a brand new provider identity attaches directly to that
+/// account instead of ever creating its own `users` row — see
+/// `db::resolve_or_create_user` (docs/mlc/plans/identity-merge-2026-09-09.md
+/// decision 3, the device-flow-orphan fix: the device link is now resolved
+/// BEFORE any account is created, so there is nothing left to reassign tokens
+/// away from and nothing left to clean up afterward). A provider identity
+/// that is already known always resolves to its own owner regardless of
+/// device (decision 2); an unknown identity with no device match but a
+/// verified email matching an existing account attaches to that account
+/// instead of creating a new one. All new auth tokens are issued under
+/// whichever account this resolves to.
 async fn finish_oauth(
     state: Arc<AppState>,
     provider: &str,
     provider_user_id: &str,
     display_name: &str,
+    email: Option<(&str, bool)>,
     device_id: &str,
 ) -> Response {
     let raw_token = generate_token();
@@ -1137,6 +1184,7 @@ async fn finish_oauth(
     let provider = provider.to_owned();
     let provider_user_id = provider_user_id.to_owned();
     let display_name = display_name.to_owned();
+    let email = email.map(|(addr, verified)| (addr.to_owned(), verified));
     let device_id = device_id.to_owned();
     let token_hash_clone = token_hash.clone();
     let raw_token_clone = raw_token.clone();
@@ -1145,28 +1193,11 @@ async fn finish_oauth(
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(i64, String)> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let email_ref = email.as_ref().map(|(addr, verified)| (addr.as_str(), *verified));
 
-        // Upsert the user row for this provider identity.
-        let new_user_id = crate::db::upsert_user(&conn, &provider, &provider_user_id, &display_name, &now)?;
-
-        // Determine canonical user_id: if the device already has a user, adopt it.
-        let canonical_user_id = if !device_id.is_empty() {
-            match crate::db::get_user_for_device(&conn, &device_id)? {
-                Some(existing_user_id) if existing_user_id != new_user_id => {
-                    // Device belongs to a different account — reassign new tokens to
-                    // the existing user so both provider identities share one account.
-                    tracing::info!(
-                        "Device {} already linked to user {}; merging new user {} into it",
-                        device_id, existing_user_id, new_user_id
-                    );
-                    crate::db::reassign_auth_tokens(&conn, new_user_id, existing_user_id)?;
-                    existing_user_id
-                }
-                _ => new_user_id,
-            }
-        } else {
-            new_user_id
-        };
+        let canonical_user_id = crate::db::resolve_or_create_user(
+            &conn, &provider, &provider_user_id, &display_name, email_ref, &device_id, &now,
+        )?;
 
         crate::db::insert_auth_token_with_expiry(&conn, &token_hash_clone, canonical_user_id, &now, &expires_at)?;
 
@@ -1248,6 +1279,53 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
         )
             .into_response()
     })
+}
+
+/// Discord's `/users/@me` returns `email`/`verified` inline (no extra call
+/// needed, unlike GitHub) — fold them into the `(address, verified)` shape
+/// every identity-resolution call takes. `email` empty or absent yields
+/// `None` regardless of `verified`.
+fn discord_email(email: &Option<String>, verified: Option<bool>) -> Option<(String, bool)> {
+    email
+        .as_ref()
+        .filter(|e| !e.is_empty())
+        .map(|e| (e.clone(), verified.unwrap_or(false)))
+}
+
+/// GitHub's `/user` never returns an email unless the account made it public
+/// — the verified address requires the `user:email` scope (see `authorize`)
+/// plus this separate call to `/user/emails`, filtered to the
+/// `primary && verified` entry (docs/mlc/plans/identity-merge-2026-09-09.md
+/// decision 1). A failed or empty fetch degrades to `None` rather than
+/// blocking sign-in — a missing email must never turn into a login failure.
+async fn fetch_github_primary_verified_email(
+    http: &reqwest::Client,
+    access_token: &str,
+    github_user_id: u64,
+) -> Option<(String, bool)> {
+    #[derive(serde::Deserialize)]
+    struct GithubEmail {
+        email: String,
+        primary: bool,
+        verified: bool,
+    }
+    match fetch_json::<Vec<GithubEmail>>(
+        http,
+        "https://api.github.com/user/emails",
+        access_token,
+        Some("mylittlechart-server/0.1"),
+    )
+    .await
+    {
+        Ok(emails) => emails
+            .into_iter()
+            .find(|e| e.primary && e.verified)
+            .map(|e| (e.email, true)),
+        Err(_) => {
+            tracing::warn!("GitHub /user/emails fetch failed for user {}", github_user_id);
+            None
+        }
+    }
 }
 
 /// Minimal percent-encoding for URL parameters (encodes everything except

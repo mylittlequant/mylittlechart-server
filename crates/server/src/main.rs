@@ -70,6 +70,7 @@ use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
+mod account_merge;
 mod auth;
 mod build_attest;
 mod db;
@@ -394,6 +395,7 @@ async fn main() {
                     std::path::Path::new(&data_dir).join("sync"),
                 ),
                 share_root: std::path::Path::new(&data_dir).join("share"),
+                data_dir: std::path::PathBuf::from(&data_dir),
             })
         }
         state::ServerRole::Edge => {
