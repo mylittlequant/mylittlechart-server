@@ -150,6 +150,7 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         // Forum engine v2 (public boards, role-gated read/write — see
         // routes/forum_v2.rs). Additive: v1's `/forum/*` routes above are
         // untouched.
+        .route("/forum/me", get(forum_v2::me))
         .route("/forum/boards", get(forum_v2::list_boards))
         .route(
             "/forum/boards/{slug}/threads",

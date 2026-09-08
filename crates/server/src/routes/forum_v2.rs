@@ -11,6 +11,11 @@
 //! (`db::user_is_paid`), exactly as v1 does.
 //!
 //! Endpoints (all under `/api`):
+//!  - `GET    /forum/me`                               — caller's classes, held
+//!                                                       role(s), and identity
+//!                                                       (label/public_id) — the
+//!                                                       client's moderation-row
+//!                                                       gate reads this.
 //!  - `GET    /forum/boards`                          — boards the caller can read.
 //!  - `GET    /forum/boards/{slug}/threads?limit=&before=` — paged thread list.
 //!  - `POST   /forum/boards/{slug}/threads`           — create a thread (write class).
@@ -201,6 +206,92 @@ fn board_json(b: &social_db::Board) -> serde_json::Value {
         "write_class": b.write_class.as_str(),
         "position": b.position,
     })
+}
+
+// ============================================================================
+// GET /api/forum/me
+// ============================================================================
+
+/// The caller's own classes, held role(s), and identity — what the client
+/// needs to decide whether to show the moderation row on a thread/reply at
+/// all, without guessing at the server's own gate. Same caller resolution as
+/// every other v2 GET (`resolve_caller`/`resolve_caller_classes`): an
+/// anonymous caller gets `{"classes": ["public"], "roles": [], "label":
+/// null, "public_id": null}`, not a 401.
+///
+/// `roles` names the [`social_db::Role`] rows this caller actually holds via
+/// [`social_db::caller_classes`] — at most one entry today, since a
+/// `forum_roles` row is one managed role per account (`social_db::set_role`
+/// upserts, it does not accumulate). `classes` is the full ladder the caller
+/// satisfies (`public`, plus `user`/`paid`/`moderator`/`admin` as earned) —
+/// what `social_db::can_read`/`can_write` compare a board's gate against.
+///
+/// Moderation permission table — MUST match [`moderate_thread`]'s action
+/// arms exactly, since the client gates its moderation UI off this route's
+/// `roles` field:
+///
+/// | Action                            | moderator | admin |
+/// |------------------------------------|-----------|-------|
+/// | hide / unhide a thread             | yes       | yes   |
+/// | lock / unlock a thread             | yes       | yes   |
+/// | pin / unpin a thread               | yes       | yes   |
+/// | move a thread to another board     | yes       | yes   |
+/// | delete (hide) any reply            | yes       | yes   |
+/// | create/update/delete a board       | no — `ADMIN_SECRET` bearer only, regardless of `forum_roles` |
+/// | grant/revoke a `forum_roles` row   | no — `ADMIN_SECRET` bearer only, regardless of `forum_roles` |
+///
+/// `moderator` and `admin` hold identical per-thread moderation permission —
+/// [`social_db::is_moderator_or_admin`] (which [`moderate_thread`] and
+/// [`create_reply`]/[`delete_reply`] all gate on) does not distinguish the
+/// two ranks, it only checks `>= Class::Moderator`. Board CRUD and role CRUD
+/// are a separate, stricter gate (`super::admin::verify_admin_secret`) that
+/// a `forum_roles` row never satisfies by itself — those two admin-only rows
+/// in the table above are not something this route's `roles` field can ever
+/// unlock client-side.
+pub async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let caller = match resolve_caller(state.clone(), &headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let classes = match resolve_caller_classes(state.clone(), caller).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let roles: Vec<&'static str> = classes.iter().filter(|c| **c >= Class::Moderator).map(|c| c.as_str()).collect();
+    let classes_json: Vec<&'static str> = classes.iter().map(|c| c.as_str()).collect();
+
+    let Some(user_id) = caller else {
+        return Json(serde_json::json!({
+            "classes": classes_json,
+            "roles": roles,
+            "label": serde_json::Value::Null,
+            "public_id": serde_json::Value::Null,
+        }))
+        .into_response();
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(String, Option<String>)> {
+        let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let label = db::effective_label_for_user(&identity_conn, user_id)?;
+        let public_id = db::get_user_public_id(&identity_conn, user_id).ok();
+        Ok((label, public_id))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((label, public_id))) => Json(serde_json::json!({
+            "classes": classes_json,
+            "roles": roles,
+            "label": label,
+            "public_id": public_id,
+        }))
+        .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error resolving forum_v2 caller identity: {}", e);
+            internal_error()
+        }
+        Err(_) => internal_error(),
+    }
 }
 
 // ============================================================================

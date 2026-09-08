@@ -106,6 +106,13 @@ public = false
 
 [[endpoints]]
 method = "GET"
+path = "/api/forum/me"
+description = "Forum v2: caller's own classes, held role(s) (forum_roles, at most one of moderator/admin), and identity {classes: [...], roles: [...], label, public_id} — anonymous callers get {classes: [\"public\"], roles: [], label: null, public_id: null}, not a 401. Drives the client's moderation-row gate."
+auth = "optional"
+public = true
+
+[[endpoints]]
+method = "GET"
 path = "/api/forum/boards"
 description = "Forum v2: boards the caller can read, by class (public/user/paid/moderator/admin — see social_db.rs). Public boards are visible to anonymous callers."
 auth = "optional"
