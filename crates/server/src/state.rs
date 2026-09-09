@@ -123,6 +123,17 @@ pub struct ControlPlane {
     /// for a refused-conflict's exported rows and for a hot-plane filesystem
     /// collision — see docs/mlc/plans/identity-merge-2026-09-09.md decision 5.
     pub data_dir: std::path::PathBuf,
+
+    /// In-memory snapshot of every `reserved_nicks` row's `(nick,
+    /// category)` (owner order 2026-09-09) — loaded once at boot right
+    /// after `db::seed_reserved_nicks` runs, and reloaded by
+    /// `routes::admin::{upsert_reserved_nick,delete_reserved_nick}`
+    /// whenever they add, recategorize, or remove a row. Exists so
+    /// `db::set_nick`'s impersonation check (`nick_policy::impersonation_hit`,
+    /// which must compare a candidate against every row) never scans
+    /// `reserved_nicks` on a self-service request — see
+    /// `reserved_nick_cache_snapshot`/`refresh_reserved_nick_cache`.
+    pub reserved_nick_cache: std::sync::RwLock<Vec<crate::db::ReservedNickEntry>>,
 }
 
 impl ControlPlane {
@@ -132,6 +143,23 @@ impl ControlPlane {
     /// every call site.
     pub fn social_conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         self.social.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A cloned snapshot of the reserved-nick cache (see the field's doc
+    /// comment) — `routes::account::set_nick`'s read half, taken outside
+    /// any database lock so a slow impersonation scan never holds `db`.
+    pub fn reserved_nick_cache_snapshot(&self) -> Vec<crate::db::ReservedNickEntry> {
+        self.reserved_nick_cache.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Reload the reserved-nick cache from `conn` — called once at boot
+    /// (`main.rs`, right after seeding) and again by
+    /// `routes::admin::{upsert_reserved_nick,delete_reserved_nick}` after
+    /// either successfully changes a row.
+    pub fn refresh_reserved_nick_cache(&self, conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+        let entries = crate::db::reserved_nick_entries(conn)?;
+        *self.reserved_nick_cache.write().unwrap_or_else(|e| e.into_inner()) = entries;
+        Ok(())
     }
 }
 

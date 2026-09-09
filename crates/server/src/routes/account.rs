@@ -177,13 +177,16 @@ pub struct SetNickRequest {
 /// most once every 30 days.
 ///
 /// Format — 3-24 ASCII characters, letters/digits plus `_`, `-`, `.`,
-/// starting with a letter or digit — is checked here before the database is
-/// ever touched (`db::nick_format_valid`); `db::set_nick` re-checks the same
-/// rule as its own backstop, then enforces the reserved-name list,
-/// uniqueness, and the cooldown.
+/// starting with a letter or digit, plus the hard shape rules in
+/// `nick_policy::nick_shape_ok` (no trailing separator, no public-id- or
+/// URL-shaped handle, no long digit run) — is checked here before the
+/// database is ever touched; `db::set_nick` re-checks both as its own
+/// backstop, then enforces the forbidden-nick registry, the reserved-name
+/// list (exact and impersonation-by-prefix), uniqueness, and the cooldown.
 ///
 /// Response on success: `{ "nick": "...", "effective_label": "..." }`.
-/// `400` invalid format, `409` taken or reserved (distinguished in the
+/// `400` invalid format or forbidden nick (distinguished by the `code`
+/// field alongside `error`), `409` taken or reserved (distinguished in the
 /// `error` string), `429` rate-limited — that response also carries
 /// `nick_changed_at` and `next_allowed_at` (both RFC3339) alongside `error`.
 pub async fn set_nick(
@@ -210,19 +213,21 @@ pub async fn set_nick(
     };
 
     let nick = body.nick.trim().to_owned();
-    if !crate::db::nick_format_valid(&nick) {
+    if !crate::db::nick_format_valid(&nick) || !crate::nick_policy::nick_shape_ok(&nick) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "Nick must be 3-24 characters: letters, digits, '_', '-', '.', starting with a letter or digit",
-            )),
+            Json(serde_json::json!({
+                "error": "Nick must be 3-24 characters: letters, digits, '_', '-', '.', starting with a letter or digit",
+                "code": "nick_invalid",
+            })),
         )
             .into_response();
     }
 
     let result = tokio::task::spawn_blocking(move || -> Result<(String, String), NickError> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::set_nick(&conn, user_id, &nick)?;
+        let reserved_cache = state.control_plane().reserved_nick_cache_snapshot();
+        crate::db::set_nick(&conn, user_id, &nick, &reserved_cache)?;
         // Read back what was actually stored rather than trusting the local
         // `nick` variable — same read-after-write shape as
         // `db::redeem_gift_code` returning the computed `paid_until` instead
@@ -240,7 +245,12 @@ pub async fn set_nick(
         }
         Ok(Err(NickError::Invalid)) => (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new("Invalid nick format")),
+            Json(serde_json::json!({ "error": "Invalid nick format", "code": "nick_invalid" })),
+        )
+            .into_response(),
+        Ok(Err(NickError::Forbidden)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "This nick is not allowed", "code": "nick_forbidden" })),
         )
             .into_response(),
         Ok(Err(NickError::Reserved)) => (

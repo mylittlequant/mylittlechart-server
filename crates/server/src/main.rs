@@ -77,6 +77,7 @@ mod db;
 mod dm_db;
 mod entitlements;
 mod models;
+mod nick_policy;
 mod notify;
 mod opswriter;
 mod pathutil;
@@ -292,6 +293,19 @@ async fn main() {
             };
             tracing::info!("Database initialized at {}", db_path);
 
+            // Reserved-nick cache (owner order 2026-09-09) — loaded once
+            // here, right after `db::init_db`'s own seeding, so
+            // `db::set_nick`'s impersonation check never scans
+            // `reserved_nicks` on a self-service request. See
+            // `ControlPlane::reserved_nick_cache_snapshot`.
+            let reserved_nick_cache_entries = match db::reserved_nick_entries(&db_conn) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    tracing::error!("Failed to load the reserved-nick cache: {}", e);
+                    Vec::new()
+                }
+            };
+
             // Initialize the social database (SQLCipher, same key, separate
             // file — 2026-09-06 storage split, see social_db.rs's module
             // doc). Forum-v2 boards/threads/replies/roles live here; the
@@ -414,6 +428,7 @@ async fn main() {
                 ),
                 share_root: std::path::Path::new(&data_dir).join("share"),
                 data_dir: std::path::PathBuf::from(&data_dir),
+                reserved_nick_cache: std::sync::RwLock::new(reserved_nick_cache_entries),
             })
         }
         state::ServerRole::Edge => {

@@ -1186,8 +1186,8 @@ mod tests {
         let conn = identity_conn();
         let from = seed_user(&conn, "github", "f1", "from-user");
         let into = seed_user(&conn, "google", "i1", "into-user");
-        crate::db::set_nick(&conn, into, "keepme").expect("set into nick");
-        crate::db::set_nick(&conn, from, "losenick").expect("set from nick");
+        crate::db::set_nick(&conn, into, "keepme", &[]).expect("set into nick");
+        crate::db::set_nick(&conn, from, "losenick", &[]).expect("set from nick");
         crate::db::set_user_paid_until(&conn, from, Some("2027-01-01T00:00:00+00:00")).expect("set paid");
         crate::db::set_user_paid_until(&conn, into, Some("2026-06-01T00:00:00+00:00")).expect("set paid");
 
@@ -1206,7 +1206,7 @@ mod tests {
         let conn = identity_conn();
         let from = seed_user(&conn, "github", "f2", "from-user");
         let into = seed_user(&conn, "google", "i2", "into-user");
-        crate::db::set_nick(&conn, from, "onlyfromhasone").expect("set from nick");
+        crate::db::set_nick(&conn, from, "onlyfromhasone", &[]).expect("set from nick");
 
         merge_paid_until_and_nick(&conn, from, into).expect("merge");
 

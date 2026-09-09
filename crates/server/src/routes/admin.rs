@@ -806,7 +806,13 @@ pub async fn upsert_reserved_nick(
     let nick_lower = nick.to_lowercase();
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::upsert_reserved_nick(&conn, &nick, &req.category, req.note.as_deref())
+        let outcome = crate::db::upsert_reserved_nick(&conn, &nick, &req.category, req.note.as_deref());
+        if outcome.is_ok() {
+            if let Err(e) = state.control_plane().refresh_reserved_nick_cache(&conn) {
+                tracing::error!("failed to refresh the reserved-nick cache after upsert: {}", e);
+            }
+        }
+        outcome
     })
     .await;
 
@@ -843,7 +849,13 @@ pub async fn delete_reserved_nick(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::delete_reserved_nick(&conn, &nick)
+        let outcome = crate::db::delete_reserved_nick(&conn, &nick);
+        if matches!(outcome, Ok(true)) {
+            if let Err(e) = state.control_plane().refresh_reserved_nick_cache(&conn) {
+                tracing::error!("failed to refresh the reserved-nick cache after delete: {}", e);
+            }
+        }
+        outcome
     })
     .await;
 
@@ -909,9 +921,16 @@ pub async fn admin_set_user_nick(
             "reserved": reserved,
         }))
         .into_response(),
-        Ok(Err(crate::db::AdminNickError::Invalid)) => {
-            (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Invalid nick format"))).into_response()
-        }
+        Ok(Err(crate::db::AdminNickError::Invalid)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid nick format", "code": "nick_invalid" })),
+        )
+            .into_response(),
+        Ok(Err(crate::db::AdminNickError::Forbidden)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "This nick is not allowed", "code": "nick_forbidden" })),
+        )
+            .into_response(),
         Ok(Err(crate::db::AdminNickError::NoSuchUser)) => {
             (StatusCode::NOT_FOUND, Json(ErrorResponse::new("no such user"))).into_response()
         }

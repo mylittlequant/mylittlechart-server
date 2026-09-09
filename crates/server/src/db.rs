@@ -564,6 +564,28 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         );
     }
 
+    // Forbidden-nick registry (owner order 2026-09-09) — parsed once here so
+    // the cost and any warnings land in the startup log rather than on the
+    // first nick-change request; see `nick_policy::init_forbidden_list`.
+    let forbidden_report = crate::nick_policy::init_forbidden_list();
+    let degenerate_count = forbidden_report.degenerate_substrings.len();
+    tracing::info!(
+        "forbidden_nicks: loaded {} substring, {} token, {} numeric rule(s), {} degenerate substring entr{} kept token-only",
+        forbidden_report.substring_count,
+        forbidden_report.token_count,
+        forbidden_report.numeric_count,
+        degenerate_count,
+        if degenerate_count == 1 { "y" } else { "ies" },
+    );
+    if !forbidden_report.empty_after_normalize.is_empty() {
+        tracing::warn!(
+            "forbidden_nicks.txt: {} entr{} normalize to nothing, dropped: {:?}",
+            forbidden_report.empty_after_normalize.len(),
+            if forbidden_report.empty_after_normalize.len() == 1 { "y" } else { "ies" },
+            forbidden_report.empty_after_normalize,
+        );
+    }
+
     // Safe migration: add profile_id column to sync_items (for multi-profile scoping).
     let _ = conn.execute("ALTER TABLE sync_items ADD COLUMN profile_id TEXT NOT NULL DEFAULT ''", []);
 
@@ -1594,11 +1616,16 @@ pub fn nick_format_valid(nick: &str) -> bool {
 /// Why a nick-change attempt was refused (or the DB call itself failed).
 #[derive(Debug)]
 pub enum NickError {
-    /// Fails [`nick_format_valid`]. `routes::account` validates the format
-    /// before ever calling `set_nick`, so this is a backstop for any other
-    /// caller, not the primary path.
+    /// Fails [`nick_format_valid`] or [`crate::nick_policy::nick_shape_ok`].
+    /// `routes::account` validates both before ever calling `set_nick`, so
+    /// this is a backstop for any other caller, not the primary path.
     Invalid,
-    /// One of [`RESERVED_NICKS`] (case-insensitive).
+    /// Matches the forbidden-nick registry (`crate::nick_policy::forbidden_hit`)
+    /// — never assignable, self-service or admin grant alike.
+    Forbidden,
+    /// Reserved (an exact match in `reserved_nicks`) or an impersonation of
+    /// one (`crate::nick_policy::impersonation_hit`) — self-service only,
+    /// [`admin_set_nick`] is the only way onto either.
     Reserved,
     /// Already claimed by a different account (case-insensitive).
     Taken,
@@ -1668,8 +1695,19 @@ pub fn effective_label_for_user(conn: &Connection, user_id: i64) -> Result<Strin
         .unwrap_or_default())
 }
 
-/// Change `user_id`'s nick to `nick`, enforcing format, reserved names,
-/// global case-insensitive uniqueness, and the 30-day change cooldown.
+/// Change `user_id`'s nick to `nick`, enforcing shape, the forbidden-nick
+/// registry, reserved names (exact and impersonation-by-prefix), global
+/// case-insensitive uniqueness, and the 30-day change cooldown — checked in
+/// that order (owner order 2026-09-09): a candidate that fails an earlier,
+/// cheaper gate never reaches a later, more expensive one.
+///
+/// `reserved_cache` is a snapshot of every `reserved_nicks` row's `(nick,
+/// category)` — `ControlPlane::reserved_nick_cache_snapshot` in production,
+/// so the impersonation check (which must compare against every row) never
+/// scans the table on this request; tests that do not exercise it may pass
+/// `&[]`. The EXACT reserved check just below still queries the database
+/// directly — a single indexed lookup, not the scan this cache exists to
+/// avoid.
 ///
 /// Uniqueness is decided twice, deliberately: the `SELECT ... WHERE
 /// LOWER(nick) = ...` pre-check below gives the common case a clear
@@ -1679,13 +1717,43 @@ pub fn effective_label_for_user(conn: &Connection, user_id: i64) -> Result<Strin
 /// between two callers claiming the same nick at once — the loser's `UPDATE`
 /// hits the index and is mapped to `Taken` here too, rather than surfaced as
 /// a raw constraint error.
-pub fn set_nick(conn: &Connection, user_id: i64, nick: &str) -> Result<(), NickError> {
-    if !nick_format_valid(nick) {
+pub fn set_nick(
+    conn: &Connection,
+    user_id: i64,
+    nick: &str,
+    reserved_cache: &[ReservedNickEntry],
+) -> Result<(), NickError> {
+    if !nick_format_valid(nick) || !crate::nick_policy::nick_shape_ok(nick) {
         return Err(NickError::Invalid);
     }
+    if let Some(hit) = crate::nick_policy::forbidden_hit(nick) {
+        tracing::warn!("set_nick: refused {:?} — forbidden {} rule matched {:?}", nick, hit.rule, hit.entry);
+        return Err(NickError::Forbidden);
+    }
+
     let lower = nick.to_lowercase();
     if is_nick_reserved(conn, &lower)? {
         return Err(NickError::Reserved);
+    }
+    let reserved_handles: Vec<crate::nick_policy::ReservedHandle<'_>> = reserved_cache
+        .iter()
+        .map(|e| crate::nick_policy::ReservedHandle { nick_lower: &e.nick, category: &e.category })
+        .collect();
+    if let Some(impersonated) = crate::nick_policy::impersonation_hit(nick, &reserved_handles) {
+        tracing::warn!("set_nick: refused {:?} — reads as an impersonation of {:?}", nick, impersonated);
+        return Err(NickError::Reserved);
+    }
+
+    let taken_by_other: bool = conn
+        .query_row(
+            "SELECT 1 FROM users WHERE LOWER(nick) = ?1 AND id != ?2",
+            params![lower, user_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if taken_by_other {
+        return Err(NickError::Taken);
     }
 
     let now = chrono::Utc::now();
@@ -1707,18 +1775,6 @@ pub fn set_nick(conn: &Connection, user_id: i64, nick: &str) -> Result<(), NickE
                 });
             }
         }
-    }
-
-    let taken_by_other: bool = conn
-        .query_row(
-            "SELECT 1 FROM users WHERE LOWER(nick) = ?1 AND id != ?2",
-            params![lower, user_id],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if taken_by_other {
-        return Err(NickError::Taken);
     }
 
     let result = conn.execute(
@@ -1904,6 +1960,21 @@ pub fn list_reserved_nicks(conn: &Connection) -> Result<Vec<ReservedNickRow>> {
     Ok(rows)
 }
 
+/// The `(nick, category)` of every row in the reserved-nick registry — the
+/// lean read behind `ControlPlane::reserved_nick_cache`: loaded once at
+/// boot (right after [`seed_reserved_nicks`]) and reloaded by
+/// `routes::admin::{upsert_reserved_nick,delete_reserved_nick}` whenever
+/// they change a row, so [`set_nick`]'s impersonation check
+/// (`crate::nick_policy::impersonation_hit`) never queries `reserved_nicks`
+/// itself on a self-service request.
+pub fn reserved_nick_entries(conn: &Connection) -> Result<Vec<ReservedNickEntry>> {
+    let mut stmt = conn.prepare("SELECT nick_lower, category FROM reserved_nicks")?;
+    let rows = stmt
+        .query_map([], |row| Ok(ReservedNickEntry { nick: row.get(0)?, category: row.get(1)? }))?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Why [`upsert_reserved_nick`] refused a call — the format check is the
 /// only refusal that isn't a bare database error, so this stays a two-arm
 /// enum rather than reusing [`NickError`]'s wider set of self-service-only
@@ -1975,8 +2046,11 @@ pub fn delete_reserved_nick(conn: &Connection, nick: &str) -> Result<bool> {
 /// Why [`admin_set_nick`] refused a call.
 #[derive(Debug)]
 pub enum AdminNickError {
-    /// Fails [`nick_format_valid`].
+    /// Fails [`nick_format_valid`] or [`crate::nick_policy::nick_shape_ok`].
     Invalid,
+    /// Matches the forbidden-nick registry (`crate::nick_policy::forbidden_hit`)
+    /// — never assignable, an admin grant included.
+    Forbidden,
     /// Held by a DIFFERENT account already.
     Taken,
     /// `user_id` names no row in `users`.
@@ -1992,11 +2066,11 @@ impl From<rusqlite::Error> for AdminNickError {
 }
 
 /// Set `user_id`'s nick directly — `routes::admin::admin_set_user_nick`'s DB
-/// half. Same format check as self-service [`set_nick`], but bypasses the
-/// reserved-name list AND the 30-day cooldown entirely: an operator handing
-/// out a reserved handle, or fixing a mistake, does neither. Uniqueness
-/// against every OTHER account still applies — two accounts never hold the
-/// same nick regardless of who assigns it.
+/// half. Same shape and forbidden-nick checks as self-service [`set_nick`],
+/// but bypasses the reserved-name/impersonation list AND the 30-day cooldown
+/// entirely: an operator handing out a reserved handle, or fixing a mistake,
+/// does neither. Uniqueness against every OTHER account still applies — two
+/// accounts never hold the same nick regardless of who assigns it.
 ///
 /// `user_id`'s previous nick, if any, is released the same way [`set_nick`]
 /// releases it ([`release_old_nick_grant`]) — moving an account off a
@@ -2004,8 +2078,12 @@ impl From<rusqlite::Error> for AdminNickError {
 /// `nick` is itself a reserved handle; when it is, that row's `granted_to`
 /// is set to `user_id`, overwriting whatever it held before.
 pub fn admin_set_nick(conn: &Connection, user_id: i64, nick: &str) -> std::result::Result<bool, AdminNickError> {
-    if !nick_format_valid(nick) {
+    if !nick_format_valid(nick) || !crate::nick_policy::nick_shape_ok(nick) {
         return Err(AdminNickError::Invalid);
+    }
+    if let Some(hit) = crate::nick_policy::forbidden_hit(nick) {
+        tracing::warn!("admin_set_nick: refused {:?} — forbidden {} rule matched {:?}", nick, hit.rule, hit.entry);
+        return Err(AdminNickError::Forbidden);
     }
     let user_exists: bool = conn
         .query_row("SELECT 1 FROM users WHERE id = ?1", params![user_id], |_| Ok(()))
@@ -6233,7 +6311,7 @@ mod tests {
         let conn = share_test_conn();
         let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
 
-        super::set_nick(&conn, uid, "Al1ce").expect("set nick");
+        super::set_nick(&conn, uid, "Al1ce", &[]).expect("set nick");
 
         assert_eq!(
             super::nick_for_user(&conn, uid).expect("nick").as_deref(),
@@ -6251,8 +6329,8 @@ mod tests {
         let a = insert_share_user(&conn, "alice", Some("pub-alice"));
         let b = insert_share_user(&conn, "bob", Some("pub-bob"));
 
-        super::set_nick(&conn, a, "Foo").expect("first claim");
-        match super::set_nick(&conn, b, "foo") {
+        super::set_nick(&conn, a, "Foo", &[]).expect("first claim");
+        match super::set_nick(&conn, b, "foo", &[]) {
             Err(super::NickError::Taken) => {}
             other => panic!("expected Taken, got {other:?}"),
         }
@@ -6264,7 +6342,7 @@ mod tests {
         let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
 
         for reserved in ["ZenGeld", "Kosti_X_ItsOK", "KOSTI_ITSOK"] {
-            match super::set_nick(&conn, uid, reserved) {
+            match super::set_nick(&conn, uid, reserved, &[]) {
                 Err(super::NickError::Reserved) => {}
                 other => panic!("expected Reserved for {reserved}, got {other:?}"),
             }
@@ -6278,7 +6356,7 @@ mod tests {
 
         let too_long = "a".repeat(25);
         for bad in ["ab", too_long.as_str(), "bad char!", "_leading"] {
-            match super::set_nick(&conn, uid, bad) {
+            match super::set_nick(&conn, uid, bad, &[]) {
                 Err(super::NickError::Invalid) => {}
                 other => panic!("expected Invalid for {bad:?}, got {other:?}"),
             }
@@ -6286,12 +6364,47 @@ mod tests {
     }
 
     #[test]
+    fn set_nick_rejects_forbidden_nicks() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+
+        for bad in ["hitler1488", "kkk", "pizdec"] {
+            match super::set_nick(&conn, uid, bad, &[]) {
+                Err(super::NickError::Forbidden) => {}
+                other => panic!("expected Forbidden for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_nick_rejects_impersonation_of_a_reserved_handle_but_not_a_short_ticker() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+        let reserved = vec![
+            super::ReservedNickEntry { nick: "binance".to_string(), category: "trading".to_string() },
+            super::ReservedNickEntry { nick: "admin".to_string(), category: "roles".to_string() },
+        ];
+
+        match super::set_nick(&conn, uid, "binance1", &reserved) {
+            Err(super::NickError::Reserved) => {}
+            other => panic!("expected Reserved for binance1, got {other:?}"),
+        }
+        match super::set_nick(&conn, uid, "admin_john", &reserved) {
+            Err(super::NickError::Reserved) => {}
+            other => panic!("expected Reserved for admin_john, got {other:?}"),
+        }
+        // Neither "binance" nor "admin" is a prefix of this nick — an
+        // ordinary compound on a short ticker must still succeed.
+        super::set_nick(&conn, uid, "eth_trader", &reserved).expect("eth_trader is not impersonation");
+    }
+
+    #[test]
     fn set_nick_rate_limits_second_change_within_30_days() {
         let conn = share_test_conn();
         let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
 
-        super::set_nick(&conn, uid, "first").expect("first change");
-        match super::set_nick(&conn, uid, "second") {
+        super::set_nick(&conn, uid, "first", &[]).expect("first change");
+        match super::set_nick(&conn, uid, "second", &[]) {
             Err(super::NickError::RateLimited { .. }) => {}
             other => panic!("expected RateLimited, got {other:?}"),
         }
@@ -6307,7 +6420,7 @@ mod tests {
         let conn = share_test_conn();
         let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
 
-        super::set_nick(&conn, uid, "first").expect("first change");
+        super::set_nick(&conn, uid, "first", &[]).expect("first change");
         // Back-date nick_changed_at past the 30-day cooldown.
         let past = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
         conn.execute(
@@ -6316,7 +6429,7 @@ mod tests {
         )
         .expect("backdate nick_changed_at");
 
-        super::set_nick(&conn, uid, "second").expect("change after cooldown");
+        super::set_nick(&conn, uid, "second", &[]).expect("change after cooldown");
         assert_eq!(
             super::nick_for_user(&conn, uid).expect("nick").as_deref(),
             Some("second")
@@ -6328,7 +6441,7 @@ mod tests {
         let conn = share_test_conn();
         let uid = insert_share_user(&conn, "erin", Some("pub-erin"));
 
-        super::set_nick(&conn, uid, "erin_nick").expect("set nick");
+        super::set_nick(&conn, uid, "erin_nick", &[]).expect("set nick");
 
         assert_eq!(
             super::share_owner_label(&conn, uid).expect("label").as_deref(),
@@ -6354,7 +6467,7 @@ mod tests {
         );
 
         // Nick set — wins over display_name.
-        super::set_nick(&conn, named, "franknick").expect("set nick");
+        super::set_nick(&conn, named, "franknick", &[]).expect("set nick");
         assert_eq!(
             super::effective_label_for_user(&conn, named).expect("label"),
             "franknick"
@@ -6370,7 +6483,7 @@ mod tests {
         let uid = insert_share_user(&conn, "gina", Some("pub-gina"));
 
         assert_eq!(super::user_nick(&conn, uid).expect("nick"), None);
-        super::set_nick(&conn, uid, "gina_nick").expect("set nick");
+        super::set_nick(&conn, uid, "gina_nick", &[]).expect("set nick");
         assert_eq!(
             super::user_nick(&conn, uid).expect("nick").as_deref(),
             Some("gina_nick")
@@ -6485,7 +6598,7 @@ mod
             rusqlite::params![past, uid],
         )
         .expect("backdate nick_changed_at");
-        super::set_nick(&conn, uid, "freeform_nick").expect("move away");
+        super::set_nick(&conn, uid, "freeform_nick", &[]).expect("move away");
 
         assert_eq!(
             conn.query_row::<Option<i64>, _, _>(
@@ -6503,7 +6616,7 @@ mod
     fn set_nick_never_lets_self_service_claim_a_reserved_nick() {
         let conn = share_test_conn();
         let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
-        match super::set_nick(&conn, uid, "zengeld") {
+        match super::set_nick(&conn, uid, "zengeld", &[]) {
             Err(super::NickError::Reserved) => {}
             other => panic!("expected Reserved, got {other:?}"),
         }
@@ -6529,7 +6642,7 @@ mod
         let conn = share_test_conn();
         let a = insert_share_user(&conn, "alice", Some("pub-alice"));
         let b = insert_share_user(&conn, "bob", Some("pub-bob"));
-        super::set_nick(&conn, a, "alicenick").expect("set nick");
+        super::set_nick(&conn, a, "alicenick", &[]).expect("set nick");
 
         match super::admin_set_nick(&conn, b, "al") {
             Err(super::AdminNickError::Invalid) => {}
