@@ -19,6 +19,10 @@
 //! second account (conversation creation, sending a message), that
 //! account's OWN paid status is checked too ([`require_peer_paid`]) —
 //! together the two checks are the plan's "both parties must be paid".
+//! [`create_conversation`] and [`create_message`] additionally require the
+//! caller to have chosen a nick ([`require_nick`], run right after
+//! [`require_dm_access`]) — owner ruling 2026-09-09: an account without a
+//! nick may only read.
 //!
 //! Endpoints (all under `/api`, all authed + paid):
 //!  - `PUT    /dm/identity`                              — publish/rotate
@@ -225,6 +229,42 @@ fn require_peer_paid(peer_is_paid: bool) -> Result<(), Response> {
         Ok(())
     } else {
         Err(forbidden("the other account does not have a paid plan"))
+    }
+}
+
+/// 403 shape for "authed and paid, but never chosen a nick" — `code` lets
+/// the client route the caller to the nick picker instead of showing a bare
+/// permission error (owner ruling 2026-09-09: an account without a nick may
+/// only read).
+fn nick_required_err() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "Choose a nick before writing",
+            "code": "nick_required",
+        })),
+    )
+        .into_response()
+}
+
+/// Refuse `user_id` if it has never chosen a nick — the write gate shared by
+/// [`create_conversation`] and [`create_message`], run right after
+/// [`require_dm_access`] resolves the caller (owner ruling 2026-09-09).
+async fn require_nick(state: Arc<AppState>, user_id: i64) -> Result<(), Response> {
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<String>> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        db::user_nick(&conn, user_id)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(_))) => Ok(()),
+        Ok(Ok(None)) => Err(nick_required_err()),
+        Ok(Err(e)) => {
+            tracing::error!("DB error checking dm nick requirement: {}", e);
+            Err(internal_error())
+        }
+        Err(_) => Err(internal_error()),
     }
 }
 
@@ -599,6 +639,9 @@ pub async fn create_conversation(
         Ok(uid) => uid,
         Err(resp) => return resp,
     };
+    if let Err(resp) = require_nick(state.clone(), user_id).await {
+        return resp;
+    }
     let with_label = req.with.trim().to_string();
     if with_label.is_empty() {
         return bad_request("with must not be empty");
@@ -766,6 +809,9 @@ pub async fn create_message(
         Ok(uid) => uid,
         Err(resp) => return resp,
     };
+    if let Err(resp) = require_nick(state.clone(), user_id).await {
+        return resp;
+    }
     let nonce = match STANDARD.decode(&req.nonce_b64) {
         Ok(b) => b,
         Err(_) => return bad_request("nonce_b64 must be valid base64"),

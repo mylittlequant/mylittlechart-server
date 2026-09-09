@@ -10,12 +10,20 @@
 //! (`db::forum_author_label`) or a caller's paid status
 //! (`db::user_is_paid`), exactly as v1 does.
 //!
+//! An account without a chosen nick may read every board it has class for,
+//! but `create_board_thread`/`create_reply` refuse it with `403
+//! {"error":"Choose a nick before writing","code":"nick_required"}` (owner
+//! ruling 2026-09-09) — `GET /forum/me`'s `nick` field is how the client
+//! knows to show the nick picker before letting the caller try to post.
+//!
 //! Endpoints (all under `/api`):
 //!  - `GET    /forum/me`                               — caller's classes, held
 //!                                                       role(s), and identity
-//!                                                       (label/public_id) — the
-//!                                                       client's moderation-row
-//!                                                       gate reads this.
+//!                                                       (label/public_id/nick) —
+//!                                                       the client's
+//!                                                       moderation-row gate
+//!                                                       and nick-required
+//!                                                       gate both read this.
 //!  - `GET    /forum/boards`                          — boards the caller can
 //!                                                       read, `{"boards":
 //!                                                       [...], "totals":
@@ -151,6 +159,44 @@ fn rate_limited() -> Response {
         })),
     )
         .into_response()
+}
+
+/// 403 shape for "signed in, but never chosen a nick" — `code` lets the
+/// client route the caller straight to the nick picker instead of showing a
+/// bare permission error (owner ruling 2026-09-09: an account without a
+/// nick may only read).
+fn nick_required() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "Choose a nick before writing",
+            "code": "nick_required",
+        })),
+    )
+        .into_response()
+}
+
+/// Refuse `user_id` if it has never chosen a nick — the write gate shared by
+/// [`create_board_thread`] and [`create_reply`] (owner ruling 2026-09-09).
+/// Called after the existing auth/class checks in both, since an anonymous
+/// caller is already refused earlier (401) and this only ever sees a
+/// signed-in id.
+async fn require_nick(state: Arc<AppState>, user_id: i64) -> Result<(), Response> {
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<String>> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        db::user_nick(&conn, user_id)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(_))) => Ok(()),
+        Ok(Ok(None)) => Err(nick_required()),
+        Ok(Err(e)) => {
+            tracing::error!("DB error checking forum_v2 nick requirement: {}", e);
+            Err(internal_error())
+        }
+        Err(_) => Err(internal_error()),
+    }
 }
 
 fn forum_error_response(e: ForumError) -> Response {
@@ -346,11 +392,12 @@ pub async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "roles": Vec::<&'static str>::new(),
             "label": serde_json::Value::Null,
             "public_id": serde_json::Value::Null,
+            "nick": serde_json::Value::Null,
         }))
         .into_response();
     };
 
-    type MeIdentity = (Option<social_db::Role>, String, Option<String>);
+    type MeIdentity = (Option<social_db::Role>, String, Option<String>, Option<String>);
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<MeIdentity> {
         let social_conn = state.control_plane().social_conn();
         let role = social_db::role_for_user(&social_conn, user_id)?;
@@ -359,18 +406,20 @@ pub async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let label = db::effective_label_for_user(&identity_conn, user_id)?;
         let public_id = db::get_user_public_id(&identity_conn, user_id).ok();
-        Ok((role, label, public_id))
+        let nick = db::user_nick(&identity_conn, user_id)?;
+        Ok((role, label, public_id, nick))
     })
     .await;
 
     match result {
-        Ok(Ok((role, label, public_id))) => {
+        Ok(Ok((role, label, public_id, nick))) => {
             let roles: Vec<&'static str> = role.map(|r| vec![r.as_str()]).unwrap_or_default();
             Json(serde_json::json!({
                 "classes": classes_json,
                 "roles": roles,
                 "label": label,
                 "public_id": public_id,
+                "nick": nick,
             }))
             .into_response()
         }
@@ -556,6 +605,9 @@ pub async fn create_board_thread(
         Ok(c) => c,
         Err(e) => return e,
     };
+    if let Err(e) = require_nick(state.clone(), user_id).await {
+        return e;
+    }
 
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<Option<i64>, ThreadCreateRefusal> {
@@ -722,6 +774,9 @@ pub async fn create_reply(
         Ok(c) => c,
         Err(e) => return e,
     };
+    if let Err(e) = require_nick(state.clone(), user_id).await {
+        return e;
+    }
     let is_mod = social_db::is_moderator_or_admin(&classes);
 
     let result = tokio::task::spawn_blocking(

@@ -2,11 +2,31 @@
 //! `GET /admin/users` (search, with each row's linked providers/email/
 //! Telegram id) and `POST /admin/users/merge` (fold a duplicate account into
 //! its survivor — see `merge_users`' own doc comment and `account_merge.rs`
-//! for the full contract and per-table order).
+//! for the full contract and per-table order), plus the reserved-nick
+//! registry (owner ruling 2026-09-09: occupy the good handles now, hand
+//! them to specific accounts later, rather than minting fake accounts to
+//! sit on them):
+//!  - `GET    /admin/nicks/reserved`             — every reserved-nick row,
+//!                                                 sorted by category then
+//!                                                 nick (`list_reserved_nicks`).
+//!  - `PUT    /admin/nicks/reserved/{nick}`      — upsert a row's
+//!                                                 category/note, never its
+//!                                                 `granted_to`
+//!                                                 (`upsert_reserved_nick`).
+//!  - `DELETE /admin/nicks/reserved/{nick}`      — release a reservation
+//!                                                 entirely (`delete_reserved_nick`).
+//!  - `PUT    /admin/users/{user_id}/nick`       — assign a nick to an
+//!                                                 account, bypassing the
+//!                                                 self-service reserved-list
+//!                                                 and cooldown gates
+//!                                                 (`admin_set_user_nick`);
+//!                                                 this is how a reservation
+//!                                                 above is actually handed
+//!                                                 to someone.
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Extension, Query, State},
+    extract::{ConnectInfo, Extension, Path, Query, State},
     http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
@@ -703,6 +723,204 @@ pub async fn merge_users(
         Ok(Err(crate::account_merge::MergeError::Serde(e))) => {
             tracing::error!("Serialization error in account merge: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response(),
+    }
+}
+
+// ============================================================================
+// Reserved-nick registry (owner ruling 2026-09-09) — see this module's `//!`
+// doc for the four routes below. `db::reserved_nicks` itself is seeded at
+// boot from `crates/server/reserved_nicks.txt`; these routes are the only
+// way to edit that registry, or an account's nick, past boot time.
+// ============================================================================
+
+/// GET /api/admin/nicks/reserved
+///
+/// Every row in the reserved-nick registry, sorted by category then nick
+/// (`db::list_reserved_nicks`) — the read half an operator uses before
+/// granting or releasing a handle. Requires `Authorization: Bearer
+/// {ADMIN_SECRET}`.
+pub async fn list_reserved_nicks(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+) -> Response {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
+        return e;
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::list_reserved_nicks(&conn)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "reserved": rows })).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error listing reserved nicks: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Database error"))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response(),
+    }
+}
+
+/// JSON body for `PUT /api/admin/nicks/reserved/{nick}`.
+#[derive(serde::Deserialize)]
+pub struct UpsertReservedNickRequest {
+    pub category: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// PUT /api/admin/nicks/reserved/{nick}
+///
+/// Upsert `nick`'s `category`/`note` in the reserved-nick registry
+/// (`db::upsert_reserved_nick`) — claiming a new handle for the project, or
+/// reclassifying an existing one. Never touches `granted_to`: handing the
+/// nick to an account is the separate `PUT /api/admin/users/{user_id}/nick`
+/// route below. `400 {"error":...}` when `nick` fails the format check;
+/// `200 {"nick","created":bool}` on success, where `created` is `false`
+/// when the row already existed and only its category/note changed.
+/// Requires `Authorization: Bearer {ADMIN_SECRET}`.
+pub async fn upsert_reserved_nick(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(nick): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
+        return e;
+    }
+    let req: UpsertReservedNickRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Invalid JSON body"))).into_response();
+        }
+    };
+
+    let nick_lower = nick.to_lowercase();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::upsert_reserved_nick(&conn, &nick, &req.category, req.note.as_deref())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(created)) => Json(serde_json::json!({ "nick": nick_lower, "created": created })).into_response(),
+        Ok(Err(crate::db::ReservedNickError::Invalid)) => {
+            (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Invalid nick format"))).into_response()
+        }
+        Ok(Err(crate::db::ReservedNickError::Db(e))) => {
+            tracing::error!("DB error upserting reserved nick: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Database error"))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response(),
+    }
+}
+
+/// DELETE /api/admin/nicks/reserved/{nick}
+///
+/// Remove `nick` from the reserved-nick registry entirely, `granted_to`
+/// included (`db::delete_reserved_nick`) — releasing a name for good, not
+/// the same operation as moving an account off it while it stays reserved
+/// for someone else. `204` on success, `404` if `nick` was not reserved.
+/// Requires `Authorization: Bearer {ADMIN_SECRET}`.
+pub async fn delete_reserved_nick(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(nick): Path<String>,
+) -> Response {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
+        return e;
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::delete_reserved_nick(&conn, &nick)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error deleting reserved nick: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Database error"))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response(),
+    }
+}
+
+/// JSON body for `PUT /api/admin/users/{user_id}/nick`.
+#[derive(serde::Deserialize)]
+pub struct AdminSetUserNickRequest {
+    pub nick: String,
+}
+
+/// PUT /api/admin/users/{user_id}/nick
+///
+/// Set `user_id`'s nick directly (`db::admin_set_nick`) — bypasses the
+/// reserved-name list and the 30-day cooldown a self-service `POST
+/// /api/account/nick` is bound by; still enforces the format check and
+/// global uniqueness against every OTHER account. This is how a
+/// reservation made through `PUT /api/admin/nicks/reserved/{nick}` above is
+/// actually handed to an account: the response's `reserved` field is `true`
+/// exactly when `nick` is a row in that registry, and that row's
+/// `granted_to` is now `user_id`. `400` invalid format, `404 {"error":"no
+/// such user"}`, `409 {"error":"nick taken"}` held by a different account.
+/// Requires `Authorization: Bearer {ADMIN_SECRET}`.
+pub async fn admin_set_user_nick(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(user_id): Path<i64>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
+        return e;
+    }
+    let req: AdminSetUserNickRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Invalid JSON body"))).into_response();
+        }
+    };
+
+    let nick = req.nick;
+    let nick_for_response = nick.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::admin_set_nick(&conn, user_id, &nick)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(reserved)) => Json(serde_json::json!({
+            "user_id": user_id,
+            "nick": nick_for_response,
+            "reserved": reserved,
+        }))
+        .into_response(),
+        Ok(Err(crate::db::AdminNickError::Invalid)) => {
+            (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Invalid nick format"))).into_response()
+        }
+        Ok(Err(crate::db::AdminNickError::NoSuchUser)) => {
+            (StatusCode::NOT_FOUND, Json(ErrorResponse::new("no such user"))).into_response()
+        }
+        Ok(Err(crate::db::AdminNickError::Taken)) => {
+            (StatusCode::CONFLICT, Json(ErrorResponse::new("nick taken"))).into_response()
+        }
+        Ok(Err(crate::db::AdminNickError::Db(e))) => {
+            tracing::error!("DB error setting user nick via admin: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Database error"))).into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response(),
     }

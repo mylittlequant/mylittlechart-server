@@ -57,6 +57,21 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         // `/admin/forum/roles/{user_id}` further down (proven by
         // `control_router_registers_without_route_conflicts` below).
         .route("/admin/users/merge", post(admin::merge_users))
+        // Reserved-nick registry (owner ruling 2026-09-09) — GET is static,
+        // PUT/DELETE address one entry by path param, same static-vs-
+        // parameter coexistence as `/admin/forum/roles` +
+        // `/admin/forum/roles/{user_id}` further down.
+        .route("/admin/nicks/reserved", get(admin::list_reserved_nicks))
+        .route(
+            "/admin/nicks/reserved/{nick}",
+            axum::routing::put(admin::upsert_reserved_nick).delete(admin::delete_reserved_nick),
+        )
+        // Grant a nick to a specific account, bypassing the self-service
+        // reserved-list/cooldown gates — a third path segment under
+        // `/admin/users/{user_id}`, coexisting with the static `/admin/users`
+        // and `/admin/users/merge` above the same way
+        // `/forum/threads/{id}/replies` coexists with `/forum/threads/{id}`.
+        .route("/admin/users/{user_id}/nick", axum::routing::put(admin::admin_set_user_nick))
         // Owner outreach (2026-09-09) — static two-segment path under the
         // one-segment `/admin/notify` right above it, same static-vs-static
         // coexistence as `/admin/users` + `/admin/users/merge` above (see

@@ -538,6 +538,32 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_nick_lower ON users(LOWER(nick)) WHERE nick IS NOT NULL;",
     )?;
 
+    // Reserved-nick registry (owner ruling 2026-09-09: occupy the good
+    // handles now, hand them to specific accounts later through an admin
+    // route — see [`seed_reserved_nicks`] and [`is_nick_reserved`]).
+    // `granted_to` is NULL until an operator hands the row to an account via
+    // `admin_set_nick`; `INSERT OR IGNORE` in the seed below never touches an
+    // existing row, so a grant is never clobbered by a reboot re-seeding the
+    // same file.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS reserved_nicks (
+            nick_lower  TEXT PRIMARY KEY,
+            category    TEXT NOT NULL,
+            note        TEXT,
+            reserved_at TEXT NOT NULL,
+            granted_to  INTEGER
+        );",
+    )?;
+    let (seeded, rejected) = seed_reserved_nicks(&conn)?;
+    if seeded > 0 || !rejected.is_empty() {
+        tracing::info!(
+            "reserved_nicks: seeded {} new entr{} from reserved_nicks.txt, {} rejected",
+            seeded,
+            if seeded == 1 { "y" } else { "ies" },
+            rejected.len(),
+        );
+    }
+
     // Safe migration: add profile_id column to sync_items (for multi-profile scoping).
     let _ = conn.execute("ALTER TABLE sync_items ADD COLUMN profile_id TEXT NOT NULL DEFAULT ''", []);
 
@@ -1543,11 +1569,6 @@ pub fn get_user_public_id(conn: &Connection, user_id: i64) -> Result<String> {
 // OAuth display names collide across accounts, a chosen nick must not.
 // ============================================================================
 
-/// Handles reserved for the project itself — never assignable regardless of
-/// case, checked before the uniqueness lookup so they never need a row in
-/// `users` to be protected.
-const RESERVED_NICKS: &[&str] = &["zengeld", "kosti_x_itsok", "kosti_itsok"];
-
 /// Minimum time between two nick changes on the same account.
 const NICK_CHANGE_COOLDOWN_DAYS: i64 = 30;
 
@@ -1663,19 +1684,19 @@ pub fn set_nick(conn: &Connection, user_id: i64, nick: &str) -> Result<(), NickE
         return Err(NickError::Invalid);
     }
     let lower = nick.to_lowercase();
-    if RESERVED_NICKS.contains(&lower.as_str()) {
+    if is_nick_reserved(conn, &lower)? {
         return Err(NickError::Reserved);
     }
 
     let now = chrono::Utc::now();
-    let changed_at: Option<String> = conn
+    let (old_nick, changed_at): (Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT nick_changed_at FROM users WHERE id = ?1",
+            "SELECT nick, nick_changed_at FROM users WHERE id = ?1",
             params![user_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
-        .flatten();
+        .unwrap_or((None, None));
     if let Some(ref changed_at_str) = changed_at {
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(changed_at_str) {
             let next_allowed = dt.with_timezone(&chrono::Utc) + chrono::Duration::days(NICK_CHANGE_COOLDOWN_DAYS);
@@ -1705,12 +1726,332 @@ pub fn set_nick(conn: &Connection, user_id: i64, nick: &str) -> Result<(), NickE
         params![nick, now.to_rfc3339(), user_id],
     );
     match result {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            release_old_nick_grant(conn, user_id, old_nick.as_deref())?;
+            Ok(())
+        }
         Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
             Err(NickError::Taken)
         }
         Err(e) => Err(NickError::Db(e)),
     }
+}
+
+/// Whether `user_id` has chosen a nick — the write gate the forum
+/// (`routes::forum_v2::create_board_thread`/`create_reply`) and DM
+/// (`routes::dm::create_conversation`/`create_message`) routes run before
+/// accepting a write (owner ruling 2026-09-09: an account without a nick may
+/// only read). Thin wrapper over [`nick_for_user`] — same query, kept under
+/// its own name because those call sites ask "does this account have SOME
+/// nick" rather than "what is this account's nick".
+pub fn user_nick(conn: &Connection, user_id: i64) -> Result<Option<String>> {
+    nick_for_user(conn, user_id)
+}
+
+// ============================================================================
+// Reserved-nick registry (owner ruling 2026-09-09)
+//
+// Occupy the good handles now, hand them to specific accounts later through
+// an admin route (`routes::admin::admin_set_user_nick`, `db::admin_set_nick`)
+// rather than minting fake accounts to sit on them. `reserved_nicks` is
+// seeded at boot from the checked-in `reserved_nicks.txt` (`include_str!`d
+// below) and can also be edited live through
+// `routes::admin::{list_reserved_nicks,upsert_reserved_nick,
+// delete_reserved_nick}`. A row's `granted_to` names the account it was
+// handed to, if any — self-service `set_nick` never checks `granted_to`, it
+// simply refuses ANY reserved nick outright (see [`is_nick_reserved`]); only
+// `admin_set_nick` can put an account onto one.
+// ============================================================================
+
+/// One entry parsed from `reserved_nicks.txt` by [`parse_reserved_nicks`]: a
+/// lowercase nick and the `[section]` category it was declared under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedNickEntry {
+    pub nick: String,
+    pub category: String,
+}
+
+/// The checked-in reserved-nick list — see that file's own header comment
+/// for the exact format [`parse_reserved_nicks`] expects.
+const RESERVED_NICKS_TXT: &str = include_str!("../reserved_nicks.txt");
+
+/// Parse a `reserved_nicks.txt`-shaped list: `#` starts a comment, `[name]`
+/// opens a category every following nick line is stamped with until the
+/// next header or end of file, blank lines are skipped. Returns the valid
+/// entries (nick lowercased) plus every line that failed
+/// [`nick_format_valid`], verbatim, for the caller to warn about — a bad
+/// line is dropped, not merely deferred.
+pub fn parse_reserved_nicks(text: &str) -> (Vec<ReservedNickEntry>, Vec<String>) {
+    let mut entries = Vec::new();
+    let mut rejected = Vec::new();
+    let mut category = String::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            category = name.trim().to_string();
+            continue;
+        }
+        if !nick_format_valid(line) {
+            rejected.push(line.to_string());
+            continue;
+        }
+        entries.push(ReservedNickEntry {
+            nick: line.to_lowercase(),
+            category: category.clone(),
+        });
+    }
+    (entries, rejected)
+}
+
+/// Seed `reserved_nicks` from [`RESERVED_NICKS_TXT`] — called once at the
+/// end of [`init_db`]. Idempotent: `INSERT OR IGNORE` never touches a row
+/// that already exists, so a later boot re-running this against the same
+/// (or an appended) file never clobbers a `granted_to` an admin already
+/// set. Returns `(seeded, rejected)`: how many NEW rows this call inserted,
+/// and every line that failed the format check (already logged via
+/// `tracing::warn!` here, so the caller only needs the count for its own
+/// boot-summary line).
+pub fn seed_reserved_nicks(conn: &Connection) -> Result<(usize, Vec<String>)> {
+    let (entries, rejected) = parse_reserved_nicks(RESERVED_NICKS_TXT);
+    for bad in &rejected {
+        tracing::warn!("reserved_nicks.txt: skipping invalid entry {:?}", bad);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut seeded = 0;
+    for entry in &entries {
+        seeded += conn.execute(
+            "INSERT OR IGNORE INTO reserved_nicks (nick_lower, category, note, reserved_at, granted_to)
+             VALUES (?1, ?2, NULL, ?3, NULL)",
+            params![entry.nick, entry.category, now],
+        )?;
+    }
+    Ok((seeded, rejected))
+}
+
+/// Whether `nick_lower` (already lowercased) is a reserved handle — checked
+/// before the uniqueness lookup in [`set_nick`], the same gate the retired
+/// `RESERVED_NICKS` const used to provide. A row that has been GRANTED
+/// (`granted_to` set) still counts as reserved here for every account that
+/// isn't its holder: this function only answers "is this nick off-limits to
+/// self-service", not "who holds it" — [`set_nick`] refuses the claim
+/// outright regardless of `granted_to`, since the only way onto a reserved
+/// nick is [`admin_set_nick`].
+pub fn is_nick_reserved(conn: &Connection, nick_lower: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM reserved_nicks WHERE nick_lower = ?1",
+            params![nick_lower],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Clear `reserved_nicks.granted_to` for `old_nick` if it names a row
+/// currently granted to `user_id` — run from both [`set_nick`] and
+/// [`admin_set_nick`] right after `user_id`'s nick changes to something
+/// else, so a reserved handle the holder moves away from becomes free for
+/// an operator to grant again (owner ruling 2026-09-09). A no-op when
+/// `old_nick` is `None` (the account never had a nick) or names a row held
+/// by a DIFFERENT account (nothing of this account's to release).
+fn release_old_nick_grant(conn: &Connection, user_id: i64, old_nick: Option<&str>) -> Result<()> {
+    let Some(old_nick) = old_nick else {
+        return Ok(());
+    };
+    let old_lower = old_nick.to_lowercase();
+    conn.execute(
+        "UPDATE reserved_nicks SET granted_to = NULL WHERE nick_lower = ?1 AND granted_to = ?2",
+        params![old_lower, user_id],
+    )?;
+    Ok(())
+}
+
+/// One row returned by [`list_reserved_nicks`] — `nick` carries the stored
+/// (lowercase) `nick_lower` value; the wire field is named `nick` because
+/// the admin API has no separate concept of "the reserved form" vs "the
+/// nick" the way `users.nick` (case-preserved) does.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReservedNickRow {
+    pub nick: String,
+    pub category: String,
+    pub note: Option<String>,
+    pub reserved_at: String,
+    pub granted_to: Option<i64>,
+}
+
+/// Every row in the reserved-nick registry, sorted by category then nick —
+/// the read half of `GET /api/admin/nicks/reserved`.
+pub fn list_reserved_nicks(conn: &Connection) -> Result<Vec<ReservedNickRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT nick_lower, category, note, reserved_at, granted_to
+         FROM reserved_nicks
+         ORDER BY category ASC, nick_lower ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ReservedNickRow {
+                nick: row.get(0)?,
+                category: row.get(1)?,
+                note: row.get(2)?,
+                reserved_at: row.get(3)?,
+                granted_to: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Why [`upsert_reserved_nick`] refused a call — the format check is the
+/// only refusal that isn't a bare database error, so this stays a two-arm
+/// enum rather than reusing [`NickError`]'s wider set of self-service-only
+/// variants (`Reserved`/`Taken`/`RateLimited` make no sense for an admin
+/// upsert of the registry itself).
+#[derive(Debug)]
+pub enum ReservedNickError {
+    /// Fails [`nick_format_valid`].
+    Invalid,
+    /// The database call itself failed.
+    Db(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for ReservedNickError {
+    fn from(e: rusqlite::Error) -> Self {
+        ReservedNickError::Db(e)
+    }
+}
+
+/// Upsert `nick`'s `category`/`note` in the reserved-nick registry —
+/// `routes::admin::upsert_reserved_nick`'s DB half. Never touches
+/// `granted_to`: handing the nick to an account is
+/// [`admin_set_nick`]/`PUT /api/admin/users/{user_id}/nick`, a separate
+/// operation. Returns `true` when this call created a brand new row,
+/// `false` when an existing row's category/note was updated in place.
+pub fn upsert_reserved_nick(
+    conn: &Connection,
+    nick: &str,
+    category: &str,
+    note: Option<&str>,
+) -> std::result::Result<bool, ReservedNickError> {
+    if !nick_format_valid(nick) {
+        return Err(ReservedNickError::Invalid);
+    }
+    let lower = nick.to_lowercase();
+    let existed: bool = conn
+        .query_row(
+            "SELECT 1 FROM reserved_nicks WHERE nick_lower = ?1",
+            params![lower],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if existed {
+        conn.execute(
+            "UPDATE reserved_nicks SET category = ?1, note = ?2 WHERE nick_lower = ?3",
+            params![category, note, lower],
+        )?;
+    } else {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO reserved_nicks (nick_lower, category, note, reserved_at, granted_to)
+             VALUES (?1, ?2, ?3, ?4, NULL)",
+            params![lower, category, note, now],
+        )?;
+    }
+    Ok(!existed)
+}
+
+/// Remove `nick` from the reserved-nick registry entirely, `granted_to`
+/// included — `routes::admin::delete_reserved_nick`'s DB half. Returns
+/// `false` when `nick` was not reserved (nothing to delete).
+pub fn delete_reserved_nick(conn: &Connection, nick: &str) -> Result<bool> {
+    let lower = nick.to_lowercase();
+    let changed = conn.execute("DELETE FROM reserved_nicks WHERE nick_lower = ?1", params![lower])?;
+    Ok(changed > 0)
+}
+
+/// Why [`admin_set_nick`] refused a call.
+#[derive(Debug)]
+pub enum AdminNickError {
+    /// Fails [`nick_format_valid`].
+    Invalid,
+    /// Held by a DIFFERENT account already.
+    Taken,
+    /// `user_id` names no row in `users`.
+    NoSuchUser,
+    /// The database call itself failed.
+    Db(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for AdminNickError {
+    fn from(e: rusqlite::Error) -> Self {
+        AdminNickError::Db(e)
+    }
+}
+
+/// Set `user_id`'s nick directly — `routes::admin::admin_set_user_nick`'s DB
+/// half. Same format check as self-service [`set_nick`], but bypasses the
+/// reserved-name list AND the 30-day cooldown entirely: an operator handing
+/// out a reserved handle, or fixing a mistake, does neither. Uniqueness
+/// against every OTHER account still applies — two accounts never hold the
+/// same nick regardless of who assigns it.
+///
+/// `user_id`'s previous nick, if any, is released the same way [`set_nick`]
+/// releases it ([`release_old_nick_grant`]) — moving an account off a
+/// reserved nick it held frees that row for the next grant. Returns whether
+/// `nick` is itself a reserved handle; when it is, that row's `granted_to`
+/// is set to `user_id`, overwriting whatever it held before.
+pub fn admin_set_nick(conn: &Connection, user_id: i64, nick: &str) -> std::result::Result<bool, AdminNickError> {
+    if !nick_format_valid(nick) {
+        return Err(AdminNickError::Invalid);
+    }
+    let user_exists: bool = conn
+        .query_row("SELECT 1 FROM users WHERE id = ?1", params![user_id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !user_exists {
+        return Err(AdminNickError::NoSuchUser);
+    }
+
+    let lower = nick.to_lowercase();
+    let taken_by_other: bool = conn
+        .query_row(
+            "SELECT 1 FROM users WHERE LOWER(nick) = ?1 AND id != ?2",
+            params![lower, user_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if taken_by_other {
+        return Err(AdminNickError::Taken);
+    }
+
+    let old_nick = nick_for_user(conn, user_id)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = conn.execute(
+        "UPDATE users SET nick = ?1, nick_changed_at = ?2 WHERE id = ?3",
+        params![nick, now, user_id],
+    );
+    match result {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
+            return Err(AdminNickError::Taken);
+        }
+        Err(e) => return Err(AdminNickError::Db(e)),
+    }
+
+    release_old_nick_grant(conn, user_id, old_nick.as_deref())?;
+
+    let reserved = is_nick_reserved(conn, &lower)?;
+    if reserved {
+        conn.execute(
+            "UPDATE reserved_nicks SET granted_to = ?1 WHERE nick_lower = ?2",
+            params![user_id, lower],
+        )?;
+    }
+    Ok(reserved)
 }
 
 /// One row returned by [`search_users`] — an operator-facing nick/label
@@ -5293,6 +5634,18 @@ mod tests {
                 text_hash TEXT    NOT NULL,
                 batch_id  INTEGER NOT NULL REFERENCES notify_batches(id)
             );
+
+            CREATE TABLE reserved_nicks (
+                nick_lower  TEXT PRIMARY KEY,
+                category    TEXT NOT NULL,
+                note        TEXT,
+                reserved_at TEXT NOT NULL,
+                granted_to  INTEGER
+            );
+            INSERT INTO reserved_nicks (nick_lower, category, note, reserved_at, granted_to) VALUES
+                ('zengeld', 'project', NULL, '2026-01-01T00:00:00+00:00', NULL),
+                ('kosti_x_itsok', 'project', NULL, '2026-01-01T00:00:00+00:00', NULL),
+                ('kosti_itsok', 'project', NULL, '2026-01-01T00:00:00+00:00', NULL);
             ",
         )
         .expect("share test schema");
@@ -6009,6 +6362,235 @@ mod tests {
 
         // No such user — empty string, not an error.
         assert_eq!(super::effective_label_for_user(&conn, 99999).expect("label"), "");
+    }
+
+    #[test]
+    fn user_nick_matches_nick_for_user() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "gina", Some("pub-gina"));
+
+        assert_eq!(super::user_nick(&conn, uid).expect("nick"), None);
+        super::set_nick(&conn, uid, "gina_nick").expect("set nick");
+        assert_eq!(
+            super::user_nick(&conn, uid).expect("nick").as_deref(),
+            Some("gina_nick")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Reserved-nick registry (owner ruling 2026-09-09)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_reserved_nicks_reads_sections_and_skips_comments_and_bad_lines() {
+        let text = "\
+# a leading comment
+[project]
+zengeld
+# a comment inside a section
+
+[roles]
+admin
+bad char!
+mod
+";
+        let (entries, rejected) = super::parse_reserved_nicks(text);
+        assert_eq!(
+            entries,
+            vec![
+                super::ReservedNickEntry { nick: "zengeld".to_string(), category: "project".to_string() },
+                super::ReservedNickEntry { nick: "admin".to_string(), category: "roles".to_string() },
+                super::ReservedNickEntry { nick: "mod".to_string(), category: "roles".to_string() },
+            ]
+        );
+        assert_eq!(rejected, vec!["bad char!".to_string()]);
+    }
+
+    #[test]
+    fn parse_reserved_nicks_lowercases_and_ignores_blank_lines() {
+        let (entries, rejected) = super::parse_reserved_nicks("[Project]\n\nZenGeld\n\n");
+        assert_eq!(
+            entries,
+            vec![super::ReservedNickEntry { nick: "zengeld".to_string(), category: "Project".to_string() }]
+        );
+        assert!(rejected.is_empty());
+    }
+
+    /// The checked-in `reserved_nicks.txt` this crate ships must never
+    /// contain a line that fails its own format check — a bad entry would
+    /// otherwise be silently dropped at every boot forever.
+    #[test]
+    fn shipped_reserved_nicks_file_has_no_invalid_entries() {
+        let (entries, rejected) = super::parse_reserved_nicks(super::RESERVED_NICKS_TXT);
+        assert!(rejected.is_empty(), "invalid entries in reserved_nicks.txt: {rejected:?}");
+        assert!(!entries.is_empty());
+    }
+
+    #[test]
+    fn seed_reserved_nicks_is_idempotent_and_never_touches_an_existing_grant() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "holder", Some("pub-holder"));
+        conn.execute(
+            "UPDATE reserved_nicks SET granted_to = ?1 WHERE nick_lower = 'zengeld'",
+            rusqlite::params![uid],
+        )
+        .expect("grant zengeld");
+
+        let (seeded_first, rejected) = super::seed_reserved_nicks(&conn).expect("seed");
+        assert!(rejected.is_empty());
+        // The three names `share_test_conn` pre-seeds are already present —
+        // only the file's remaining entries are newly inserted.
+        assert!(seeded_first > 0);
+
+        let (seeded_second, _) = super::seed_reserved_nicks(&conn).expect("re-seed");
+        assert_eq!(seeded_second, 0, "a second seed pass must insert nothing new");
+
+        let granted: Option<i64> = conn
+            .query_row(
+                "SELECT granted_to FROM reserved_nicks WHERE nick_lower = 'zengeld'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read grant");
+        assert_eq!(granted, Some(uid), "re-seeding must never clear an existing grant");
+    }
+
+    #[test]
+    fn is_nick_reserved_true_for_seeded_names_false_otherwise() {
+        let conn = share_test_conn();
+        assert!(super::is_nick_reserved(&conn, "zengeld").expect("check"));
+        assert!(super::is_nick_reserved(&conn, "kosti_itsok").expect("check"));
+        assert!(!super::is_nick_reserved(&conn, "totally_free_nick").expect("check"));
+    }
+
+    #[test]
+    fn set_nick_releases_grant_when_holder_moves_away() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "holder", Some("pub-holder"));
+        super::admin_set_nick(&conn, uid, "zengeld").expect("admin grant");
+        assert_eq!(
+            conn.query_row::<Option<i64>, _, _>(
+                "SELECT granted_to FROM reserved_nicks WHERE nick_lower = 'zengeld'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read grant"),
+            Some(uid)
+        );
+
+        // Self-service move to a non-reserved nick must free the grant.
+        let past = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        conn.execute(
+            "UPDATE users SET nick_changed_at = ?1 WHERE id = ?2",
+            rusqlite::params![past, uid],
+        )
+        .expect("backdate nick_changed_at");
+        super::set_nick(&conn, uid, "freeform_nick").expect("move away");
+
+        assert_eq!(
+            conn.query_row::<Option<i64>, _, _>(
+                "SELECT granted_to FROM reserved_nicks WHERE nick_lower = 'zengeld'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read grant"),
+            None,
+            "moving away from a granted reserved nick must clear its grant"
+        );
+    }
+
+    #[test]
+    fn set_nick_never_lets_self_service_claim_a_reserved_nick() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+        match super::set_nick(&conn, uid, "zengeld") {
+            Err(super::NickError::Reserved) => {}
+            other => panic!("expected Reserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admin_set_nick_bypasses_reserved_list_and_cooldown() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+
+        let reserved = super::admin_set_nick(&conn, uid, "zengeld").expect("admin set");
+        assert!(reserved);
+        assert_eq!(super::nick_for_user(&conn, uid).expect("nick").as_deref(), Some("zengeld"));
+
+        // Immediately setting again (well within the 30-day cooldown) must
+        // still succeed — the admin route is not bound by it.
+        let reserved2 = super::admin_set_nick(&conn, uid, "kosti_itsok").expect("admin set again");
+        assert!(reserved2);
+    }
+
+    #[test]
+    fn admin_set_nick_rejects_bad_format_taken_and_missing_user() {
+        let conn = share_test_conn();
+        let a = insert_share_user(&conn, "alice", Some("pub-alice"));
+        let b = insert_share_user(&conn, "bob", Some("pub-bob"));
+        super::set_nick(&conn, a, "alicenick").expect("set nick");
+
+        match super::admin_set_nick(&conn, b, "al") {
+            Err(super::AdminNickError::Invalid) => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        match super::admin_set_nick(&conn, b, "alicenick") {
+            Err(super::AdminNickError::Taken) => {}
+            other => panic!("expected Taken, got {other:?}"),
+        }
+        match super::admin_set_nick(&conn, 99999, "nobodys_nick") {
+            Err(super::AdminNickError::NoSuchUser) => {}
+            other => panic!("expected NoSuchUser, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upsert_reserved_nick_creates_then_updates_in_place() {
+        let conn = share_test_conn();
+
+        let created = super::upsert_reserved_nick(&conn, "brandnew", "brands", Some("first note")).expect("insert");
+        assert!(created);
+        let rows = super::list_reserved_nicks(&conn).expect("list");
+        let row = rows.iter().find(|r| r.nick == "brandnew").expect("row present");
+        assert_eq!(row.category, "brands");
+        assert_eq!(row.note.as_deref(), Some("first note"));
+
+        let created_again =
+            super::upsert_reserved_nick(&conn, "BrandNew", "trading", Some("second note")).expect("update");
+        assert!(!created_again, "an existing row must be updated, not re-created");
+        let rows = super::list_reserved_nicks(&conn).expect("list");
+        let row = rows.iter().find(|r| r.nick == "brandnew").expect("row present");
+        assert_eq!(row.category, "trading");
+        assert_eq!(row.note.as_deref(), Some("second note"));
+    }
+
+    #[test]
+    fn upsert_reserved_nick_rejects_bad_format() {
+        let conn = share_test_conn();
+        match super::upsert_reserved_nick(&conn, "ab", "brands", None) {
+            Err(super::ReservedNickError::Invalid) => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_reserved_nick_removes_existing_and_reports_missing() {
+        let conn = share_test_conn();
+        assert!(super::delete_reserved_nick(&conn, "zengeld").expect("delete"));
+        assert!(!super::is_nick_reserved(&conn, "zengeld").expect("check"));
+        assert!(!super::delete_reserved_nick(&conn, "zengeld").expect("delete again"));
+        assert!(!super::delete_reserved_nick(&conn, "never_was_reserved").expect("delete missing"));
+    }
+
+    #[test]
+    fn list_reserved_nicks_sorted_by_category_then_nick() {
+        let conn = share_test_conn();
+        let rows = super::list_reserved_nicks(&conn).expect("list");
+        let pairs: Vec<(&str, &str)> = rows.iter().map(|r| (r.category.as_str(), r.nick.as_str())).collect();
+        let mut sorted = pairs.clone();
+        sorted.sort();
+        assert_eq!(pairs, sorted);
     }
 
     // ------------------------------------------------------------------
