@@ -9,7 +9,7 @@
 //!
 //! | Class       | Paths                                                          | Rate     | Burst |
 //! |-------------|-----------------------------------------------------------------|----------|-------|
-//! | `auth_poll` | `/auth/poll`, `/auth/agent-key/poll`, `/auth/link/poll`, `/auth/tg-login/poll` | 30/min | 10 |
+//! | `auth_poll` | `/auth/poll`, `/auth/agent-key/poll`, `/auth/link/poll`, `/auth/tg-login/poll` | 60/min | 30 |
 //! | `oauth`     | `/oauth/*`, `/auth/*/init`, `/auth/*/start`                     | 20/min   | 20    |
 //! | `api_write` | every other POST/PUT/PATCH/DELETE                                | 120/min | 120   |
 //! | `api_read`  | every other GET (and anything not matched above)                 | 600/min | 600   |
@@ -53,7 +53,7 @@ impl BucketKind {
     /// faster than they refill.
     fn limits(self) -> (f64, f64) {
         match self {
-            BucketKind::AuthPoll => (10.0, 30.0 / 60.0),
+            BucketKind::AuthPoll => (30.0, 60.0 / 60.0),
             BucketKind::Oauth => (20.0, 20.0 / 60.0),
             BucketKind::ApiWrite => (120.0, 120.0 / 60.0),
             BucketKind::ApiRead => (600.0, 600.0 / 60.0),
