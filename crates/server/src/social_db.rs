@@ -673,6 +673,109 @@ pub fn delete_board(conn: &Connection, id: i64) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// One board plus live activity stats (owner ruling 2026-09-09: "the forum
+/// must look like a forum" — every board row shows how many threads/posts
+/// it holds and when the last activity was). `thread_count`/`reply_count`
+/// are recomputed fresh from `forum_threads_v2`/`forum_replies_v2` on every
+/// call — NEVER read from `forum_threads_v2.reply_count`, which is a
+/// monotonic counter [`create_reply_v2`] only ever increments and never
+/// decrements when a reply is later hidden, so it does not track "visible"
+/// replies. `last_post_at`/`last_thread_title` name the newest VISIBLE
+/// activity on the board — either a thread's own creation or any visible
+/// reply on a visible thread — `None` for a board with no visible activity
+/// at all (a brand-new board, or one where every thread/reply has been
+/// hidden). "Visible" here matches [`list_threads_v2`]/[`list_replies_v2`]'s
+/// own `hidden = 0` filter exactly, uniformly for every caller — same as
+/// the paged thread list, this does NOT give a moderator a peek at hidden
+/// rows (unlike [`get_thread_v2`]'s `include_hidden` override, which is a
+/// thread-DETAIL concession, not something the board list makes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardWithStats {
+    pub board: Board,
+    pub thread_count: i64,
+    pub reply_count: i64,
+    pub last_post_at: Option<String>,
+    pub last_thread_title: Option<String>,
+}
+
+fn board_with_stats_from_row(row: &rusqlite::Row<'_>) -> Result<BoardWithStats> {
+    Ok(BoardWithStats {
+        board: Board {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            title: row.get(2)?,
+            description: row.get(3)?,
+            read_class: row.get(4)?,
+            write_class: row.get(5)?,
+            position: row.get(6)?,
+            created_at: row.get(7)?,
+        },
+        thread_count: row.get(8)?,
+        reply_count: row.get(9)?,
+        last_post_at: row.get(10)?,
+        last_thread_title: row.get(11)?,
+    })
+}
+
+/// Every board, ordered by `position` then `id`, each carrying live
+/// [`BoardWithStats`] fields — ONE query for the whole list (a `WITH` CTE
+/// plus a `ROW_NUMBER()` window function ranks each board's visible
+/// activity newest-first; two more CTEs aggregate visible thread/reply
+/// counts), never one query per board. `routes::forum_v2::list_boards`
+/// filters the result by [`can_read`] afterward (the class ladder lives in
+/// Rust, not SQL) — stats are computed here for every board regardless of
+/// read gate, same division of labour as [`list_boards`].
+pub fn list_boards_with_stats(conn: &Connection) -> Result<Vec<BoardWithStats>> {
+    let mut stmt = conn.prepare(
+        "WITH activity AS (
+            SELECT t.board_id AS board_id, t.id AS thread_id, t.title AS thread_title,
+                   t.created_at AS activity_at
+            FROM forum_threads_v2 t
+            WHERE t.hidden = 0
+            UNION ALL
+            SELECT t.board_id AS board_id, t.id AS thread_id, t.title AS thread_title,
+                   r.created_at AS activity_at
+            FROM forum_replies_v2 r
+            JOIN forum_threads_v2 t ON t.id = r.thread_id
+            WHERE r.hidden = 0 AND t.hidden = 0
+        ),
+        ranked_activity AS (
+            SELECT board_id, thread_title, activity_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY board_id ORDER BY activity_at DESC, thread_id DESC
+                   ) AS rn
+            FROM activity
+        ),
+        thread_counts AS (
+            SELECT board_id, COUNT(*) AS thread_count
+            FROM forum_threads_v2
+            WHERE hidden = 0
+            GROUP BY board_id
+        ),
+        reply_counts AS (
+            SELECT t.board_id AS board_id, COUNT(*) AS reply_count
+            FROM forum_replies_v2 r
+            JOIN forum_threads_v2 t ON t.id = r.thread_id
+            WHERE r.hidden = 0 AND t.hidden = 0
+            GROUP BY t.board_id
+        )
+        SELECT b.id, b.slug, b.title, b.description, b.read_class, b.write_class, b.position, b.created_at,
+               COALESCE(tc.thread_count, 0), COALESCE(rc.reply_count, 0),
+               ra.activity_at, ra.thread_title
+        FROM forum_boards b
+        LEFT JOIN thread_counts tc ON tc.board_id = b.id
+        LEFT JOIN reply_counts rc ON rc.board_id = b.id
+        LEFT JOIN ranked_activity ra ON ra.board_id = b.id AND ra.rn = 1
+        ORDER BY b.position ASC, b.id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(board_with_stats_from_row(row)?);
+    }
+    Ok(out)
+}
+
 // ============================================================================
 // Threads v2
 // ============================================================================
@@ -877,6 +980,7 @@ fn reply_v2_from_row(row: &rusqlite::Row<'_>) -> Result<ForumReplyV2> {
 /// Why [`create_reply_v2`] was refused before ever touching the database, on
 /// top of [`ForumError`] — a bad `parent_reply_id` is a v2-only concern (v1
 /// has no reply tree).
+#[derive(Debug)]
 pub enum ReplyError {
     Forum(ForumError),
     /// `parent_reply_id` named a reply that does not exist, is hidden, or
@@ -1413,6 +1517,74 @@ mod tests {
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].reply.id, 1);
         assert!(tree[0].children.is_empty());
+    }
+
+    // ---- list_boards_with_stats: live counts + newest-activity tracking ----
+
+    #[test]
+    fn list_boards_with_stats_empty_board_yields_zero_counts_and_null_activity() {
+        let conn = test_conn();
+        let stats = list_boards_with_stats(&conn).expect("list with stats");
+        let general = stats.iter().find(|s| s.board.slug == "general").expect("general stats");
+        assert_eq!(general.thread_count, 0);
+        assert_eq!(general.reply_count, 0);
+        assert_eq!(general.last_post_at, None);
+        assert_eq!(general.last_thread_title, None);
+    }
+
+    #[test]
+    fn list_boards_with_stats_counts_exclude_hidden_and_track_latest_activity() {
+        let conn = test_conn();
+        let general = get_board_by_slug(&conn, "general").expect("query").expect("general board seeded");
+
+        let t1 = create_thread_v2(&conn, general.id, 1, "First thread", "body one", "2026-09-09T00:00:00+00:00")
+            .expect("create thread 1");
+        let t2 = create_thread_v2(&conn, general.id, 1, "Second thread", "body two", "2026-09-09T01:00:00+00:00")
+            .expect("create thread 2");
+        create_reply_v2(&conn, t1, None, 2, "a reply", "2026-09-09T02:00:00+00:00").expect("create reply");
+
+        let stats = list_boards_with_stats(&conn).expect("list with stats");
+        let general_stats = stats.iter().find(|s| s.board.slug == "general").expect("general stats");
+        assert_eq!(general_stats.thread_count, 2);
+        assert_eq!(general_stats.reply_count, 1);
+        assert_eq!(general_stats.last_post_at.as_deref(), Some("2026-09-09T02:00:00+00:00"));
+        assert_eq!(general_stats.last_thread_title.as_deref(), Some("First thread"));
+
+        // Hide the reply: reply_count drops, and the newest visible activity
+        // falls back to the second thread's own creation time — not the now-
+        // hidden reply, even though its row still exists in the table.
+        let reply_id: i64 = conn
+            .query_row("SELECT id FROM forum_replies_v2 WHERE thread_id = ?1", params![t1], |row| row.get(0))
+            .expect("reply id");
+        delete_reply_v2(&conn, reply_id, None).expect("hide reply");
+        let stats = list_boards_with_stats(&conn).expect("list with stats");
+        let general_stats = stats.iter().find(|s| s.board.slug == "general").expect("general stats");
+        assert_eq!(general_stats.thread_count, 2);
+        assert_eq!(general_stats.reply_count, 0);
+        assert_eq!(general_stats.last_post_at.as_deref(), Some("2026-09-09T01:00:00+00:00"));
+        assert_eq!(general_stats.last_thread_title.as_deref(), Some("Second thread"));
+
+        // Hide both threads too: the board goes back to zero counts and null
+        // activity even though the rows are still in the table.
+        hide_thread_v2(&conn, t1).expect("hide t1");
+        hide_thread_v2(&conn, t2).expect("hide t2");
+        let stats = list_boards_with_stats(&conn).expect("list with stats");
+        let general_stats = stats.iter().find(|s| s.board.slug == "general").expect("general stats");
+        assert_eq!(general_stats.thread_count, 0);
+        assert_eq!(general_stats.reply_count, 0);
+        assert_eq!(general_stats.last_post_at, None);
+        assert_eq!(general_stats.last_thread_title, None);
+    }
+
+    #[test]
+    fn list_boards_with_stats_covers_every_seeded_board_ordered_by_position() {
+        let conn = test_conn();
+        let stats = list_boards_with_stats(&conn).expect("list with stats");
+        assert_eq!(stats.len(), 7);
+        let positions: Vec<i64> = stats.iter().map(|s| s.board.position).collect();
+        let mut sorted = positions.clone();
+        sorted.sort();
+        assert_eq!(positions, sorted, "rows must already come back position-ordered");
     }
 
     // ---- schema smoke test (boards seeded, FTS5 present) ----

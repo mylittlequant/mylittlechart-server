@@ -130,7 +130,7 @@ public = true
 [[endpoints]]
 method = "GET"
 path = "/api/forum/boards"
-description = "Forum v2: boards the caller can read, by class (public/user/paid/trusted/moderator/admin — see social_db.rs). Public boards are visible to anonymous callers."
+description = "Forum v2: {boards: [...], totals: {boards, threads, posts}} — boards the caller can read, by class (public/user/paid/trusted/moderator/admin — see social_db.rs). Public boards are visible to anonymous callers. Each board row also carries thread_count/reply_count (visible, not hidden) and last_post_at/last_thread_title (newest visible activity, null when the board is empty), computed in one query (social_db::list_boards_with_stats). totals sums the caller's visible board set; posts = every message including each thread's opening post."
 auth = "optional"
 public = true
 

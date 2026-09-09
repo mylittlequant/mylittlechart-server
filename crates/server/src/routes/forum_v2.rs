@@ -16,7 +16,36 @@
 //!                                                       (label/public_id) — the
 //!                                                       client's moderation-row
 //!                                                       gate reads this.
-//!  - `GET    /forum/boards`                          — boards the caller can read.
+//!  - `GET    /forum/boards`                          — boards the caller can
+//!                                                       read, `{"boards":
+//!                                                       [...], "totals":
+//!                                                       {...}}`. Each board
+//!                                                       row carries live
+//!                                                       `thread_count`/
+//!                                                       `reply_count`
+//!                                                       (visible, not
+//!                                                       hidden) plus
+//!                                                       `last_post_at`/
+//!                                                       `last_thread_title`
+//!                                                       naming the newest
+//!                                                       visible activity
+//!                                                       (`null` for an
+//!                                                       empty board) — one
+//!                                                       query, see
+//!                                                       `social_db::
+//!                                                       list_boards_with_stats`.
+//!                                                       `totals` sums the
+//!                                                       CALLER's visible
+//!                                                       board set:
+//!                                                       `{boards, threads,
+//!                                                       posts}` where
+//!                                                       `posts` is every
+//!                                                       message (a thread's
+//!                                                       opening post plus
+//!                                                       its replies), not a
+//!                                                       duplicate of the
+//!                                                       per-board
+//!                                                       `reply_count`.
 //!  - `GET    /forum/boards/{slug}/threads?limit=&before=` — paged thread list.
 //!  - `POST   /forum/boards/{slug}/threads`           — create a thread (write class).
 //!  - `GET    /forum/v2/threads/{id}`                 — thread + reply tree
@@ -218,7 +247,8 @@ fn parse_before_cursor(raw: &str) -> Option<(String, i64)> {
     Some((activity.to_string(), id))
 }
 
-fn board_json(b: &social_db::Board) -> serde_json::Value {
+fn board_json(row: &social_db::BoardWithStats) -> serde_json::Value {
+    let b = &row.board;
     serde_json::json!({
         "id": b.id,
         "slug": b.slug,
@@ -227,6 +257,28 @@ fn board_json(b: &social_db::Board) -> serde_json::Value {
         "read_class": b.read_class.as_str(),
         "write_class": b.write_class.as_str(),
         "position": b.position,
+        "thread_count": row.thread_count,
+        "reply_count": row.reply_count,
+        "last_post_at": row.last_post_at,
+        "last_thread_title": row.last_thread_title,
+    })
+}
+
+/// `{"boards": n, "threads": n, "posts": n}` for the caller's visible board
+/// set (owner ruling 2026-09-09) — `boards`/`threads` are straight counts;
+/// `posts` is every individual message the caller can see, a thread's own
+/// opening post included (`thread_count + reply_count` per board, summed
+/// across the visible set) — the phpBB-style "topics"/"posts" split, kept
+/// deliberately distinct from the per-board `reply_count` field
+/// [`board_json`] already exposes.
+fn board_totals_json(visible: &[social_db::BoardWithStats]) -> serde_json::Value {
+    let boards = visible.len() as i64;
+    let threads: i64 = visible.iter().map(|r| r.thread_count).sum();
+    let replies: i64 = visible.iter().map(|r| r.reply_count).sum();
+    serde_json::json!({
+        "boards": boards,
+        "threads": threads,
+        "posts": threads + replies,
     })
 }
 
@@ -344,17 +396,18 @@ pub async fn list_boards(State(state): State<Arc<AppState>>, headers: HeaderMap)
         Err(e) => return e,
     };
 
-    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<social_db::Board>> {
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<social_db::BoardWithStats>> {
         let conn = state.control_plane().social_conn();
-        social_db::list_boards(&conn)
+        social_db::list_boards_with_stats(&conn)
     })
     .await;
 
     match result {
-        Ok(Ok(boards)) => {
-            let visible: Vec<_> = boards.into_iter().filter(|b| social_db::can_read(b, &classes)).collect();
+        Ok(Ok(rows)) => {
+            let visible: Vec<_> = rows.into_iter().filter(|r| social_db::can_read(&r.board, &classes)).collect();
             Json(serde_json::json!({
                 "boards": visible.iter().map(board_json).collect::<Vec<_>>(),
+                "totals": board_totals_json(&visible),
             }))
             .into_response()
         }
@@ -1508,5 +1561,44 @@ mod tests {
 
         let resp = parse_class_field("write_class", "bogus").expect_err("bogus class must be refused");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn board_with_stats_fixture(slug: &str, thread_count: i64, reply_count: i64) -> social_db::BoardWithStats {
+        social_db::BoardWithStats {
+            board: social_db::Board {
+                id: 1,
+                slug: slug.to_string(),
+                title: slug.to_string(),
+                description: String::new(),
+                read_class: Class::Public,
+                write_class: Class::Public,
+                position: 0,
+                created_at: "2026-09-09T00:00:00+00:00".to_string(),
+            },
+            thread_count,
+            reply_count,
+            last_post_at: None,
+            last_thread_title: None,
+        }
+    }
+
+    /// `board_totals_json`'s `posts` is `thread_count + reply_count` summed
+    /// across every visible board — the opening post of each thread counts
+    /// toward `posts` on top of its replies, not just the replies alone.
+    #[test]
+    fn board_totals_json_sums_thread_and_reply_counts_into_posts() {
+        let visible = vec![board_with_stats_fixture("a", 2, 3), board_with_stats_fixture("b", 1, 0)];
+        let totals = board_totals_json(&visible);
+        assert_eq!(totals["boards"], serde_json::json!(2));
+        assert_eq!(totals["threads"], serde_json::json!(3));
+        assert_eq!(totals["posts"], serde_json::json!(6));
+    }
+
+    /// No visible boards at all (every board gated above the caller's class)
+    /// yields all-zero totals, not an error or a missing field.
+    #[test]
+    fn board_totals_json_empty_visible_set_is_all_zero() {
+        let totals = board_totals_json(&[]);
+        assert_eq!(totals, serde_json::json!({"boards": 0, "threads": 0, "posts": 0}));
     }
 }
