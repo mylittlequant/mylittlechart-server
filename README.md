@@ -205,7 +205,7 @@ This is a thin wrapper over `mlc-opsd publish <path> <platform> <version> [chann
 - Web sessions: HttpOnly + Secure + SameSite=Strict cookies, 24h TTL, bound to User-Agent fingerprint (SHA-256)
 - Public IDs: external APIs return 32-char random hex `public_id` instead of sequential autoincrement `id` to prevent enumeration
 - Provider linking guard: `link_provider_to_user()` checks existing ownership before attaching — refuses to steal identity from another account
-- Orphan cleanup: `cleanup_orphan_users()` runs on startup, deletes user rows with no linked providers
+- Orphan cleanup: `cleanup_orphan_users()` runs on startup, deletes user rows with no linked providers, plus self-referencing-orphan rows created in the last 24h only — older ones are dormant accounts left for the admin merge flow (`POST /api/admin/users/merge`)
 - No application-level rate limiting (handled at Cloudflare)
 - Graceful shutdown: Ctrl+C / SIGTERM triggers clean shutdown with in-flight request draining
 

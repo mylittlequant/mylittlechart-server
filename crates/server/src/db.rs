@@ -603,8 +603,18 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
 
     // Clean up orphan users left behind by merge/link operations.
     let cleaned = cleanup_orphan_users(&conn)?;
-    if cleaned > 0 {
-        tracing::info!("Cleaned up {} orphan user(s) with no linked providers", cleaned);
+    if cleaned.removed_no_provider > 0 || cleaned.removed_recent_self_ref > 0 {
+        tracing::info!(
+            "Cleaned up {} orphan user(s) with no linked providers, {} self-referencing orphan(s) created in the last 24h",
+            cleaned.removed_no_provider,
+            cleaned.removed_recent_self_ref,
+        );
+    }
+    if cleaned.skipped_dormant > 0 {
+        tracing::info!(
+            "Left {} dormant self-referencing user(s) older than 24h in place (admin merge territory)",
+            cleaned.skipped_dormant,
+        );
     }
 
     // Safe migration: widen releases UNIQUE from (version, platform) to (version, platform, channel).
@@ -647,6 +657,21 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Outcome of [`cleanup_orphan_users`] — how many rows each rule removed,
+/// plus how many self-referencing candidates were left in place for being
+/// too old to be the throwaway shape the rule targets.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanCleanup {
+    /// Rows deleted for having no `user_providers` entry at all.
+    pub removed_no_provider: usize,
+    /// Self-referencing-orphan-shape rows created within the last 24h.
+    pub removed_recent_self_ref: usize,
+    /// Self-referencing-orphan-shape rows older than 24h, left alone —
+    /// these are dormant accounts the admin merge flow handles, not the
+    /// throwaway rows this rule targets.
+    pub skipped_dormant: usize,
+}
+
 /// Delete users who have no entries in `user_providers`, plus the subtler
 /// shape the pre-fix `finish_oauth` device-merge branch used to leave behind
 /// (docs/mlc/plans/identity-merge-2026-09-09.md decision 3): a `users` row
@@ -660,21 +685,39 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
 /// moves all provider identities to a canonical user account without removing
 /// the now-empty source row from `users`.
 ///
-/// Returns the total number of deleted rows across both rules.
-pub fn cleanup_orphan_users(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
-    let no_providers = conn.execute(
+/// The self-referencing rule only fires on rows created in the last 24
+/// hours: on 2026-09-09 it deleted two dormant-but-real accounts (a second
+/// provider linked once, months ago, then never used again) — for people
+/// other than an account's own owner, that dormant shape is exactly what the
+/// admin merge (`POST /api/admin/users/merge`) exists to fold, not something
+/// boot-time cleanup should silently erase. Only the throwaway rows the old
+/// device flow left behind seconds after creation are still swept
+/// automatically.
+pub fn cleanup_orphan_users(conn: &rusqlite::Connection) -> rusqlite::Result<OrphanCleanup> {
+    let removed_no_provider = conn.execute(
         "DELETE FROM users WHERE id NOT IN (SELECT DISTINCT user_id FROM user_providers)",
         [],
     )?;
 
-    // The self-referencing shape: find the candidate ids first, then delete
-    // each one's self-mirror `user_providers` row before the `users` row
-    // itself — `PRAGMA foreign_keys=ON` (see `init_db`) refuses `DELETE FROM
-    // users` while a `user_providers` row still references it, and this
-    // shape by definition has exactly one such row.
-    let candidate_ids: Vec<i64> = {
+    // The self-referencing shape: find the candidates (with their creation
+    // time) first, then delete each recent one's self-mirror
+    // `user_providers` row before the `users` row itself —
+    // `PRAGMA foreign_keys=ON` (see `init_db`) refuses `DELETE FROM users`
+    // while a `user_providers` row still references it, and this shape by
+    // definition has exactly one such row.
+    //
+    // The age cutoff is computed in Rust and bound as a parameter, compared
+    // directly against the RFC3339 `created_at` text (both sides use
+    // `to_rfc3339()`'s fixed-width, always-UTC-offset format, so plain text
+    // comparison sorts chronologically) — unlike `cleanup_oauth_states`'
+    // `datetime('now', ...)` idiom, this avoids SQLite's `datetime()`
+    // rendering a space-separated, offset-less string that would compare
+    // unreliably against the `T`-separated, offset-carrying column.
+    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+
+    let candidates: Vec<(i64, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT u.id FROM users u
+            "SELECT u.id, u.created_at FROM users u
              WHERE (SELECT COUNT(*) FROM user_providers up WHERE up.user_id = u.id) = 1
                AND EXISTS (
                    SELECT 1 FROM user_providers up
@@ -690,17 +733,28 @@ pub fn cleanup_orphan_users(conn: &rusqlite::Connection) -> rusqlite::Result<usi
                AND NOT EXISTS (SELECT 1 FROM forum_threads WHERE author_user_id = u.id)
                AND NOT EXISTS (SELECT 1 FROM forum_replies WHERE author_user_id = u.id)",
         )?;
-        let rows = stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(i64, String)>>>()?;
         rows
     };
 
-    let mut self_referencing = 0;
-    for id in candidate_ids {
+    let mut removed_recent_self_ref = 0;
+    let mut skipped_dormant = 0;
+    for (id, created_at) in candidates {
+        if created_at < cutoff {
+            skipped_dormant += 1;
+            continue;
+        }
         conn.execute("DELETE FROM user_providers WHERE user_id = ?1", params![id])?;
-        self_referencing += conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+        removed_recent_self_ref += conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
     }
 
-    Ok(no_providers + self_referencing)
+    Ok(OrphanCleanup {
+        removed_no_provider,
+        removed_recent_self_ref,
+        skipped_dormant,
+    })
 }
 
 // ============================================================================
@@ -1657,6 +1711,18 @@ pub struct AdminUserRow {
     /// row, if any — who the operator can reach through the Telegram login
     /// bot. `None` when no Telegram identity is linked.
     pub telegram_id: Option<String>,
+    /// `true` when the account holds at least one `user_providers` row but
+    /// none of `auth_tokens`, `web_sessions`, `device_users`, `sync_items`,
+    /// `share_links`, or forum authorship — signed in once and never used
+    /// again. This is the same activity predicate
+    /// `cleanup_orphan_users`'s self-referencing rule checks, without the
+    /// self-mirror or age restriction: a dormant account with several
+    /// providers linked over time still reads as dormant here, and stays
+    /// that way regardless of when it was created — it's what
+    /// `POST /api/admin/users/merge` is for, not boot-time cleanup
+    /// (docs/mlc/plans/identity-merge-2026-09-09.md decision 3, revised
+    /// 2026-09-09 after boot-time cleanup deleted two real dormant accounts).
+    pub dormant: bool,
 }
 
 /// Cap on `search_users`' result set — an operator resolving a nick to an
@@ -1700,6 +1766,7 @@ pub fn search_users(conn: &Connection, q: &str) -> Result<Vec<AdminUserRow>> {
             providers: Vec::new(),
             has_email: false,
             telegram_id: None,
+            dormant: false,
         });
     }
     if users.is_empty() {
@@ -1736,13 +1803,42 @@ pub fn search_users(conn: &Connection, q: &str) -> Result<Vec<AdminUserRow>> {
         }
     }
 
+    // `dormant`: has at least one provider row (checked below, after
+    // `u.providers` is filled in) and no row in any activity table — same
+    // predicate `cleanup_orphan_users`'s self-referencing rule uses, batched
+    // over the whole matched set the same way the provider query above is,
+    // not one query per row. The placeholder list is repeated once per
+    // `UNION ALL` arm since each `IN (...)` binds its own copy of `ids`.
+    let activity_sql = format!(
+        "SELECT user_id FROM (
+             SELECT user_id FROM auth_tokens WHERE user_id IN ({placeholders})
+             UNION ALL SELECT user_id FROM web_sessions WHERE user_id IN ({placeholders})
+             UNION ALL SELECT user_id FROM device_users WHERE user_id IN ({placeholders})
+             UNION ALL SELECT user_id FROM sync_items WHERE user_id IN ({placeholders})
+             UNION ALL SELECT user_id FROM share_links WHERE user_id IN ({placeholders})
+             UNION ALL SELECT author_user_id AS user_id FROM forum_threads WHERE author_user_id IN ({placeholders})
+             UNION ALL SELECT author_user_id AS user_id FROM forum_replies WHERE author_user_id IN ({placeholders})
+         )"
+    );
+    let mut activity_stmt = conn.prepare(&activity_sql)?;
+    let mut activity_bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() * 7);
+    for _ in 0..7 {
+        activity_bound.extend(ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+    }
+    let mut activity_rows = activity_stmt.query(activity_bound.as_slice())?;
+    let mut has_activity: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    while let Some(row) = activity_rows.next()? {
+        has_activity.insert(row.get(0)?);
+    }
+
     for u in users.iter_mut() {
         let mut names = providers_by_user.remove(&u.user_id).unwrap_or_default();
         names.sort();
         names.dedup();
-        u.providers = names;
         u.has_email = has_email_by_user.contains_key(&u.user_id);
         u.telegram_id = telegram_id_by_user.remove(&u.user_id);
+        u.dormant = !names.is_empty() && !has_activity.contains(&u.user_id);
+        u.providers = names;
     }
 
     Ok(users)
@@ -5398,8 +5494,13 @@ mod tests {
         conn.execute("DELETE FROM user_providers WHERE user_id = ?1", rusqlite::params![d])
             .expect("strip providers");
 
-        let removed = super::cleanup_orphan_users(&conn).expect("cleanup");
-        assert_eq!(removed, 2, "exactly B (self-referencing) and D (no providers) should be removed");
+        let cleaned = super::cleanup_orphan_users(&conn).expect("cleanup");
+        assert_eq!(cleaned.removed_no_provider, 1, "D (no providers) should be removed");
+        assert_eq!(
+            cleaned.removed_recent_self_ref, 1,
+            "B (self-referencing, created just now) should be removed"
+        );
+        assert_eq!(cleaned.skipped_dormant, 0);
 
         let remaining: Vec<i64> = {
             let mut stmt = conn.prepare("SELECT id FROM users ORDER BY id").expect("prepare");
@@ -5408,6 +5509,75 @@ mod tests {
         assert_eq!(remaining, vec![a, c]);
         assert!(!remaining.contains(&b));
         assert!(!remaining.contains(&d));
+    }
+
+    #[test]
+    fn cleanup_orphan_users_self_referencing_rule_respects_24h_cutoff() {
+        let conn = share_test_conn();
+
+        // A 30-day-old self-referencing orphan — a real dormant account
+        // someone signed into once, months ago. The admin merge flow
+        // (`POST /api/admin/users/merge`) handles this shape now; boot-time
+        // cleanup must leave it in place.
+        let old_created_at = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let old = super::upsert_user(&conn, "github", "old1", "dormant", None, &old_created_at)
+            .expect("seed old");
+
+        // A 5-minute-old self-referencing orphan — the throwaway shape the
+        // old device-merge flow left behind seconds after creation. Still
+        // swept automatically.
+        let recent_created_at = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        let recent = super::upsert_user(&conn, "github", "new1", "throwaway", None, &recent_created_at)
+            .expect("seed recent");
+
+        let cleaned = super::cleanup_orphan_users(&conn).expect("cleanup");
+        assert_eq!(cleaned.removed_no_provider, 0);
+        assert_eq!(cleaned.removed_recent_self_ref, 1, "the 5-minute-old row should be removed");
+        assert_eq!(cleaned.skipped_dormant, 1, "the 30-day-old row should be skipped");
+
+        let remaining: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT id FROM users ORDER BY id").expect("prepare");
+            stmt.query_map([], |row| row.get(0)).expect("query").collect::<rusqlite::Result<Vec<i64>>>().expect("rows")
+        };
+        assert_eq!(remaining, vec![old]);
+        assert!(!remaining.contains(&recent));
+    }
+
+    #[test]
+    fn search_users_reports_dormant() {
+        let conn = share_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // idle: has a linked provider, never touched any activity table —
+        // dormant.
+        let _idle = super::upsert_user(&conn, "github", "idle1", "idle", None, &now).expect("seed idle");
+
+        // active: has a linked provider AND a live auth token — not dormant.
+        let active = super::upsert_user(&conn, "github", "active1", "active", None, &now).expect("seed active");
+        conn.execute(
+            "INSERT INTO auth_tokens (token_hash, user_id, created_at) VALUES ('tok-active', ?1, ?2)",
+            rusqlite::params![active, now],
+        )
+        .expect("insert token");
+
+        // stripped: no provider row at all — not dormant (the "has a
+        // provider row" half of the predicate fails).
+        let stripped = super::upsert_user(&conn, "github", "stripped1", "stripped", None, &now)
+            .expect("seed stripped");
+        conn.execute("DELETE FROM user_providers WHERE user_id = ?1", rusqlite::params![stripped])
+            .expect("strip providers");
+
+        let rows = super::search_users(&conn, "idle").expect("search idle");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].dormant);
+
+        let rows = super::search_users(&conn, "active").expect("search active");
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].dormant);
+
+        let rows = super::search_users(&conn, "stripped").expect("search stripped");
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].dormant);
     }
 
     // ------------------------------------------------------------------

@@ -515,10 +515,12 @@ pub struct AdminUsersQuery {
 /// same `users` row this query already reads. Each row also carries
 /// `providers` (every linked provider name, deduplicated and sorted),
 /// `has_email` (whether any linked identity captured a verified email —
-/// docs/mlc/plans/identity-merge-2026-09-09.md decision 1), and
+/// docs/mlc/plans/identity-merge-2026-09-09.md decision 1),
 /// `telegram_id` (the `provider_user_id` of the account's `telegram`
 /// identity, if any — who the operator can reach through the Telegram
-/// login bot). Requires `Authorization: Bearer {ADMIN_SECRET}`.
+/// login bot), and `dormant` (has a linked provider but no activity in
+/// any table — see `db::AdminUserRow::dormant`; this is what the merge
+/// endpoint below is for). Requires `Authorization: Bearer {ADMIN_SECRET}`.
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
