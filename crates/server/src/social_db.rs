@@ -214,7 +214,11 @@ pub(crate) fn create_social_schema(conn: &Connection) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     for (slug, title, description, read_class, write_class, position) in [
         ("announcements", "Announcements", "Project news, posted by the team.", Class::Public, Class::Admin, 0),
-        ("general", "General", "Open discussion.", Class::Public, Class::Paid, 1),
+        // `general` is read-Public/write-User (owner ruling: any signed-in
+        // account may post on the open board) — was write-Paid until the
+        // migration right below flipped it on every install seeded before
+        // this ruling.
+        ("general", "General", "Open discussion.", Class::Public, Class::User, 1),
         ("members", "Members", "Any signed-in account can post here.", Class::User, Class::User, 2),
         ("paid", "Paid", "Paid-only discussion.", Class::Paid, Class::Paid, 3),
         ("trusted", "Trusted", "Paid accounts holding trusted standing.", Class::Trusted, Class::Trusted, 4),
@@ -228,6 +232,16 @@ pub(crate) fn create_social_schema(conn: &Connection) -> Result<()> {
             params![slug, title, description, read_class, write_class, position, now],
         )?;
     }
+
+    // Forward migration for a `general` row seeded before the ruling above:
+    // `INSERT OR IGNORE` never touches a row that already exists, so an
+    // install that seeded `general` at write-Paid needs this separate,
+    // idempotent flip. A no-op on a fresh install (the seed loop already
+    // wrote `user`) and a no-op on every boot after the first time it runs.
+    conn.execute(
+        "UPDATE forum_boards SET write_class = ?1 WHERE slug = 'general' AND write_class = ?2",
+        params![Class::User, Class::Paid],
+    )?;
 
     Ok(())
 }
@@ -1470,7 +1484,7 @@ mod tests {
 
         let expected: &[(&str, Class, Class)] = &[
             ("announcements", Class::Public, Class::Admin),
-            ("general", Class::Public, Class::Paid),
+            ("general", Class::Public, Class::User),
             ("members", Class::User, Class::User),
             ("paid", Class::Paid, Class::Paid),
             ("trusted", Class::Trusted, Class::Trusted),
@@ -1482,6 +1496,55 @@ mod tests {
             assert_eq!(board.read_class, *read_class, "{slug} read_class");
             assert_eq!(board.write_class, *write_class, "{slug} write_class");
         }
+    }
+
+    #[test]
+    fn general_write_class_migration_flips_an_existing_paid_row_to_user_and_leaves_other_boards_alone() {
+        // Simulate an install seeded before the ruling: hand-write a
+        // `forum_boards` row (and a sibling board) with the OLD write-Paid
+        // value, on a connection that has never run `create_social_schema`
+        // — the seed loop's `INSERT OR IGNORE` alone would never touch this
+        // row, so only the follow-up `UPDATE` can prove this test.
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE forum_boards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                read_class TEXT NOT NULL,
+                write_class TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );",
+        )
+        .expect("pre-migration table");
+        conn.execute(
+            "INSERT INTO forum_boards (slug, title, description, read_class, write_class, position, created_at)
+             VALUES ('general', 'General', 'Open discussion.', 'public', 'paid', 1, '2026-09-05T00:00:00+00:00')",
+            [],
+        )
+        .expect("pre-migration general row");
+        conn.execute(
+            "INSERT INTO forum_boards (slug, title, description, read_class, write_class, position, created_at)
+             VALUES ('paid', 'Paid', 'Paid-only discussion.', 'paid', 'paid', 3, '2026-09-05T00:00:00+00:00')",
+            [],
+        )
+        .expect("pre-migration paid-board row, untouched by the general-only migration");
+
+        create_social_schema(&conn).expect("schema + migration on an existing install");
+
+        let general = get_board_by_slug(&conn, "general").expect("query").expect("general board");
+        assert_eq!(general.write_class, Class::User);
+        assert_eq!(general.read_class, Class::Public, "migration touches write_class only");
+
+        let paid = get_board_by_slug(&conn, "paid").expect("query").expect("paid board");
+        assert_eq!(paid.write_class, Class::Paid, "the migration's WHERE clause names slug='general' only");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM forum_boards", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 7, "the seed loop still fills in every other missing board");
     }
 
     // ---- tree assembly ----
@@ -1596,7 +1659,7 @@ mod tests {
         assert_eq!(boards.len(), 7);
         let general = boards.iter().find(|b| b.slug == "general").expect("general board");
         assert_eq!(general.read_class, Class::Public);
-        assert_eq!(general.write_class, Class::Paid);
+        assert_eq!(general.write_class, Class::User);
         let paid = boards.iter().find(|b| b.slug == "paid").expect("paid board");
         assert_eq!(paid.read_class, Class::Paid);
 

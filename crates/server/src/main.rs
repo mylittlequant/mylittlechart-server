@@ -145,6 +145,23 @@ async fn security_headers(
     response
 }
 
+/// Middleware layered on the `/api` sub-router only (never on the static
+/// files, blog, or health routes, which want caching) — owner ruling: an API
+/// answer must never be served from a cache, by this process or by anything
+/// in front of it (nginx/Cloudflare/a browser). `pragma: no-cache` is the
+/// HTTP/1.0-era companion header some older intermediaries still honor
+/// instead of `cache-control`; harmless, and cheap insurance alongside it.
+async fn no_store_api_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert("cache-control", "no-store".parse().unwrap());
+    headers.insert("pragma", "no-cache".parse().unwrap());
+    response
+}
+
 #[tokio::main]
 async fn main() {
     // Load .env file (if present) into process environment.
@@ -762,6 +779,11 @@ async fn main() {
         state::ServerRole::Control => routes::control_api_router(app_state),
         state::ServerRole::Edge => routes::edge_api_router(app_state),
     };
+    // `no_store_api_headers` is scoped to `/api` alone, applied before the
+    // `.nest()` below — the top-level `security_headers` layer further down
+    // also wraps the static file server, blog, and `/health`, which must
+    // keep their existing caching behaviour untouched.
+    let api_router = api_router.layer(axum::middleware::from_fn(no_store_api_headers));
     let app = axum::Router::new()
         // Root redirect (see redirect_to_app_root's doc comment) — ahead of
         // the static fallback so the deleted landing page's index.html, if

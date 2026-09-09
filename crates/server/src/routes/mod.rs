@@ -223,6 +223,10 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
             axum::routing::put(dm::publish_identity),
         )
         .route("/dm/identity/{label}", get(dm::get_identity))
+        // Recipient search by nick/display name (see routes/dm.rs's module
+        // doc) — a plain static single-segment path, same depth as
+        // `/dm/conversations` below, no parameter to coexist with.
+        .route("/dm/lookup", get(dm::lookup_recipients))
         .route(
             "/dm/conversations",
             get(dm::list_conversations).post(dm::create_conversation),

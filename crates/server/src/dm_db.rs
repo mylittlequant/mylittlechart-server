@@ -43,6 +43,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 // ============================================================================
 // Schema
@@ -215,6 +216,29 @@ pub fn get_identity_key(conn: &Connection, user_id: i64) -> Result<Option<DmIden
         identity_key_from_row,
     )
     .optional()
+}
+
+/// Which of `user_ids` have published a DM identity key — the social-plane
+/// half of `routes::dm::lookup_recipients`'s two-query candidate filter (the
+/// identity-plane half, "is this account currently paid", is a separate
+/// query against the identity database; the two are never joined in SQL,
+/// per this module's cross-database rule). One batched `IN (...)` query
+/// regardless of how many ids are passed, not one query per candidate.
+/// Empty input returns an empty set without touching the database.
+pub fn identity_key_owner_ids(conn: &Connection, user_ids: &[i64]) -> Result<HashSet<i64>> {
+    if user_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let placeholders = user_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT user_id FROM dm_identity_keys WHERE user_id IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let bound: Vec<&dyn rusqlite::ToSql> = user_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let mut rows = stmt.query(bound.as_slice())?;
+    let mut out = HashSet::new();
+    while let Some(row) = rows.next()? {
+        out.insert(row.get(0)?);
+    }
+    Ok(out)
 }
 
 // ============================================================================
@@ -507,6 +531,23 @@ mod tests {
     fn get_identity_key_missing_is_none() {
         let conn = test_conn();
         assert_eq!(get_identity_key(&conn, 999).expect("get"), None);
+    }
+
+    #[test]
+    fn identity_key_owner_ids_returns_only_the_published_subset() {
+        let conn = test_conn();
+        let key = vec![1u8; DM_PUBLIC_KEY_LEN];
+        upsert_identity_key(&conn, 1, &key, "2026-09-06T00:00:00+00:00").expect("publish for user 1");
+        upsert_identity_key(&conn, 3, &key, "2026-09-06T00:00:00+00:00").expect("publish for user 3");
+
+        let owners = identity_key_owner_ids(&conn, &[1, 2, 3, 4]).expect("batch lookup");
+        assert_eq!(owners, [1, 3].into_iter().collect());
+    }
+
+    #[test]
+    fn identity_key_owner_ids_of_empty_input_is_empty_without_a_query() {
+        let conn = test_conn();
+        assert_eq!(identity_key_owner_ids(&conn, &[]).expect("empty lookup"), HashSet::new());
     }
 
     // ---- ordered-pair uniqueness ----

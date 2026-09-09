@@ -25,6 +25,17 @@
 //!                                                          own DM public key.
 //!  - `GET    /dm/identity/{public_id_or_nick}`           — a user's public
 //!                                                          key + fingerprint.
+//!  - `GET    /dm/lookup?q=`                              — recipient search
+//!                                                          by nick/display
+//!                                                          name: paid
+//!                                                          accounts with a
+//!                                                          published DM
+//!                                                          identity key
+//!                                                          only, ranked
+//!                                                          exact/prefix/
+//!                                                          substring/fuzzy
+//!                                                          (see
+//!                                                          [`lookup_recipients`]).
 //!  - `POST   /dm/conversations`                          — `{with}` ->
 //!                                                          existing or new
 //!                                                          conversation.
@@ -335,6 +346,233 @@ pub async fn get_identity(State(state): State<Arc<AppState>>, headers: HeaderMap
         Ok(Ok(Some((_, _, None)))) | Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => {
             tracing::error!("DB error fetching dm identity: {}", e);
+            internal_error()
+        }
+        Err(_) => internal_error(),
+    }
+}
+
+// ============================================================================
+// GET /api/dm/lookup?q=
+// ============================================================================
+
+/// A trimmed, lowercased query longer than this is truncated rather than
+/// refused — generous for a real nick/display-name search while bounding the
+/// cost of scoring every candidate against it.
+const MAX_LOOKUP_QUERY_LEN: usize = 64;
+
+/// How many ranked matches [`lookup_recipients`] returns at most.
+const MAX_LOOKUP_RESULTS: usize = 10;
+
+/// Ceiling on how many currently-paid accounts one lookup call loads from the
+/// identity database before scoring in Rust — the table is small enough that
+/// a single unfiltered-by-text query plus in-process ranking beats a second
+/// LIKE-shaped query per keystroke (same reasoning `db::search_users` skips
+/// for its own, admin-only, already-`LIKE`-filtered query).
+const PAID_CANDIDATE_LIMIT: i64 = 5000;
+
+/// A fuzzy match is only offered once the query is long enough that a
+/// distance-1 typo is unlikely to also match something unrelated; a longer
+/// query is allowed a distance of 2.
+const FUZZY_SHORT_QUERY_MAX_LEN: usize = 4;
+const FUZZY_DISTANCE_SHORT_QUERY: usize = 1;
+const FUZZY_DISTANCE_LONG_QUERY: usize = 2;
+
+#[derive(serde::Deserialize)]
+pub struct LookupQuery {
+    pub q: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct LookupUser {
+    public_id: String,
+    nick: Option<String>,
+    label: String,
+    rank: u8,
+}
+
+/// One row loaded from the identity database: a currently-paid account,
+/// before it is known whether it also published a DM identity key (checked
+/// separately against the social connection — see [`lookup_recipients`]).
+struct PaidCandidate {
+    id: i64,
+    nick: Option<String>,
+    display_name: String,
+    public_id: String,
+}
+
+/// The label [`db::effective_label_for_user`] would compute for the same
+/// three columns — inlined here (rather than a second per-row identity
+/// query) because [`lookup_recipients`] already has `nick`/`display_name`/
+/// `public_id` in hand from its one candidate-loading query.
+fn effective_label_from_parts(nick: Option<&str>, display_name: &str, public_id: &str) -> String {
+    nick.filter(|n| !n.is_empty())
+        .or_else(|| Some(display_name).filter(|d| !d.is_empty()))
+        .unwrap_or(public_id)
+        .to_string()
+}
+
+/// Optimal-string-alignment (restricted) Damerau-Levenshtein distance
+/// between `a` and `b`: insertion, deletion, substitution, and swapping two
+/// ADJACENT characters each cost 1 — a transposed pair such as `"ab"` vs
+/// `"ba"` is distance 1, not 2, but (unlike full Damerau-Levenshtein) a
+/// character already involved in a transposition cannot be edited again in
+/// the same step. Counts Unicode scalar values, not bytes, so it works the
+/// same on non-ASCII nicks/names.
+fn osa_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (len_a, len_b) = (a.len(), b.len());
+    if len_a == 0 {
+        return len_b;
+    }
+    if len_b == 0 {
+        return len_a;
+    }
+
+    let mut dp = vec![vec![0usize; len_b + 1]; len_a + 1];
+    for (i, row) in dp.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=len_b {
+        dp[0][j] = j;
+    }
+    for i in 1..=len_a {
+        for j in 1..=len_b {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (dp[i - 1][j] + 1) // deletion
+                .min(dp[i][j - 1] + 1) // insertion
+                .min(dp[i - 1][j - 1] + cost); // match/substitution
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(dp[i - 2][j - 2] + 1); // adjacent transposition
+            }
+            dp[i][j] = best;
+        }
+    }
+    dp[len_a][len_b]
+}
+
+/// Score one candidate against an already-trimmed-lowercased `query`,
+/// ranked exactly as `routes::dm`'s module doc lists (lower is a better
+/// match): exact nick (0), nick prefix (1), display-name prefix (2),
+/// substring in either (3), fuzzy match on the nick or on any
+/// whitespace-separated word of the display name (4). `None` if nothing
+/// matches at all. `nick`/`display_name` are the candidate's raw (mixed-
+/// case) stored values; this function lowercases its own copies rather than
+/// requiring the caller to.
+fn rank_candidate(query: &str, nick: Option<&str>, display_name: &str) -> Option<u8> {
+    let nick_lower = nick.map(str::to_lowercase);
+    let display_lower = display_name.to_lowercase();
+
+    if nick_lower.as_deref() == Some(query) {
+        return Some(0);
+    }
+    if nick_lower.as_deref().is_some_and(|n| n.starts_with(query)) {
+        return Some(1);
+    }
+    if display_lower.starts_with(query) {
+        return Some(2);
+    }
+    if nick_lower.as_deref().is_some_and(|n| n.contains(query)) || display_lower.contains(query) {
+        return Some(3);
+    }
+
+    let max_distance = if query.chars().count() <= FUZZY_SHORT_QUERY_MAX_LEN {
+        FUZZY_DISTANCE_SHORT_QUERY
+    } else {
+        FUZZY_DISTANCE_LONG_QUERY
+    };
+    if nick_lower.as_deref().is_some_and(|n| osa_distance(n, query) <= max_distance) {
+        return Some(4);
+    }
+    if display_lower.split_whitespace().any(|word| osa_distance(word, query) <= max_distance) {
+        return Some(4);
+    }
+    None
+}
+
+/// `GET /dm/lookup?q=<text>` -> `{"users": [{"public_id","nick","label",
+/// "rank"}]}`, sorted by rank then label, at most [`MAX_LOOKUP_RESULTS`].
+/// Same [`require_dm_access`] gate as every other route here — only a paid
+/// caller can search for a DM recipient. A candidate must be BOTH currently
+/// paid (a DM recipient's own gate) AND have published a DM identity key (a
+/// paid account that never called `PUT /dm/identity` cannot receive
+/// anything yet, same posture [`get_identity`] takes) — two queries, one
+/// against the identity connection and one batched against the social
+/// connection, never a cross-database join (see `dm_db`'s module doc). The
+/// caller itself is excluded from its own results.
+pub async fn lookup_recipients(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<LookupQuery>,
+) -> Response {
+    let caller_id = match require_dm_access(state.clone(), &headers).await {
+        Ok(uid) => uid,
+        Err(resp) => return resp,
+    };
+
+    let q = match query.q.as_deref().map(|s| s.trim().to_lowercase()) {
+        Some(q) if !q.is_empty() => q,
+        _ => return bad_request("q required"),
+    };
+    let q: String = q.chars().take(MAX_LOOKUP_QUERY_LEN).collect();
+
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<LookupUser>> {
+        use rusqlite::params;
+
+        let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut candidates = Vec::new();
+        {
+            let mut stmt = identity_conn.prepare(
+                "SELECT id, nick, display_name, public_id FROM users
+                 WHERE paid_until IS NOT NULL AND paid_until > ?1 AND id != ?2
+                 LIMIT ?3",
+            )?;
+            let mut rows = stmt.query(params![now, caller_id, PAID_CANDIDATE_LIMIT])?;
+            while let Some(row) = rows.next()? {
+                candidates.push(PaidCandidate {
+                    id: row.get(0)?,
+                    nick: row.get(1)?,
+                    display_name: row.get(2)?,
+                    public_id: row.get(3)?,
+                });
+            }
+        }
+        drop(identity_conn);
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
+        let social_conn = state.control_plane().social_conn();
+        let keyed = dm_db::identity_key_owner_ids(&social_conn, &ids)?;
+        drop(social_conn);
+
+        let mut matched: Vec<LookupUser> = candidates
+            .into_iter()
+            .filter(|c| keyed.contains(&c.id))
+            .filter_map(|c| {
+                let rank = rank_candidate(&q, c.nick.as_deref(), &c.display_name)?;
+                let label = effective_label_from_parts(c.nick.as_deref(), &c.display_name, &c.public_id);
+                Some(LookupUser {
+                    public_id: c.public_id,
+                    nick: c.nick,
+                    label,
+                    rank,
+                })
+            })
+            .collect();
+        matched.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.label.cmp(&b.label)));
+        matched.truncate(MAX_LOOKUP_RESULTS);
+        Ok(matched)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(users)) => Json(serde_json::json!({ "users": users })).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error in dm recipient lookup: {}", e);
             internal_error()
         }
         Err(_) => internal_error(),
@@ -716,5 +954,74 @@ mod tests {
     fn require_peer_paid_allows_a_paid_peer_and_refuses_an_unpaid_one() {
         assert!(require_peer_paid(true).is_ok());
         assert!(require_peer_paid(false).is_err());
+    }
+
+    // ---- lookup: osa_distance ----
+
+    #[test]
+    fn osa_distance_of_identical_strings_is_zero() {
+        assert_eq!(osa_distance("kosti", "kosti"), 0);
+        assert_eq!(osa_distance("", ""), 0);
+    }
+
+    #[test]
+    fn osa_distance_counts_an_adjacent_transposition_as_one_not_two() {
+        // Plain Levenshtein would need a delete + insert (2) for this pair;
+        // OSA recognises the swapped adjacent pair as a single edit.
+        assert_eq!(osa_distance("ab", "ba"), 1);
+        assert_eq!(osa_distance("kosti", "kosit"), 1);
+    }
+
+    #[test]
+    fn osa_distance_against_empty_input_is_the_other_strings_length() {
+        assert_eq!(osa_distance("", "abc"), 3);
+        assert_eq!(osa_distance("abc", ""), 3);
+    }
+
+    #[test]
+    fn osa_distance_counts_unicode_scalar_values_not_bytes() {
+        // "über" vs "uber": one substitution (ü -> u), not the multi-byte
+        // UTF-8 distance a byte-wise comparison would report.
+        assert_eq!(osa_distance("über", "uber"), 1);
+    }
+
+    // ---- lookup: rank_candidate ----
+
+    #[test]
+    fn rank_candidate_prefers_exact_nick_over_every_other_tier() {
+        assert_eq!(rank_candidate("kosti", Some("kosti"), "Someone Else"), Some(0));
+    }
+
+    #[test]
+    fn rank_candidate_orders_nick_prefix_above_display_name_prefix() {
+        assert_eq!(rank_candidate("kos", Some("kosti"), "kostroma events"), Some(1));
+        assert_eq!(rank_candidate("kos", None, "kostroma events"), Some(2));
+    }
+
+    #[test]
+    fn rank_candidate_falls_back_to_substring_then_fuzzy() {
+        // "ost" is a substring of "kosti" but not a prefix of either field.
+        assert_eq!(rank_candidate("ost", Some("kosti"), "Someone Else"), Some(3));
+        // "kosit" (5 chars, threshold 2) is neither a substring of "kosti"
+        // nor vice versa, but is distance 1 from it (one adjacent
+        // transposition) — a fuzzy match.
+        assert_eq!(rank_candidate("kosit", Some("kosti"), "Someone Else"), Some(4));
+    }
+
+    #[test]
+    fn rank_candidate_matches_a_word_inside_display_name_by_fuzzy_distance() {
+        // "vann" (4 chars, threshold 1) fuzzy-matches "van" inside "Kosti van Trading" via one insertion.
+        assert_eq!(rank_candidate("vann", None, "Kosti van Trading"), Some(4));
+    }
+
+    #[test]
+    fn rank_candidate_none_when_nothing_matches() {
+        assert_eq!(rank_candidate("zzzzzzzzzz", Some("kosti"), "Someone Else"), None);
+    }
+
+    #[test]
+    fn rank_candidate_handles_empty_and_unicode_inputs() {
+        assert_eq!(rank_candidate("", Some(""), ""), Some(0));
+        assert_eq!(rank_candidate("über", Some("Über"), "Someone Else"), Some(0));
     }
 }
