@@ -38,6 +38,7 @@ use crate::db::{self, ForumError};
 use crate::entitlements::{self, Feature};
 use crate::models::types::ErrorResponse;
 use crate::state::AppState;
+use crate::text_policy::clean_user_text;
 
 /// Default page size for `GET /forum/threads` when `limit` is omitted.
 const DEFAULT_LIMIT: i64 = 50;
@@ -57,6 +58,17 @@ const EXCERPT_CHARS: usize = 160;
 const RATE_LIMIT_WINDOW_SECS: i64 = 60;
 const THREAD_RATE_LIMIT_MAX: i64 = 1;
 const REPLY_RATE_LIMIT_MAX: i64 = 10;
+
+/// Cleaning caps for `title`/`body` (see `text_policy::clean_user_text`) —
+/// deliberately the SAME numbers `db::is_valid_forum_title`/
+/// `is_valid_forum_body` already enforce (120 chars, 8192 bytes): cleaning
+/// never widens what the database layer accepts, it only adds NFC
+/// normalization and control-character rejection ahead of it. A body within
+/// [`CLEAN_BODY_MAX_CHARS`] chars can still be rejected by the database
+/// layer's own byte cap if it is multi-byte-heavy — that check is
+/// unaffected by cleaning either way.
+const CLEAN_TITLE_MAX_CHARS: usize = 120;
+const CLEAN_BODY_MAX_CHARS: usize = 8192;
 
 fn internal_error() -> Response {
     (
@@ -352,6 +364,15 @@ pub async fn create_thread(
         Err(resp) => return resp,
     };
 
+    let title = match clean_user_text(&req.title, CLEAN_TITLE_MAX_CHARS) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let body = match clean_user_text(&req.body, CLEAN_BODY_MAX_CHARS) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<i64, CreateRefusal> {
             let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
@@ -361,7 +382,7 @@ pub async fn create_thread(
             if recent >= THREAD_RATE_LIMIT_MAX {
                 return Err(CreateRefusal::RateLimited);
             }
-            db::create_thread(&conn, user_id, &req.title, &req.body, &now.to_rfc3339())
+            db::create_thread(&conn, user_id, &title, &body, &now.to_rfc3339())
                 .map_err(CreateRefusal::Forum)
         },
     )
@@ -473,6 +494,11 @@ pub async fn create_reply(
         Err(resp) => return resp,
     };
 
+    let body = match clean_user_text(&req.body, CLEAN_BODY_MAX_CHARS) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<Option<i64>, CreateRefusal> {
             let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
@@ -485,7 +511,7 @@ pub async fn create_reply(
             if recent >= REPLY_RATE_LIMIT_MAX {
                 return Err(CreateRefusal::RateLimited);
             }
-            db::create_reply(&conn, thread_id, user_id, &req.body, &now.to_rfc3339())
+            db::create_reply(&conn, thread_id, user_id, &body, &now.to_rfc3339())
                 .map(Some)
                 .map_err(CreateRefusal::Forum)
         },

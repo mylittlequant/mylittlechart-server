@@ -39,9 +39,10 @@ use axum::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::db::{Post, PostError};
+use crate::db::{Post, PostError, MAX_POST_BODY_CHARS, MAX_POST_SUMMARY_CHARS, MAX_POST_TITLE_CHARS};
 use crate::models::types::ErrorResponse;
 use crate::state::AppState;
+use crate::text_policy::clean_optional_user_text;
 
 /// Public origin every absolute URL in the feed/HTML mirror is built from —
 /// same hardcoded constant the rest of the server already uses (see
@@ -77,6 +78,18 @@ fn post_error_response(e: PostError) -> Response {
         PostError::InvalidKind => bad_request("kind must be 'patch' or 'post'"),
         PostError::InvalidDate => bad_request("date must be a real YYYY-MM-DD date"),
         PostError::InvalidVisibility => bad_request("visibility must be 'public' or 'paid'"),
+        PostError::TitleTooLong => bad_request(&format!(
+            "title exceeds {} characters",
+            crate::db::MAX_POST_TITLE_CHARS
+        )),
+        PostError::SummaryTooLong => bad_request(&format!(
+            "summary exceeds {} characters",
+            crate::db::MAX_POST_SUMMARY_CHARS
+        )),
+        PostError::BodyTooLong => bad_request(&format!(
+            "body exceeds {} characters",
+            crate::db::MAX_POST_BODY_CHARS
+        )),
         PostError::Db(e) => {
             tracing::error!("DB error upserting post: {}", e);
             internal_error()
@@ -264,6 +277,24 @@ pub async fn admin_upsert_post(
         Err(_) => return bad_request("Invalid JSON body"),
     };
 
+    // Cleaning (NFC-normalize, control-character rejection) ahead of the
+    // database layer's own length ceilings (`db::upsert_post`'s
+    // `PostError::{Title,Summary,Body}TooLong`) — all three are optional
+    // in the sense that an empty value passes through unchanged (a patch
+    // note with only a title, or a title-only stub, is a legitimate post).
+    let title = match clean_optional_user_text(&req.title, MAX_POST_TITLE_CHARS) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let summary = match clean_optional_user_text(&req.summary, MAX_POST_SUMMARY_CHARS) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let post_body = match clean_optional_user_text(&req.body, MAX_POST_BODY_CHARS) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+
     let now = chrono::Utc::now().to_rfc3339();
     let url = req.url.unwrap_or_else(|| format!("/blog/{}", req.id));
     let post = Post {
@@ -271,9 +302,9 @@ pub async fn admin_upsert_post(
         kind: req.kind,
         version: req.version,
         date: req.date,
-        title: req.title,
-        summary: req.summary,
-        body: req.body,
+        title,
+        summary,
+        body: post_body,
         url,
         visibility: req.visibility,
         created_at: now.clone(),

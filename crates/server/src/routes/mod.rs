@@ -1,9 +1,13 @@
 //! Route assembly for the `/api` sub-router.
 //!
-//! Note: rate limiting for public endpoints (telemetry, heartbeat) is handled at the
-//! Cloudflare level. `tower_governor 0.4` is incompatible with `axum 0.8` (axum-core
-//! version mismatch), so application-level rate limiting is deferred until a compatible
-//! version is available.
+//! Rate limiting: `tower_governor 0.4` is incompatible with `axum 0.8`
+//! (axum-core version mismatch), so application-level limiting is a small
+//! purpose-built per-IP token-bucket middleware instead — see `ratelimit.rs`,
+//! layered onto `api_router` in `main.rs` before `.nest("/api", …)`. Two of
+//! the busiest public writes (`/api/telemetry`, `/api/heartbeat`) ALSO get a
+//! second, independent limit at the nginx layer in front
+//! (`ops/nginx-mlc-ratelimit.conf`); the auth-poll paths get the same
+//! nginx-layer treatment now too.
 
 use axum::{
     extract::DefaultBodyLimit,

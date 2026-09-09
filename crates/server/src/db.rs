@@ -5133,6 +5133,17 @@ pub fn is_valid_post_date(date: &str) -> bool {
     date.len() == 10 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
 }
 
+/// Length ceilings for a post's free-text fields, counted in `chars` (a
+/// human-facing limit, not a storage one — same convention as
+/// [`is_valid_forum_title`]). Cleaning (NFC-normalize, control-character
+/// rejection) happens at the route layer (`routes::posts::admin_upsert_post`,
+/// via `text_policy::clean_user_text`/`clean_optional_user_text`); these
+/// ceilings are the database layer's own backstop in case a future caller
+/// ever bypasses that route-level cleaning.
+pub const MAX_POST_TITLE_CHARS: usize = 200;
+pub const MAX_POST_SUMMARY_CHARS: usize = 500;
+pub const MAX_POST_BODY_CHARS: usize = 64_000;
+
 /// Why an [`upsert_post`] call was refused before ever touching the database.
 #[derive(Debug)]
 pub enum PostError {
@@ -5144,6 +5155,12 @@ pub enum PostError {
     InvalidDate,
     /// Not exactly `"public"` or `"paid"`.
     InvalidVisibility,
+    /// Longer than [`MAX_POST_TITLE_CHARS`].
+    TitleTooLong,
+    /// Longer than [`MAX_POST_SUMMARY_CHARS`].
+    SummaryTooLong,
+    /// Longer than [`MAX_POST_BODY_CHARS`].
+    BodyTooLong,
     /// The database call itself failed.
     Db(rusqlite::Error),
 }
@@ -5155,8 +5172,10 @@ impl From<rusqlite::Error> for PostError {
 }
 
 /// Insert or update one post by `id`. Validates `id`/`kind`/`date`/
-/// `visibility` before touching the database — `title`/`summary`/`body`/`url`
-/// carry no format constraint beyond what the column types already enforce.
+/// `visibility` before touching the database, plus a length ceiling on
+/// `title`/`summary`/`body` (see [`MAX_POST_TITLE_CHARS`] and siblings) —
+/// `url` still carries no format constraint beyond what the column type
+/// already enforces.
 ///
 /// `created_at` is stamped once, at first insert, and never moves; `now` is
 /// written to `updated_at` on every call, insert or update alike — same
@@ -5176,6 +5195,15 @@ pub fn upsert_post(conn: &Connection, post: &Post, now: &str) -> std::result::Re
     }
     if post.visibility != "public" && post.visibility != "paid" {
         return Err(PostError::InvalidVisibility);
+    }
+    if post.title.chars().count() > MAX_POST_TITLE_CHARS {
+        return Err(PostError::TitleTooLong);
+    }
+    if post.summary.chars().count() > MAX_POST_SUMMARY_CHARS {
+        return Err(PostError::SummaryTooLong);
+    }
+    if post.body.chars().count() > MAX_POST_BODY_CHARS {
+        return Err(PostError::BodyTooLong);
     }
 
     let existed: bool = conn
@@ -6813,6 +6841,38 @@ mod
 
         // None of the rejected calls left a row behind.
         assert!(super::get_post(&conn, "v1", true).expect("get").is_none());
+    }
+
+    #[test]
+    fn upsert_post_rejects_fields_over_their_length_ceiling() {
+        let conn = posts_test_conn();
+        let now = "2026-09-01T00:00:00+00:00";
+
+        let mut bad_title = sample_post("v1", "patch", "2026-09-01", "public");
+        bad_title.title = "a".repeat(super::MAX_POST_TITLE_CHARS + 1);
+        assert!(matches!(
+            super::upsert_post(&conn, &bad_title, now),
+            Err(super::PostError::TitleTooLong)
+        ));
+
+        let mut bad_summary = sample_post("v2", "patch", "2026-09-01", "public");
+        bad_summary.summary = "a".repeat(super::MAX_POST_SUMMARY_CHARS + 1);
+        assert!(matches!(
+            super::upsert_post(&conn, &bad_summary, now),
+            Err(super::PostError::SummaryTooLong)
+        ));
+
+        let mut bad_body = sample_post("v3", "patch", "2026-09-01", "public");
+        bad_body.body = "a".repeat(super::MAX_POST_BODY_CHARS + 1);
+        assert!(matches!(
+            super::upsert_post(&conn, &bad_body, now),
+            Err(super::PostError::BodyTooLong)
+        ));
+
+        // Exactly at the ceiling still passes.
+        let mut ok_title = sample_post("v4", "patch", "2026-09-01", "public");
+        ok_title.title = "a".repeat(super::MAX_POST_TITLE_CHARS);
+        assert!(super::upsert_post(&conn, &ok_title, now).is_ok());
     }
 
     #[test]

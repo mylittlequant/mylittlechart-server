@@ -607,9 +607,20 @@ pub fn get_board_by_id(conn: &Connection, id: i64) -> Result<Option<Board>> {
     .optional()
 }
 
+/// Slug rule for a board: 2-40 ASCII lowercase letters, digits, or hyphens
+/// — no existing format rule predated this (the only prior check was
+/// uniqueness, see [`BoardError::SlugTaken`]), so this is the fallback
+/// shape a URL-safe, human-typeable slug should have.
+pub fn is_valid_board_slug(slug: &str) -> bool {
+    let len = slug.chars().count();
+    (2..=40).contains(&len) && slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// Why [`create_board`] was refused before ever touching the database.
 #[derive(Debug)]
 pub enum BoardError {
+    /// Fails [`is_valid_board_slug`].
+    InvalidSlug,
     /// A board with this slug already exists. Checked with a `SELECT`
     /// before the `INSERT` (same idiom `db::set_nick` uses for nick
     /// uniqueness) rather than by matching the UNIQUE constraint's error —
@@ -635,6 +646,9 @@ pub fn create_board(
     position: i64,
     now: &str,
 ) -> std::result::Result<i64, BoardError> {
+    if !is_valid_board_slug(slug) {
+        return Err(BoardError::InvalidSlug);
+    }
     if get_board_by_slug(conn, slug)?.is_some() {
         return Err(BoardError::SlugTaken);
     }
@@ -1396,6 +1410,26 @@ mod tests {
                 Class::Admin
             ]
         );
+    }
+
+    // ---- is_valid_board_slug ----
+
+    #[test]
+    fn board_slug_accepts_lowercase_alnum_and_hyphens_in_range() {
+        assert!(is_valid_board_slug("general"));
+        assert!(is_valid_board_slug("off-topic"));
+        assert!(is_valid_board_slug("v2"));
+        assert!(is_valid_board_slug(&"a".repeat(40)));
+    }
+
+    #[test]
+    fn board_slug_rejects_wrong_length_or_charset() {
+        assert!(!is_valid_board_slug("a")); // too short
+        assert!(!is_valid_board_slug(&"a".repeat(41))); // too long
+        assert!(!is_valid_board_slug("Off-Topic")); // uppercase
+        assert!(!is_valid_board_slug("off_topic")); // underscore
+        assert!(!is_valid_board_slug("off topic")); // space
+        assert!(!is_valid_board_slug(""));
     }
 
     // ---- can_read / can_write ----

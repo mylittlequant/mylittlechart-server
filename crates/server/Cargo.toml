@@ -29,6 +29,15 @@ tg-login-bot = { path = "../tg-login-bot" }
 mlc-alert-daemon = { path = "../mlc-alert-daemon" }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
+# `tower::limit::ConcurrencyLimitLayer` (main.rs's app-wide concurrency
+# backstop) and `tower::service_fn` (main.rs's bare-404 `ServeDir` fallback)
+# need `tower` as a real dependency, not just the test-only `ServiceExt`
+# import it used to be — already resolved transitively via axum itself (see
+# Cargo.lock), so this makes it directly nameable rather than adding a new
+# crate to the dependency graph. `ServiceExt::oneshot` (routes/mod.rs's
+# admin-gate tests) rides along on the same `util` feature.
+tower = { workspace = true }
+unicode-normalization = { workspace = true }
 
 # Static musl builds cannot link a system OpenSSL, so the deploy target — and
 # only the deploy target — builds it from source. Features are additive, so
@@ -36,10 +45,3 @@ base64 = { workspace = true }
 # replacing it.
 [target.'cfg(target_env = "musl")'.dependencies]
 rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
-
-# Test-only: drives a built `Router` through a request with `ServiceExt::oneshot`
-# (see routes/mod.rs's admin-gate tests). Already resolved transitively via axum
-# itself (see Cargo.lock) — this only makes it directly nameable, no new crate
-# enters the dependency graph.
-[dev-dependencies]
-tower = { version = "0.5", default-features = false, features = ["util"] }

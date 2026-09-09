@@ -63,7 +63,6 @@ pub async fn init_link(
     Json(req): Json<InitLinkRequest>,
 ) -> Response {
     // Basic input validation.
-    let device_name = req.device_name.trim().to_string();
     let device_id = req.device_id.trim().to_string();
 
     if device_id.is_empty() {
@@ -87,13 +86,18 @@ pub async fn init_link(
         )
             .into_response();
     }
-    if device_name.len() > 128 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new("device_name too long")),
-        )
-            .into_response();
-    }
+
+    // Sanitize device_name: printable ASCII + space, max 128 chars — same
+    // filter `heartbeat.rs`/`telemetry.rs` apply to their own device_name
+    // fields, so a device name is cleaned the same way everywhere it is
+    // accepted, not length-capped-only here and charset-filtered elsewhere.
+    let device_name: String = req
+        .device_name
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(128)
+        .collect();
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());

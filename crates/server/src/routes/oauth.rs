@@ -16,6 +16,13 @@ use crate::models::types::{
     TelegramCallbackRequest,
 };
 use crate::state::AppState;
+use crate::text_policy::sanitize_display_name;
+
+/// Cap on a stored `display_name` — provider-supplied, never something an
+/// unauthenticated caller controls directly, so a malformed one degrades the
+/// stored name (`text_policy::sanitize_display_name`) rather than failing
+/// the login.
+const MAX_DISPLAY_NAME_CHARS: usize = 128;
 
 /// The base URL for web OAuth callbacks (provider redirects here for browser-based logins).
 const WEB_CALLBACK_BASE: &str = "https://mylittlechart.org/api/oauth";
@@ -227,6 +234,10 @@ pub async fn web_callback(
             Ok(t) => t,
             Err(resp) => return resp,
         };
+    // Cleaned right here, the single point this GET web-callback flow (as
+    // opposed to `finish_oauth`'s device-flow one) writes `display_name`
+    // through — see `text_policy::sanitize_display_name`.
+    let display_name = sanitize_display_name(&display_name, MAX_DISPLAY_NAME_CHARS);
 
     // --- Upsert/link user and create web session ---
     let now = chrono::Utc::now().to_rfc3339();
@@ -698,6 +709,9 @@ pub async fn telegram_web_callback(
     } else {
         query.first_name.clone().unwrap_or_else(|| query.id.clone())
     };
+    // Cleaned right here, the single point this flow writes `display_name`
+    // through — see `text_policy::sanitize_display_name`.
+    let display_name = sanitize_display_name(&display_name, MAX_DISPLAY_NAME_CHARS);
 
     // --- Resolve link_user_id if this is a "link provider" flow ---
     let link_user_id: Option<i64> = if query.link {
@@ -1183,7 +1197,10 @@ async fn finish_oauth(
 
     let provider = provider.to_owned();
     let provider_user_id = provider_user_id.to_owned();
-    let display_name = display_name.to_owned();
+    // Provider-supplied, cleaned right at this single choke point every
+    // device-flow callback (github/discord/google/twitter/telegram) writes
+    // `display_name` through — see `text_policy::sanitize_display_name`.
+    let display_name = sanitize_display_name(display_name, MAX_DISPLAY_NAME_CHARS);
     let email = email.map(|(addr, verified)| (addr.to_owned(), verified));
     let device_id = device_id.to_owned();
     let token_hash_clone = token_hash.clone();

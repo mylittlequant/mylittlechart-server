@@ -118,6 +118,7 @@ use crate::db::{self, ForumError};
 use crate::models::types::ErrorResponse;
 use crate::social_db::{self, Class, ReplyError};
 use crate::state::AppState;
+use crate::text_policy::{clean_optional_user_text, clean_user_text};
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
@@ -125,6 +126,18 @@ const SEARCH_LIMIT: i64 = 50;
 const RATE_LIMIT_WINDOW_SECS: i64 = 60;
 const THREAD_RATE_LIMIT_MAX: i64 = 1;
 const REPLY_RATE_LIMIT_MAX: i64 = 10;
+
+/// Cleaning caps for thread `title`/`body` — same numbers `db::
+/// is_valid_forum_title`/`is_valid_forum_body` already enforce (v1 and v2
+/// share both functions, see `social_db::create_thread_v2`'s doc comment).
+const CLEAN_TITLE_MAX_CHARS: usize = 120;
+const CLEAN_BODY_MAX_CHARS: usize = 8192;
+
+/// Cleaning caps for admin board metadata (owner-facing, ADMIN_SECRET-gated,
+/// but still run through the same NFC/control-character cleaning as every
+/// other stored text — see `text_policy`'s module doc).
+const BOARD_TITLE_MAX_CHARS: usize = 80;
+const BOARD_DESCRIPTION_MAX_CHARS: usize = 300;
 
 fn internal_error() -> Response {
     (
@@ -609,6 +622,15 @@ pub async fn create_board_thread(
         return e;
     }
 
+    let title = match clean_user_text(&req.title, CLEAN_TITLE_MAX_CHARS) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let body = match clean_user_text(&req.body, CLEAN_BODY_MAX_CHARS) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<Option<i64>, ThreadCreateRefusal> {
             let conn = state.control_plane().social_conn();
@@ -624,7 +646,7 @@ pub async fn create_board_thread(
             if recent >= THREAD_RATE_LIMIT_MAX {
                 return Err(ThreadCreateRefusal::RateLimited);
             }
-            social_db::create_thread_v2(&conn, board.id, user_id, &req.title, &req.body, &now.to_rfc3339())
+            social_db::create_thread_v2(&conn, board.id, user_id, &title, &body, &now.to_rfc3339())
                 .map(Some)
                 .map_err(ThreadCreateRefusal::Forum)
         },
@@ -779,6 +801,11 @@ pub async fn create_reply(
     }
     let is_mod = social_db::is_moderator_or_admin(&classes);
 
+    let body = match clean_user_text(&req.body, CLEAN_BODY_MAX_CHARS) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<Option<i64>, ReplyCreateRefusal> {
             let conn = state.control_plane().social_conn();
@@ -800,7 +827,7 @@ pub async fn create_reply(
             if recent >= REPLY_RATE_LIMIT_MAX {
                 return Err(ReplyCreateRefusal::RateLimited);
             }
-            social_db::create_reply_v2(&conn, thread_id, req.parent_reply_id, user_id, &req.body, &now.to_rfc3339())
+            social_db::create_reply_v2(&conn, thread_id, req.parent_reply_id, user_id, &body, &now.to_rfc3339())
                 .map(Some)
                 .map_err(ReplyCreateRefusal::Reply)
         },
@@ -1030,9 +1057,17 @@ pub async fn admin_create_board(
         Ok(r) => r,
         Err(_) => return bad_request("Invalid JSON body"),
     };
-    if req.slug.trim().is_empty() || req.title.trim().is_empty() {
-        return bad_request("slug and title are required");
-    }
+    let title = match clean_user_text(&req.title, BOARD_TITLE_MAX_CHARS) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let description = match clean_optional_user_text(
+        req.description.as_deref().unwrap_or(""),
+        BOARD_DESCRIPTION_MAX_CHARS,
+    ) {
+        Ok(d) => d,
+        Err(e) => return e.into_response(),
+    };
     let read_class = match parse_class_field("read_class", &req.read_class) {
         Ok(c) => c,
         Err(e) => return e,
@@ -1041,18 +1076,20 @@ pub async fn admin_create_board(
         Ok(c) => c,
         Err(e) => return e,
     };
+    let slug = req.slug;
+    let position = req.position.unwrap_or(0);
 
     let result = tokio::task::spawn_blocking(move || -> std::result::Result<i64, social_db::BoardError> {
         let conn = state.control_plane().social_conn();
         let now = chrono::Utc::now().to_rfc3339();
         social_db::create_board(
             &conn,
-            &req.slug,
-            &req.title,
-            req.description.as_deref().unwrap_or(""),
+            &slug,
+            &title,
+            &description,
             read_class,
             write_class,
-            req.position.unwrap_or(0),
+            position,
             &now,
         )
     })
@@ -1063,6 +1100,9 @@ pub async fn admin_create_board(
         Ok(Err(social_db::BoardError::SlugTaken)) => {
             (StatusCode::CONFLICT, Json(ErrorResponse::new("slug already exists"))).into_response()
         }
+        Ok(Err(social_db::BoardError::InvalidSlug)) => bad_request(
+            "slug must be 2-40 characters: lowercase letters, digits, and hyphens only",
+        ),
         Ok(Err(social_db::BoardError::Db(e))) => {
             tracing::error!("DB error creating forum board: {}", e);
             internal_error()
@@ -1105,14 +1145,32 @@ pub async fn admin_update_board(
         Some(Err(e)) => return e,
         None => None,
     };
+    // `title`, if given at all, must still be a real title once cleaned
+    // (`clean_user_text` refuses empty); `description`, if given, may be
+    // cleared to blank on purpose (`clean_optional_user_text` allows it) —
+    // same required-vs-optional split `admin_create_board` makes.
+    let title = match req.title.as_deref().map(|t| clean_user_text(t, BOARD_TITLE_MAX_CHARS)) {
+        Some(Ok(t)) => Some(t),
+        Some(Err(e)) => return e.into_response(),
+        None => None,
+    };
+    let description = match req
+        .description
+        .as_deref()
+        .map(|d| clean_optional_user_text(d, BOARD_DESCRIPTION_MAX_CHARS))
+    {
+        Some(Ok(d)) => Some(d),
+        Some(Err(e)) => return e.into_response(),
+        None => None,
+    };
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
         let conn = state.control_plane().social_conn();
         social_db::update_board(
             &conn,
             id,
-            req.title.as_deref(),
-            req.description.as_deref(),
+            title.as_deref(),
+            description.as_deref(),
             read_class,
             write_class,
             req.position,

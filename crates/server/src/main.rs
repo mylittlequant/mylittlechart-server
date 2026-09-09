@@ -66,9 +66,12 @@
 //!                            `MLC_ALERT_DAEMON` is off.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
+use tower_http::timeout::TimeoutLayer;
 
 mod account_merge;
 mod auth;
@@ -81,10 +84,12 @@ mod nick_policy;
 mod notify;
 mod opswriter;
 mod pathutil;
+mod ratelimit;
 mod routes;
 mod social_db;
 mod state;
 mod syncstore;
+mod text_policy;
 
 use state::AppState;
 
@@ -161,6 +166,173 @@ async fn no_store_api_headers(
     headers.insert("cache-control", "no-store".parse().unwrap());
     headers.insert("pragma", "no-cache".parse().unwrap());
     response
+}
+
+/// The one 404 every path OUTSIDE `/api` falls back to — byte-identical
+/// (empty body, no extra headers) to `routes::admin::admin_not_found()`'s
+/// answer for the `/api` half of this invariant. Before this existed, a
+/// top-level unknown path (`handler_single`/`handler_nested`'s miss arm)
+/// answered `text/plain "Not Found"` instead — a different shape a prober
+/// could use to tell "under /api" apart from "not under /api" by body
+/// content. That distinction carries no information about admin secrets
+/// (the property `admin_not_found` actually claims), but there is no reason
+/// to leave two different 404 shapes lying around outside `/api` either.
+fn bare_not_found() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    axum::http::StatusCode::NOT_FOUND.into_response()
+}
+
+/// Build the static/clean-URL sub-app: the fixed `.well-known/security.txt`
+/// route, the `/{page}` and `/{dir}/{page}` clean-URL handlers, and the
+/// `ServeDir` fallback for everything else (assets, `index.html`, 3+segment
+/// paths). Standalone (rather than inlined in `main()`) so this module's own
+/// tests can build the exact same router `main()` serves — see
+/// `tests::outside_api_paths_get_the_same_bare_404_everywhere` below.
+fn outside_api_app(static_dir: &str) -> axum::Router {
+    // Serve a file from the static directory, guessing content-type from extension.
+    let serve_file = {
+        let dir = static_dir.to_string();
+        move |path: String| {
+            let dir = dir.clone();
+            async move {
+                let base = std::path::Path::new(&dir);
+
+                // Path traversal guard (2026-07-27 incident): reject `\`,
+                // `.`/`..` and anything outside the component allowlist,
+                // then verify canonicalized containment inside `base`.
+                // Rejection surfaces as a bare 404 — no detail is leaked.
+                if !pathutil::is_safe_relative_path(&path) {
+                    return None;
+                }
+
+                // 1) Try {path}.html (clean URL: /privacy → privacy.html)
+                if !path.contains('.') {
+                    if let Some(html_path) =
+                        pathutil::resolve_under(base, &format!("{}.html", path))
+                    {
+                        if let Ok(body) = tokio::fs::read(&html_path).await {
+                            return Some(
+                                axum::response::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "text/html; charset=utf-8")
+                                    .body(axum::body::Body::from(body))
+                                    .unwrap(),
+                            );
+                        }
+                    }
+                }
+
+                // 2) Try exact path (for robots.txt, sitemap.xml, llms.txt, etc.)
+                if let Some(exact_path) = pathutil::resolve_under(base, &path) {
+                    if let Ok(body) = tokio::fs::read(&exact_path).await {
+                        let ct = match exact_path.extension().and_then(|e| e.to_str()) {
+                            Some("xml") => "application/xml; charset=utf-8",
+                            Some("txt") => "text/plain; charset=utf-8",
+                            Some("json") => "application/json; charset=utf-8",
+                            Some("html") => "text/html; charset=utf-8",
+                            Some("js") => "application/javascript; charset=utf-8",
+                            Some("wasm") => "application/wasm",
+                            Some("css") => "text/css; charset=utf-8",
+                            Some("png") => "image/png",
+                            Some("jpg") | Some("jpeg") => "image/jpeg",
+                            Some("svg") => "image/svg+xml",
+                            Some("webp") => "image/webp",
+                            Some("ico") => "image/x-icon",
+                            _ => "application/octet-stream",
+                        };
+                        return Some(
+                            axum::response::Response::builder()
+                                .status(200)
+                                .header("content-type", ct)
+                                .body(axum::body::Body::from(body))
+                                .unwrap(),
+                        );
+                    }
+                }
+
+                None
+            }
+        }
+    };
+
+    // Clean URL routes: /privacy → privacy.html, /docs/agent-api → docs/agent-api.html
+    // Also serves files with extensions that would otherwise miss ServeDir due to route priority.
+    let handler_single = {
+        let f = serve_file.clone();
+        move |axum::extract::Path(page): axum::extract::Path<String>| {
+            let f = f.clone();
+            async move {
+                match f(page).await {
+                    Some(resp) => resp,
+                    None => bare_not_found(),
+                }
+            }
+        }
+    };
+    let handler_nested = {
+        let f = serve_file;
+        move |axum::extract::Path((dir, page)): axum::extract::Path<(String, String)>| {
+            let f = f.clone();
+            async move {
+                match f(format!("{}/{}", dir, page)).await {
+                    Some(resp) => resp,
+                    None => bare_not_found(),
+                }
+            }
+        }
+    };
+
+    // The one dot-prefixed path this server ever serves:
+    // `.well-known/security.txt` (RFC 9116). The static handler's
+    // `pathutil::is_safe_path_component` refuses every dot-prefixed segment
+    // on principle (see pathutil.rs) — this is a fixed route matched by its
+    // own literal string, not a loosened general rule.
+    let well_known_security_txt = {
+        let dir = static_dir.to_string();
+        move || {
+            let dir = dir.clone();
+            async move {
+                const REL: &str = ".well-known/security.txt";
+                // `REL` is a compile-time literal — this check can only ever
+                // pass — kept so the route shares the exact allowlist
+                // spelling the pathutil test exercises, not a second copy of
+                // the string.
+                if !pathutil::is_well_known_security_txt(REL) {
+                    return bare_not_found();
+                }
+                match tokio::fs::read(std::path::Path::new(&dir).join(REL)).await {
+                    Ok(body) => axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/plain; charset=utf-8")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                    Err(_) => bare_not_found(),
+                }
+            }
+        }
+    };
+
+    // Landing page static file service. Wrapped with `.not_found_service`
+    // so a 3+-segment miss (the one case neither `/{page}` nor
+    // `/{dir}/{page}` can match) answers the SAME bare 404 as everything
+    // else here, instead of `tower_http`'s own default not-found shape.
+    let empty_not_found = tower::service_fn(|_req: axum::extract::Request| async move {
+        Ok::<_, std::convert::Infallible>(bare_not_found())
+    });
+    let static_files = ServeDir::new(static_dir)
+        .append_index_html_on_directories(true)
+        .not_found_service(empty_not_found);
+
+    axum::Router::new()
+        .route(
+            "/.well-known/security.txt",
+            axum::routing::get(well_known_security_txt),
+        )
+        // Clean URLs + file serving for subpages (before static fallback)
+        .route("/{page}", axum::routing::get(handler_single))
+        .route("/{dir}/{page}", axum::routing::get(handler_nested))
+        // Static files at root (fallback for index.html, assets, etc.).
+        .fallback_service(static_files)
 }
 
 #[tokio::main]
@@ -613,147 +785,11 @@ async fn main() {
         }
     });
     tracing::info!("Serving static files from: {}", static_dir);
-    let static_files = ServeDir::new(&static_dir)
-        .append_index_html_on_directories(true);
-
-    // Serve a file from the static directory, guessing content-type from extension.
-    let serve_file = {
-        let dir = static_dir.clone();
-        move |path: String| {
-            let dir = dir.clone();
-            async move {
-                let base = std::path::Path::new(&dir);
-
-                // Path traversal guard (2026-07-27 incident): reject `\`,
-                // `.`/`..` and anything outside the component allowlist,
-                // then verify canonicalized containment inside `base`.
-                // Rejection surfaces as a bare 404 — no detail is leaked.
-                if !pathutil::is_safe_relative_path(&path) {
-                    return None;
-                }
-
-                // 1) Try {path}.html (clean URL: /privacy → privacy.html)
-                if !path.contains('.') {
-                    if let Some(html_path) =
-                        pathutil::resolve_under(base, &format!("{}.html", path))
-                    {
-                        if let Ok(body) = tokio::fs::read(&html_path).await {
-                            return Some(
-                                axum::response::Response::builder()
-                                    .status(200)
-                                    .header("content-type", "text/html; charset=utf-8")
-                                    .body(axum::body::Body::from(body))
-                                    .unwrap(),
-                            );
-                        }
-                    }
-                }
-
-                // 2) Try exact path (for robots.txt, sitemap.xml, llms.txt, etc.)
-                if let Some(exact_path) = pathutil::resolve_under(base, &path) {
-                    if let Ok(body) = tokio::fs::read(&exact_path).await {
-                        let ct = match exact_path.extension().and_then(|e| e.to_str()) {
-                            Some("xml") => "application/xml; charset=utf-8",
-                            Some("txt") => "text/plain; charset=utf-8",
-                            Some("json") => "application/json; charset=utf-8",
-                            Some("html") => "text/html; charset=utf-8",
-                            Some("js") => "application/javascript; charset=utf-8",
-                            Some("wasm") => "application/wasm",
-                            Some("css") => "text/css; charset=utf-8",
-                            Some("png") => "image/png",
-                            Some("jpg") | Some("jpeg") => "image/jpeg",
-                            Some("svg") => "image/svg+xml",
-                            Some("webp") => "image/webp",
-                            Some("ico") => "image/x-icon",
-                            _ => "application/octet-stream",
-                        };
-                        return Some(
-                            axum::response::Response::builder()
-                                .status(200)
-                                .header("content-type", ct)
-                                .body(axum::body::Body::from(body))
-                                .unwrap(),
-                        );
-                    }
-                }
-
-                None
-            }
-        }
-    };
-
-    // Clean URL routes: /privacy → privacy.html, /docs/agent-api → docs/agent-api.html
-    // Also serves files with extensions that would otherwise miss ServeDir due to route priority.
-    let handler_single = {
-        let f = serve_file.clone();
-        move |axum::extract::Path(page): axum::extract::Path<String>| {
-            let f = f.clone();
-            async move {
-                match f(page).await {
-                    Some(resp) => resp,
-                    None => axum::response::Response::builder()
-                        .status(404)
-                        .header("content-type", "text/plain")
-                        .body(axum::body::Body::from("Not Found"))
-                        .unwrap(),
-                }
-            }
-        }
-    };
-    let handler_nested = {
-        let f = serve_file;
-        move |axum::extract::Path((dir, page)): axum::extract::Path<(String, String)>| {
-            let f = f.clone();
-            async move {
-                match f(format!("{}/{}", dir, page)).await {
-                    Some(resp) => resp,
-                    None => axum::response::Response::builder()
-                        .status(404)
-                        .header("content-type", "text/plain")
-                        .body(axum::body::Body::from("Not Found"))
-                        .unwrap(),
-                }
-            }
-        }
-    };
-
-    // The one dot-prefixed path this server ever serves:
-    // `.well-known/security.txt` (RFC 9116). The static handler's
-    // `pathutil::is_safe_path_component` refuses every dot-prefixed segment
-    // on principle (see pathutil.rs) — this is a fixed route matched by its
-    // own literal string, not a loosened general rule.
-    let well_known_security_txt = {
-        let dir = static_dir.clone();
-        move || {
-            let dir = dir.clone();
-            async move {
-                const REL: &str = ".well-known/security.txt";
-                // `REL` is a compile-time literal — this check can only ever
-                // pass — kept so the route shares the exact allowlist
-                // spelling the pathutil test exercises, not a second copy of
-                // the string.
-                if !pathutil::is_well_known_security_txt(REL) {
-                    return axum::response::Response::builder()
-                        .status(404)
-                        .header("content-type", "text/plain")
-                        .body(axum::body::Body::from("Not Found"))
-                        .unwrap();
-                }
-                match tokio::fs::read(std::path::Path::new(&dir).join(REL)).await {
-                    Ok(body) => axum::response::Response::builder()
-                        .status(200)
-                        .header("content-type", "text/plain; charset=utf-8")
-                        .body(axum::body::Body::from(body))
-                        .unwrap(),
-                    Err(_) => axum::response::Response::builder()
-                        .status(404)
-                        .header("content-type", "text/plain")
-                        .body(axum::body::Body::from("Not Found"))
-                        .unwrap(),
-                }
-            }
-        }
-    };
+    // `.well-known/security.txt`, the `/{page}`/`/{dir}/{page}` clean-URL
+    // handlers, and the `ServeDir` fallback — see `outside_api_app`'s own
+    // doc comment for why this is a standalone function rather than inlined
+    // here.
+    let outside_api = outside_api_app(&static_dir);
 
     // Dashboard router — localhost only, no auth, control role only: it reads
     // the database directly (routes/dashboard.rs) and an edge process has
@@ -794,39 +830,61 @@ async fn main() {
         state::ServerRole::Control => routes::control_api_router(app_state),
         state::ServerRole::Edge => routes::edge_api_router(app_state),
     };
-    // `no_store_api_headers` is scoped to `/api` alone, applied before the
-    // `.nest()` below — the top-level `security_headers` layer further down
-    // also wraps the static file server, blog, and `/health`, which must
-    // keep their existing caching behaviour untouched.
-    let api_router = api_router.layer(axum::middleware::from_fn(no_store_api_headers));
+    // Per-IP token-bucket rate limiting (see ratelimit.rs) — one process-wide
+    // limiter, swept for idle entries every 5 minutes.
+    let rate_limiter = Arc::new(ratelimit::RateLimiter::new());
+    ratelimit::spawn_sweeper(rate_limiter.clone());
+    // Layering order here matters: `rate_limit_middleware` is added FIRST
+    // (innermost) and `no_store_api_headers` SECOND (outermost) — each
+    // subsequent `.layer()` call wraps the previous one, so the outermost
+    // layer's post-response step ALWAYS runs, even when an inner layer
+    // short-circuits with an early response. That is exactly what a 429
+    // does: without this ordering, a rate-limited response would skip
+    // `no_store_api_headers` entirely and reach the caller without
+    // `cache-control: no-store` — the one thing this ordering exists to
+    // prevent.
+    let api_router = api_router
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limiter,
+            ratelimit::rate_limit_middleware,
+        ))
+        .layer(axum::middleware::from_fn(no_store_api_headers));
     let app = axum::Router::new()
         // Root redirect (see redirect_to_app_root's doc comment) — ahead of
         // the static fallback so the deleted landing page's index.html, if
         // it is ever restored on disk by mistake, still cannot answer here.
         .route("/", axum::routing::get(redirect_to_app_root))
-        .route(
-            "/.well-known/security.txt",
-            axum::routing::get(well_known_security_txt),
-        )
-        .nest("/api", api_router)
-        // Clean URLs + file serving for subpages (before static fallback)
-        .route("/{page}", axum::routing::get(handler_single))
-        .route("/{dir}/{page}", axum::routing::get(handler_nested))
-        // Static files at root (fallback for index.html, assets, etc.).
-        .fallback_service(static_files);
+        .nest("/api", api_router);
     // Literal routes (`/blog/posts.json`, `/blog/feed.xml`, `/blog/`, and
-    // `/health` below) always win over the `/{dir}/{page}` parameter route
-    // and the static fallback above regardless of merge order — matchit
-    // prioritises a static path segment over a dynamic one — so these
-    // merges can happen anywhere ahead of `.layer(...)` below.
+    // `/health` below) always win over `outside_api`'s `/{dir}/{page}`
+    // parameter route and its `ServeDir` fallback regardless of merge order
+    // — matchit prioritises a static path segment over a dynamic one — so
+    // these merges can happen anywhere ahead of `.layer(...)` below. Exactly
+    // one of the routers being merged here (`outside_api`) sets a
+    // `fallback_service`; axum panics at merge time if two did.
     let app = match blog_app {
         Some(blog_app) => app.merge(blog_app),
         None => app,
     };
-    let app = app.merge(health_app);
+    let app = app.merge(health_app).merge(outside_api);
     let app = app
         .layer(cors)
-        .layer(axum::middleware::from_fn(security_headers));
+        .layer(axum::middleware::from_fn(security_headers))
+        // App-wide concurrency backstop — behind nginx this is not meant to
+        // throttle legitimate traffic (512 is far above anything nginx lets
+        // through today), only to bound how many requests this process ever
+        // has in flight at once.
+        .layer(ConcurrencyLimitLayer::new(512))
+        // App-wide request deadline. `TimeoutLayer::with_status_code` (NOT
+        // the deprecated `TimeoutLayer::new`, which this crate's
+        // `-D warnings` gate would refuse to build) answers a timed-out
+        // request with an empty body and the given status directly — it
+        // does not change the wrapped service's error type, so no
+        // `HandleErrorLayer` is needed to keep the stack infallible.
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(60),
+        ));
 
     // Bind the main listener.
     //
@@ -928,4 +986,56 @@ async fn main() {
     }
 
     tracing::info!("Server shut down gracefully");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// Extends `routes::mod`'s own indistinguishability proof (admin refusal
+    /// ≡ unknown `/api/*` path) to every path OUTSIDE `/api`: a 1-segment
+    /// miss (`handler_single`), a 2-segment miss (`handler_nested`), and a
+    /// 3+-segment miss (the `ServeDir` fallback) must all answer the exact
+    /// same bare 404 `bare_not_found()` gives — empty body, no extra
+    /// headers — the same shape `routes::admin::admin_not_found()` answers
+    /// for the `/api` half of this invariant. The static dir here is
+    /// deliberately nonexistent: every one of these paths must miss on
+    /// disk for the test to exercise the actual "nothing answers" case.
+    #[tokio::test]
+    async fn outside_api_paths_get_the_same_bare_404_everywhere() {
+        for path in ["/whatever", "/a/b", "/a/b/c"] {
+            let router = outside_api_app("this-directory-does-not-exist-2026-09-10");
+            let resp = router
+                .oneshot(
+                    Request::get(path)
+                        .body(Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("Router::call is infallible");
+
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "path {path}");
+            let body = to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            assert!(body.is_empty(), "path {path} body must be empty, got {body:?}");
+        }
+    }
+
+    /// The bare 404 helper itself: empty body, no content-type — the exact
+    /// shape `routes::admin::admin_not_found()` gives, so the two are
+    /// provably the same construction, not just coincidentally equal today.
+    #[tokio::test]
+    async fn bare_not_found_has_no_body_and_no_content_type_header() {
+        let resp = bare_not_found();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp.headers().get(axum::http::header::CONTENT_TYPE).is_none());
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert!(body.is_empty());
+    }
 }

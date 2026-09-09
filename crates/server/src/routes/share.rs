@@ -47,9 +47,16 @@ use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_toke
 use crate::entitlements::{self, ShareKind};
 use crate::models::types::ErrorResponse;
 use crate::state::AppState;
+use crate::text_policy::clean_optional_user_text;
 
 /// Maximum serialized size of a live share's ChartPreset JSON.
 const MAX_PRESET_BYTES: usize = 256 * 1024;
+
+/// Cap on a share's `title` — optional (an empty title is a blank chart,
+/// not an error, see `clean_optional_user_text`), NFC-normalized and
+/// control-character-cleaned the same way every other user-text field is
+/// (`text_policy::clean_user_text`'s module doc).
+const MAX_TITLE_CHARS: usize = 200;
 
 /// PNG magic bytes — the only content check a screenshot gets.
 const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -286,7 +293,10 @@ pub async fn create_live_share(
         return resp;
     }
 
-    let title = body.title;
+    let title = match clean_optional_user_text(&body.title, MAX_TITLE_CHARS) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     let clone_allowed = body.clone_allowed;
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(String, String)> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
@@ -410,6 +420,11 @@ pub async fn create_screenshot_share(
     if let Err(resp) = check_share_entitlement(state.clone(), user_id, ShareKind::Screenshot).await {
         return resp;
     }
+
+    let title = match clean_optional_user_text(&title, MAX_TITLE_CHARS) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
 
     let blob_bytes = png.len() as i64;
     let result =
