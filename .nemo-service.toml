@@ -94,6 +94,22 @@ public = false
 
 [[endpoints]]
 method = "POST"
+path = "/api/admin/notify"
+description = "Owner outreach (2026-09-09): send one message to every account with a linked Telegram identity, or an explicit subset. Body {channel:\"telegram\", to:\"all\"|[user_id,...], text, dry_run}. text over 3900 chars (margin under Telegram's 4096) is refused with 400. dry_run:true resolves and returns {recipients:[{user_id,nick,chat_id_present:true}],count} without sending or logging anything. Otherwise sends sequentially (100ms spacing) via the same bot identity tg-login-bot/mlc-alert-daemon use, records every attempt in notify_log, and returns {batch_id,sent,failed:[{user_id,error}]}. 503 {\"error\":\"telegram bot token not configured\"} if TELEGRAM_BOT_TOKEN is unset."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/admin/notify/batches"
+description = "Owner outreach: the last 50 notify_batches rows, newest first, each with its sent/failed counts aggregated from notify_log."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "POST"
 path = "/api/auth/device-code"
 description = "Start device authorization flow — returns device code"
 auth = "none"

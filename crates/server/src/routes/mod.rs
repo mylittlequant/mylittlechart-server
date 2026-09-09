@@ -25,6 +25,7 @@ pub mod forum;
 pub mod forum_v2;
 pub mod heartbeat;
 pub mod link;
+pub mod notify;
 pub mod oauth;
 pub mod posts;
 pub mod proxy;
@@ -56,6 +57,12 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         // `/admin/forum/roles/{user_id}` further down (proven by
         // `control_router_registers_without_route_conflicts` below).
         .route("/admin/users/merge", post(admin::merge_users))
+        // Owner outreach (2026-09-09) — static two-segment path under the
+        // one-segment `/admin/notify` right above it, same static-vs-static
+        // coexistence as `/admin/users` + `/admin/users/merge` above (see
+        // routes/notify.rs for the handlers).
+        .route("/admin/notify", post(notify::notify))
+        .route("/admin/notify/batches", get(notify::list_batches))
         .route("/admin/posts", post(posts::admin_upsert_post))
         .route("/admin/posts/{id}", delete(posts::admin_delete_post))
         // In-app blog: patch notes and posts (see routes/posts.rs). Public.

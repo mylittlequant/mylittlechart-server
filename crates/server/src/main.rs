@@ -77,6 +77,7 @@ mod db;
 mod dm_db;
 mod entitlements;
 mod models;
+mod notify;
 mod opswriter;
 mod pathutil;
 mod routes;

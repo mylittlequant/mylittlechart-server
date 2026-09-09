@@ -379,6 +379,32 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
             ts            TEXT    NOT NULL,
             summary_json  TEXT    NOT NULL
         );
+
+        -- Outreach notifications (owner ruling 2026-09-09, `POST
+        -- /api/admin/notify` — see the "Outreach notifications" section
+        -- above this file's `redeem_gift_code`). `notify_batches` stores the
+        -- message text exactly once per non-dry-run call; `notify_log` never
+        -- repeats it, one row per (batch, recipient) attempt instead.
+        CREATE TABLE IF NOT EXISTS notify_batches (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts           TEXT    NOT NULL,
+            channel      TEXT    NOT NULL,
+            text         TEXT    NOT NULL,
+            requested_by TEXT    NOT NULL DEFAULT 'admin'
+        );
+
+        CREATE TABLE IF NOT EXISTS notify_log (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        TEXT    NOT NULL,
+            channel   TEXT    NOT NULL,
+            user_id   INTEGER NOT NULL,
+            ok        INTEGER NOT NULL,
+            error     TEXT,
+            text_hash TEXT    NOT NULL,
+            batch_id  INTEGER NOT NULL REFERENCES notify_batches(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_notify_log_batch ON notify_log(batch_id);
     "#)?;
 
     // Safe migration: add signature column to releases if not present. `releases`
@@ -2423,6 +2449,183 @@ pub fn redeem_gift_code(
     set_user_paid_until(conn, user_id, Some(&new_until))?;
 
     Ok(RedeemOutcome::Redeemed(new_until))
+}
+
+// ============================================================================
+// Outreach notifications
+//
+// Owner ruling 2026-09-09: the only channel to reach an existing user
+// outside the app is the one they already opened themselves — a private
+// chat with `mylittlechart_login_bot` (see `tg-login-bot`), whose chat id
+// IS `user_providers.provider_user_id` for that account's `telegram` row
+// (same identity `mlc-alert-daemon`'s alert delivery already resolves this
+// way). `POST /api/admin/notify` (routes/notify.rs) resolves recipients via
+// [`telegram_recipients`] below and hands the actual send off to
+// `crate::notify::send_batch`, which is transport-agnostic (see that
+// module's doc comment) — this section only owns resolution and the two
+// tables an outreach call writes:
+//
+// - `notify_batches`: one row per `POST /api/admin/notify` call that was
+//   NOT a dry run — the message text lives here, written exactly once.
+// - `notify_log`: one row per (batch, recipient) attempt — `ok`/`error`
+//   record the outcome, `text_hash` carries the sha256 of the same batch's
+//   text for a quick per-row audit without a join back to `notify_batches`,
+//   and `batch_id` is the actual key `list_notify_batches` groups on.
+//
+// A dry run never reaches either table: it calls [`telegram_recipients`]
+// directly and returns the preview without writing anything.
+// ============================================================================
+
+/// Which accounts one outreach call targets — the `to` field of
+/// `POST /api/admin/notify`'s body, already parsed (see
+/// `routes::notify::parse_target`).
+#[derive(Debug, Clone)]
+pub enum NotifyTarget {
+    /// Every account with a linked Telegram identity.
+    All,
+    /// Exactly these account ids. An id with no Telegram identity is
+    /// silently excluded by [`telegram_recipients`] — it is not an error,
+    /// there is simply no channel to reach that account through.
+    Users(Vec<i64>),
+}
+
+/// One resolved outreach recipient: the account, the Telegram chat id to
+/// send to (parsed from `user_providers.provider_user_id`), and its nick
+/// (if chosen) for the dry-run preview.
+#[derive(Debug, Clone)]
+pub struct NotifyRecipient {
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub nick: Option<String>,
+}
+
+/// Resolve `target` to every account holding a `telegram`
+/// `user_providers` row, joined back to `users` for `nick`. `provider_user_id`
+/// is stored as text (see `tg-login-bot`'s `telegram_user_id`); a row that
+/// somehow fails to parse as an integer chat id is skipped with a warning
+/// rather than failing the whole batch — it cannot be reached either way.
+pub fn telegram_recipients(conn: &Connection, target: &NotifyTarget) -> Result<Vec<NotifyRecipient>> {
+    fn collect(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<NotifyRecipient>> {
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let user_id: i64 = row.get(0)?;
+            let chat_id_raw: String = row.get(1)?;
+            let nick: Option<String> = row.get(2)?;
+            match chat_id_raw.parse::<i64>() {
+                Ok(chat_id) => out.push(NotifyRecipient { user_id, chat_id, nick }),
+                Err(_) => tracing::warn!(
+                    "notify: user {user_id} has a non-numeric telegram provider_user_id {chat_id_raw:?}, skipped"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    match target {
+        NotifyTarget::All => {
+            let mut stmt = conn.prepare(
+                "SELECT u.id, up.provider_user_id, u.nick
+                 FROM user_providers up
+                 JOIN users u ON u.id = up.user_id
+                 WHERE up.provider = 'telegram'
+                 ORDER BY u.id ASC",
+            )?;
+            let mut rows = stmt.query([])?;
+            collect(&mut rows)
+        }
+        NotifyTarget::Users(ids) => {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT u.id, up.provider_user_id, u.nick
+                 FROM user_providers up
+                 JOIN users u ON u.id = up.user_id
+                 WHERE up.provider = 'telegram' AND u.id IN ({placeholders})
+                 ORDER BY u.id ASC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let bound: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let mut rows = stmt.query(bound.as_slice())?;
+            collect(&mut rows)
+        }
+    }
+}
+
+/// Write the one `notify_batches` row for a non-dry-run
+/// `POST /api/admin/notify` call. Returns the new `id` (`last_insert_rowid`)
+/// — the `batch_id` every `notify_log` row for this call references.
+pub fn insert_notify_batch(conn: &Connection, channel: &str, text: &str, requested_by: &str, ts: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO notify_batches (ts, channel, text, requested_by) VALUES (?1, ?2, ?3, ?4)",
+        params![ts, channel, text, requested_by],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Record one send attempt against `batch_id`. `error` is `None` on
+/// success; `text_hash` is the sha256 of the batch's text (the same value
+/// for every row in a batch — see this section's doc comment on why it
+/// rides along here instead of only living in `notify_batches`).
+pub fn insert_notify_log(
+    conn: &Connection,
+    batch_id: i64,
+    channel: &str,
+    user_id: i64,
+    ok: bool,
+    error: Option<&str>,
+    text_hash: &str,
+    ts: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO notify_log (ts, channel, user_id, ok, error, text_hash, batch_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![ts, channel, user_id, ok as i64, error, text_hash, batch_id],
+    )?;
+    Ok(())
+}
+
+/// One row of `GET /api/admin/notify/batches` — a `notify_batches` row plus
+/// its `notify_log` rows' outcome counts (`sent` = `ok`, `failed` = not
+/// `ok`), grouped by `batch_id`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NotifyBatchSummary {
+    pub batch_id: i64,
+    pub ts: String,
+    pub channel: String,
+    pub text: String,
+    pub requested_by: String,
+    pub sent: i64,
+    pub failed: i64,
+}
+
+/// Most recent `limit` outreach batches, newest first.
+pub fn list_notify_batches(conn: &Connection, limit: i64) -> Result<Vec<NotifyBatchSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.id, b.ts, b.channel, b.text, b.requested_by,
+                COALESCE(SUM(CASE WHEN l.ok = 1 THEN 1 ELSE 0 END), 0) AS sent,
+                COALESCE(SUM(CASE WHEN l.ok = 0 THEN 1 ELSE 0 END), 0) AS failed
+         FROM notify_batches b
+         LEFT JOIN notify_log l ON l.batch_id = b.id
+         GROUP BY b.id
+         ORDER BY b.id DESC
+         LIMIT ?1",
+    )?;
+    let mut rows = stmt.query(params![limit])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(NotifyBatchSummary {
+            batch_id: row.get(0)?,
+            ts: row.get(1)?,
+            channel: row.get(2)?,
+            text: row.get(3)?,
+            requested_by: row.get(4)?,
+            sent: row.get(5)?,
+            failed: row.get(6)?,
+        });
+    }
+    Ok(out)
 }
 
 // ============================================================================
@@ -5071,6 +5274,25 @@ mod tests {
                 created_at     TEXT    NOT NULL,
                 hidden         INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE notify_batches (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts           TEXT    NOT NULL,
+                channel      TEXT    NOT NULL,
+                text         TEXT    NOT NULL,
+                requested_by TEXT    NOT NULL DEFAULT 'admin'
+            );
+
+            CREATE TABLE notify_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts        TEXT    NOT NULL,
+                channel   TEXT    NOT NULL,
+                user_id   INTEGER NOT NULL,
+                ok        INTEGER NOT NULL,
+                error     TEXT,
+                text_hash TEXT    NOT NULL,
+                batch_id  INTEGER NOT NULL REFERENCES notify_batches(id)
+            );
             ",
         )
         .expect("share test schema");
@@ -5578,6 +5800,62 @@ mod tests {
         let rows = super::search_users(&conn, "stripped").expect("search stripped");
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].dormant);
+    }
+
+    // ------------------------------------------------------------------
+    // Outreach notifications (owner ruling 2026-09-09)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn telegram_recipients_all_and_list_exclude_non_telegram() {
+        let conn = share_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let alice = super::upsert_user(&conn, "github", "gh-a", "alice", None, &now).expect("seed alice");
+        super::link_provider_to_user(&conn, alice, "telegram", "111", "@alice", None, &now)
+            .expect("link telegram alice");
+
+        // bob has no telegram identity at all.
+        let bob = super::upsert_user(&conn, "discord", "d-b", "bob", None, &now).expect("seed bob");
+
+        let carol = super::upsert_user(&conn, "github", "gh-c", "carol", None, &now).expect("seed carol");
+        super::link_provider_to_user(&conn, carol, "telegram", "333", "@carol", None, &now)
+            .expect("link telegram carol");
+
+        let all = super::telegram_recipients(&conn, &super::NotifyTarget::All).expect("resolve all");
+        let mut all_ids: Vec<i64> = all.iter().map(|r| r.user_id).collect();
+        all_ids.sort();
+        assert_eq!(all_ids, vec![alice, carol], "bob has no telegram identity, must be excluded");
+        let alice_row = all.iter().find(|r| r.user_id == alice).expect("alice row");
+        assert_eq!(alice_row.chat_id, 111);
+
+        let list = super::telegram_recipients(&conn, &super::NotifyTarget::Users(vec![alice, bob]))
+            .expect("resolve explicit list");
+        assert_eq!(list.len(), 1, "bob is in the requested list but has no telegram identity");
+        assert_eq!(list[0].user_id, alice);
+
+        let empty = super::telegram_recipients(&conn, &super::NotifyTarget::Users(Vec::new()))
+            .expect("resolve empty list");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn notify_batches_and_log_round_trip() {
+        let conn = share_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let batch_id = super::insert_notify_batch(&conn, "telegram", "hello", "admin", &now).expect("insert batch");
+        super::insert_notify_log(&conn, batch_id, "telegram", 1, true, None, "hash1", &now).expect("log ok");
+        super::insert_notify_log(&conn, batch_id, "telegram", 2, false, Some("boom"), "hash1", &now)
+            .expect("log fail");
+
+        let batches = super::list_notify_batches(&conn, 50).expect("list");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].batch_id, batch_id);
+        assert_eq!(batches[0].sent, 1);
+        assert_eq!(batches[0].failed, 1);
+        assert_eq!(batches[0].text, "hello");
+        assert_eq!(batches[0].requested_by, "admin");
     }
 
     // ------------------------------------------------------------------

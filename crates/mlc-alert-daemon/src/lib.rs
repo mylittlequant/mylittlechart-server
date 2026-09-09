@@ -42,7 +42,7 @@ mod health;
 mod identity_db;
 mod price_source;
 mod store;
-mod telegram;
+pub mod telegram;
 
 pub use config::{ConfigError, DaemonConfig};
 pub use health::{DaemonStats, HealthBody};
