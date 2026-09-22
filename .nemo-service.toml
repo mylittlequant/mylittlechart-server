@@ -2,7 +2,7 @@
 name = "mylittlechart-server"
 kind = "http_api"
 display_name = "mylittlechart Server"
-description = "Backend для mylittlechart.org — auth, sync, OTA, telegram bot, agent keys"
+description = "Backend for mylittlechart.org — identity/OAuth, cloud sync, OTA releases, paid forum v1 + public forum v2 + DMs, telegram bot, agent API keys. Control-role process (crates/server, ServerRole::Control); identity/social/operational databases live only on this box (mlc-c2-1) — the two edges (mlc-utah-1, mlc-ams-1) run nginx only, see ops/README.md."
 
 [links]
 public_url = "https://mylittlechart.org"
@@ -16,6 +16,13 @@ path = "/health"
 description = "Health check. {status, alert_daemon: {enabled, checked, fired, delivered, skipped_unpaid, skipped_unlinked, last_cycle_at}} — the alert_daemon object reports the embedded mlc-alert-daemon evaluation loop (MLC_ALERT_DAEMON=1, default off); enabled=false with zeroed counters when the toggle is off or on an edge-role process. d-watchdog itself only checks the status code, not this body."
 auth = "none"
 public = true
+
+[[endpoints]]
+method = "GET"
+path = "/"
+description = "Admin dashboard — single server-rendered HTML page, summary stats + data tables straight from SQLite (routes/dashboard.rs). Control role only; not started at all on an edge process. Served on admin_url (127.0.0.1:19237) — never on local_url/public_url, and unrelated to the public landing page's GET /."
+auth = "none"
+public = false
 
 [[endpoints]]
 method = "GET"
@@ -41,7 +48,7 @@ public = true
 [[endpoints]]
 method = "POST"
 path = "/api/telemetry"
-description = "Submit anonymous telemetry data"
+description = "Submit usage/telemetry metrics (fixed schema, GPU name sanitized). Optional Authorization: Bearer <token> links the record to a user; anonymous submissions are accepted."
 auth = "none"
 public = true
 
@@ -49,6 +56,20 @@ public = true
 method = "GET"
 path = "/api/updates/latest"
 description = "Get latest release metadata for OTA updates"
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/updates/list"
+description = "Every published release row, newest first, across all platforms (optional channel= filter). Reads the same releases table /latest resolves against — a row exists only after every edge confirmed the artifact's sha256, so this cannot list a file that is not actually there."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/updates/download/{platform}/{version}"
+description = "302 redirect to the artifact's location on whichever edge answers (Location: /dl/{platform}/{version}/{filename}, relative, cache-control: no-store). version may be \"latest\". Streams nothing itself — since the 2026-08-30 split the control box holds no artifact bytes to stream from."
 auth = "none"
 public = true
 
@@ -77,9 +98,17 @@ auth_env = "ADMIN_SECRET"
 public = false
 
 [[endpoints]]
+method = "POST"
+path = "/api/admin/gift-codes"
+description = "Mint count (default 1, max 200 per request) single-use gift/trial codes, each granting days of paid access from the moment an account redeems it via POST /api/account/redeem. Body {days, count?, note?}. Response {codes:[...]} is the only place a minted code is ever returned — no read path exposes an existing code, and this response is never logged in full."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
 method = "GET"
 path = "/api/admin/users"
-description = "Case-insensitive substring search over an account's nick and display name (q=, required, max 50 rows, ordered by user id). Resolves a nick to the numeric id PUT /api/admin/forum/roles/{user_id} requires. Each row also carries providers (every linked provider name, sorted), has_email (any linked identity captured a verified email), and telegram_id (the account's telegram provider_user_id, if any)."
+description = "Case-insensitive substring search over an account's nick and display name (q=, required, max 50 rows, ordered by user id). Resolves a nick to the numeric id PUT /api/admin/forum/roles/{user_id} requires. Each row also carries providers (every linked provider name, sorted), has_email (any linked identity captured a verified email), telegram_id (the account's telegram provider_user_id, if any), and dormant (linked provider but no activity anywhere — see POST /api/admin/users/merge)."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -88,6 +117,38 @@ public = false
 method = "POST"
 path = "/api/admin/users/merge"
 description = "Fold a duplicate account (from) into its survivor (into) — identity-merge decisions 4-6 (docs/mlc/plans/identity-merge-2026-09-09.md). Body {from, into, dry_run, keep_vault: \"into\"|\"from\"|null}. 400 when from==into or either id does not exist; 409 {error:\"hard conflicts\",conflicts:[...]} when a vault/recovery_key/salt singleton or a sync_e2e_params row is held by both accounts, or both hold a dm_identity_keys row, unless keep_vault names the survivor (the loser's conflicting rows are archived to <data_dir>/merge-archive/ before deletion, never silently dropped). dry_run:true returns the same summary a real merge would write and touches nothing. Response body is the MergeSummary JSON itself (row counts per table, conflicts, hot-plane file counts)."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "PUT"
+path = "/api/admin/users/{user_id}/nick"
+description = "Assign a nick to user_id directly — bypasses the reserved-name list and the 30-day self-service cooldown POST /api/account/nick is bound by; still enforces the format check and global uniqueness against every other account. Body {nick}. 400 invalid format, 404 no such user, 409 nick taken by a different account. This is how a row reserved via PUT /api/admin/nicks/reserved/{nick} is actually handed to an account — response's reserved field is true exactly when nick is in that registry."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/admin/nicks/reserved"
+description = "Every row in the reserved-nick registry (owner ruling 2026-09-09 — occupy the good handles now, hand them to specific accounts later, rather than minting fake accounts to sit on them), sorted by category then nick."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "PUT"
+path = "/api/admin/nicks/reserved/{nick}"
+description = "Upsert nick's category/note in the reserved-nick registry. Body {category, note?}. Never touches granted_to — handing a reservation to an account is the separate PUT /api/admin/users/{user_id}/nick above. 400 on an invalid nick format; 200 {nick, created} on success."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/admin/nicks/reserved/{nick}"
+description = "Release nick from the reserved-nick registry entirely, granted_to included — not the same as moving an account off it while it stays reserved for someone else. 204 on delete, 404 if it was not reserved."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -110,6 +171,106 @@ public = false
 
 [[endpoints]]
 method = "POST"
+path = "/api/admin/posts"
+description = "Upsert an in-app blog post/patch-note by id (the object verbatim — id, kind, version?, date, title, summary, body, url?, visibility?). url defaults to /blog/<id>; visibility defaults to 'public'. Response {id, created}. Checked before the body is ever parsed, same rule as every other admin route."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/admin/posts/{id}"
+description = "Delete an in-app blog post. 204 on delete, 404 if no such post."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/posts"
+description = "Public blog/patch-note feed, visibility='public' only. Query kind=&limit=&before=; one-row-lookahead pagination. Response {posts:[...], next_before}. The compatibility mirror for already-released native clients (0.5.588+) is GET /blog/posts.json below."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/posts/{id}"
+description = "One public post by id, or a bare 404."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/blog/posts.json"
+description = "Not under /api. Compatibility JSON feed for already-released native clients (0.5.588+) that fetch this path directly instead of GET /api/posts — newest first, unpaginated, capped row count."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/blog/feed.xml"
+description = "Not under /api. Atom 1.0 feed of public posts, newest first, unpaginated — polled by feed-aware crawlers (Perplexity et al.) rather than rendered."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/.well-known/security.txt"
+description = "Not under /api. RFC 9116 contact file, served from the static dir. The only dot-prefixed path this server ever serves: it is a fixed literal route, not a loosening of pathutil's refusal of dot-prefixed segments (main.rs, is_well_known_security_txt)."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/blog/"
+description = "Not under /api. Server-rendered blog index (\"Patch notes\" and \"Posts\" sections), newest first."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/blog/{id}"
+description = "Not under /api. Server-rendered single post page, or a bare 404."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/oauth/{provider}/authorize"
+description = "Start an OAuth flow for provider (github|discord|google|twitter). Desktop app: ?redirect_port=&device_id=, ends up redirecting the browser to http://localhost:{redirect_port}/callback. Web (no redirect_port): ends in a session cookie via the web-callback below. ?link=1 stores the caller's session user_id as link_user_id, so the callback links into that account instead of creating a new one."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/oauth/{provider}/callback"
+description = "Desktop-app leg: exchanges the authorization code for a provider token after validating CSRF state (consume_oauth_state, single-use, 10-min TTL), upserts the user, returns a 30-day app token."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/oauth/{provider}/web-callback"
+description = "Web leg: provider redirects the browser here after consent. Exchanges the code, upserts the user, sets the session_id cookie, redirects to /dashboard. If link_user_id was stored in the CSRF state, links the provider into that account instead of creating a new one."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/oauth/telegram/callback"
+description = "Desktop-app Telegram login widget callback — verifies the HMAC-SHA256 login payload and returns an app token."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/oauth/telegram/web-callback"
+description = "Web Telegram login callback — client JS POSTs the decoded tgAuthResult here; verifies HMAC-SHA256, checks freshness, upserts the user, sets the session_id cookie, returns {ok:true}."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "POST"
 path = "/api/auth/device-code"
 description = "Start device authorization flow — returns device code"
 auth = "none"
@@ -124,16 +285,332 @@ public = true
 
 [[endpoints]]
 method = "POST"
+path = "/api/auth/confirm"
+description = "Confirm a device code from the logged-in web dashboard, linking the device to the authenticated user. Requires a valid session_id cookie — not a bearer token."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/auth/me"
+description = "Current logged-in web user's profile plus every linked provider. Requires a valid session_id cookie — not a bearer token; 401 if missing or expired."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/auth/logout"
+description = "Destroy the web session and clear the session_id cookie. Requires a valid session_id cookie — not a bearer token."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/auth/tg-login"
+description = "Create a Telegram bot login token, returns {token, bot_url} (t.me deep link), 5-min TTL. ?link=1 stores the caller's session user_id in the token so bot confirmation merges into the existing account instead of creating one."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/auth/tg-login/poll"
+description = "Poll a Telegram bot login token by ?token=. {status: pending|expired|confirmed}; on confirmed also sets the session_id cookie."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/auth/link/init"
+description = "Desktop app starts the OAuth account-linking flow with its device_name/device_id. Returns a link token (10-min TTL) and the URL for the user to open and authenticate in a browser."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/auth/link/poll"
+description = "Poll ?token= for the link flow. 202 {status:pending}, 410 {status:expired}, 200 {status:linked, user_id, display_name, provider, auth_token} once the web side confirms."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/auth/link/confirm"
+description = "Logged-in web user confirms a pending link token, attaching the desktop device to their account. Requires a valid session_id cookie — not a bearer token."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/auth/keys/generate"
+description = "Generate an agent API key with a label and permission set. Requires a valid session_id cookie — not a bearer token. Returns the raw key once — never retrievable again, only its hash is stored."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/auth/agent-key/request"
+description = "Agent-initiated device-code-style key request: submits a desired label/permissions, gets back a short code and a confirmation URL (10-min TTL). Rate-limited, no auth."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/auth/agent-key/poll"
+description = "Poll ?code= for an agent key request. 202 {status:pending}, 410 {status:expired} (expired, denied, or already claimed), 200 {status:confirmed, raw_key} delivered exactly once on approval."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "POST"
+path = "/api/auth/agent-key/confirm"
+description = "User approves a pending agent key request from the confirmation page. Requires a valid session_id cookie — not a bearer token. Generates the raw key, stores its hash, makes it available to the poll endpoint above."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/auth/agent-key/deny"
+description = "User denies a pending agent key request, making it permanently unavailable. Requires a valid session_id cookie — not a bearer token. 404 if already processed or unknown."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/auth/agent-key/info"
+description = "Request info by ?code= for the confirmation page to render — only while the request is still pending; leaks nothing about confirmed/claimed requests."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/auth/keys"
+description = "List the caller's agent API keys. Cookie session (default: dashboard view, hash_prefix + metadata) or Bearer device token (?format=sync: full token_hash list for local validation)."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "PATCH"
+path = "/api/auth/keys/usage"
+description = "Batch-update up to 50 keys' last_used_at/last_ip (each entry: 6-12 char hash_prefix, last_ip up to 45 chars). Requires a Bearer device token. Returns the count of rows updated."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/auth/keys/{hash_prefix}"
+description = "Revoke one agent API key by hash prefix. Requires a valid session_id cookie — not a bearer token. 409 if the prefix is ambiguous (too short) for this user."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/auth/sessions"
+description = "List every active Bearer token (auth_tokens row) for the caller — label, source, last_ip, created_at, expires_at. Requires a valid session_id cookie — not a bearer token."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/auth/sessions/{hash_prefix}"
+description = "Revoke one Bearer token by hash prefix (min 8 chars). Requires a valid session_id cookie — not a bearer token. {revoked:true} on success, 404 if not found."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/auth/account/export"
+description = "GDPR data export — {user, sync_items (metadata only, content excluded), auth_tokens} as a JSON download. Requires a valid session_id cookie — not a bearer token."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/auth/account/delete"
+description = "Permanently delete the caller's account and all data. Requires a valid session_id cookie (not a bearer token), an X-Confirm-Delete: yes header, AND body {confirm:\"DELETE\"}. Cascades e2e_params -> sync_items -> auth_tokens -> device_users -> user_providers -> web_sessions -> users."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/sync/status"
+description = "{has_cloud_data, item_count, last_modified, quota_used_bytes, quota_limit_bytes}; quota_limit_bytes is 52428800 (50 MiB). Cookie session or Bearer device token."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/sync/changes"
+description = "Items changed since ?since=<unix_ms> cursor. Response includes server_timestamp — the client's cursor for the next incremental call. Cookie session or Bearer device token."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
 path = "/api/sync/push"
 description = "Push cloud sync changes from client"
 auth = "bearer"
 public = false
 
 [[endpoints]]
+method = "GET"
+path = "/api/sync/pull"
+description = "Download every sync item for the caller, decrypted. Cookie session or Bearer device token."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/sync/item/{sync_id}"
+description = "Soft-delete one sync item (tombstone, deleted=1) so other devices see the deletion on their next changes poll. 404 if the item does not exist for this user or was already deleted."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/sync/all"
+description = "Hard-delete every sync item for the caller (rows removed, not tombstoned). Response {deleted: N}."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/sync/e2e-params"
+description = "{enabled:true, salt, iterations} when the caller set up client-side E2E encryption, else {enabled:false}."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/sync/e2e-setup"
+description = "Store PBKDF2 params (salt exactly 32 hex chars, iterations) for the caller's optional client-side E2E layer on top of at-rest encryption. Response {enabled:true}."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/sync/profiles"
+description = "Per-profile-id summary for the caller: {profile_id, item_count, total_bytes, last_modified, has_vault, has_recovery_key} for each X-Profile-Id namespace the account has synced under."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/sync/pull-profile"
+description = "Same response shape as GET /api/sync/pull, scoped to one profile_id (last-writer-wins across devices sharing that profile)."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/account/redeem"
+description = "Redeem a gift/trial code minted by POST /api/admin/gift-codes, extending the caller's paid_until (extend, not replace; single-use guaranteed under a race). Response {paid_until}. 404 no such code, 409 already used. The submitted code is never logged in full."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/account/nick"
+description = "Change the caller's nick — 3-24 ASCII chars, globally unique case-insensitively, at most once every 30 days; checked against the forbidden-nick and reserved-name registries. Response {nick, effective_label}. 400 invalid/forbidden, 409 taken/reserved, 429 rate-limited (carries nick_changed_at/next_allowed_at)."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/share/live"
+description = "Freeze a preset (JSON object, size-capped) into a share link. Body {title?, preset, clone_allowed?}. Response {token, url_path, expires_at}; TTL is stamped at creation and never extended by reads."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/share/screenshot"
+description = "Create a share link backed by an uploaded PNG (magic-byte checked, up to 8 MiB, stored at <data_dir>/share/<user_id>/<token>.png via atomic write). Same response shape as POST /api/share/live."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/share/mine"
+description = "The caller's own active shares, newest first."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/share/{token}"
+description = "PUBLIC — resolve a share token. Live shares answer the frozen preset; screenshot shares answer the PNG endpoint's URL. Also carries the caller's own rights on it (e.g. [\"read\",\"clone\",\"edit\"] for the owner). Unknown, expired, and revoked tokens all get the same bare 404."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/share/{token}"
+description = "Revoke the caller's own share. A screenshot share's blob file is unlinked alongside the row (a failed unlink is logged, never reported to the client)."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/share/{token}/png"
+description = "PUBLIC — stream a screenshot share's PNG bytes, short cache lifetime (bytes are immutable for the share's life, but revocation must surface within minutes, not days). Same 404 discipline as GET /api/share/{token}."
+auth = "none"
+public = true
+
+[[endpoints]]
 method = "POST"
 path = "/api/share/{token}/clone"
 description = "Clone a live chart share into the caller's own preset (rights v1). Requires the `clone` right on the token (owner, or the share was created with clone_allowed=true); indicators the caller has no vendor grant for are stripped and listed in the response. 403 without the right, 400 for a screenshot token, 404 for unknown/revoked/expired."
 auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/forum/threads"
+description = "Paid in-app forum v1 (entitlements::Feature::Forum — never in the free set): list visible threads, newest activity first. Query limit=&before=, same one-row-lookahead pagination as GET /api/posts. Authed AND paid; 401 signed-out, 403 unpaid."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/forum/threads"
+description = "Create a v1 forum thread {title, body} -> {id}. Authed AND paid. Rate-limited to 1 thread per 60s per account."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/forum/threads/{id}"
+description = "One v1 forum thread plus its replies. Authed AND paid. Bare 404 if the thread does not exist or is hidden."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/forum/threads/{id}"
+description = "Author hides their own v1 forum thread. 204 on success, bare 403 otherwise (not the author, already hidden, or unknown id — no distinguishable states)."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/forum/threads/{id}/replies"
+description = "Reply to a v1 forum thread. Authed AND paid. Rate-limited to 10 replies per 60s per account; bare 404 if the thread does not exist or is hidden."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/forum/replies/{id}"
+description = "Author hides their own v1 forum reply. Same contract as DELETE /api/forum/threads/{id}."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/admin/forum/hide"
+description = "Hide any v1 forum thread or reply regardless of author. Body {kind:\"thread\"|\"reply\", id}. 204 if a visible row was hidden, 404 if no such row existed (unknown id or already hidden)."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
 public = false
 
 [[endpoints]]
@@ -160,7 +637,7 @@ public = true
 [[endpoints]]
 method = "POST"
 path = "/api/forum/boards/{slug}/threads"
-description = "Forum v2: create a thread on a board. Requires the board's write class (401 signed-out, 403 insufficient class, 429 rate-limited)."
+description = "Forum v2: create a thread on a board. Requires the board's write class (401 signed-out, 403 insufficient class, 429 rate-limited); refuses a caller with no nick chosen yet (403 {\"code\":\"nick_required\"})."
 auth = "bearer"
 public = false
 
@@ -202,7 +679,23 @@ public = false
 [[endpoints]]
 method = "POST"
 path = "/api/admin/forum/boards"
-description = "Forum v2 admin: create a board {slug, title, description?, read_class, write_class, position?}. read_class/write_class must be one of public|user|paid|trusted|moderator|admin (400 with the list otherwise)."
+description = "Forum v2 admin: create a board {slug, title, description?, read_class, write_class, position?}. read_class/write_class must be one of public|user|paid|trusted|moderator|admin (400 with the list otherwise). Board CRUD is ADMIN_SECRET-only regardless of any forum_roles a bearer's account might also hold."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "PATCH"
+path = "/api/admin/forum/boards/{id}"
+description = "Forum v2 admin: update a board's fields — same shape as create; only the fields given in the body change."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/admin/forum/boards/{id}"
+description = "Forum v2 admin: delete a board."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -219,6 +712,14 @@ public = false
 method = "PUT"
 path = "/api/admin/forum/roles/{user_id}"
 description = "Forum v2 admin: grant a role {role: moderator|admin} to a user_id."
+auth = "bearer"
+auth_env = "ADMIN_SECRET"
+public = false
+
+[[endpoints]]
+method = "DELETE"
+path = "/api/admin/forum/roles/{user_id}"
+description = "Forum v2 admin: revoke a granted moderator/admin role from a user_id. 204 on revoke, 404 if the user held no role."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -288,8 +789,15 @@ public = false
 
 [[endpoints]]
 method = "GET"
-path = "/api/dm/identity/{public_id_or_nick}"
-description = "Direct messages: a user's published DM public key, fingerprint, and label. 404 if the label names no user or the user never published a key."
+path = "/api/dm/identity/{label}"
+description = "Direct messages: a user's published DM public key, fingerprint, and label. The path segment is spelled {label} in the router and accepts either a public_id or a nick. 404 if it names no user or the user never published a key."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/dm/lookup"
+description = "Direct messages: search DM-eligible recipients by nick/display-name substring or fuzzy match (?q=). Response {users:[{public_id,nick,label,rank}]}, ranked, capped, caller excluded from its own results. Same paid gate as every other /dm route; a candidate must ALSO have published a DM identity key via PUT /dm/identity to appear."
 auth = "bearer"
 public = false
 
@@ -344,5 +852,10 @@ endpoint = "/health"
 [dependencies]
 # Serves mylittlechart-landing (static web + WASM) via tower_http ServeDir
 upstream = ["mylittlechart-landing"]
-# cloudflared tunnel exposes this server publicly as mylittlechart.org
-downstream = ["cloudflared-mylittlechart"]
+# No local downstream service to name: production public traffic reaches
+# this process through nginx on the two edge boxes (mlc-utah-1, mlc-ams-1)
+# over WireGuard, not through a local Cloudflare Tunnel — that path was
+# retired at the 2026-08-24 cutover (see crates/server/src/main.rs's
+# BIND_ADDR comment). The edges are remote systemd units, not local
+# d-watchdog processes, so they are not named here.
+downstream = []
