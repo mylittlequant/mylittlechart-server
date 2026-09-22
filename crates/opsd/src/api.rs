@@ -137,11 +137,13 @@ fn build_docs() -> RouterDocs {
 }
 
 /// Assemble the served router: the bearer layer guards only the routes
-/// recorded above (`route_layer`, not `layer` — `DocRouter` exposes no
-/// `route_layer`, so it is applied to the raw `axum::Router` `into_parts()`
-/// handed back, the same way the pre-`DocRouter` code applied it), so an
-/// unmapped path under `/api` still 404s without a bearer, exactly as
-/// before this conversion.
+/// recorded above — `route_layer`, never `layer`, so an unmapped path under
+/// `/api` still answers 404 without a bearer instead of the guard's 401,
+/// exactly as before this conversion. It is applied to the raw
+/// `axum::Router` here rather than through `DocRouter::route_layer`
+/// because the guard is built with `state`, and `build_docs()` is
+/// deliberately state-free so the tests can enumerate the endpoints
+/// without constructing one.
 fn build_router(state: Arc<OpsdState>) -> (Router, Vec<Endpoint>) {
     let docs = build_docs();
     let api = docs.api.route_layer(axum::middleware::from_fn_with_state(
