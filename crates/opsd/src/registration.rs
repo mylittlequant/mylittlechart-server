@@ -40,7 +40,7 @@ fn get_action(id: &str, label: &str, description: &str, path: &str) -> ManageAct
         method: "GET".to_string(),
         path: path.to_string(),
         auth: "bearer".to_string(),
-        auth_env: None,
+        key_ref: None,
         confirm: false,
         icon: None,
         body: None,
@@ -63,6 +63,11 @@ pub(crate) fn service_manifest(endpoints: Vec<Endpoint>) -> ServiceManifest {
             display_name: Some("mlc-opsd".to_string()),
             description: Some(SERVICE_DESCRIPTION.to_string()),
             version: None,
+            // opsd's own bearer is a generated 32-byte hex token at
+            // `<state_dir>/api-key` (`state::load_or_generate_api_key`), not
+            // a `VAR=value` line in a `nemo/env/*.env` file — key_ref's
+            // `<path>:<VAR>` shape has nothing to point at here.
+            key_ref: None,
         },
         links: Links {
             public_url: None,
