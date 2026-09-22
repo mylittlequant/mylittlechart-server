@@ -1,0 +1,148 @@
+[service]
+name = "mlc-opsd"
+kind = "http_api"
+display_name = "mlc-opsd"
+description = "Operator control plane for the mylittlechart.org production fleet — runs on the operator's workstation (opbox), NOT on any served box. It is the only tool allowed to reach the fleet: SSH to the control box (mlc-c2-1, holds identity/social/sync data) and both public edges (mlc-utah-1, mlc-ams-1, nginx-only). This is not the mylittlechart.org backend itself (see mylittlechart-server's own .nemo-service.toml) — it deploys, publishes, unlocks and backs that backend up. Capabilities: deploy a musl server binary to control with health-verified auto-rollback, publish a signed release artifact to both edges then register its manifest on control, boot-unlock (push the SQLCipher key + server.env to control's tmpfs and start mlc-server), pull encrypted backups to the opbox, restart a whitelisted systemd unit (mlc-server/nginx/nftables/fail2ban), and an autonomous 60s watch loop that detects control being down for the key and unlocks it without operator action."
+
+[links]
+local_url = "http://127.0.0.1:18360"
+docs = "mylittlechart-server/ops/README.md"
+
+[[endpoints]]
+method = "GET"
+path = "/health"
+description = "Liveness for d-watchdog. No auth."
+auth = "none"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/status"
+description = "One SSH round-trip to control: systemd ActiveState/SubState for mlc-server/nginx/nftables/fail2ban, app health, disk/mem, uptime. Read-only, safe."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/box/state"
+description = "mlc-server state on control: is the SQLCipher key present in tmpfs, is the journal stuck waiting for it. Read-only, safe."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/logs"
+description = "Journal tail from control (query unit=, default mlc-server; lines=, default 50, clamped 1..500 server-side; unit restricted to the same whitelist as /api/restart). Read-only, safe."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/restart"
+description = "Body {unit}. Restarts one systemd unit on control — whitelist only: mlc-server | nginx | nftables | fail2ban (state::UNIT_WHITELIST); anything else is rejected before a command string is built. Drops the unit's traffic/connections for the restart duration."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/unlock"
+description = "Boot-unlock: pushes the canonical sqlcipher.key + server.env to control's tmpfs (0600, root), starts mlc-server, verifies health. Also the watch loop's own recovery action. Places a live secret on the box, even if only in tmpfs."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/deploy"
+description = "Body {path} — local path on the opbox to a musl server binary. Uploads to control, sha256-verifies, saves the running binary as .prev, stops/swaps/starts the unit, health-polls (30x3s) against the unit's own BIND_ADDR, auto-rolls back to .prev on failure. Replaces the running production server binary."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/release/publish"
+description = "Body {path, platform, version, channel, release_notes, signature}. Uploads a client release artifact to BOTH public edges, sha256-verifies each, unwinds anything already landed if either edge fails, then registers the release manifest row on control (calls the backend's own admin-listener /api/admin/register-release over an in-box ssh session). Publishes to production; channel defaults to \"stable\" when omitted."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/backup/now"
+description = "Triggers an on-demand DB snapshot on control (systemctl start mlc-backup.service) and lists the resulting archive dir. Safe, but touches the box."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "POST"
+path = "/api/backup/pull"
+description = "SFTP-pulls the newest *.db + config-*.tar.gz from control to the opbox (E:\\backups\\mlc-c2-1\\), encrypts at rest (AES-256-GCM), prunes to the 30 newest archives. Read-only against the box, writes locally; also runs automatically every hour."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/backup/list"
+description = "Local listing (names, sizes, mtimes) of the opbox-side encrypted backup archive. Read-only, safe."
+auth = "bearer"
+public = false
+
+[[endpoints]]
+method = "GET"
+path = "/api/watch/state"
+description = "Watch-loop counters: consecutive public-health misses, last intervention timestamp, cooldown horizon. Read-only, safe."
+auth = "bearer"
+public = false
+
+[[manage_actions]]
+id = "status"
+label = "Fleet Status"
+description = "Read-only: systemd unit states, app health, disk/mem, uptime on the control box."
+method = "GET"
+path = "/api/status"
+auth = "bearer"
+confirm = false
+
+[[manage_actions]]
+id = "box_state"
+label = "Box Unlock State"
+description = "Read-only: whether the SQLCipher key is present in control's tmpfs and whether the boot journal is stuck waiting for it."
+method = "GET"
+path = "/api/box/state"
+auth = "bearer"
+confirm = false
+
+[[manage_actions]]
+id = "backup_list"
+label = "List Local Backups"
+description = "Read-only: opbox-side encrypted backup archive listing."
+method = "GET"
+path = "/api/backup/list"
+auth = "bearer"
+confirm = false
+
+[[manage_actions]]
+id = "watch_state"
+label = "Watch Loop State"
+description = "Read-only: watch-loop miss counters and last intervention."
+method = "GET"
+path = "/api/watch/state"
+auth = "bearer"
+confirm = false
+
+[[manage_actions]]
+id = "logs"
+label = "Journal Tail"
+description = "Read-only: journal tail for a whitelisted unit on control (query unit=, lines=)."
+method = "GET"
+path = "/api/logs"
+auth = "bearer"
+confirm = false
+
+[health]
+endpoint = "/health"
+
+[dependencies]
+# Reaches the control box and both public edges over SSH; none of them are
+# local d-watchdog processes, so they are not named as upstream/downstream
+# services here.
+upstream = []
+downstream = []
