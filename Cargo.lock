@@ -1481,6 +1481,7 @@ dependencies = [
  "chrono",
  "clap",
  "hex",
+ "nemo-service",
  "rand 0.8.5",
  "reqwest",
  "rusqlite",
@@ -1554,6 +1555,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+]
+
+[[package]]
+name = "nemo-service"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "reqwest",
+ "serde",
+ "tokio",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]

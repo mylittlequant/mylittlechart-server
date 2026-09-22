@@ -219,19 +219,24 @@ the same daemon, for the recurring jobs, live in `../CICD/mlc/scripts/`:
 
 ## Deploy pipeline — server binary
 
-Build the musl binary (docker, canonical — the box runs Linux) and hand
-opsd its absolute path; it uploads to **control**, verifies sha256, keeps
-`.prev`, swaps, then polls health 30×3s against the unit's own `BIND_ADDR`
-and rolls back to `.prev` on failure:
+Build the musl binary (docker, canonical — the box runs Linux), then hand
+it to opsd; it uploads to **control**, verifies sha256, keeps `.prev`,
+swaps, then polls health 30×3s against the unit's own `BIND_ADDR` and rolls
+back to `.prev` on failure. Two fixed commands, run from the `nemo` root:
 
 ```bash
-docker run --rm -v "$(pwd -W)":/home/rust/src messense/rust-musl-cross:x86_64-musl \
-  cargo build --release --target x86_64-unknown-linux-musl
-
-curl -s -m 1800 -X POST -H "Authorization: Bearer $K" -H "Content-Type: application/json" \
-  -d '{"path":"<ABSOLUTE>/target/x86_64-unknown-linux-musl/release/mylittlechart-server"}' \
-  http://127.0.0.1:18360/api/deploy
+bash CICD/mlc/scripts/build-server-musl.sh
+bash CICD/mlc/scripts/deploy-server.sh
 ```
+
+Do not hand-type the `docker run`. The workspace depends on the sibling
+submodule `nemo-service` (`path = "../nemo-service"`, via `crates/opsd`),
+and cargo reads every workspace member's manifest before building anything —
+even with `-p mylittlechart-server`. A container with only this directory
+mounted fails at resolution with `failed to read
+/home/rust/nemo-service/Cargo.toml` (measured 2026-09-22). The build script
+mounts the sibling at the matching path; a sibling dependency added later
+needs its own mount there, not here.
 
 Docker is needed for the *artifact*, not for checking the code. `cargo check
 -p mylittlechart-server --release` runs natively on this Windows box in well
@@ -243,8 +248,7 @@ version of this file claimed the docker image was the only working
 `cargo check` for this crate; it is not, and gating on docker for a
 type-check costs minutes per iteration.
 
-Or the wrapper that does exactly this: `bash ../CICD/mlc/scripts/deploy-server.sh`.
-The client waits up to 30 minutes — opsd runs the whole deploy inside the
+`deploy-server.sh` waits up to 30 minutes — opsd runs the whole deploy inside the
 HTTP request, and a client disconnect cancels it mid-flight (the SFTP leg
 alone can take 5+ minutes on a slow link).
 

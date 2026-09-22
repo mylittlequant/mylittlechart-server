@@ -1,5 +1,6 @@
 //! mlc-opsd — operator control plane for the mylittlechart.org production
-//! box (mlc-utah-1). Standalone infra in the spirit of the mirage
+//! fleet: control box mlc-c2-1 plus the two nginx edges (see
+//! ops/README.md). Standalone infra in the spirit of the mirage
 //! operator-box, minus mesh/fleet.
 //!
 //! `daemon` (default) serves the local HTTP API on 127.0.0.1:18360 and runs
@@ -17,6 +18,7 @@ mod backup;
 mod deploy;
 mod error;
 mod ops;
+mod registration;
 mod release;
 mod ssh;
 mod state;

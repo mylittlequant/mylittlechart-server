@@ -47,6 +47,18 @@ russh-keys = "0.49"
 russh-sftp = "2"
 async-trait = "0.1"
 aes-gcm = "0.10"
+# `nemo-service` is a sibling submodule of this one, not a crates.io crate —
+# cross-submodule path deps are accepted workspace-wide (see nemo/CLAUDE.md).
+# Consumed by `crates/opsd` only today (d-watchdog registration, see
+# nemo/docs/d-watchdog/plans/service-registration-and-pid-ownership-2026-09-22.md
+# step 4). TRAP: cargo resolves every workspace member's manifest, this path
+# included, before it builds anything — even with `-p mylittlechart-server`.
+# A musl build container with only this directory mounted fails at
+# resolution (`failed to read /home/rust/nemo-service/Cargo.toml`, measured
+# 2026-09-22). Build through `nemo/CICD/mlc/scripts/build-server-musl.sh`,
+# which mounts the sibling at the matching path; a new sibling path
+# dependency needs its own mount added there.
+nemo-service = { path = "../nemo-service" }
 tower = { version = "0.5", default-features = false, features = ["limit", "util"] }
 # Pure-Rust Unicode Normalization Forms (NFC) — the one text-cleaning
 # primitive `std` has no equivalent for; see `crates/server/src/text_policy.rs`.

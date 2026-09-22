@@ -2,6 +2,14 @@
 //!
 //! `GET /health` is open; everything under `/api` goes through the bearer
 //! middleware (`crate::auth`). Handlers are thin wrappers over `crate::ops`.
+//!
+//! The router is built through `nemo_service::router::DocRouter`, which
+//! records `(method, path, description, auth)` for every route as it is
+//! added and hands the list back alongside the real `axum::Router` —
+//! `crate::registration::service_manifest` uses that list to describe this
+//! daemon to d-watchdog, so a route can never drift from the manifest the
+//! way `.nemo-services/mlc-opsd.toml` did (see
+//! `nemo/docs/d-watchdog/plans/service-registration-and-pid-ownership-2026-09-22.md`).
 
 use std::sync::Arc;
 
@@ -9,9 +17,10 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
     Json, Router,
 };
+use nemo_service::manifest::Endpoint;
+use nemo_service::router::{DocRouter, RouteDoc};
 use serde::Deserialize;
 
 use crate::ops;
@@ -48,37 +57,123 @@ where
     });
 }
 
+const STATUS_DESC: &str = "One SSH round-trip to control: systemd ActiveState/SubState for \
+mlc-server/nginx/nftables/fail2ban, app health, disk/mem, uptime. Read-only, safe.";
+const RESTART_DESC: &str = "Body {unit}. Restarts one systemd unit on control — whitelist only: \
+mlc-server | nginx | nftables | fail2ban (state::UNIT_WHITELIST); anything else is rejected before a \
+command string is built. Drops the unit's traffic/connections for the restart duration.";
+const LOGS_DESC: &str = "Journal tail from control (query unit=, default mlc-server; lines=, default 50, \
+clamped 1..500 server-side; unit restricted to the same whitelist as /api/restart). Read-only, safe.";
+const UNLOCK_DESC: &str = "Boot-unlock: pushes the canonical sqlcipher.key + server.env to control's tmpfs \
+(0600, root), starts mlc-server, verifies health. Also the watch loop's own recovery action. Places a live \
+secret on the box, even if only in tmpfs.";
+const BOX_STATE_DESC: &str = "mlc-server state on control: is the SQLCipher key present in tmpfs, is the \
+journal stuck waiting for it. Read-only, safe.";
+const DEPLOY_DESC: &str = "Body {path} — local path on the opbox to a musl server binary. Uploads to \
+control, sha256-verifies, saves the running binary as .prev, stops/swaps/starts the unit, health-polls \
+(30x3s) against the unit's own BIND_ADDR, auto-rolls back to .prev on failure. Replaces the running \
+production server binary.";
+const RELEASE_PUBLISH_DESC: &str = "Body {path, platform, version, channel, release_notes, signature}. \
+Uploads a client release artifact to BOTH public edges, sha256-verifies each, unwinds anything already \
+landed if either edge fails, then registers the release manifest row on control (calls the backend's own \
+admin-listener /api/admin/register-release over an in-box ssh session). Publishes to production; channel \
+defaults to \"stable\" when omitted.";
+const BACKUP_NOW_DESC: &str = "Triggers an on-demand DB snapshot on control (systemctl start \
+mlc-backup.service) and lists the resulting archive dir. Safe, but touches the box.";
+const BACKUP_PULL_DESC: &str = "SFTP-pulls the newest *.db + config-*.tar.gz from control to the opbox \
+(E:\\backups\\mlc-c2-1\\), encrypts at rest (AES-256-GCM), prunes to the 30 newest archives. Read-only \
+against the box, writes locally; also runs automatically every hour.";
+const BACKUP_LIST_DESC: &str =
+    "Local listing (names, sizes, mtimes) of the opbox-side encrypted backup archive. Read-only, safe.";
+const WATCH_STATE_DESC: &str = "Watch-loop counters: consecutive public-health misses, last intervention \
+timestamp, cooldown horizon. Read-only, safe.";
+const HEALTH_DESC: &str = "Liveness for d-watchdog. No auth.";
+
+/// The two sub-routers `build_router` composes, plus the endpoint list
+/// `DocRouter` recorded while building them — split out from the bearer
+/// layer and the live `OpsdState` so the route *shape* (method, path, auth)
+/// can be asserted in a test without constructing one (see `tests` below).
+struct RouterDocs {
+    health: Router<Arc<OpsdState>>,
+    api: Router<Arc<OpsdState>>,
+    endpoints: Vec<Endpoint>,
+}
+
+/// Build the health and (still bearer-unguarded) API sub-routers through
+/// `DocRouter`, and the endpoint list that is their by-product. Needs no
+/// `OpsdState` value — only its type, since `DocRouter` does not require a
+/// live state until `.with_state()` is called, which happens in
+/// `build_router`, not here.
+fn build_docs() -> RouterDocs {
+    let (api, api_endpoints): (Router<Arc<OpsdState>>, Vec<Endpoint>) = DocRouter::<Arc<OpsdState>>::new()
+        .get("/status", handle_status, RouteDoc::bearer(STATUS_DESC))
+        .post("/restart", handle_restart, RouteDoc::bearer(RESTART_DESC))
+        .get("/logs", handle_logs, RouteDoc::bearer(LOGS_DESC))
+        .post("/unlock", handle_unlock, RouteDoc::bearer(UNLOCK_DESC))
+        .get("/box/state", handle_box_state, RouteDoc::bearer(BOX_STATE_DESC))
+        .post("/deploy", handle_deploy, RouteDoc::bearer(DEPLOY_DESC))
+        .post(
+            "/release/publish",
+            handle_release_publish,
+            RouteDoc::bearer(RELEASE_PUBLISH_DESC),
+        )
+        .post("/backup/now", handle_backup_now, RouteDoc::bearer(BACKUP_NOW_DESC))
+        .post("/backup/pull", handle_backup_pull, RouteDoc::bearer(BACKUP_PULL_DESC))
+        .get("/backup/list", handle_backup_list, RouteDoc::bearer(BACKUP_LIST_DESC))
+        .get("/watch/state", handle_watch_state, RouteDoc::bearer(WATCH_STATE_DESC))
+        .into_parts();
+
+    let (health, health_endpoints): (Router<Arc<OpsdState>>, Vec<Endpoint>) = DocRouter::<Arc<OpsdState>>::new()
+        .get("/health", || async { "ok" }, HEALTH_DESC)
+        .into_parts();
+
+    let mut endpoints = health_endpoints;
+    endpoints.extend(api_endpoints.into_iter().map(|mut ep| {
+        ep.path = format!("/api{}", ep.path);
+        ep
+    }));
+
+    RouterDocs { health, api, endpoints }
+}
+
+/// Assemble the served router: the bearer layer guards only the routes
+/// recorded above (`route_layer`, not `layer` — `DocRouter` exposes no
+/// `route_layer`, so it is applied to the raw `axum::Router` `into_parts()`
+/// handed back, the same way the pre-`DocRouter` code applied it), so an
+/// unmapped path under `/api` still 404s without a bearer, exactly as
+/// before this conversion.
+fn build_router(state: Arc<OpsdState>) -> (Router, Vec<Endpoint>) {
+    let docs = build_docs();
+    let api = docs.api.route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::auth::require_bearer,
+    ));
+    let app = docs.health.nest("/api", api).with_state(state);
+    (app, docs.endpoints)
+}
+
 pub async fn serve(state: Arc<OpsdState>) -> Result<(), Box<dyn std::error::Error>> {
     spawn_supervised("watch", state.clone(), crate::watch::run_watch_loop);
     // Hourly backup pull — the sole owner of the pull cycle (replaces the
     // Windows Task Scheduler `mlc-backup-pull` task).
     spawn_supervised("backup_pull", state.clone(), crate::backup::run_pull_loop);
 
-    let api = Router::new()
-        .route("/status", get(handle_status))
-        .route("/restart", post(handle_restart))
-        .route("/logs", get(handle_logs))
-        .route("/unlock", post(handle_unlock))
-        .route("/box/state", get(handle_box_state))
-        .route("/deploy", post(handle_deploy))
-        .route("/release/publish", post(handle_release_publish))
-        .route("/backup/now", post(handle_backup_now))
-        .route("/backup/pull", post(handle_backup_pull))
-        .route("/backup/list", get(handle_backup_list))
-        .route("/watch/state", get(handle_watch_state))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::auth::require_bearer,
-        ))
-        .with_state(state.clone());
-
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .nest("/api", api);
+    let (app, endpoints) = build_router(state.clone());
 
     let bind = crate::state::bind_addr();
     tracing::info!("mlc-opsd listening on http://{bind}");
     let listener = tokio::net::TcpListener::bind(&bind).await?;
+
+    // Register with d-watchdog now that the socket is live. `spawn` is
+    // synchronous and fire-and-forget (nemo-service/CLAUDE.md's contract:
+    // registration can never fail or delay a service's own startup) — no
+    // `.await`, no `?` on its result, just a background task handle this
+    // function does not need to hold onto.
+    let _reassert = nemo_service::register::spawn(
+        crate::registration::service_manifest(endpoints),
+        nemo_service::register::DEFAULT_REASSERT_INTERVAL,
+    );
+
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -232,5 +327,47 @@ async fn handle_backup_list(State(state): State<Arc<OpsdState>>) -> axum::respon
         }))
         .into_response(),
         Err(e) => err_response(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (method, path, auth) for the 12 endpoints that lived in the now-deleted
+    /// `.nemo-services/mlc-opsd.toml` — captured here before its deletion so a
+    /// route silently dropped (or its auth class silently loosened) from the
+    /// `DocRouter` build shows up as a test failure here, instead of a
+    /// manifest that quietly drifts from what d-watchdog is told.
+    const EXPECTED: &[(&str, &str, &str)] = &[
+        ("GET", "/health", "none"),
+        ("GET", "/api/status", "bearer"),
+        ("POST", "/api/restart", "bearer"),
+        ("GET", "/api/logs", "bearer"),
+        ("POST", "/api/unlock", "bearer"),
+        ("GET", "/api/box/state", "bearer"),
+        ("POST", "/api/deploy", "bearer"),
+        ("POST", "/api/release/publish", "bearer"),
+        ("POST", "/api/backup/now", "bearer"),
+        ("POST", "/api/backup/pull", "bearer"),
+        ("GET", "/api/backup/list", "bearer"),
+        ("GET", "/api/watch/state", "bearer"),
+    ];
+
+    #[test]
+    fn endpoints_match_the_retired_manifest_file() {
+        let docs = build_docs();
+        let actual: Vec<(&str, &str, &str)> = docs
+            .endpoints
+            .iter()
+            .map(|e| (e.method.as_str(), e.path.as_str(), e.auth.as_str()))
+            .collect();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    #[test]
+    fn endpoint_count_matches_the_retired_manifest_file() {
+        let docs = build_docs();
+        assert_eq!(docs.endpoints.len(), 12, "mlc-opsd's real endpoint count");
     }
 }

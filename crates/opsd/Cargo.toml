@@ -25,6 +25,7 @@ hex = { workspace = true }
 subtle = { workspace = true }
 reqwest = { workspace = true }
 clap = { workspace = true }
+nemo-service = { workspace = true }
 russh = { workspace = true }
 russh-keys = { workspace = true }
 russh-sftp = { workspace = true }
