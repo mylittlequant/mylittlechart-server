@@ -64,6 +64,22 @@
 //!   MLC_ALERT_POLL_SECS    — alert-evaluation cycle interval in seconds
 //!                            for the above (default: 30). Ignored when
 //!                            `MLC_ALERT_DAEMON` is off.
+//!   ADMIN_BIND / ADMIN_PORT — admin API listener (`routes::admin_api_router`,
+//!                            every `/admin/*` route, mounted as
+//!                            `/api/admin/...`), default `127.0.0.1:19238`.
+//!                            Control role only — an edge process never
+//!                            starts this listener. This is the ONLY place
+//!                            `/api/admin/*` answers (2026-09-22
+//!                            admin-listener split — see
+//!                            `docs/mlc/audits/api-surface-hardening-2026-09-10.md`
+//!                            §3/§6): the main listener (`BIND_ADDR:PORT`
+//!                            above) mounts `control_api_router`, which does
+//!                            not register `/admin/*` at all. An operator
+//!                            reaches this listener only through an SSH
+//!                            tunnel to the loopback bind (see
+//!                            `ops/README.md`) — `ADMIN_SECRET` is still
+//!                            checked on every route here; the tunnel is a
+//!                            first lock, not a replacement for it.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -817,6 +833,29 @@ async fn main() {
             .with_state(app_state.clone())
     });
 
+    // Admin API router — its own loopback listener, control role only, same
+    // reasoning as `dash_app` above: `routes::admin_api_router` needs
+    // `state.control_plane()`, which an edge process has none of. Mounted
+    // the same way the main `/api` router is further down
+    // (`.nest("/api", …)`), so every admin path keeps its
+    // `/api/admin/...` shape — only the listener a caller has to reach
+    // changes (see `routes/mod.rs`'s `//!` doc for the 2026-09-22 split).
+    // `no_store_api_headers` is layered the same way it is on the main
+    // `/api` router further down (`cache-control: no-store` on every admin
+    // response); the concurrency/timeout backstops mirror the main app's
+    // own (`ConcurrencyLimitLayer`/`TimeoutLayer` further down). No per-IP
+    // rate limit here — the admin listener has exactly one loopback peer.
+    let admin_app = (role == state::ServerRole::Control).then(|| {
+        axum::Router::new()
+            .nest("/api", routes::admin_api_router(app_state.clone()))
+            .layer(axum::middleware::from_fn(no_store_api_headers))
+            .layer(ConcurrencyLimitLayer::new(512))
+            .layer(TimeoutLayer::with_status_code(
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                Duration::from_secs(60),
+            ))
+    });
+
     // `/health` as its own tiny state-carrying router (see `health_handler`)
     // — built ahead of the `/api` router below, which otherwise consumes
     // `app_state` by value.
@@ -906,8 +945,9 @@ async fn main() {
         .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", main_addr, e));
 
     // Subscribe to the shutdown channel before spawning the signal task, for
-    // both listeners that will exist — otherwise a shutdown broadcast that
-    // fires between spawn and subscribe would be missed.
+    // every listener that will exist — otherwise a shutdown broadcast that
+    // fires between spawn and subscribe would be missed. Three listeners
+    // now, not two: main, dashboard, admin.
     let mut main_shutdown_rx = shutdown_tx.subscribe();
     let dash_listen = if let Some(dash_app) = dash_app {
         // Read dashboard port from environment (default 19237).
@@ -923,6 +963,26 @@ async fn main() {
         Some((dash_listener, dash_app, shutdown_tx.subscribe()))
     } else {
         tracing::info!("Edge role: admin dashboard listener not started");
+        None
+    };
+    // Admin API listener — same role gate and subscribe-before-spawn
+    // reasoning as the dashboard listener above. `ADMIN_BIND` defaults to
+    // loopback (never a public interface, see this file's module doc);
+    // `ADMIN_PORT` defaults to 19238.
+    let admin_listen = if let Some(admin_app) = admin_app {
+        let admin_host = std::env::var("ADMIN_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let admin_port: u16 = std::env::var("ADMIN_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(19238);
+        let admin_addr = format!("{}:{}", admin_host, admin_port);
+        tracing::info!("Admin API listening on http://{}", admin_addr);
+        let admin_listener = tokio::net::TcpListener::bind(&admin_addr)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to bind admin listener to {}: {}", admin_addr, e));
+        Some((admin_listener, admin_app, shutdown_tx.subscribe()))
+    } else {
+        tracing::info!("Edge role: admin listener not started");
         None
     };
 
@@ -954,35 +1014,83 @@ async fn main() {
     let main_shutdown = async move {
         let _ = main_shutdown_rx.recv().await;
     };
-    // A 30-second hard timeout prevents a stuck connection from blocking deploys.
+    // A 30-second hard timeout prevents a stuck connection from blocking
+    // deploys.
     //
     // `into_make_service_with_connect_info` (rather than passing `app`
     // directly) is what makes `ConnectInfo<SocketAddr>` extractable in
     // handlers — `routes::admin::verify_admin_secret` logs the peer address
     // on every refusal (see its doc comment), and that address has to come
-    // from somewhere: this is the one place it is threaded onto every
-    // connection this listener accepts.
-    let main_serve = axum::serve(
-        main_listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(main_shutdown);
+    // from somewhere: this is where it is threaded onto every connection
+    // this listener accepts. The admin listener further down does the same
+    // for its own connections, for the same reason.
+    //
+    // Each of the three `_serve` futures below resolves to `Result<(), String>`
+    // (mapped from `io::Result<()>`, tagged with which listener it came
+    // from) so `tokio::try_join!` further down can report which one failed.
+    let main_serve = async move {
+        axum::serve(
+            main_listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(main_shutdown)
+        .await
+        .map_err(|e| format!("main listener: {e}"))
+    };
 
-    // Run the main server, plus the dashboard when this is a control process.
-    // Both drain when the shutdown signal fires.
-    match dash_listen {
-        Some((dash_listener, dash_app, mut dash_shutdown_rx)) => {
-            let dash_shutdown = async move {
-                let _ = dash_shutdown_rx.recv().await;
-            };
-            let dash_serve =
-                axum::serve(dash_listener, dash_app).with_graceful_shutdown(dash_shutdown);
-            tokio::select! {
-                r = main_serve => r.expect("Main server error"),
-                r = dash_serve => r.expect("Dashboard server error"),
-            };
+    // Run the main server, plus the dashboard/admin listeners when this is a
+    // control process. All three must drain fully before the process exits
+    // — `tokio::try_join!`, not `select!`: `select!` resolves on whichever
+    // listener finishes FIRST, and a quiet dashboard/admin listener
+    // routinely finishes before the main listener's in-flight requests
+    // drain, which used to cut the main listener's 30-second drain short on
+    // every SIGTERM (all three receive the same shutdown broadcast at once,
+    // so the dashboard/admin futures reliably raced ahead and won).
+    // `try_join!` polls all three concurrently and only returns once every
+    // one of them has resolved `Ok` — it still short-circuits immediately on
+    // the first `Err`, cancelling the rest, so a genuine listener failure
+    // (not a graceful shutdown — those always resolve `Ok`) still kills the
+    // process right away, the same property `select!` had. A `None`
+    // listener (edge role: no dashboard/admin) resolves to `Ok(())`
+    // immediately rather than `std::future::pending()` — `pending()` would
+    // make `try_join!` wait forever for an arm that can never finish.
+    let dash_serve = async move {
+        match dash_listen {
+            Some((dash_listener, dash_app, mut dash_shutdown_rx)) => {
+                let dash_shutdown = async move {
+                    let _ = dash_shutdown_rx.recv().await;
+                };
+                axum::serve(dash_listener, dash_app)
+                    .with_graceful_shutdown(dash_shutdown)
+                    .await
+                    .map_err(|e| format!("dashboard listener: {e}"))
+            }
+            None => Ok(()),
         }
-        None => main_serve.await.expect("Main server error"),
+    };
+    // `into_make_service_with_connect_info` here too — `routes::admin`
+    // logs the peer address on every refusal (see the main listener's own
+    // comment above), and a loopback-only listener with a single expected
+    // peer is exactly where that address is most worth keeping.
+    let admin_serve = async move {
+        match admin_listen {
+            Some((admin_listener, admin_app, mut admin_shutdown_rx)) => {
+                let admin_shutdown = async move {
+                    let _ = admin_shutdown_rx.recv().await;
+                };
+                axum::serve(
+                    admin_listener,
+                    admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(admin_shutdown)
+                .await
+                .map_err(|e| format!("admin listener: {e}"))
+            }
+            None => Ok(()),
+        }
+    };
+    if let Err(e) = tokio::try_join!(main_serve, dash_serve, admin_serve) {
+        panic!("server error: {e}");
     }
 
     tracing::info!("Server shut down gracefully");
@@ -1037,5 +1145,114 @@ mod tests {
             .await
             .expect("read body");
         assert!(body.is_empty());
+    }
+
+    /// `main()`'s three listeners (main/dashboard/admin) share one shutdown
+    /// broadcast and are joined with `tokio::try_join!`, not `select!` — the
+    /// 2026-09-22 admin-listener-split review caught that `select!` resolves
+    /// on whichever listener finishes FIRST, and a quiet dashboard/admin
+    /// listener (nothing in flight) routinely finishes before the main
+    /// listener's real traffic drains, cutting the 30-second drain window
+    /// short on every SIGTERM. `main()` itself isn't callable from a test
+    /// (real sockets on fixed ports, needs a database), so this reproduces
+    /// the identical shape — two `axum::serve(...).with_graceful_shutdown`
+    /// futures sharing one `broadcast` channel — with a real TCP connection
+    /// held open past the shutdown signal, and proves `try_join!` does NOT
+    /// resolve until that connection's request finishes.
+    #[tokio::test]
+    async fn try_join_waits_for_the_slower_listener_to_finish_draining() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::{broadcast, Notify};
+
+        // "Busy" listener: its one handler blocks on `hold` until released,
+        // standing in for a request still in flight when shutdown fires.
+        let hold = Arc::new(Notify::new());
+        let hold_for_handler = hold.clone();
+        let busy_router = axum::Router::new().route(
+            "/hold",
+            axum::routing::get(move || {
+                let hold = hold_for_handler.clone();
+                async move {
+                    hold.notified().await;
+                    "released"
+                }
+            }),
+        );
+        let busy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind busy listener");
+        let busy_addr = busy_listener.local_addr().expect("busy listener addr");
+
+        // "Idle" listener: nothing ever connects to it, so its graceful
+        // shutdown resolves the instant the signal fires — the role the
+        // dashboard/admin listeners play against a quiet operator.
+        let idle_router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let idle_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind idle listener");
+
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let mut busy_shutdown_rx = shutdown_tx.subscribe();
+        let mut idle_shutdown_rx = shutdown_tx.subscribe();
+
+        let busy_serve = async move {
+            axum::serve(busy_listener, busy_router)
+                .with_graceful_shutdown(async move {
+                    let _ = busy_shutdown_rx.recv().await;
+                })
+                .await
+        };
+        let idle_serve = async move {
+            axum::serve(idle_listener, idle_router)
+                .with_graceful_shutdown(async move {
+                    let _ = idle_shutdown_rx.recv().await;
+                })
+                .await
+        };
+
+        // Open a real in-flight request against the busy listener — a raw
+        // HTTP/1.1 GET, written by hand (no new client dependency): the
+        // handler above blocks on `hold` the moment it starts running, so
+        // the connection stays open until this test releases it.
+        let mut client = TcpStream::connect(busy_addr)
+            .await
+            .expect("connect to busy listener");
+        client
+            .write_all(b"GET /hold HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
+
+        // Same shape as `main()`: spawn the joined pair as its own task so
+        // this test can observe it from the outside via `JoinHandle`
+        // rather than pinning/polling a macro-generated future by hand.
+        let join_handle = tokio::spawn(async move { tokio::try_join!(busy_serve, idle_serve) });
+
+        // Give the server a moment to accept the connection and reach the
+        // handler's `hold.notified().await`, then fire shutdown — the same
+        // sequence a real SIGTERM produces against `main()`'s listeners.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = shutdown_tx.send(());
+
+        // Well past the point an idle listener alone would have resolved
+        // (`select!`'s old, buggy exit point), the joined future must still
+        // be pending — proving `try_join!` is correctly waiting on the busy
+        // listener's held connection, not racing ahead on the idle one.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !join_handle.is_finished(),
+            "try_join! resolved before the busy listener's in-flight request finished draining"
+        );
+
+        // Release the held request; the joined future must now finish
+        // promptly, and both toy listeners must report a clean shutdown.
+        hold.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), join_handle)
+            .await
+            .expect("try_join! did not finish within 2s of releasing the held request")
+            .expect("join task panicked")
+            .expect("both toy listeners should shut down cleanly");
     }
 }

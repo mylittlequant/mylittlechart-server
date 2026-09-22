@@ -18,11 +18,16 @@
 //!      registered ONLY after every edge is confirmed, and a half-uploaded
 //!      release must not linger on the edges it did reach either.
 //!   5. Only once every edge has verified: register the manifest row on the
-//!      control box (`register_release`). The box's admin API is reachable
-//!      only from inside a box ssh session (it binds the WireGuard tunnel
-//!      address, never a public one), so this reuses the same indirection
-//!      `deploy::health_cmd` / `ops::unlock` already use — `curl` runs on
-//!      the box itself, against its own app port.
+//!      control box (`register_release`). Since the 2026-09-22
+//!      admin-listener split (`docs/mlc/audits/api-surface-hardening-2026-09-10.md`
+//!      §3/§6), the admin API is its own loopback-only listener, unreachable
+//!      from off-box entirely — so this still runs `curl` from inside a box
+//!      ssh session (same indirection `deploy::health_cmd` / `ops::unlock`
+//!      use), but against `$A` (`state::APP_ADMIN_RESOLVE`, fixed
+//!      `127.0.0.1` host, `ADMIN_PORT` read back from the unit — see its own
+//!      doc for why the port still needs remote resolution even though the
+//!      host does not), not the main app port `$H`
+//!      ([`crate::state::APP_HEALTH_RESOLVE`]) resolves.
 //!
 //! Command/parsing helpers are pure and unit-tested without a box or edge;
 //! [`publish`] is the async orchestrator over `crate::ssh`.
@@ -235,8 +240,10 @@ async fn remove_from_edge(state: &Arc<OpsdState>, edge: &EdgeConfig, remote_file
 /// edge has a verified copy of the artifact. The JSON body and the admin
 /// secret are delivered as scratch files over SFTP (byte-exact, no shell
 /// quoting hazard) and removed again by the same command that reads them;
-/// `curl` on the box calls the box's own app port via `$B`
-/// ([`crate::state::APP_BASE_RESOLVE`]).
+/// `curl` on the box calls the box's own admin listener, resolved by
+/// [`crate::state::APP_ADMIN_RESOLVE`] into `$A` — not the main app port,
+/// since the 2026-09-22 admin-listener split moved `/api/admin/*` off that
+/// port entirely.
 ///
 /// The scratch files live under `/run` — tmpfs — not `/tmp`. This crate
 /// already holds that line for the SQLCipher key it pushes on unlock, and a
@@ -279,11 +286,11 @@ async fn register_release(
            -H \"Authorization: Bearer $(cat '{remote_secret}')\" \
            -H 'Content-Type: application/json' \
            --data-binary @'{remote_body}' \
-           \"$B/api/admin/register-release\"); \
+           \"$A/api/admin/register-release\"); \
          BODY=$(cat '{remote_resp}' 2>/dev/null); \
          rm -f '{remote_body}' '{remote_secret}' '{remote_resp}'; \
          echo \"HTTP:$RC\"; echo \"BODY:$BODY\"",
-        base = crate::state::APP_BASE_RESOLVE,
+        base = crate::state::APP_ADMIN_RESOLVE,
     );
     let out = session.exec(&cmd).await?;
     let (code, body_text) = parse_register_response(&out.stdout);

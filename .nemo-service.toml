@@ -2,12 +2,13 @@
 name = "mylittlechart-server"
 kind = "http_api"
 display_name = "mylittlechart Server"
-description = "Backend for mylittlechart.org — identity/OAuth, cloud sync, OTA releases, paid forum v1 + public forum v2 + DMs, telegram bot, agent API keys. Control-role process (crates/server, ServerRole::Control); identity/social/operational databases live only on this box (mlc-c2-1) — the two edges (mlc-utah-1, mlc-ams-1) run nginx only, see ops/README.md."
+description = "Backend for mylittlechart.org — identity/OAuth, cloud sync, OTA releases, paid forum v1 + public forum v2 + DMs, telegram bot, agent API keys. Control-role process (crates/server, ServerRole::Control); identity/social/operational databases live only on this box (mlc-c2-1) — the two edges (mlc-utah-1, mlc-ams-1) run nginx only, see ops/README.md. Every /api/admin/* route answers only on its own admin listener (ADMIN_BIND/ADMIN_PORT env, default 127.0.0.1:19238, control role only, admin_api_url below) — not the main listener (local_url/public_url below). Not yet deployed to prod as of 2026-09-22; see ops/README.md's admin-listener section."
 
 [links]
 public_url = "https://mylittlechart.org"
 local_url = "http://127.0.0.1:19200"
 admin_url = "http://127.0.0.1:19237"
+admin_api_url = "http://127.0.0.1:19238"
 docs = "mylittlechart-server/docs/"
 
 [[endpoints]]
@@ -76,7 +77,7 @@ public = true
 [[endpoints]]
 method = "POST"
 path = "/api/admin/restart"
-description = "Gracefully restart the server process"
+description = "Gracefully restart the server process. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -84,7 +85,7 @@ public = false
 [[endpoints]]
 method = "POST"
 path = "/api/admin/register-release"
-description = "Register a release manifest row (metadata only — filename, sha256, size, notes). The artifact itself is never uploaded here: mlc-opsd (see mylittlechart-server/crates/opsd) uploads and sha256-verifies it on both public edges first, then calls this endpoint. Replaces the old body-accepting /api/admin/upload."
+description = "Register a release manifest row (metadata only — filename, sha256, size, notes). The artifact itself is never uploaded here: mlc-opsd (see mylittlechart-server/crates/opsd) uploads and sha256-verifies it on both public edges first, then calls this endpoint. Replaces the old body-accepting /api/admin/upload. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -92,7 +93,7 @@ public = false
 [[endpoints]]
 method = "POST"
 path = "/api/admin/promote"
-description = "Promote an uploaded binary to latest"
+description = "Promote an uploaded binary to latest. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -100,7 +101,7 @@ public = false
 [[endpoints]]
 method = "POST"
 path = "/api/admin/gift-codes"
-description = "Mint count (default 1, max 200 per request) single-use gift/trial codes, each granting days of paid access from the moment an account redeems it via POST /api/account/redeem. Body {days, count?, note?}. Response {codes:[...]} is the only place a minted code is ever returned — no read path exposes an existing code, and this response is never logged in full."
+description = "Mint count (default 1, max 200 per request) single-use gift/trial codes, each granting days of paid access from the moment an account redeems it via POST /api/account/redeem. Body {days, count?, note?}. Response {codes:[...]} is the only place a minted code is ever returned — no read path exposes an existing code, and this response is never logged in full. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -108,7 +109,7 @@ public = false
 [[endpoints]]
 method = "GET"
 path = "/api/admin/users"
-description = "Case-insensitive substring search over an account's nick and display name (q=, required, max 50 rows, ordered by user id). Resolves a nick to the numeric id PUT /api/admin/forum/roles/{user_id} requires. Each row also carries providers (every linked provider name, sorted), has_email (any linked identity captured a verified email), telegram_id (the account's telegram provider_user_id, if any), and dormant (linked provider but no activity anywhere — see POST /api/admin/users/merge)."
+description = "Case-insensitive substring search over an account's nick and display name (q=, required, max 50 rows, ordered by user id). Resolves a nick to the numeric id PUT /api/admin/forum/roles/{user_id} requires. Each row also carries providers (every linked provider name, sorted), has_email (any linked identity captured a verified email), telegram_id (the account's telegram provider_user_id, if any), and dormant (linked provider but no activity anywhere — see POST /api/admin/users/merge). Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -116,7 +117,7 @@ public = false
 [[endpoints]]
 method = "POST"
 path = "/api/admin/users/merge"
-description = "Fold a duplicate account (from) into its survivor (into) — identity-merge decisions 4-6 (docs/mlc/plans/identity-merge-2026-09-09.md). Body {from, into, dry_run, keep_vault: \"into\"|\"from\"|null}. 400 when from==into or either id does not exist; 409 {error:\"hard conflicts\",conflicts:[...]} when a vault/recovery_key/salt singleton or a sync_e2e_params row is held by both accounts, or both hold a dm_identity_keys row, unless keep_vault names the survivor (the loser's conflicting rows are archived to <data_dir>/merge-archive/ before deletion, never silently dropped). dry_run:true returns the same summary a real merge would write and touches nothing. Response body is the MergeSummary JSON itself (row counts per table, conflicts, hot-plane file counts)."
+description = "Fold a duplicate account (from) into its survivor (into) — identity-merge decisions 4-6 (docs/mlc/plans/identity-merge-2026-09-09.md). Body {from, into, dry_run, keep_vault: \"into\"|\"from\"|null}. 400 when from==into or either id does not exist; 409 {error:\"hard conflicts\",conflicts:[...]} when a vault/recovery_key/salt singleton or a sync_e2e_params row is held by both accounts, or both hold a dm_identity_keys row, unless keep_vault names the survivor (the loser's conflicting rows are archived to <data_dir>/merge-archive/ before deletion, never silently dropped). dry_run:true returns the same summary a real merge would write and touches nothing. Response body is the MergeSummary JSON itself (row counts per table, conflicts, hot-plane file counts). Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -124,7 +125,7 @@ public = false
 [[endpoints]]
 method = "PUT"
 path = "/api/admin/users/{user_id}/nick"
-description = "Assign a nick to user_id directly — bypasses the reserved-name list and the 30-day self-service cooldown POST /api/account/nick is bound by; still enforces the format check and global uniqueness against every other account. Body {nick}. 400 invalid format, 404 no such user, 409 nick taken by a different account. This is how a row reserved via PUT /api/admin/nicks/reserved/{nick} is actually handed to an account — response's reserved field is true exactly when nick is in that registry."
+description = "Assign a nick to user_id directly — bypasses the reserved-name list and the 30-day self-service cooldown POST /api/account/nick is bound by; still enforces the format check and global uniqueness against every other account. Body {nick}. 400 invalid format, 404 no such user, 409 nick taken by a different account. This is how a row reserved via PUT /api/admin/nicks/reserved/{nick} is actually handed to an account — response's reserved field is true exactly when nick is in that registry. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -132,7 +133,7 @@ public = false
 [[endpoints]]
 method = "GET"
 path = "/api/admin/nicks/reserved"
-description = "Every row in the reserved-nick registry (owner ruling 2026-09-09 — occupy the good handles now, hand them to specific accounts later, rather than minting fake accounts to sit on them), sorted by category then nick."
+description = "Every row in the reserved-nick registry (owner ruling 2026-09-09 — occupy the good handles now, hand them to specific accounts later, rather than minting fake accounts to sit on them), sorted by category then nick. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -140,7 +141,7 @@ public = false
 [[endpoints]]
 method = "PUT"
 path = "/api/admin/nicks/reserved/{nick}"
-description = "Upsert nick's category/note in the reserved-nick registry. Body {category, note?}. Never touches granted_to — handing a reservation to an account is the separate PUT /api/admin/users/{user_id}/nick above. 400 on an invalid nick format; 200 {nick, created} on success."
+description = "Upsert nick's category/note in the reserved-nick registry. Body {category, note?}. Never touches granted_to — handing a reservation to an account is the separate PUT /api/admin/users/{user_id}/nick above. 400 on an invalid nick format; 200 {nick, created} on success. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -148,7 +149,7 @@ public = false
 [[endpoints]]
 method = "DELETE"
 path = "/api/admin/nicks/reserved/{nick}"
-description = "Release nick from the reserved-nick registry entirely, granted_to included — not the same as moving an account off it while it stays reserved for someone else. 204 on delete, 404 if it was not reserved."
+description = "Release nick from the reserved-nick registry entirely, granted_to included — not the same as moving an account off it while it stays reserved for someone else. 204 on delete, 404 if it was not reserved. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -156,7 +157,7 @@ public = false
 [[endpoints]]
 method = "POST"
 path = "/api/admin/notify"
-description = "Owner outreach (2026-09-09): send one message to every account with a linked Telegram identity, or an explicit subset. Body {channel:\"telegram\", to:\"all\"|[user_id,...], text, dry_run}. text over 3900 chars (margin under Telegram's 4096) is refused with 400. dry_run:true resolves and returns {recipients:[{user_id,nick,chat_id_present:true}],count} without sending or logging anything. Otherwise sends sequentially (100ms spacing) via the same bot identity tg-login-bot/mlc-alert-daemon use, records every attempt in notify_log, and returns {batch_id,sent,failed:[{user_id,error}]}. 503 {\"error\":\"telegram bot token not configured\"} if TELEGRAM_BOT_TOKEN is unset."
+description = "Owner outreach (2026-09-09): send one message to every account with a linked Telegram identity, or an explicit subset. Body {channel:\"telegram\", to:\"all\"|[user_id,...], text, dry_run}. text over 3900 chars (margin under Telegram's 4096) is refused with 400. dry_run:true resolves and returns {recipients:[{user_id,nick,chat_id_present:true}],count} without sending or logging anything. Otherwise sends sequentially (100ms spacing) via the same bot identity tg-login-bot/mlc-alert-daemon use, records every attempt in notify_log, and returns {batch_id,sent,failed:[{user_id,error}]}. 503 {\"error\":\"telegram bot token not configured\"} if TELEGRAM_BOT_TOKEN is unset. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -164,7 +165,7 @@ public = false
 [[endpoints]]
 method = "GET"
 path = "/api/admin/notify/batches"
-description = "Owner outreach: the last 50 notify_batches rows, newest first, each with its sent/failed counts aggregated from notify_log."
+description = "Owner outreach: the last 50 notify_batches rows, newest first, each with its sent/failed counts aggregated from notify_log. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -172,7 +173,7 @@ public = false
 [[endpoints]]
 method = "POST"
 path = "/api/admin/posts"
-description = "Upsert an in-app blog post/patch-note by id (the object verbatim — id, kind, version?, date, title, summary, body, url?, visibility?). url defaults to /blog/<id>; visibility defaults to 'public'. Response {id, created}. Checked before the body is ever parsed, same rule as every other admin route."
+description = "Upsert an in-app blog post/patch-note by id (the object verbatim — id, kind, version?, date, title, summary, body, url?, visibility?). url defaults to /blog/<id>; visibility defaults to 'public'. Response {id, created}. Checked before the body is ever parsed, same rule as every other admin route. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -180,7 +181,7 @@ public = false
 [[endpoints]]
 method = "DELETE"
 path = "/api/admin/posts/{id}"
-description = "Delete an in-app blog post. 204 on delete, 404 if no such post."
+description = "Delete an in-app blog post. 204 on delete, 404 if no such post. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -608,7 +609,7 @@ public = false
 [[endpoints]]
 method = "POST"
 path = "/api/admin/forum/hide"
-description = "Hide any v1 forum thread or reply regardless of author. Body {kind:\"thread\"|\"reply\", id}. 204 if a visible row was hidden, 404 if no such row existed (unknown id or already hidden)."
+description = "Hide any v1 forum thread or reply regardless of author. Body {kind:\"thread\"|\"reply\", id}. 204 if a visible row was hidden, 404 if no such row existed (unknown id or already hidden). Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -679,7 +680,7 @@ public = false
 [[endpoints]]
 method = "POST"
 path = "/api/admin/forum/boards"
-description = "Forum v2 admin: create a board {slug, title, description?, read_class, write_class, position?}. read_class/write_class must be one of public|user|paid|trusted|moderator|admin (400 with the list otherwise). Board CRUD is ADMIN_SECRET-only regardless of any forum_roles a bearer's account might also hold."
+description = "Forum v2 admin: create a board {slug, title, description?, read_class, write_class, position?}. read_class/write_class must be one of public|user|paid|trusted|moderator|admin (400 with the list otherwise). Board CRUD is ADMIN_SECRET-only regardless of any forum_roles a bearer's account might also hold. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -687,7 +688,7 @@ public = false
 [[endpoints]]
 method = "PATCH"
 path = "/api/admin/forum/boards/{id}"
-description = "Forum v2 admin: update a board's fields — same shape as create; only the fields given in the body change."
+description = "Forum v2 admin: update a board's fields — same shape as create; only the fields given in the body change. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -695,7 +696,7 @@ public = false
 [[endpoints]]
 method = "DELETE"
 path = "/api/admin/forum/boards/{id}"
-description = "Forum v2 admin: delete a board."
+description = "Forum v2 admin: delete a board. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -703,7 +704,7 @@ public = false
 [[endpoints]]
 method = "GET"
 path = "/api/admin/forum/roles"
-description = "Forum v2 admin: every granted role row {user_id, nick, role, granted_at}, nick resolved from the identity database."
+description = "Forum v2 admin: every granted role row {user_id, nick, role, granted_at}, nick resolved from the identity database. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -711,7 +712,7 @@ public = false
 [[endpoints]]
 method = "PUT"
 path = "/api/admin/forum/roles/{user_id}"
-description = "Forum v2 admin: grant a role {role: moderator|admin} to a user_id."
+description = "Forum v2 admin: grant a role {role: moderator|admin} to a user_id. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -719,7 +720,7 @@ public = false
 [[endpoints]]
 method = "DELETE"
 path = "/api/admin/forum/roles/{user_id}"
-description = "Forum v2 admin: revoke a granted moderator/admin role from a user_id. 204 on revoke, 404 if the user held no role."
+description = "Forum v2 admin: revoke a granted moderator/admin role from a user_id. 204 on revoke, 404 if the user held no role. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -727,7 +728,7 @@ public = false
 [[endpoints]]
 method = "PUT"
 path = "/api/admin/forum/roles/by-nick/{nick}"
-description = "Forum v2 admin: same grant as PUT .../roles/{user_id}, addressed by nick (case-insensitive, exact match). 404 {\"error\":\"no user with that nick\"} when absent."
+description = "Forum v2 admin: same grant as PUT .../roles/{user_id}, addressed by nick (case-insensitive, exact match). 404 {\"error\":\"no user with that nick\"} when absent. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -735,7 +736,7 @@ public = false
 [[endpoints]]
 method = "DELETE"
 path = "/api/admin/forum/roles/by-nick/{nick}"
-description = "Forum v2 admin: same revoke as DELETE .../roles/{user_id}, addressed by nick. 404 {\"error\":\"no user with that nick\"} when absent."
+description = "Forum v2 admin: same revoke as DELETE .../roles/{user_id}, addressed by nick. 404 {\"error\":\"no user with that nick\"} when absent. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -743,7 +744,7 @@ public = false
 [[endpoints]]
 method = "GET"
 path = "/api/admin/forum/trusted"
-description = "Forum v2 admin: every forum_trusted row {user_id, nick, note, granted_at} (Class::Trusted, owner ruling 2026-09-09 — 'paid with standing'), nick resolved from the identity database."
+description = "Forum v2 admin: every forum_trusted row {user_id, nick, note, granted_at} (Class::Trusted, owner ruling 2026-09-09 — 'paid with standing'), nick resolved from the identity database. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -751,7 +752,7 @@ public = false
 [[endpoints]]
 method = "PUT"
 path = "/api/admin/forum/trusted/{user_id}"
-description = "Forum v2 admin: grant Class::Trusted standing to a user_id. Body {note: \"...\"} optional, may be omitted entirely. Idempotent (a second grant replaces note/granted_at)."
+description = "Forum v2 admin: grant Class::Trusted standing to a user_id. Body {note: \"...\"} optional, may be omitted entirely. Idempotent (a second grant replaces note/granted_at). Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -759,7 +760,7 @@ public = false
 [[endpoints]]
 method = "DELETE"
 path = "/api/admin/forum/trusted/{user_id}"
-description = "Forum v2 admin: revoke Class::Trusted standing from a user_id. 404 if the account was not trusted."
+description = "Forum v2 admin: revoke Class::Trusted standing from a user_id. 404 if the account was not trusted. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -767,7 +768,7 @@ public = false
 [[endpoints]]
 method = "PUT"
 path = "/api/admin/forum/trusted/by-nick/{nick}"
-description = "Forum v2 admin: same grant as PUT .../trusted/{user_id}, addressed by nick (case-insensitive, exact match). 404 {\"error\":\"no user with that nick\"} when absent."
+description = "Forum v2 admin: same grant as PUT .../trusted/{user_id}, addressed by nick (case-insensitive, exact match). 404 {\"error\":\"no user with that nick\"} when absent. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false
@@ -775,7 +776,7 @@ public = false
 [[endpoints]]
 method = "DELETE"
 path = "/api/admin/forum/trusted/by-nick/{nick}"
-description = "Forum v2 admin: same revoke as DELETE .../trusted/{user_id}, addressed by nick. 404 {\"error\":\"no user with that nick\"} when absent."
+description = "Forum v2 admin: same revoke as DELETE .../trusted/{user_id}, addressed by nick. 404 {\"error\":\"no user with that nick\"} when absent. Admin listener only (127.0.0.1:19238 by default), never on local_url/public_url."
 auth = "bearer"
 auth_env = "ADMIN_SECRET"
 public = false

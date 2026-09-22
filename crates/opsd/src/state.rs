@@ -42,11 +42,26 @@ pub const PUBLIC_HEALTH_URL: &str = "https://mylittlechart.org/health";
 /// Reading the address back from the unit keeps the probe honest through any
 /// future rebind, and falls back to loopback when the unit sets nothing.
 pub const APP_HEALTH_RESOLVE: &str = "H=http://$(systemctl show mlc-server -p Environment --value 2>/dev/null | tr ' ' '\\n' | sed -n 's/^BIND_ADDR=//p' | head -n1 | grep . || echo 127.0.0.1):19200/health; ";
-/// Same address resolution as [`APP_HEALTH_RESOLVE`] but leaving the bare
-/// base URL (no `/health` suffix) in `$B` — for anything that needs to hit a
-/// different route on the app's own port from inside a box ssh session (see
-/// `release::register_release`).
-pub const APP_BASE_RESOLVE: &str = "B=http://$(systemctl show mlc-server -p Environment --value 2>/dev/null | tr ' ' '\\n' | sed -n 's/^BIND_ADDR=//p' | head -n1 | grep . || echo 127.0.0.1):19200; ";
+/// Shell prefix that resolves `mlc-server`'s admin API listener port from
+/// the unit's own `ADMIN_PORT` and leaves the base URL in `$A` for the
+/// command that follows — 2026-09-22 admin-listener split, see
+/// `docs/mlc/audits/api-surface-hardening-2026-09-10.md` §3/§6.
+///
+/// The host half is a fixed `127.0.0.1`, unlike [`APP_HEALTH_RESOLVE`]'s
+/// `BIND_ADDR` resolution: the admin listener's host always defaults to
+/// loopback (`crates/server/src/main.rs`'s `ADMIN_BIND`), and the command
+/// this feeds runs inside an ssh session directly on the control box (see
+/// `release::register_release`, the only caller), so loopback is already
+/// the right address regardless of `BIND_ADDR`. The PORT half still has to
+/// be read back from the unit, though — an operator can override
+/// `ADMIN_PORT` on the box without opsd (running on a workstation, not the
+/// box) ever knowing, the same reason [`APP_HEALTH_RESOLVE`] resolves
+/// `BIND_ADDR`, not a hardcoded one. This is the ONLY place the admin port
+/// is resolved — no separate opsd-side `MLC_OPSD_ADMIN_PORT` override
+/// exists, so there is exactly one source of truth (the box's own unit
+/// environment), not two that could disagree.
+pub const APP_ADMIN_RESOLVE: &str = "A=http://127.0.0.1:$(systemctl show mlc-server -p Environment --value 2>/dev/null | tr ' ' '\\n' | sed -n 's/^ADMIN_PORT=//p' | head -n1 | grep . || echo 19238); ";
+
 pub const BIND_ADDR: &str = "127.0.0.1:18360";
 
 /// Effective bind address. `MLC_OPSD_BIND` overrides the default for

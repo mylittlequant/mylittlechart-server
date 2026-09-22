@@ -29,6 +29,50 @@ both SQLCipher, one key — plus plaintext `operational.db` and
 `alert_daemon.db`) live **only** on control, `/var/lib/mlc/data/`. Neither
 edge holds a copy or runs `mlc-server`; they serve static files only.
 
+## Admin API listener
+
+**NOT deployed yet** — code is merged (`routes::admin_api_router`,
+`crates/server/src/main.rs`'s `ADMIN_BIND`/`ADMIN_PORT`), but production
+still serves `/api/admin/*` on the same public path as `/api/posts`
+(`10.77.0.1:19200`, behind Cloudflare → edge nginx → WireGuard, `ADMIN_SECRET`
+the only lock) until the owner gives the word to deploy. Do not assume the
+tunnel below works against the live box before that.
+
+Once deployed: `mlc-server` on control binds a **third** listener,
+loopback-only, control role only — `127.0.0.1:19238` by default
+(`ADMIN_BIND` overrides the host, `ADMIN_PORT` the port; same override
+idiom as the dashboard listener's `DASHBOARD_PORT`). Every
+`ADMIN_SECRET`-gated route (`/api/admin/*`, ~28 endpoints — see
+`.nemo-service.toml`) answers there and ONLY there; the main listener no
+longer registers `/admin/*` at all, so an `/api/admin/*` probe against
+`10.77.0.1:19200` gets the same bare 404 as any other unknown path — by
+construction, not by masking (`routes/mod.rs`'s
+`admin_paths_are_ordinary_unknown_paths_on_the_public_router` test proves
+it).
+
+An operator reaches it through an SSH tunnel to the box, never directly:
+
+```sh
+ssh -N -L 19238:127.0.0.1:19238 -i env/mlc-c2-box root@144.172.97.2
+# then, in another shell:
+curl -s -X POST -H "Authorization: Bearer $ADMIN_SECRET" http://127.0.0.1:19238/api/admin/restart
+```
+
+`ADMIN_SECRET` is still checked on every route through the tunnel — the
+tunnel is the first lock, not a replacement for the bearer. `mlc-opsd`'s own
+`POST /api/release/publish` reaches the admin API differently: it runs
+`curl` from inside a box ssh session it already holds (not through this
+tunnel), against a loopback base URL it resolves ON the box from the unit's
+own `ADMIN_PORT` (same reasoning `APP_HEALTH_RESOLVE` already uses for the
+main listener's `BIND_ADDR` — opsd runs on a workstation, not the box, so it
+cannot know a port the operator overrode on the box without reading it
+back) — see `crates/opsd/src/state.rs`'s `APP_ADMIN_RESOLVE` and
+`crates/opsd/src/release.rs`'s `register_release`.
+
+Background: `docs/mlc/audits/api-surface-hardening-2026-09-10.md` §3/§6
+(the finding this closes — no separate listener carved out for
+`/api/admin`, riding the same path as `/api/posts`).
+
 ## What's live vs retired
 
 | Piece | Where | Status |
@@ -53,8 +97,8 @@ These cost real incidents. Read before touching the fleet.
    **correct**, not an outage — edges run nginx only, and the unit there is
    disabled on purpose.
 3. `curl 127.0.0.1:19200/health` on control does not work: the unit binds
-   `10.77.0.1`, not loopback (`APP_HEALTH_RESOLVE`/`APP_BASE_RESOLVE` in
-   `crates/opsd/src/state.rs` read the bind address back from the unit's own
+   `10.77.0.1`, not loopback (`APP_HEALTH_RESOLVE` in
+   `crates/opsd/src/state.rs` reads the bind address back from the unit's own
    environment for exactly this reason — reuse that instead of hardcoding
    loopback in a new script).
 4. Ubuntu's stock `sqlcipher` CLI is format-incompatible with this project's
@@ -94,7 +138,7 @@ committed. State db: `env/mlc-c2-1/opsd/opsd.sqlite` (WAL; `audit_log`,
 | `POST /api/restart {"unit"}` | bearer | whitelist only: `mlc-server` / `nginx` / `nftables` / `fail2ban` |
 | `POST /api/unlock` | bearer | boot-unlock: push canon `sqlcipher.key` + `server.env` to control's tmpfs (0600 root), start `mlc-server`, verify health |
 | `POST /api/deploy {"path"}` | bearer | upload musl binary to **control** → sha256 check → save `.prev` → stop/mv/start → health-poll 30×3s against the unit's own `BIND_ADDR` → auto-rollback to `.prev` on failure; verdict + `builds`/`audit_log` records |
-| `POST /api/release/publish {"path","platform","version","channel","release_notes","signature"}` | bearer | upload artifact to **every edge**, sha256-verify each, unwind what already landed if any edge fails, then register the manifest row on control (`POST /api/admin/register-release`, run from inside a box ssh session — the admin API is WireGuard-only) |
+| `POST /api/release/publish {"path","platform","version","channel","release_notes","signature"}` | bearer | upload artifact to **every edge**, sha256-verify each, unwind what already landed if any edge fails, then register the manifest row on control (`POST /api/admin/register-release`, run from inside a box ssh session against the admin listener's loopback address — see "Admin API listener" below; NOT reachable over WireGuard at all since the 2026-09-22 split) |
 | `POST /api/backup/now` | bearer | `systemctl start mlc-backup.service` on control + list `/var/lib/mlc/backups` |
 | `POST /api/backup/pull` | bearer | SFTP-pull latest `*.db` + `config-*.tar.gz` from control → `E:\backups\mlc-c2-1\` → AES-256-GCM (`env/backups/backup-key`) → plaintext removed → keep 30 newest `*.db.gcm`. Box-reported filenames are whitelisted before touching the local fs |
 | `GET /api/backup/list` | bearer | opbox-side archive listing (names, sizes, mtimes) |

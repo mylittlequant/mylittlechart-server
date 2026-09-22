@@ -8,6 +8,19 @@
 //! second, independent limit at the nginx layer in front
 //! (`ops/nginx-mlc-ratelimit.conf`); the auth-poll paths get the same
 //! nginx-layer treatment now too.
+//!
+//! Admin surface (2026-09-22 split): every `ADMIN_SECRET`-gated `/admin/*`
+//! route lives in [`admin_api_router`], never in [`control_api_router`] —
+//! closing the gap `docs/mlc/audits/api-surface-hardening-2026-09-10.md`
+//! §3/§6 named (no separate listener carved out for `/api/admin`; it rode
+//! the same path as `/api/posts`). Both routers are mounted as
+//! `.nest("/api", …)`, so every admin path keeps its `/api/admin/...` shape
+//! unchanged — only the listener a caller has to reach differs: `main.rs`
+//! binds `admin_api_router` on its own loopback listener (`ADMIN_BIND`/
+//! `ADMIN_PORT`, default `127.0.0.1:19238`, control role only), reachable
+//! operator-side only through an SSH tunnel (`ops/README.md`).
+//! `ADMIN_SECRET` stays the second lock — the tunnel is the first, not a
+//! replacement.
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -40,50 +53,16 @@ pub mod telemetry;
 pub mod tg_login;
 pub mod updates;
 
-/// Build the `/api` sub-router for a control-role process: every endpoint,
-/// unchanged from before the 2026-08-30 control/edge split.
+/// Build the `/api` sub-router for a control-role process: every public
+/// endpoint except `/admin/*`. Admin endpoints (`ADMIN_SECRET`-gated) are
+/// NOT mounted here — see [`admin_api_router`], mounted on its own loopback
+/// listener in `main.rs` (`ADMIN_BIND`/`ADMIN_PORT`, default
+/// `127.0.0.1:19238`, control role only) so the admin surface is
+/// unreachable from this router's listener regardless of bearer (see this
+/// module's `//!` doc for the 2026-09-22 split and why).
 /// The state is `Arc<AppState>` and is attached via `.with_state()` on the outer router.
 pub fn control_api_router(state: Arc<AppState>) -> Router {
     Router::new()
-        // Admin endpoints — protected by ADMIN_SECRET.
-        .route("/admin/register-release", post(admin::register_release))
-        .route("/admin/restart", post(admin::restart))
-        .route("/admin/promote", post(admin::promote))
-        .route("/admin/gift-codes", post(admin::mint_gift_codes))
-        // Static, not `/admin/users/{id}` — see this file's `//!` note near
-        // the tests module on static-vs-parameter coexistence; nothing here
-        // collides with it either way, since no `/admin/users/{...}` route
-        // exists.
-        .route("/admin/users", get(admin::list_users))
-        // Static two-segment path under the same `/admin/users` prefix —
-        // coexists with the single-segment `/admin/users` directly above the
-        // same way `/admin/forum/roles/by-nick/{nick}` coexists with
-        // `/admin/forum/roles/{user_id}` further down (proven by
-        // `control_router_registers_without_route_conflicts` below).
-        .route("/admin/users/merge", post(admin::merge_users))
-        // Reserved-nick registry (owner ruling 2026-09-09) — GET is static,
-        // PUT/DELETE address one entry by path param, same static-vs-
-        // parameter coexistence as `/admin/forum/roles` +
-        // `/admin/forum/roles/{user_id}` further down.
-        .route("/admin/nicks/reserved", get(admin::list_reserved_nicks))
-        .route(
-            "/admin/nicks/reserved/{nick}",
-            axum::routing::put(admin::upsert_reserved_nick).delete(admin::delete_reserved_nick),
-        )
-        // Grant a nick to a specific account, bypassing the self-service
-        // reserved-list/cooldown gates — a third path segment under
-        // `/admin/users/{user_id}`, coexisting with the static `/admin/users`
-        // and `/admin/users/merge` above the same way
-        // `/forum/threads/{id}/replies` coexists with `/forum/threads/{id}`.
-        .route("/admin/users/{user_id}/nick", axum::routing::put(admin::admin_set_user_nick))
-        // Owner outreach (2026-09-09) — static two-segment path under the
-        // one-segment `/admin/notify` right above it, same static-vs-static
-        // coexistence as `/admin/users` + `/admin/users/merge` above (see
-        // routes/notify.rs for the handlers).
-        .route("/admin/notify", post(notify::notify))
-        .route("/admin/notify/batches", get(notify::list_batches))
-        .route("/admin/posts", post(posts::admin_upsert_post))
-        .route("/admin/posts/{id}", delete(posts::admin_delete_post))
         // In-app blog: patch notes and posts (see routes/posts.rs). Public.
         .route("/posts", get(posts::list_posts))
         .route("/posts/{id}", get(posts::get_post))
@@ -183,7 +162,6 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         )
         .route("/forum/threads/{id}/replies", post(forum::create_reply))
         .route("/forum/replies/{id}", delete(forum::delete_reply))
-        .route("/admin/forum/hide", post(forum::admin_hide))
         // Forum engine v2 (public boards, role-gated read/write — see
         // routes/forum_v2.rs). Additive: v1's `/forum/*` routes above are
         // untouched.
@@ -198,43 +176,6 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/forum/v2/threads/{id}/moderate", post(forum_v2::moderate_thread))
         .route("/forum/v2/replies/{id}", delete(forum_v2::delete_reply))
         .route("/forum/search", get(forum_v2::search))
-        .route("/admin/forum/boards", post(forum_v2::admin_create_board))
-        .route(
-            "/admin/forum/boards/{id}",
-            patch(forum_v2::admin_update_board).delete(forum_v2::admin_delete_board),
-        )
-        // Static, coexists with the parameterized `/admin/forum/roles/{user_id}`
-        // right below the same way `/admin/users` coexists above.
-        .route("/admin/forum/roles", get(forum_v2::admin_list_roles))
-        .route(
-            "/admin/forum/roles/{user_id}",
-            axum::routing::put(forum_v2::admin_set_role).delete(forum_v2::admin_remove_role),
-        )
-        // Literal `by-nick` segment under the same `/admin/forum/roles/`
-        // prefix as the `{user_id}` parameter directly above — matchit
-        // resolves a literal segment over a parameter at the same tree
-        // depth (proven by `control_router_registers_without_route_conflicts`
-        // below, the same way `/share/mine` coexists with `/share/{token}`),
-        // so this is not the shadowing case the static-vs-parameter note
-        // above warns about.
-        .route(
-            "/admin/forum/roles/by-nick/{nick}",
-            axum::routing::put(forum_v2::admin_set_role_by_nick)
-                .delete(forum_v2::admin_remove_role_by_nick),
-        )
-        // Forum v2 trusted standing (`Class::Trusted` — owner ruling
-        // 2026-09-09, plan §5). Same static/parameter/by-nick coexistence as
-        // the role CRUD directly above.
-        .route("/admin/forum/trusted", get(forum_v2::admin_list_trusted))
-        .route(
-            "/admin/forum/trusted/{user_id}",
-            axum::routing::put(forum_v2::admin_set_trusted).delete(forum_v2::admin_remove_trusted),
-        )
-        .route(
-            "/admin/forum/trusted/by-nick/{nick}",
-            axum::routing::put(forum_v2::admin_set_trusted_by_nick)
-                .delete(forum_v2::admin_remove_trusted_by_nick),
-        )
         // Direct messages (paid, end-to-end encrypted — see routes/dm.rs).
         // Every route is authed AND paid; no public GET of any kind.
         .route(
@@ -255,6 +196,104 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
             get(dm::list_messages).post(dm::create_message),
         )
         .route("/dm/conversations/{id}/read", post(dm::mark_read))
+        .with_state(state)
+}
+
+/// Build the `/api` sub-router carrying every `ADMIN_SECRET`-gated route —
+/// split out of [`control_api_router`] (2026-09-22 admin-listener
+/// hardening; see this module's `//!` doc for why). Mounted the same way as
+/// `control_api_router` — `.nest("/api", admin_api_router(...))` in
+/// `main.rs` — so every route here keeps its `/api/admin/...` path
+/// unchanged; only the listener a caller has to reach differs: a separate
+/// loopback bind (`ADMIN_BIND`/`ADMIN_PORT`, default `127.0.0.1:19238`,
+/// control role only), reachable operator-side only through an SSH tunnel
+/// (see `ops/README.md`). `ADMIN_SECRET` is still checked on every route
+/// here — the listener split is a first lock, not a replacement for it.
+/// The state is `Arc<AppState>` and is attached via `.with_state()` on the outer router.
+pub fn admin_api_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        // Admin endpoints — protected by ADMIN_SECRET.
+        .route("/admin/register-release", post(admin::register_release))
+        .route("/admin/restart", post(admin::restart))
+        .route("/admin/promote", post(admin::promote))
+        .route("/admin/gift-codes", post(admin::mint_gift_codes))
+        // Static, not `/admin/users/{id}` — see this file's `//!` note near
+        // the tests module on static-vs-parameter coexistence; nothing here
+        // collides with it either way, since no `/admin/users/{...}` route
+        // exists.
+        .route("/admin/users", get(admin::list_users))
+        // Static two-segment path under the same `/admin/users` prefix —
+        // coexists with the single-segment `/admin/users` directly above the
+        // same way `/admin/forum/roles/by-nick/{nick}` coexists with
+        // `/admin/forum/roles/{user_id}` further down (proven by
+        // `admin_router_registers_without_route_conflicts` below).
+        .route("/admin/users/merge", post(admin::merge_users))
+        // Reserved-nick registry (owner ruling 2026-09-09) — GET is static,
+        // PUT/DELETE address one entry by path param, same static-vs-
+        // parameter coexistence as `/admin/forum/roles` +
+        // `/admin/forum/roles/{user_id}` further down.
+        .route("/admin/nicks/reserved", get(admin::list_reserved_nicks))
+        .route(
+            "/admin/nicks/reserved/{nick}",
+            axum::routing::put(admin::upsert_reserved_nick).delete(admin::delete_reserved_nick),
+        )
+        // Grant a nick to a specific account, bypassing the self-service
+        // reserved-list/cooldown gates — a third path segment under
+        // `/admin/users/{user_id}`, coexisting with the static `/admin/users`
+        // and `/admin/users/merge` above the same way
+        // `/forum/threads/{id}/replies` coexists with `/forum/threads/{id}`
+        // (in `control_api_router`).
+        .route("/admin/users/{user_id}/nick", axum::routing::put(admin::admin_set_user_nick))
+        // Owner outreach (2026-09-09) — static two-segment path under the
+        // one-segment `/admin/notify` right above it, same static-vs-static
+        // coexistence as `/admin/users` + `/admin/users/merge` above (see
+        // routes/notify.rs for the handlers).
+        .route("/admin/notify", post(notify::notify))
+        .route("/admin/notify/batches", get(notify::list_batches))
+        .route("/admin/posts", post(posts::admin_upsert_post))
+        .route("/admin/posts/{id}", delete(posts::admin_delete_post))
+        // Hide any v1 forum thread or reply, admin-only (see routes/forum.rs
+        // — the paid, non-admin `/forum/*` v1 routes live in
+        // `control_api_router`; this is the one ADMIN_SECRET-gated route
+        // that module registers).
+        .route("/admin/forum/hide", post(forum::admin_hide))
+        .route("/admin/forum/boards", post(forum_v2::admin_create_board))
+        .route(
+            "/admin/forum/boards/{id}",
+            patch(forum_v2::admin_update_board).delete(forum_v2::admin_delete_board),
+        )
+        // Static, coexists with the parameterized `/admin/forum/roles/{user_id}`
+        // right below the same way `/admin/users` coexists above.
+        .route("/admin/forum/roles", get(forum_v2::admin_list_roles))
+        .route(
+            "/admin/forum/roles/{user_id}",
+            axum::routing::put(forum_v2::admin_set_role).delete(forum_v2::admin_remove_role),
+        )
+        // Literal `by-nick` segment under the same `/admin/forum/roles/`
+        // prefix as the `{user_id}` parameter directly above — matchit
+        // resolves a literal segment over a parameter at the same tree
+        // depth (proven by `admin_router_registers_without_route_conflicts`
+        // below, the same way `/share/mine` coexists with `/share/{token}`
+        // in `control_api_router`), so this is not the shadowing case the
+        // static-vs-parameter note above warns about.
+        .route(
+            "/admin/forum/roles/by-nick/{nick}",
+            axum::routing::put(forum_v2::admin_set_role_by_nick)
+                .delete(forum_v2::admin_remove_role_by_nick),
+        )
+        // Forum v2 trusted standing (`Class::Trusted` — owner ruling
+        // 2026-09-09, plan §5). Same static/parameter/by-nick coexistence as
+        // the role CRUD directly above.
+        .route("/admin/forum/trusted", get(forum_v2::admin_list_trusted))
+        .route(
+            "/admin/forum/trusted/{user_id}",
+            axum::routing::put(forum_v2::admin_set_trusted).delete(forum_v2::admin_remove_trusted),
+        )
+        .route(
+            "/admin/forum/trusted/by-nick/{nick}",
+            axum::routing::put(forum_v2::admin_set_trusted_by_nick)
+                .delete(forum_v2::admin_remove_trusted_by_nick),
+        )
         .with_state(state)
 }
 
@@ -288,20 +327,20 @@ pub fn edge_api_router(_state: Arc<AppState>) -> Router {
 mod tests {
     use super::*;
 
-    /// The full control route table must register without a conflict panic.
-    /// This is what proves `/share/mine` (static) coexists with
-    /// `/share/{token}` (parameter) and that the GET+DELETE pair on
-    /// `/share/{token}` merges, and — since the 2026-09-05 in-app blog —
-    /// that `/posts/{id}` and `/admin/posts/{id}` (parameter) coexist with
-    /// the static `/posts` and `/admin/posts` — axum/matchit panics at
-    /// registration time on a genuinely conflicting pair, so building the
-    /// router once is the whole test. Since the same day's paid forum: the
-    /// GET+DELETE pair on `/forum/threads/{id}` merges the same way
-    /// `/share/{token}` does, and `/forum/threads/{id}/replies` (two
-    /// parameter-then-literal segments) coexists with the single-parameter
-    /// `/forum/threads/{id}` and the separate `/forum/replies/{id}`.
-    /// `control_plane` is `None`: registration never calls a handler, so no
-    /// database is needed.
+    /// The full control route table (admin routes excluded — see
+    /// `admin_router_registers_without_route_conflicts` below for those)
+    /// must register without a conflict panic. This is what proves
+    /// `/share/mine` (static) coexists with `/share/{token}` (parameter) and
+    /// that the GET+DELETE pair on `/share/{token}` merges, and — since the
+    /// 2026-09-05 in-app blog — that `/posts/{id}` (parameter) coexists with
+    /// the static `/posts` — axum/matchit panics at registration time on a
+    /// genuinely conflicting pair, so building the router once is the whole
+    /// test. Since the same day's paid forum: the GET+DELETE pair on
+    /// `/forum/threads/{id}` merges the same way `/share/{token}` does, and
+    /// `/forum/threads/{id}/replies` (two parameter-then-literal segments)
+    /// coexists with the single-parameter `/forum/threads/{id}` and the
+    /// separate `/forum/replies/{id}`. `control_plane` is `None`:
+    /// registration never calls a handler, so no database is needed.
     #[test]
     fn control_router_registers_without_route_conflicts() {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -325,6 +364,45 @@ mod tests {
             None,
         ));
         let _router = control_api_router(state);
+    }
+
+    /// The full admin route table must register without a conflict panic —
+    /// the counterpart of `control_router_registers_without_route_conflicts`
+    /// above, split out 2026-09-22. This is what proves `/admin/users`
+    /// (static) coexists with `/admin/users/merge` and
+    /// `/admin/users/{user_id}/nick` (both under the same prefix),
+    /// `/admin/nicks/reserved` (static) coexists with
+    /// `/admin/nicks/reserved/{nick}` (parameter), `/admin/notify` coexists
+    /// with `/admin/notify/batches`, `/admin/posts` coexists with
+    /// `/admin/posts/{id}`, `/admin/forum/boards` coexists with
+    /// `/admin/forum/boards/{id}`, and — the deepest case — the static
+    /// `/admin/forum/roles`/`/admin/forum/trusted` each coexist with both
+    /// their own `{user_id}` parameter route AND the literal `by-nick/{nick}`
+    /// segment at the same tree depth. `control_plane` is `None`:
+    /// registration never calls a handler, so no database is needed.
+    #[test]
+    fn admin_router_registers_without_route_conflicts() {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let state = Arc::new(AppState::new(
+            None,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            shutdown_tx,
+            Vec::new(),
+            false,
+            0,
+            0,
+            None,
+        ));
+        let _router = admin_api_router(state);
     }
 
     /// `main.rs` merges the blog router (`/blog/posts.json`, `/blog/feed.xml`,
@@ -377,20 +455,75 @@ mod tests {
         ))
     }
 
-    /// `verify_admin_secret`'s refusal (no bearer at all, here) must be
-    /// byte-for-byte the same response axum's own routing gives an unmatched
-    /// path under this router — same status, same headers, same (empty)
-    /// body. This is what makes the admin surface invisible from outside: a
-    /// probe cannot tell "this route exists but the secret is wrong" apart
-    /// from "this route was never registered" (see
-    /// `routes::admin::verify_admin_secret`'s doc comment).
+    /// Since the 2026-09-22 admin-listener split, `/api/admin/*` is not
+    /// registered on `control_api_router` at all — this proves the
+    /// invariant the pre-split test of this name used to prove by masking
+    /// (`admin_not_found()` answering byte-for-byte like an unmatched path)
+    /// now holds structurally instead: an `/admin/*` path on this router
+    /// hits matchit's own "nothing registered" fallback, the exact same
+    /// code path a path that was never anything hits. Unlike the pre-split
+    /// test, `content-length` needs no exclusion here — neither response
+    /// ever reaches a matched `Route` (see
+    /// `admin_router_unauthenticated_route_is_indistinguishable_from_an_unknown_path`
+    /// below for the same proof against `admin_api_router`, where
+    /// `/admin/restart` IS a matched route and the exclusion is still
+    /// needed).
     #[tokio::test]
-    async fn unauthenticated_admin_route_is_indistinguishable_from_an_unknown_path() {
+    async fn admin_paths_are_ordinary_unknown_paths_on_the_public_router() {
         use axum::body::{to_bytes, Body};
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
 
         let router = control_api_router(admin_gate_test_state("s3cr3t"));
+
+        let unknown = router
+            .clone()
+            .oneshot(
+                Request::get("/totally-unknown-path-2026-09-22")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("Router::call is infallible");
+        let admin_path = router
+            .oneshot(
+                Request::post("/admin/restart")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("Router::call is infallible");
+
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(unknown.status(), admin_path.status());
+        assert_eq!(unknown.headers(), admin_path.headers());
+
+        let unknown_body = to_bytes(unknown.into_body(), usize::MAX)
+            .await
+            .expect("read unknown-path body");
+        let admin_body = to_bytes(admin_path.into_body(), usize::MAX)
+            .await
+            .expect("read admin-path body");
+        assert_eq!(unknown_body, admin_body);
+        assert!(unknown_body.is_empty());
+    }
+
+    /// On `admin_api_router` itself, `verify_admin_secret`'s refusal (no
+    /// bearer at all, here) must still be byte-for-byte the same response
+    /// axum's own routing gives an unmatched path under this router — same
+    /// status, same headers, same (empty) body. This is what makes the
+    /// admin surface invisible from outside a caller who already reached
+    /// its listener (the loopback bind + SSH tunnel are the first lock,
+    /// this masking is the second): a probe cannot tell "this route exists
+    /// but the secret is wrong" apart from "this route was never
+    /// registered" (see `routes::admin::verify_admin_secret`'s doc comment).
+    #[tokio::test]
+    async fn admin_router_unauthenticated_route_is_indistinguishable_from_an_unknown_path() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let router = admin_api_router(admin_gate_test_state("s3cr3t"));
 
         let unknown = router
             .clone()
@@ -443,12 +576,12 @@ mod tests {
     /// A wrong (but well-formed) bearer gets the exact same 404 as a missing
     /// one — the refusal shape does not vary with how wrong the caller is.
     #[tokio::test]
-    async fn admin_route_refuses_with_404_on_wrong_bearer() {
+    async fn admin_router_refuses_with_404_on_wrong_bearer() {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
 
-        let router = control_api_router(admin_gate_test_state("s3cr3t"));
+        let router = admin_api_router(admin_gate_test_state("s3cr3t"));
 
         let resp = router
             .oneshot(
@@ -469,12 +602,12 @@ mod tests {
     /// (the empty-secret check in `verify_admin_secret` runs before the
     /// token comparison ever could).
     #[tokio::test]
-    async fn admin_route_refuses_with_404_when_admin_secret_is_unset() {
+    async fn admin_router_refuses_with_404_when_admin_secret_is_unset() {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
 
-        let router = control_api_router(admin_gate_test_state(""));
+        let router = admin_api_router(admin_gate_test_state(""));
 
         let resp = router
             .oneshot(
