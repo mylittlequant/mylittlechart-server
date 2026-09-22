@@ -26,7 +26,7 @@ mod watch;
 #[command(
     name = "mlc-opsd",
     version,
-    about = "operator control plane for the mylittlechart.org production box (mlc-utah-1)"
+    about = "operator control plane for the mylittlechart.org fleet (control mlc-c2-1 + two nginx edges)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -41,7 +41,8 @@ enum Cmd {
     Status,
     /// Deliver dbkey + server.env to box tmpfs, start mlc-server, verify.
     Unlock,
-    /// Restart a whitelisted unit: mlc-server | nginx | fail2ban.
+    /// Restart a whitelisted unit: mlc-server | nginx | nftables | fail2ban
+    /// (the list of record is `state::UNIT_WHITELIST`).
     Restart { unit: String },
     /// Journal tail (default: mlc-server, 50 lines).
     Logs { unit: Option<String>, lines: Option<u32> },
