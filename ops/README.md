@@ -175,9 +175,7 @@ the same daemon, for the recurring jobs, live in `../CICD/mlc/scripts/`:
 
 ## Deploy pipeline — server binary
 
-Build the musl binary (docker, canonical — native Windows cannot build
-`openssl-sys` here, its bundled Perl lacks `Locale::Maketext::Simple`, so the
-same image is also the only working `cargo check` for this crate) and hand
+Build the musl binary (docker, canonical — the box runs Linux) and hand
 opsd its absolute path; it uploads to **control**, verifies sha256, keeps
 `.prev`, swaps, then polls health 30×3s against the unit's own `BIND_ADDR`
 and rolls back to `.prev` on failure:
@@ -190,6 +188,16 @@ curl -s -m 1800 -X POST -H "Authorization: Bearer $K" -H "Content-Type: applicat
   -d '{"path":"<ABSOLUTE>/target/x86_64-unknown-linux-musl/release/mylittlechart-server"}' \
   http://127.0.0.1:18360/api/deploy
 ```
+
+Docker is needed for the *artifact*, not for checking the code. `cargo check
+-p mylittlechart-server --release` runs natively on this Windows box in well
+under a minute — SQLCipher builds against the system OpenSSL wired up in
+`nemo/.cargo/config.toml`, and the `vendored-openssl` feature that used to
+break the native build is scoped to the musl target only
+(`crates/server/Cargo.toml`'s `cfg(target_env = "musl")` block). An earlier
+version of this file claimed the docker image was the only working
+`cargo check` for this crate; it is not, and gating on docker for a
+type-check costs minutes per iteration.
 
 Or the wrapper that does exactly this: `bash ../CICD/mlc/scripts/deploy-server.sh`.
 The client waits up to 30 minutes — opsd runs the whole deploy inside the
