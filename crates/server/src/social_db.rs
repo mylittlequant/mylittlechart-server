@@ -519,6 +519,31 @@ pub fn caller_classes(conn_social: &Connection, caller: Option<i64>, is_paid: bo
         .collect()
 }
 
+/// Every `user_id` holding a `forum_trusted` row or a `forum_roles` row —
+/// the accounts [`caller_classes`] resolves to at least [`Class::Paid`]
+/// regardless of their own subscription (trusted standing, or a moderator/
+/// admin role, both outrank `Paid` on the ladder — see that function's doc
+/// comment on why the ladder is cumulative). `routes::dm::lookup_recipients`
+/// uses this to include a ladder-paid account whose `paid_until` has lapsed
+/// in the recipient search, the same account `caller_classes` already
+/// treats as `Paid` for every other DM entitlement check (owner ruling
+/// 2026-09-23: "класс и роль нормально"). Deduplicated — a `UNION` (not
+/// `UNION ALL`), since an account can hold both a trusted row and a role row
+/// at once.
+pub fn ladder_boosted_user_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT user_id FROM forum_trusted
+         UNION
+         SELECT user_id FROM forum_roles",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
+}
+
 /// Highest rank held anywhere in `classes` — `0` (`Public`) for an empty
 /// slice, which should not happen since [`caller_classes`] always includes
 /// at least `Public`.
@@ -1410,6 +1435,28 @@ mod tests {
                 Class::Admin
             ]
         );
+    }
+
+    // ---- ladder_boosted_user_ids ----
+
+    #[test]
+    fn ladder_boosted_user_ids_includes_trusted_and_role_rows_deduplicated() {
+        let conn = test_conn();
+        set_trusted(&conn, 2, None, "2026-09-09T00:00:00+00:00").expect("set trusted");
+        set_role(&conn, 7, Role::Moderator, "2026-09-06T00:00:00+00:00").expect("set role");
+        // 8 holds both a trusted row and a role row — must appear once, not twice.
+        set_trusted(&conn, 8, None, "2026-09-09T00:00:00+00:00").expect("set trusted");
+        set_role(&conn, 8, Role::Admin, "2026-09-06T00:00:00+00:00").expect("set role");
+
+        let mut ids = ladder_boosted_user_ids(&conn).expect("boosted ids");
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 7, 8]);
+    }
+
+    #[test]
+    fn ladder_boosted_user_ids_is_empty_with_no_trusted_or_role_rows() {
+        let conn = test_conn();
+        assert!(ladder_boosted_user_ids(&conn).expect("boosted ids").is_empty());
     }
 
     // ---- is_valid_board_slug ----

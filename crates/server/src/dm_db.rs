@@ -219,12 +219,14 @@ pub fn get_identity_key(conn: &Connection, user_id: i64) -> Result<Option<DmIden
 }
 
 /// Which of `user_ids` have published a DM identity key — the social-plane
-/// half of `routes::dm::lookup_recipients`'s two-query candidate filter (the
-/// identity-plane half, "is this account currently paid", is a separate
-/// query against the identity database; the two are never joined in SQL,
-/// per this module's cross-database rule). One batched `IN (...)` query
-/// regardless of how many ids are passed, not one query per candidate.
-/// Empty input returns an empty set without touching the database.
+/// half of `routes::dm::lookup_recipients`'s candidate filter (the other
+/// half, "does this account reach `Class::Paid` on the forum ladder", is
+/// `routes::dm::paid_recipient_candidates` against the identity database
+/// plus `social_db::ladder_boosted_user_ids` against this one; the two are
+/// never joined in SQL, per this module's cross-database rule). One batched
+/// `IN (...)` query regardless of how many ids are passed, not one query per
+/// candidate. Empty input returns an empty set without touching the
+/// database.
 pub fn identity_key_owner_ids(conn: &Connection, user_ids: &[i64]) -> Result<HashSet<i64>> {
     if user_ids.is_empty() {
         return Ok(HashSet::new());

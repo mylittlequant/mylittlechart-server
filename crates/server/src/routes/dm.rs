@@ -12,13 +12,17 @@
 //! thread's. The only lever over an abusive DM account is revoking its paid
 //! status, which closes every route below (see [`require_dm_access`]).
 //!
-//! Every route requires both an authenticated AND a paid caller
-//! ([`require_dm_access`], same `entitlements::Feature::Forum` gate
-//! `routes::forum` uses — the plan's own words for it: "Feature::Forum
-//! today stands for the paid social tier"). Wherever a route also names a
-//! second account (conversation creation, sending a message), that
-//! account's OWN paid status is checked too ([`require_peer_paid`]) —
-//! together the two checks are the plan's "both parties must be paid".
+//! Every route requires an authenticated caller who reaches
+//! [`social_db::Class::Paid`] on the forum ladder ([`require_dm_access`] via
+//! [`is_dm_paid`]) — the SAME rule `GET /forum/me` reports
+//! (`social_db::caller_classes`), not a second copy of it: an unexpired
+//! `paid_until`, trusted standing, or a moderator/admin `forum_roles` row
+//! all satisfy this, even when the account's own subscription has lapsed
+//! (owner ruling 2026-09-23: "класс и роль нормально"). Wherever a route
+//! also names a second account (conversation creation, sending a message),
+//! that account's OWN ladder standing is checked too ([`require_peer_paid`])
+//! — together the two checks are the plan's "both parties must be paid",
+//! now read off the ladder instead of the raw subscription flag.
 //! [`create_conversation`] and [`create_message`] additionally require the
 //! caller to have chosen a nick ([`require_nick`], run right after
 //! [`require_dm_access`]) — owner ruling 2026-09-09: an account without a
@@ -31,8 +35,10 @@
 //!                                                          key + fingerprint.
 //!  - `GET    /dm/lookup?q=`                              — recipient search
 //!                                                          by nick/display
-//!                                                          name: paid
-//!                                                          accounts with a
+//!                                                          name: ladder-paid
+//!                                                          accounts (see
+//!                                                          [`is_dm_paid`])
+//!                                                          with a
 //!                                                          published DM
 //!                                                          identity key
 //!                                                          only, ranked
@@ -67,8 +73,8 @@ use std::sync::Arc;
 use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_token};
 use crate::db;
 use crate::dm_db;
-use crate::entitlements::{self, Feature};
 use crate::models::types::ErrorResponse;
+use crate::social_db::{self, Class};
 use crate::state::AppState;
 
 const DEFAULT_MESSAGE_LIMIT: i64 = 50;
@@ -190,18 +196,43 @@ fn not_paid_err() -> Response {
         .into_response()
 }
 
-/// The one entitlement gate every route in this module runs through:
-/// resolve the caller (401 if anonymous), then require `Feature::Forum`
-/// (403 if not paid) — see `routes::forum::require_forum_access`, the same
-/// shape. Returns the caller's `user_id` on success.
+/// Whether `user_id` reaches [`Class::Paid`] on the forum ladder — the SAME
+/// rule `GET /forum/me` reports via `social_db::caller_classes`
+/// (owner ruling 2026-09-23: "класс и роль нормально"). A moderator/admin
+/// `forum_roles` row or trusted standing satisfies this exactly like an
+/// unexpired `paid_until` does, even when the account's own subscription has
+/// lapsed. Every DM payment check in this module goes through this one
+/// function — the caller's own gate ([`require_dm_access`]) and every "the
+/// OTHER account must be paid" check ([`create_conversation`],
+/// [`create_message`], [`lookup_recipients`]'s candidate filter) — so there
+/// is exactly one copy of the ladder rule, not a second one duplicating
+/// `social_db::caller_classes`.
+///
+/// Takes `is_paid` (from `db::user_is_paid` on the identity connection)
+/// rather than resolving it itself: every call site already needs to
+/// sequence "read identity, drop the lock, then read social" for its own
+/// other purposes (a label, a public id, a key), so threading the bool
+/// through keeps the two connections from ever being held at once — same
+/// discipline `routes::forum_v2::resolve_caller_classes` documents.
+fn is_dm_paid(conn_social: &rusqlite::Connection, user_id: i64, is_paid: bool) -> bool {
+    social_db::caller_classes(conn_social, Some(user_id), is_paid).contains(&Class::Paid)
+}
+
+/// The one access gate every route in this module runs through: resolve the
+/// caller (401 if anonymous), then require [`is_dm_paid`] (403 if the ladder
+/// does not reach `Paid`). Returns the caller's `user_id` on success.
 async fn require_dm_access(state: Arc<AppState>, headers: &HeaderMap) -> Result<i64, Response> {
     let user_id = resolve_user_id(state.clone(), headers).await.map_err(auth_err)?;
 
     let paid_result = tokio::task::spawn_blocking({
         let state = state.clone();
         move || -> rusqlite::Result<bool> {
-            let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-            db::user_is_paid(&conn, user_id)
+            let is_paid = {
+                let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+                db::user_is_paid(&identity_conn, user_id)?
+            };
+            let social_conn = state.control_plane().social_conn();
+            Ok(is_dm_paid(&social_conn, user_id, is_paid))
         }
     })
     .await;
@@ -215,7 +246,7 @@ async fn require_dm_access(state: Arc<AppState>, headers: &HeaderMap) -> Result<
         Err(_) => return Err(internal_error()),
     };
 
-    if !entitlements::resolve_for_user(is_paid).contains(Feature::Forum) {
+    if !is_paid {
         return Err(not_paid_err());
     }
     Ok(user_id)
@@ -404,11 +435,14 @@ const MAX_LOOKUP_QUERY_LEN: usize = 64;
 /// How many ranked matches [`lookup_recipients`] returns at most.
 const MAX_LOOKUP_RESULTS: usize = 10;
 
-/// Ceiling on how many currently-paid accounts one lookup call loads from the
-/// identity database before scoring in Rust — the table is small enough that
-/// a single unfiltered-by-text query plus in-process ranking beats a second
-/// LIKE-shaped query per keystroke (same reasoning `db::search_users` skips
-/// for its own, admin-only, already-`LIKE`-filtered query).
+/// Ceiling on how many currently-subscription-paid accounts one lookup call
+/// loads from the identity database before scoring in Rust — the table is
+/// small enough that a single unfiltered-by-text query plus in-process
+/// ranking beats a second LIKE-shaped query per keystroke (same reasoning
+/// `db::search_users` skips for its own, admin-only, already-`LIKE`-filtered
+/// query). Ladder-boosted accounts (see [`paid_recipient_candidates`]) are
+/// loaded separately and are not bounded by this — `forum_roles`/
+/// `forum_trusted` are small, admin-managed tables.
 const PAID_CANDIDATE_LIMIT: i64 = 5000;
 
 /// A fuzzy match is only offered once the query is long enough that a
@@ -431,14 +465,72 @@ struct LookupUser {
     rank: u8,
 }
 
-/// One row loaded from the identity database: a currently-paid account,
-/// before it is known whether it also published a DM identity key (checked
-/// separately against the social connection — see [`lookup_recipients`]).
+/// One row loaded from the identity database: a ladder-paid account (see
+/// [`paid_recipient_candidates`]), before it is known whether it also
+/// published a DM identity key (checked separately against the social
+/// connection — see [`lookup_recipients`]).
 struct PaidCandidate {
     id: i64,
     nick: Option<String>,
     display_name: String,
     public_id: String,
+}
+
+/// Every recipient candidate for [`lookup_recipients`]: accounts with an
+/// unexpired `paid_until` (bounded by [`PAID_CANDIDATE_LIMIT`]) PLUS
+/// `boosted_ids` — accounts that reach [`Class::Paid`] via
+/// [`social_db::ladder_boosted_user_ids`] (trusted standing, or a
+/// moderator/admin role) regardless of their own subscription (owner ruling
+/// 2026-09-23, same rule [`is_dm_paid`] applies to the caller and to a
+/// conversation peer). `caller_id` is always excluded; a `boosted_ids` entry
+/// already covered by the `paid_until` query is not loaded twice.
+fn paid_recipient_candidates(
+    identity_conn: &rusqlite::Connection,
+    caller_id: i64,
+    boosted_ids: &[i64],
+    now: &str,
+) -> rusqlite::Result<Vec<PaidCandidate>> {
+    use rusqlite::{params, OptionalExtension};
+
+    let mut candidates = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    {
+        let mut stmt = identity_conn.prepare(
+            "SELECT id, nick, display_name, public_id FROM users
+             WHERE paid_until IS NOT NULL AND paid_until > ?1 AND id != ?2
+             LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(params![now, caller_id, PAID_CANDIDATE_LIMIT])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            seen_ids.insert(id);
+            candidates.push(PaidCandidate {
+                id,
+                nick: row.get(1)?,
+                display_name: row.get(2)?,
+                public_id: row.get(3)?,
+            });
+        }
+    }
+
+    for &id in boosted_ids {
+        if id == caller_id || seen_ids.contains(&id) {
+            continue;
+        }
+        let row: Option<(Option<String>, String, String)> = identity_conn
+            .query_row(
+                "SELECT nick, display_name, public_id FROM users WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((nick, display_name, public_id)) = row {
+            seen_ids.insert(id);
+            candidates.push(PaidCandidate { id, nick, display_name, public_id });
+        }
+    }
+
+    Ok(candidates)
 }
 
 /// The label [`db::effective_label_for_user`] would compute for the same
@@ -533,14 +625,16 @@ fn rank_candidate(query: &str, nick: Option<&str>, display_name: &str) -> Option
 
 /// `GET /dm/lookup?q=<text>` -> `{"users": [{"public_id","nick","label",
 /// "rank"}]}`, sorted by rank then label, at most [`MAX_LOOKUP_RESULTS`].
-/// Same [`require_dm_access`] gate as every other route here — only a paid
-/// caller can search for a DM recipient. A candidate must be BOTH currently
-/// paid (a DM recipient's own gate) AND have published a DM identity key (a
-/// paid account that never called `PUT /dm/identity` cannot receive
-/// anything yet, same posture [`get_identity`] takes) — two queries, one
-/// against the identity connection and one batched against the social
-/// connection, never a cross-database join (see `dm_db`'s module doc). The
-/// caller itself is excluded from its own results.
+/// Same [`require_dm_access`] gate as every other route here — only a
+/// ladder-paid caller can search for a DM recipient. A candidate must be
+/// BOTH ladder-paid ([`is_dm_paid`]'s rule — an unexpired `paid_until`,
+/// trusted standing, or a moderator/admin role: [`paid_recipient_candidates`])
+/// AND have published a DM identity key (a paid account that never called
+/// `PUT /dm/identity` cannot receive anything yet, same posture
+/// [`get_identity`] takes) — queries against the identity connection and a
+/// batched one against the social connection, never a cross-database join
+/// (see `dm_db`'s module doc). The caller itself is excluded from its own
+/// results.
 pub async fn lookup_recipients(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -558,27 +652,18 @@ pub async fn lookup_recipients(
     let q: String = q.chars().take(MAX_LOOKUP_QUERY_LEN).collect();
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<LookupUser>> {
-        use rusqlite::params;
+        // Ladder-boosted accounts (trusted standing, or a moderator/admin
+        // role) — read before the identity connection is taken, same
+        // "never hold both locks at once" discipline as elsewhere in this
+        // module.
+        let boosted_ids: Vec<i64> = {
+            let social_conn = state.control_plane().social_conn();
+            social_db::ladder_boosted_user_ids(&social_conn)?
+        };
 
         let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
-        let mut candidates = Vec::new();
-        {
-            let mut stmt = identity_conn.prepare(
-                "SELECT id, nick, display_name, public_id FROM users
-                 WHERE paid_until IS NOT NULL AND paid_until > ?1 AND id != ?2
-                 LIMIT ?3",
-            )?;
-            let mut rows = stmt.query(params![now, caller_id, PAID_CANDIDATE_LIMIT])?;
-            while let Some(row) = rows.next()? {
-                candidates.push(PaidCandidate {
-                    id: row.get(0)?,
-                    nick: row.get(1)?,
-                    display_name: row.get(2)?,
-                    public_id: row.get(3)?,
-                });
-            }
-        }
+        let candidates = paid_recipient_candidates(&identity_conn, caller_id, &boosted_ids, &now)?;
         drop(identity_conn);
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -651,13 +736,17 @@ pub async fn create_conversation(
     let peer = tokio::task::spawn_blocking({
         let state = state.clone();
         move || -> rusqlite::Result<PeerLookup> {
-            let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(peer_id) = resolve_user_by_label(&conn, &with_label)? else {
+            let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(peer_id) = resolve_user_by_label(&identity_conn, &with_label)? else {
                 return Ok(None);
             };
-            let peer_paid = db::user_is_paid(&conn, peer_id)?;
-            let public_id = db::get_user_public_id(&conn, peer_id)?;
-            let label = db::effective_label_for_user(&conn, peer_id)?;
+            let peer_is_paid = db::user_is_paid(&identity_conn, peer_id)?;
+            let public_id = db::get_user_public_id(&identity_conn, peer_id)?;
+            let label = db::effective_label_for_user(&identity_conn, peer_id)?;
+            drop(identity_conn);
+
+            let social_conn = state.control_plane().social_conn();
+            let peer_paid = is_dm_paid(&social_conn, peer_id, peer_is_paid);
             Ok(Some((peer_id, peer_paid, public_id, label)))
         }
     })
@@ -796,9 +885,10 @@ pub struct SendMessageRequest {
 /// `POST /dm/conversations/{id}/messages` —
 /// `{"nonce_b64":"...","ciphertext_b64":"..."}` -> `{"id","created_at"}`.
 /// The sender must be a party to the conversation; the OTHER party must
-/// currently be paid (re-checked here, not just at conversation creation —
-/// see the module doc); rate-limited to
-/// [`dm_db::DM_MESSAGE_DAILY_LIMIT`] per rolling day per sender.
+/// currently reach [`Class::Paid`] on the ladder ([`is_dm_paid`], re-checked
+/// here, not just at conversation creation — see the module doc);
+/// rate-limited to [`dm_db::DM_MESSAGE_DAILY_LIMIT`] per rolling day per
+/// sender.
 pub async fn create_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -838,14 +928,16 @@ pub async fn create_message(
             };
             drop(social_conn);
 
-            let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-            let peer_paid = db::user_is_paid(&identity_conn, peer_id)?;
-            drop(identity_conn);
-            if !peer_paid {
+            let peer_is_paid = {
+                let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+                db::user_is_paid(&identity_conn, peer_id)?
+            };
+
+            let social_conn = state.control_plane().social_conn();
+            if !is_dm_paid(&social_conn, peer_id, peer_is_paid) {
                 return Err(SendMessageRefusal::PeerNotPaid);
             }
 
-            let social_conn = state.control_plane().social_conn();
             let now = chrono::Utc::now();
             let since = (now - chrono::Duration::hours(24)).to_rfc3339();
             let recent = dm_db::messages_sent_since(&social_conn, user_id, &since)?;
@@ -1023,6 +1115,158 @@ mod tests {
     fn require_peer_paid_allows_a_paid_peer_and_refuses_an_unpaid_one() {
         assert!(require_peer_paid(true).is_ok());
         assert!(require_peer_paid(false).is_err());
+    }
+
+    // ---- ladder-based paid gate: is_dm_paid (owner ruling 2026-09-23) ----
+
+    /// An in-memory `social.db` — both schemas [`is_dm_paid`] and
+    /// [`paid_recipient_candidates`] read from (`forum_roles`/`forum_trusted`
+    /// via `social_db`, `dm_identity_keys` via `dm_db`) live in the same
+    /// physical file in production, so tests build both on one connection.
+    fn social_test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+        social_db::create_social_schema(&conn).expect("social schema");
+        dm_db::create_dm_schema(&conn).expect("dm schema");
+        conn
+    }
+
+    #[test]
+    fn is_dm_paid_true_for_an_unpaid_admin_role_account() {
+        let conn = social_test_conn();
+        social_db::set_role(&conn, 42, social_db::Role::Admin, "2026-09-23T00:00:00+00:00").expect("set role");
+        assert!(is_dm_paid(&conn, 42, false));
+    }
+
+    #[test]
+    fn is_dm_paid_true_for_an_unpaid_moderator_role_account() {
+        let conn = social_test_conn();
+        social_db::set_role(&conn, 43, social_db::Role::Moderator, "2026-09-23T00:00:00+00:00").expect("set role");
+        assert!(is_dm_paid(&conn, 43, false));
+    }
+
+    #[test]
+    fn is_dm_paid_false_for_an_unpaid_plain_user() {
+        let conn = social_test_conn();
+        assert!(!is_dm_paid(&conn, 44, false));
+    }
+
+    #[test]
+    fn is_dm_paid_true_for_a_paid_user() {
+        let conn = social_test_conn();
+        assert!(is_dm_paid(&conn, 45, true));
+    }
+
+    /// The refusal an unpaid plain-user caller gets from [`require_dm_access`]
+    /// is exactly [`not_paid_err`] — this pins its shape (status + body) so a
+    /// future change to the ladder rule cannot silently change what an
+    /// unpaid caller sees.
+    #[tokio::test]
+    async fn not_paid_err_response_shape_is_unchanged() {
+        use axum::body::to_bytes;
+
+        let resp = not_paid_err();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["error"], "paid account required for direct messages");
+    }
+
+    // ---- lookup candidate resolution: paid_recipient_candidates ----
+
+    fn identity_test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL DEFAULT 'test',
+                provider_user_id TEXT NOT NULL DEFAULT '',
+                display_name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '',
+                public_id TEXT,
+                nick TEXT,
+                paid_until TEXT
+            );",
+        )
+        .expect("identity test schema");
+        conn
+    }
+
+    fn insert_identity_test_user(
+        conn: &rusqlite::Connection,
+        nick: &str,
+        public_id: &str,
+        paid_until: Option<&str>,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO users (provider, provider_user_id, display_name, created_at, public_id, nick, paid_until)
+             VALUES ('test', ?1, ?1, '2026-01-01T00:00:00+00:00', ?2, ?1, ?3)",
+            rusqlite::params![nick, public_id, paid_until],
+        )
+        .expect("insert user");
+        conn.last_insert_rowid()
+    }
+
+    fn future_ts() -> String {
+        (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339()
+    }
+
+    /// The exact scenario the brief names: an unpaid admin-role account with
+    /// a published DM identity key is a valid lookup result — reachable
+    /// through `paid_recipient_candidates` (the ladder half) and
+    /// `dm_db::identity_key_owner_ids` (the published-key half), the same
+    /// two queries `lookup_recipients` runs.
+    #[test]
+    fn lookup_recipient_candidates_includes_an_unpaid_admin_role_account_with_a_published_key() {
+        let identity_conn = identity_test_conn();
+        let social_conn = social_test_conn();
+
+        let caller_id = insert_identity_test_user(&identity_conn, "caller", "pub-caller", Some(&future_ts()));
+        let admin_id = insert_identity_test_user(&identity_conn, "admino", "pub-admino", None);
+
+        social_db::set_role(&social_conn, admin_id, social_db::Role::Admin, "2026-09-23T00:00:00+00:00")
+            .expect("set role");
+        dm_db::upsert_identity_key(
+            &social_conn,
+            admin_id,
+            &[7u8; dm_db::DM_PUBLIC_KEY_LEN],
+            "2026-09-23T00:00:00+00:00",
+        )
+        .expect("publish key");
+
+        let boosted_ids = social_db::ladder_boosted_user_ids(&social_conn).expect("boosted ids");
+        assert!(boosted_ids.contains(&admin_id));
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let candidates =
+            paid_recipient_candidates(&identity_conn, caller_id, &boosted_ids, &now).expect("candidates");
+        assert!(candidates.iter().any(|c| c.id == admin_id));
+
+        let ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
+        let keyed = dm_db::identity_key_owner_ids(&social_conn, &ids).expect("keyed");
+        assert!(keyed.contains(&admin_id));
+
+        let matched: Vec<i64> = candidates
+            .into_iter()
+            .filter(|c| keyed.contains(&c.id))
+            .filter_map(|c| rank_candidate("admino", c.nick.as_deref(), &c.display_name).map(|_| c.id))
+            .collect();
+        assert!(matched.contains(&admin_id));
+    }
+
+    #[test]
+    fn lookup_recipient_candidates_excludes_the_caller_and_deduplicates_a_boosted_id_already_paid() {
+        let identity_conn = identity_test_conn();
+        let caller_id = insert_identity_test_user(&identity_conn, "caller", "pub-caller", Some(&future_ts()));
+        let paid_and_boosted_id =
+            insert_identity_test_user(&identity_conn, "trusty", "pub-trusty", Some(&future_ts()));
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let boosted_ids = vec![caller_id, paid_and_boosted_id];
+        let candidates =
+            paid_recipient_candidates(&identity_conn, caller_id, &boosted_ids, &now).expect("candidates");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, paid_and_boosted_id);
     }
 
     // ---- message pagination: resolve_message_page ----
