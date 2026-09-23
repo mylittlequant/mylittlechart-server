@@ -355,6 +355,63 @@ pub fn share_ttl_secs(kind: ShareKind, is_paid: bool) -> u64 {
 }
 
 // ============================================================================
+// Shared presets (rooms) — Phase 1
+// (docs/mlc/plans/shared-presets-rights-and-live-sync-2026-09-23.md §1/§8)
+// ============================================================================
+//
+// Deviates from the plan's original §1 code sketch in one place: the plan
+// proposed a 4th `Feature::SharedPresets` variant resolved through
+// `resolve_for_user`'s raw `db::user_is_paid` fact, the same way every other
+// `Feature` is. The owner's ruling the same day (2026-09-23, "класс и роль
+// нормально" — see `routes::dm::is_dm_paid`'s doc comment) moved DM access
+// off the raw paid flag onto the forum ladder (`social_db::Class::Paid` —
+// reachable via an unexpired subscription, trusted standing, OR a moderator/
+// admin role) and named shared presets as following the SAME rule. Reading
+// the ladder needs `social.db` (`ControlPlane::social_conn`), a connection
+// this module deliberately never touches (see the module doc's "this module
+// never gains a database dependency" line) — so there is no `Feature::
+// SharedPresets` here. `routes::rooms` resolves the ladder-paid fact itself
+// (`routes::rooms::is_shared_presets_paid`, mirroring `routes::dm::
+// is_dm_paid` byte for byte) and feeds the resulting `bool` into
+// [`shared_preset_create_allowed`] below exactly like `routes::share` feeds
+// `db::user_is_paid`'s raw bool into [`share_create_allowed`] — same shape of
+// function, different source for the bool.
+
+/// Aggregate preset JSON size ceiling, in bytes — applies both to a whole
+/// preset at room-creation time and to each individual patch op's `json`
+/// payload thereafter (op payloads are always a small fraction of a whole
+/// preset). Hoisted from `routes::share`'s local `MAX_PRESET_BYTES` (now
+/// `entitlements::PRESET_MAX_BYTES`, the one constant both `routes::share`
+/// and `routes::rooms` read) — same 256 KiB figure, not a new decision.
+pub const PRESET_MAX_BYTES: usize = 256 * 1024;
+
+/// Rooms one account may HOST (own) at once. Never free — see the module
+/// doc above: reaching this quota requires ladder-paid standing, the same
+/// way `Feature::Forum` is never granted by [`free_features`]'s unset-env
+/// default. Being a grantee of someone else's room has no ceiling here.
+pub const PAID_SHARED_PRESET_LIMIT: i64 = 20;
+
+/// Live grants one room may hold at once — bounds the Phase 2 live-channel
+/// fan-out cost (one `broadcast` subscriber slot per grantee).
+pub const MAX_GRANTS_PER_OBJECT: i64 = 50;
+
+/// Decide whether `caller` may create/host one more shared-preset room,
+/// given how many it already hosts (`db::count_hosted_shared_presets`) and
+/// its ladder-paid standing (`routes::rooms::is_shared_presets_paid` — NOT
+/// `db::user_is_paid` directly, per the module doc above).
+pub fn shared_preset_create_allowed(current_hosted: i64, is_ladder_paid: bool) -> bool {
+    is_ladder_paid && current_hosted < PAID_SHARED_PRESET_LIMIT
+}
+
+/// Decide whether one more grant may be created on a room, given how many
+/// live (non-expired) grants it already holds (`db::count_object_grants`).
+/// Unlike room hosting, creating a grant carries no paid requirement of its
+/// own — the room's owner already had to be ladder-paid to host it.
+pub fn grant_create_allowed(current_grants: i64) -> bool {
+    current_grants < MAX_GRANTS_PER_OBJECT
+}
+
+// ============================================================================
 // Hot-plane sync quota rule
 // ============================================================================
 
@@ -548,6 +605,24 @@ mod tests {
             assert_eq!(ShareKind::from_wire_name(kind.as_str()), Some(kind));
         }
     }
+    #[test]
+    fn shared_preset_create_allowed_requires_ladder_paid_regardless_of_count() {
+        assert!(!shared_preset_create_allowed(0, false));
+        assert!(shared_preset_create_allowed(0, true));
+    }
+
+    #[test]
+    fn shared_preset_create_allowed_boundary_at_the_hosted_ceiling() {
+        assert!(shared_preset_create_allowed(PAID_SHARED_PRESET_LIMIT - 1, true));
+        assert!(!shared_preset_create_allowed(PAID_SHARED_PRESET_LIMIT, true));
+    }
+
+    #[test]
+    fn grant_create_allowed_boundary_at_the_grant_ceiling() {
+        assert!(grant_create_allowed(MAX_GRANTS_PER_OBJECT - 1));
+        assert!(!grant_create_allowed(MAX_GRANTS_PER_OBJECT));
+    }
+
     #[test]
     fn hot_limits_are_free_figures_for_free_and_ten_times_for_paid() {
         assert_eq!(hot_bytes_limit(false), crate::db::SYNC_MAX_TOTAL_BYTES);

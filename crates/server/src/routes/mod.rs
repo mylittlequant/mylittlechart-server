@@ -46,6 +46,7 @@ pub mod notify;
 pub mod oauth;
 pub mod posts;
 pub mod proxy;
+pub mod rooms;
 pub mod sessions;
 pub mod share;
 pub mod sync;
@@ -150,6 +151,22 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         // Clone-with-strip (rights v1): auth required, needs the `clone`
         // right on the token (see routes/share.rs's module doc).
         .route("/share/{token}/clone", post(share::clone_share))
+        // Shared presets (rooms) — server-hosted, per-nick rights, per-entity
+        // LWW patch, no live channel yet (Phase 1 — see routes/rooms.rs's
+        // module doc). `{kind}` is reserved for future object kinds; Phase 1
+        // resolves only "preset". `/patch` doubles as create-if-absent.
+        .route(
+            "/objects/{kind}/{object_id}",
+            get(rooms::get_room).post(rooms::create_room).delete(rooms::delete_room),
+        )
+        .route("/objects/{kind}/{object_id}/patch", post(rooms::patch_room))
+        .route("/objects/{kind}/{object_id}/entities", get(rooms::get_room_entities))
+        .route("/objects/{kind}/{object_id}/clone", post(rooms::clone_room))
+        .route(
+            "/objects/{kind}/{object_id}/grants",
+            get(rooms::list_grants).post(rooms::create_grant),
+        )
+        .route("/objects/{kind}/{object_id}/grants/{grant_id}", delete(rooms::delete_grant))
         // Paid in-app forum (entitlements::Feature::Forum) — every route
         // authed AND paid, no public GET of any kind (see routes/forum.rs).
         .route(

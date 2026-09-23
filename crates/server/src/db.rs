@@ -290,6 +290,55 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_indicator_grants_type_grantee
             ON indicator_grants(type_id, grantee_user_id);
 
+        -- Shared presets (rooms) — Phase 1 (docs/mlc/plans/shared-presets-
+        -- rights-and-live-sync-2026-09-23.md §1). A room header: no preset
+        -- blob and no single version live here — those live in
+        -- shared_preset_entities below (per-entity LWW, §3). `object_id`
+        -- reuses the client's own ChartPreset.id verbatim (see
+        -- `db::apply_room_patch`, which never remaps it). `seq` is a
+        -- room-level monotonic counter, +1 per successfully applied entity
+        -- op (including a cascade tombstone) — the input `room_entities_
+        -- since` polls against.
+        CREATE TABLE IF NOT EXISTS shared_presets (
+            object_id     TEXT    PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL REFERENCES users(id),
+            title         TEXT    NOT NULL DEFAULT '',
+            visibility    TEXT    NOT NULL DEFAULT 'private',
+            seq           INTEGER NOT NULL DEFAULT 0,
+            created_at    TEXT    NOT NULL,
+            updated_at    TEXT    NOT NULL
+        );
+
+        -- One row per entity a room's preset decomposes into (window,
+        -- bubble, indicator, alert, primitive, or the singleton "layout"
+        -- catch-all — see `rooms_codec::decompose_preset`). A real table
+        -- per entity, not a JSON blob patched in place: a per-entity write
+        -- is a trivial single-row `UPDATE ... WHERE version=?` (atomic,
+        -- cheap), and the table doubles as its own diff/replay ring for the
+        -- live channel (`SELECT WHERE seq > ?`, see `db::room_entities_
+        -- since`) with zero extra bookkeeping. `parent_kind`/`parent_id`
+        -- are real, indexed columns (not buried in `json`) so a window/
+        -- bubble delete can cascade to its primitives with one indexed
+        -- `UPDATE`, no JSON1 extension dependency — set only for
+        -- kind = 'primitive'. `json` is NULL exactly when `deleted = 1`
+        -- (a tombstone).
+        CREATE TABLE IF NOT EXISTS shared_preset_entities (
+            room_id     TEXT    NOT NULL REFERENCES shared_presets(object_id),
+            kind        TEXT    NOT NULL,
+            entity_id   TEXT    NOT NULL,
+            version     INTEGER NOT NULL DEFAULT 1,
+            updated_by  INTEGER NOT NULL REFERENCES users(id),
+            updated_at  TEXT    NOT NULL,
+            json        TEXT,
+            deleted     INTEGER NOT NULL DEFAULT 0,
+            seq         INTEGER NOT NULL,
+            parent_kind TEXT,
+            parent_id   TEXT,
+            PRIMARY KEY (room_id, kind, entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_shared_preset_entities_room_seq ON shared_preset_entities(room_id, seq);
+        CREATE INDEX IF NOT EXISTS idx_shared_preset_entities_parent ON shared_preset_entities(room_id, parent_kind, parent_id);
+
         -- In-app blog (2026-09-05 web-surface-cleanup plan): patch notes and
         -- posts pushed one at a time by the operator (`POST /api/admin/posts`,
         -- see routes/posts.rs), replacing the static `web/blog/posts.json`
@@ -3367,6 +3416,630 @@ pub fn indicator_should_strip(conn: &Connection, type_id: &str, recipient: i64) 
         return Ok(false);
     }
     Ok(!indicator_grant_is_live(conn, type_id, recipient)?)
+}
+
+// ============================================================================
+// Object grants (docs/mlc/plans/shared-presets-rights-and-live-sync-
+// 2026-09-23.md §2) — the `object_grants` table finally gets writers/readers.
+// `object_kind` is `"chart"|"indicator"|"strategy"|"template"` per its DDL
+// comment; Phase 1 (`routes::rooms`) only ever writes/reads `"preset"`
+// (a shared-preset room). `grantee_user_id = NULL` means public — "anyone
+// with the link" — for `view`/`clone` only: a public `edit` row is refused
+// at grant-creation time (`routes::rooms`'s grant-CRUD handler), never here.
+// ============================================================================
+
+/// One row of the `object_grants` table.
+pub struct ObjectGrantRow {
+    pub id: i64,
+    pub object_kind: String,
+    pub object_id: String,
+    pub owner_user_id: i64,
+    /// `None` = public ("anyone with the link").
+    pub grantee_user_id: Option<i64>,
+    pub right: String,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+}
+
+fn object_grant_from_row(row: &rusqlite::Row<'_>) -> Result<ObjectGrantRow> {
+    Ok(ObjectGrantRow {
+        id: row.get(0)?,
+        object_kind: row.get(1)?,
+        object_id: row.get(2)?,
+        owner_user_id: row.get(3)?,
+        grantee_user_id: row.get(4)?,
+        right: row.get(5)?,
+        expires_at: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
+/// Create or refresh a grant. "Upsert" against the tuple `(object_kind,
+/// object_id, grantee_user_id, right)` — the table carries no UNIQUE
+/// constraint on that tuple (an admin-style CRUD row, not a high-frequency
+/// write path), so this does an explicit find-then-update-or-insert rather
+/// than `ON CONFLICT`. Re-granting the SAME right to the SAME grantee just
+/// refreshes `expires_at`/`created_at` in place instead of piling up
+/// duplicate rows. Returns the resulting row's id.
+pub fn upsert_object_grant(
+    conn: &Connection,
+    object_kind: &str,
+    object_id: &str,
+    owner_user_id: i64,
+    grantee_user_id: Option<i64>,
+    right: &str,
+    expires_at: Option<&str>,
+    now: &str,
+) -> Result<i64> {
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM object_grants
+             WHERE object_kind = ?1 AND object_id = ?2 AND right = ?3
+               AND ((grantee_user_id IS NULL AND ?4 IS NULL) OR grantee_user_id = ?4)",
+            params![object_kind, object_id, right, grantee_user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let Some(id) = existing {
+        conn.execute(
+            "UPDATE object_grants SET expires_at = ?1, created_at = ?2 WHERE id = ?3",
+            params![expires_at, now, id],
+        )?;
+        return Ok(id);
+    }
+
+    conn.execute(
+        "INSERT INTO object_grants (object_kind, object_id, owner_user_id, grantee_user_id, right, expires_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![object_kind, object_id, owner_user_id, grantee_user_id, right, expires_at, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Revoke one grant, owner-only — the `owner_user_id` in the WHERE clause is
+/// what makes "someone else's grant" answer `false` exactly like "no such
+/// grant" (same discipline as [`revoke_share`]).
+pub fn revoke_object_grant(conn: &Connection, grant_id: i64, owner_user_id: i64) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM object_grants WHERE id = ?1 AND owner_user_id = ?2",
+        params![grant_id, owner_user_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Every grant on one object, newest first — the owner's grant-management
+/// view (`GET .../grants`). Unfiltered: an expired grant still lists (so the
+/// owner can see and clean it up), unlike [`count_object_grants`], which
+/// only counts live ones.
+pub fn list_object_grants(conn: &Connection, object_kind: &str, object_id: &str) -> Result<Vec<ObjectGrantRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, object_kind, object_id, owner_user_id, grantee_user_id, right, expires_at, created_at
+         FROM object_grants WHERE object_kind = ?1 AND object_id = ?2 ORDER BY created_at DESC",
+    )?;
+    let mut rows = stmt.query(params![object_kind, object_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(object_grant_from_row(row)?);
+    }
+    Ok(out)
+}
+
+/// Count of currently-live (non-expired) grants on one object — the input to
+/// [`entitlements::grant_create_allowed`]'s fan-out ceiling.
+pub fn count_object_grants(conn: &Connection, object_kind: &str, object_id: &str) -> Result<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.query_row(
+        "SELECT COUNT(*) FROM object_grants
+         WHERE object_kind = ?1 AND object_id = ?2 AND (expires_at IS NULL OR expires_at > ?3)",
+        params![object_kind, object_id, now],
+        |row| row.get(0),
+    )
+}
+
+/// Effective rights `caller` holds on `(kind, object_id)`, owned by
+/// `owner_user_id`. The owner always holds every right (implicit, not
+/// stored — same posture as [`effective_rights`]'s share-link owner).
+/// Otherwise the union of every live (non-expired) grant row matching
+/// EITHER `grantee_user_id = caller` OR `grantee_user_id IS NULL` (the
+/// public "anyone with the link" row) — `caller: None` (anonymous) only
+/// ever matches the public half. Returned in a fixed `view, clone, edit`
+/// order, not the query's own row order.
+pub fn effective_object_rights(
+    conn: &Connection,
+    kind: &str,
+    object_id: &str,
+    owner_user_id: i64,
+    caller: Option<i64>,
+) -> Result<Vec<&'static str>> {
+    if caller == Some(owner_user_id) {
+        return Ok(vec!["view", "clone", "edit"]);
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT right FROM object_grants
+         WHERE object_kind = ?1 AND object_id = ?2
+           AND (grantee_user_id = ?3 OR grantee_user_id IS NULL)
+           AND (expires_at IS NULL OR expires_at > ?4)",
+    )?;
+    let mut rows = stmt.query(params![kind, object_id, caller, now])?;
+    let mut has_view = false;
+    let mut has_clone = false;
+    let mut has_edit = false;
+    while let Some(row) = rows.next()? {
+        match row.get::<_, String>(0)?.as_str() {
+            "view" => has_view = true,
+            "clone" => has_clone = true,
+            "edit" => has_edit = true,
+            _ => {}
+        }
+    }
+    let mut rights = Vec::with_capacity(3);
+    if has_view {
+        rights.push("view");
+    }
+    if has_clone {
+        rights.push("clone");
+    }
+    if has_edit {
+        rights.push("edit");
+    }
+    Ok(rights)
+}
+
+// ============================================================================
+// Shared presets (rooms) — Phase 1 (docs/mlc/plans/shared-presets-rights-
+// and-live-sync-2026-09-23.md §1/§3). Storage for a server-hosted preset
+// room: the header (`shared_presets`) plus its per-entity LWW rows
+// (`shared_preset_entities`). Entity JSON shape (window/bubble/indicator/
+// alert/primitive/layout) is `rooms_codec`'s concern, not this module's —
+// every function here treats an entity's `json` as an opaque
+// already-serialized string.
+// ============================================================================
+
+/// One row of the `shared_presets` header table.
+pub struct SharedPresetRow {
+    pub object_id: String,
+    pub owner_user_id: i64,
+    pub title: String,
+    pub visibility: String,
+    pub seq: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Fetch a room's header row, or `None` if no room with this id exists.
+pub fn get_shared_preset(conn: &Connection, object_id: &str) -> Result<Option<SharedPresetRow>> {
+    conn.query_row(
+        "SELECT object_id, owner_user_id, title, visibility, seq, created_at, updated_at
+         FROM shared_presets WHERE object_id = ?1",
+        params![object_id],
+        |row| {
+            Ok(SharedPresetRow {
+                object_id: row.get(0)?,
+                owner_user_id: row.get(1)?,
+                title: row.get(2)?,
+                visibility: row.get(3)?,
+                seq: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Rooms `owner_user_id` currently hosts — the input to
+/// [`entitlements::shared_preset_create_allowed`]'s hosting ceiling.
+pub fn count_hosted_shared_presets(conn: &Connection, owner_user_id: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM shared_presets WHERE owner_user_id = ?1",
+        params![owner_user_id],
+        |row| row.get(0),
+    )
+}
+
+/// Stamp a room's `title`, owner-only. Used at room creation
+/// (`routes::rooms::create_room`) when the caller supplies one — Phase 1 has
+/// no separate "rename a room" route.
+pub fn set_shared_preset_title(conn: &Connection, object_id: &str, owner_user_id: i64, title: &str) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE shared_presets SET title = ?1 WHERE object_id = ?2 AND owner_user_id = ?3",
+        params![title, object_id, owner_user_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Owner-only teardown: deletes every entity row, every `object_grants` row
+/// on this room, then the header itself, in that order (children before the
+/// parent — `shared_preset_entities.room_id` references `shared_presets.
+/// object_id` under `PRAGMA foreign_keys=ON`, so deleting the header first
+/// while entities remain would fail the constraint). Ownership is checked
+/// BEFORE anything is deleted, so a non-owner's call touches no row at all.
+/// Returns `false` for an unknown room or a caller who is not its owner —
+/// the route answers the same 404 for both (see `routes::rooms::
+/// room_not_found`).
+pub fn delete_shared_preset(conn: &Connection, object_id: &str, owner_user_id: i64) -> Result<bool> {
+    let is_owner: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM shared_presets WHERE object_id = ?1 AND owner_user_id = ?2",
+            params![object_id, owner_user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if is_owner.is_none() {
+        return Ok(false);
+    }
+    conn.execute("DELETE FROM shared_preset_entities WHERE room_id = ?1", params![object_id])?;
+    conn.execute(
+        "DELETE FROM object_grants WHERE object_kind = 'preset' AND object_id = ?1",
+        params![object_id],
+    )?;
+    conn.execute("DELETE FROM shared_presets WHERE object_id = ?1", params![object_id])?;
+    Ok(true)
+}
+
+/// One row of `shared_preset_entities`, read back for a GET/poll/clone/live
+/// frame. `json` is `None` exactly when `deleted` is `true` (a tombstone).
+#[derive(Debug, Clone)]
+pub struct SharedPresetEntityRow {
+    pub kind: String,
+    pub entity_id: String,
+    pub version: i64,
+    pub updated_by: i64,
+    pub updated_at: String,
+    pub json: Option<String>,
+    pub deleted: bool,
+    pub seq: i64,
+    pub parent_kind: Option<String>,
+    pub parent_id: Option<String>,
+}
+
+fn shared_preset_entity_from_row(row: &rusqlite::Row<'_>) -> Result<SharedPresetEntityRow> {
+    Ok(SharedPresetEntityRow {
+        kind: row.get(0)?,
+        entity_id: row.get(1)?,
+        version: row.get(2)?,
+        updated_by: row.get(3)?,
+        updated_at: row.get(4)?,
+        json: row.get(5)?,
+        deleted: row.get::<_, i64>(6)? != 0,
+        seq: row.get(7)?,
+        parent_kind: row.get(8)?,
+        parent_id: row.get(9)?,
+    })
+}
+
+const SHARED_PRESET_ENTITY_COLUMNS: &str =
+    "kind, entity_id, version, updated_by, updated_at, json, deleted, seq, parent_kind, parent_id";
+
+/// Every entity row a room has ever touched with `seq > since_seq`, seq
+/// order — tombstones (`deleted = true`) included. This IS the live-channel
+/// resume ring (plan §4): because the table holds one row per entity
+/// (latest state only), this naturally coalesces several intermediate edits
+/// to the SAME entity into one row. `since_seq = 0` (a brand-new subscriber
+/// or the first poll) already is the full snapshot via this same query —
+/// there is no separate snapshot code path.
+pub fn room_entities_since(conn: &Connection, room_id: &str, since_seq: i64) -> Result<Vec<SharedPresetEntityRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SHARED_PRESET_ENTITY_COLUMNS} FROM shared_preset_entities
+         WHERE room_id = ?1 AND seq > ?2 ORDER BY seq"
+    ))?;
+    let mut rows = stmt.query(params![room_id, since_seq])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(shared_preset_entity_from_row(row)?);
+    }
+    Ok(out)
+}
+
+/// Every currently-live (non-tombstoned) entity a room holds, insertion
+/// order — the read path for `GET` (full reassembly) and `clone`. Unlike
+/// [`room_entities_since`], tombstones are excluded: a full-preset read has
+/// nothing to show for a deleted entity.
+pub fn room_live_entities(conn: &Connection, room_id: &str) -> Result<Vec<SharedPresetEntityRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SHARED_PRESET_ENTITY_COLUMNS} FROM shared_preset_entities
+         WHERE room_id = ?1 AND deleted = 0 ORDER BY seq"
+    ))?;
+    let mut rows = stmt.query(params![room_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(shared_preset_entity_from_row(row)?);
+    }
+    Ok(out)
+}
+
+// ---- apply_room_patch: per-entity LWW patch application (plan §3) ----
+
+/// One op in a `POST .../patch` batch. Deserialized directly off the wire
+/// by `routes::rooms` (same one-copy pattern `dm_db::MessageError` uses —
+/// this type is reused verbatim by the route rather than mirrored into a
+/// second, converted copy) and fed straight into [`apply_room_patch`].
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RoomOp {
+    /// `"window" | "bubble" | "indicator" | "alert" | "primitive" | "layout"`
+    /// — validated by `routes::rooms` before this ever reaches
+    /// [`apply_room_patch`], which treats it as an opaque storage key.
+    pub kind: String,
+    /// The entity's stable id (stringified).
+    pub id: String,
+    #[serde(rename = "op")]
+    pub action: RoomOpAction,
+    /// The entity's version this op was computed against. `0` means "I
+    /// believe this entity does not exist yet" (create path).
+    pub base_version: i64,
+    /// Required unless `action == Delete` — validated by `routes::rooms`.
+    #[serde(default)]
+    pub json: Option<serde_json::Value>,
+    /// Only meaningful for `kind = "primitive"`: which window/bubble entity
+    /// owns it. Required on an Upsert creating a new primitive id; ignored
+    /// (read back from storage) on Delete.
+    #[serde(default)]
+    pub parent_kind: Option<String>,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomOpAction {
+    Upsert,
+    Delete,
+}
+
+/// The per-op (or per-cascade-row) result of [`apply_room_patch`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoomOpOutcome {
+    Applied { version: i64, seq: i64 },
+    /// The entity exists but `base_version` didn't match current — someone
+    /// else's write already landed on THIS entity. Carries the current row
+    /// so the client can re-anchor without a second round trip.
+    Stale {
+        current_version: i64,
+        current_json: Option<String>,
+    },
+    /// `base_version` pointed at a version the caller believed live, but the
+    /// entity is gone (deleted directly, or cascade-deleted with its parent
+    /// window/bubble).
+    Gone,
+    /// Whole-batch gate: caller lacked `edit` on an existing room, or — for
+    /// a not-yet-existing room — `room_create_allowed` (the caller's
+    /// resolved create/quota check) was `false`. Every op in the batch
+    /// carries this SAME outcome; no per-op write is attempted.
+    Forbidden,
+}
+
+/// Read `(version, json, deleted)` for one entity, or `None` if no row
+/// exists at all — the shared re-select both [`apply_upsert_op`] and
+/// [`apply_delete_op`] run after a `version=?` UPDATE affects zero rows, to
+/// tell `Stale` (row exists, different version) apart from `Gone` (no row,
+/// or a tombstone).
+fn select_current_entity(
+    tx: &rusqlite::Transaction,
+    room_id: &str,
+    kind: &str,
+    entity_id: &str,
+) -> Result<Option<(i64, Option<String>, i64)>> {
+    tx.query_row(
+        "SELECT version, json, deleted FROM shared_preset_entities
+         WHERE room_id = ?1 AND kind = ?2 AND entity_id = ?3",
+        params![room_id, kind, entity_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)?)),
+    )
+    .optional()
+}
+
+fn apply_upsert_op(
+    tx: &rusqlite::Transaction,
+    room_id: &str,
+    caller: i64,
+    now: &str,
+    op: &RoomOp,
+    seq: &mut i64,
+) -> Result<RoomOpOutcome> {
+    // `op.json` presence for an Upsert is validated by `routes::rooms`
+    // before this is ever called — an empty string here would only be
+    // reachable through a routing bug, not a caller-controlled input.
+    let json_str = op.json.as_ref().map(|v| v.to_string()).unwrap_or_default();
+
+    if op.base_version == 0 {
+        // "I believe this doesn't exist yet." A row already occupying this
+        // PK — live OR a tombstone — is a collision, never silently
+        // overwritten (the tombstone case also avoids a PK violation on the
+        // INSERT below).
+        if let Some((cur_version, cur_json, _deleted)) = select_current_entity(tx, room_id, &op.kind, &op.id)? {
+            return Ok(RoomOpOutcome::Stale { current_version: cur_version, current_json: cur_json });
+        }
+        let candidate_seq = *seq + 1;
+        tx.execute(
+            "INSERT INTO shared_preset_entities
+                (room_id, kind, entity_id, version, updated_by, updated_at, json, deleted, seq, parent_kind, parent_id)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, 0, ?7, ?8, ?9)",
+            params![room_id, op.kind, op.id, caller, now, json_str, candidate_seq, op.parent_kind, op.parent_id],
+        )?;
+        *seq = candidate_seq;
+        return Ok(RoomOpOutcome::Applied { version: 1, seq: candidate_seq });
+    }
+
+    let candidate_seq = *seq + 1;
+    let affected = tx.execute(
+        "UPDATE shared_preset_entities
+         SET json = ?1, version = version + 1, updated_by = ?2, updated_at = ?3, deleted = 0, seq = ?4
+         WHERE room_id = ?5 AND kind = ?6 AND entity_id = ?7 AND version = ?8 AND deleted = 0",
+        params![json_str, caller, now, candidate_seq, room_id, op.kind, op.id, op.base_version],
+    )?;
+    if affected == 1 {
+        *seq = candidate_seq;
+        return Ok(RoomOpOutcome::Applied { version: op.base_version + 1, seq: candidate_seq });
+    }
+
+    match select_current_entity(tx, room_id, &op.kind, &op.id)? {
+        Some((cur_version, cur_json, deleted)) if deleted == 0 => {
+            Ok(RoomOpOutcome::Stale { current_version: cur_version, current_json: cur_json })
+        }
+        _ => Ok(RoomOpOutcome::Gone),
+    }
+}
+
+fn apply_delete_op(
+    tx: &rusqlite::Transaction,
+    room_id: &str,
+    caller: i64,
+    now: &str,
+    op: &RoomOp,
+    seq: &mut i64,
+) -> Result<RoomOpOutcome> {
+    let candidate_seq = *seq + 1;
+    let affected = tx.execute(
+        "UPDATE shared_preset_entities
+         SET deleted = 1, version = version + 1, updated_by = ?1, updated_at = ?2, seq = ?3, json = NULL
+         WHERE room_id = ?4 AND kind = ?5 AND entity_id = ?6 AND version = ?7 AND deleted = 0",
+        params![caller, now, candidate_seq, room_id, op.kind, op.id, op.base_version],
+    )?;
+    if affected == 1 {
+        *seq = candidate_seq;
+        return Ok(RoomOpOutcome::Applied { version: op.base_version + 1, seq: candidate_seq });
+    }
+
+    match select_current_entity(tx, room_id, &op.kind, &op.id)? {
+        Some((cur_version, cur_json, deleted)) if deleted == 0 => {
+            Ok(RoomOpOutcome::Stale { current_version: cur_version, current_json: cur_json })
+        }
+        _ => Ok(RoomOpOutcome::Gone),
+    }
+}
+
+/// Tombstone every live `primitive` row parented to `(parent_kind,
+/// parent_id)` — run in the SAME transaction right after a `window`/
+/// `bubble` Delete op applies (plan §1/§3), so a viewer never sees an
+/// orphaned primitive whose parent silently vanished. Each cascaded row
+/// burns its own `seq` (a real applied write, same as any direct op).
+fn cascade_delete_primitives(
+    tx: &rusqlite::Transaction,
+    room_id: &str,
+    parent_kind: &str,
+    parent_id: &str,
+    caller: i64,
+    now: &str,
+    seq: &mut i64,
+) -> Result<Vec<(String, RoomOpOutcome)>> {
+    let ids: Vec<(String, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT entity_id, version FROM shared_preset_entities
+             WHERE room_id = ?1 AND kind = 'primitive' AND parent_kind = ?2 AND parent_id = ?3 AND deleted = 0",
+        )?;
+        let rows = stmt.query_map(params![room_id, parent_kind, parent_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>>>()?
+    };
+
+    let mut out = Vec::with_capacity(ids.len());
+    for (entity_id, old_version) in ids {
+        *seq += 1;
+        tx.execute(
+            "UPDATE shared_preset_entities
+             SET deleted = 1, version = version + 1, updated_by = ?1, updated_at = ?2, seq = ?3, json = NULL
+             WHERE room_id = ?4 AND kind = 'primitive' AND entity_id = ?5 AND deleted = 0",
+            params![caller, now, *seq, room_id, entity_id],
+        )?;
+        out.push((entity_id, RoomOpOutcome::Applied { version: old_version + 1, seq: *seq }));
+    }
+    Ok(out)
+}
+
+/// Apply one patch batch, per-entity LWW, inside one sqlite transaction —
+/// the batch is atomic as a unit of COMMIT (a partial per-op outcome is
+/// normal and expected; only an actual DB error rolls back the whole
+/// batch). Bumps `shared_presets.seq` once per successfully applied op
+/// (rejected ops don't burn a seq number; cascade tombstones DO, each one).
+///
+/// `room_create_allowed` is resolved by the CALLER before this runs
+/// (`routes::rooms::is_shared_presets_paid` + `entitlements::
+/// shared_preset_create_allowed`) — this function cannot resolve it itself
+/// because the ladder-paid fact needs the social-plane connection
+/// (`ControlPlane::social`), which is a different connection from `conn`
+/// here (see `entitlements.rs`'s "Shared presets" module doc for the
+/// 2026-09-23 ladder ruling this reflects). This is the one deviation from
+/// the plan's literal signature. Editing an EXISTING room needs no such
+/// externally-resolved fact — `effective_object_rights` (identity-DB only)
+/// is resolved right here.
+///
+/// Returns the room's seq after the batch, one outcome per INPUT op in
+/// request order, PLUS zero or more synthetic cascade outcomes
+/// (`kind = "primitive"`, `Applied`-as-tombstone) for any window/bubble
+/// Delete that removed primitives. If the room does not exist yet and
+/// `room_create_allowed`, the first successfully-applied op implicitly
+/// creates `shared_presets` with `caller` as owner, in the same
+/// transaction as every op below it.
+pub fn apply_room_patch(
+    conn: &mut Connection,
+    kind: &str,
+    room_id: &str,
+    caller: i64,
+    now: &str,
+    ops: &[RoomOp],
+    room_create_allowed: bool,
+) -> Result<(i64, Vec<(RoomOp, RoomOpOutcome)>, Vec<(String, RoomOpOutcome)>)> {
+    let header: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT owner_user_id, seq FROM shared_presets WHERE object_id = ?1",
+            params![room_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+
+    let (is_new_room, owner_user_id, mut seq) = match header {
+        Some((owner, seq)) => (false, owner, seq),
+        None => (true, caller, 0),
+    };
+
+    let authorized = if is_new_room {
+        room_create_allowed
+    } else {
+        effective_object_rights(conn, kind, room_id, owner_user_id, Some(caller))?.contains(&"edit")
+    };
+
+    if !authorized {
+        let forbidden = ops.iter().cloned().map(|op| (op, RoomOpOutcome::Forbidden)).collect();
+        return Ok((seq, forbidden, Vec::new()));
+    }
+
+    let tx = conn.transaction()?;
+    if is_new_room {
+        tx.execute(
+            "INSERT INTO shared_presets (object_id, owner_user_id, title, visibility, seq, created_at, updated_at)
+             VALUES (?1, ?2, '', 'private', 0, ?3, ?3)",
+            params![room_id, caller, now],
+        )?;
+    }
+
+    let mut results = Vec::with_capacity(ops.len());
+    let mut cascades = Vec::new();
+    for op in ops {
+        let outcome = match op.action {
+            RoomOpAction::Upsert => apply_upsert_op(&tx, room_id, caller, now, op, &mut seq)?,
+            RoomOpAction::Delete => apply_delete_op(&tx, room_id, caller, now, op, &mut seq)?,
+        };
+        if matches!(outcome, RoomOpOutcome::Applied { .. })
+            && op.action == RoomOpAction::Delete
+            && (op.kind == "window" || op.kind == "bubble")
+        {
+            let cascaded = cascade_delete_primitives(&tx, room_id, &op.kind, &op.id, caller, now, &mut seq)?;
+            cascades.extend(cascaded);
+        }
+        results.push((op.clone(), outcome));
+    }
+
+    tx.execute(
+        "UPDATE shared_presets SET seq = ?1, updated_at = ?2 WHERE object_id = ?3",
+        params![seq, now, room_id],
+    )?;
+    tx.commit()?;
+
+    Ok((seq, results, cascades))
 }
 
 // ============================================================================

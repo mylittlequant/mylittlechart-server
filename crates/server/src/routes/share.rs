@@ -49,9 +49,6 @@ use crate::models::types::ErrorResponse;
 use crate::state::AppState;
 use crate::text_policy::clean_optional_user_text;
 
-/// Maximum serialized size of a live share's ChartPreset JSON.
-const MAX_PRESET_BYTES: usize = 256 * 1024;
-
 /// Cap on a share's `title` — optional (an empty title is a blank chart,
 /// not an error, see `clean_optional_user_text`), NFC-normalized and
 /// control-character-cleaned the same way every other user-text field is
@@ -251,7 +248,7 @@ pub struct CreateLiveShareRequest {
 /// ```json
 /// { "token": "…", "url_path": "/?share=…", "expires_at": "<RFC3339>" }
 /// ```
-/// The preset must be a JSON object of at most [`MAX_PRESET_BYTES`] bytes
+/// The preset must be a JSON object of at most [`entitlements::PRESET_MAX_BYTES`] bytes
 /// serialized. TTL is stamped at creation (`entitlements::share_ttl_secs`);
 /// reading the share never extends it.
 pub async fn create_live_share(
@@ -272,7 +269,7 @@ pub async fn create_live_share(
             .into_response();
     }
     let preset_json = match serde_json::to_string(&body.preset) {
-        Ok(s) if s.len() <= MAX_PRESET_BYTES => s,
+        Ok(s) if s.len() <= entitlements::PRESET_MAX_BYTES => s,
         Ok(_) => {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -816,6 +813,41 @@ enum CloneOutcome {
     Corrupt,
 }
 
+/// Walk `preset.indicators[*].type_id` and drop any entry
+/// `db::indicator_should_strip` flags for `recipient`, recording each as
+/// `{type_id, name}`. Every other part of `preset` (windows, bubbles,
+/// layout, alerts, primitives, …) is carried through unchanged — only the
+/// `indicators` array is filtered.
+///
+/// Extracted out of [`clone_share`]'s own inline loop
+/// (docs/mlc/plans/shared-presets-rights-and-live-sync-2026-09-23.md §5) so
+/// `routes::rooms`'s own clone route can run the exact same strip rule over
+/// a room's reassembled preset — one strip implementation, not two that
+/// could drift apart.
+pub(crate) fn clone_preset_with_strip(
+    conn: &rusqlite::Connection,
+    mut preset: serde_json::Value,
+    recipient: i64,
+) -> rusqlite::Result<(serde_json::Value, Vec<serde_json::Value>)> {
+    let mut stripped = Vec::new();
+    if let Some(indicators) = preset.get_mut("indicators").and_then(|v| v.as_array_mut()) {
+        let mut kept = Vec::with_capacity(indicators.len());
+        for entry in indicators.drain(..) {
+            let type_id = entry.get("type_id").and_then(|v| v.as_str()).unwrap_or("");
+            let should_strip =
+                !type_id.is_empty() && crate::db::indicator_should_strip(conn, type_id, recipient)?;
+            if should_strip {
+                let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                stripped.push(serde_json::json!({ "type_id": type_id, "name": name }));
+            } else {
+                kept.push(entry);
+            }
+        }
+        *indicators = kept;
+    }
+    Ok((preset, stripped))
+}
+
 /// POST /api/share/{token}/clone
 ///
 /// Auth required (see `resolve_user_id`). Requires `clone` in the caller's
@@ -857,7 +889,7 @@ pub async fn clone_share(
             return Ok(Some(CloneOutcome::NotClonable));
         }
 
-        let mut preset: serde_json::Value = match serde_json::from_str(&row.preset_json) {
+        let preset: serde_json::Value = match serde_json::from_str(&row.preset_json) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("corrupt preset_json on share {}: {}", row.token, e);
@@ -865,23 +897,7 @@ pub async fn clone_share(
             }
         };
 
-        let mut stripped = Vec::new();
-        if let Some(indicators) = preset.get_mut("indicators").and_then(|v| v.as_array_mut()) {
-            let mut kept = Vec::with_capacity(indicators.len());
-            for entry in indicators.drain(..) {
-                let type_id = entry.get("type_id").and_then(|v| v.as_str()).unwrap_or("");
-                let should_strip = !type_id.is_empty()
-                    && crate::db::indicator_should_strip(&conn, type_id, user_id)?;
-                if should_strip {
-                    let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    stripped.push(serde_json::json!({ "type_id": type_id, "name": name }));
-                } else {
-                    kept.push(entry);
-                }
-            }
-            *indicators = kept;
-        }
-
+        let (preset, stripped) = clone_preset_with_strip(&conn, preset, user_id)?;
         Ok(Some(CloneOutcome::Cloned { preset, stripped }))
     })
     .await;

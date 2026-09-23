@@ -101,6 +101,7 @@ mod notify;
 mod opswriter;
 mod pathutil;
 mod ratelimit;
+mod rooms_codec;
 mod routes;
 mod social_db;
 mod state;
