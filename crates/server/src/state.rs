@@ -134,6 +134,15 @@ pub struct ControlPlane {
     /// `reserved_nicks` on a self-service request — see
     /// `reserved_nick_cache_snapshot`/`refresh_reserved_nick_cache`.
     pub reserved_nick_cache: std::sync::RwLock<Vec<crate::db::ReservedNickEntry>>,
+
+    /// Shared live-event registry (see `mylittlechart_server::live`'s
+    /// module doc — it lives in this package's library target, not this
+    /// binary crate's own module tree) — one registry, every topic family
+    /// (`"conversation:{id}"` for the community messenger,
+    /// `"room:{kind}:{object_id}"` reserved for shared-presets Phase 2).
+    /// Constructed once at boot next to `reserved_nick_cache`; no SSE
+    /// handler mounts on it yet (that is a later piece).
+    pub live: mylittlechart_server::live::LiveRegistry,
 }
 
 impl ControlPlane {

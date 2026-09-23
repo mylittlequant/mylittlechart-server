@@ -12,21 +12,23 @@
 //! since an external crate might be the caller. The community messenger
 //! arc's server pieces are deliberately split across separate work items
 //! (`docs/mlc/plans/community-messenger-arc-2026-09-24.md` §4): `S1`
-//! (`conversations_db`, schema + CRUD) ships before `S3` (the routes that
-//! call it). Rather than silence that lint (banned in this codebase) or
-//! fabricate a fake call site in `main`, that module lives here instead,
-//! where its `pub` API is genuinely correct as a public surface awaiting
-//! its caller.
+//! (`conversations_db`, schema + CRUD) and `S2` (`live`, the live-event
+//! registry) ship before `S3`/`S4` (the routes that call them). Rather than
+//! silence that lint (banned in this codebase) or fabricate a fake call
+//! site in `main`, those two modules live here instead, where their `pub`
+//! API is genuinely correct as a public surface awaiting its caller.
 //!
 //! `mylittlechart-server` (the binary) automatically links against this
 //! same-package library crate — reach these modules from bin-crate code
-//! (`main.rs`, `social_db.rs`, and eventually `routes::conversations`) as
-//! `mylittlechart_server::conversations_db`, the same way any other
-//! external crate is named. This module depends on nothing in the binary
-//! crate's own module tree — it duplicates the handful of `dm_db.rs`
+//! (`main.rs`, `state.rs`, `social_db.rs`, and eventually `routes::
+//! conversations`/`routes::rooms`) as `mylittlechart_server::conversations_db`/
+//! `mylittlechart_server::live`, the same way any other external crate is
+//! named. Neither module depends on anything in the binary crate's own
+//! module tree — `conversations_db.rs` duplicates the handful of `dm_db.rs`
 //! constants it needs by hand (documented at each duplicate) rather than
 //! reaching back into the bin, the same documented-not-derived pattern
 //! `src/bin/mlc-dbadmin.rs`'s `HOT_CATEGORIES` already uses in this crate
 //! for the identical binary-cannot-import-binary problem.
 
 pub mod conversations_db;
+pub mod live;
