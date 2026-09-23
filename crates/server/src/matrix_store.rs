@@ -157,6 +157,20 @@ pub enum MatrixStoreError {
     /// An `m.room.member` event's `content.membership` was missing or not
     /// one of `join`/`invite`/`leave`/`ban`.
     InvalidMembership(String),
+    /// A relation's `m.relates_to` target (the `String` is the target event
+    /// id) does not exist, or exists in a different room than the relation
+    /// event being inserted — a relation can never point out of its own
+    /// room.
+    InvalidRelationTarget(String),
+    /// A referenced event (the `String` is its event id) exists but is in a
+    /// different room than the one the caller named — refused rather than
+    /// silently acted on, since acting on it would let a caller redact or
+    /// mark-read an event that was never a member of the room they claimed.
+    WrongRoom(String),
+    /// [`redact_event`] was asked to redact an event type this server never
+    /// allows to be redacted (the `String` is that `event_type`) — see
+    /// [`redact_event`]'s doc comment.
+    UnredactableEvent(String),
 }
 
 impl From<rusqlite::Error> for MatrixStoreError {
@@ -845,10 +859,20 @@ pub fn events_in_room_before(conn: &Connection, room_id: &str, before_stream: i6
 /// shape is unrecognized. Two shapes are handled: the common
 /// `{"rel_type":..., "event_id":..., "key": "..."}` (annotation/replace/
 /// thread) and the nested `{"m.in_reply_to": {"event_id": "..."}}` reply
-/// form. A second identical `m.annotation` (same sender, target, key) is
-/// refused with [`MatrixStoreError::DuplicateAnnotation`] — checked BEFORE
-/// insert, so the caller's whole transaction rolls back and no partial
-/// `events` row survives the refusal.
+/// form.
+///
+/// The target must exist and be in the SAME room as `room_id` — refused
+/// with [`MatrixStoreError::InvalidRelationTarget`] otherwise (a relation
+/// can never point out of its own room, and a target that does not exist
+/// would otherwise only surface as an opaque foreign-key `Db` error from
+/// the `INSERT` below).
+///
+/// A second identical `m.annotation` (same sender, target, key) is refused
+/// with [`MatrixStoreError::DuplicateAnnotation`] — checked BEFORE insert,
+/// so the caller's whole transaction rolls back and no partial `events` row
+/// survives the refusal. A REDACTED prior annotation does not count: once a
+/// reaction is redacted, its sender is free to react with the same key
+/// again (`e.redacted_by IS NULL` in the duplicate check).
 fn populate_relations(tx: &Transaction, event_id: &str, room_id: &str, sender_user_id: i64, content: &str) -> Result<(), MatrixStoreError> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
         return Ok(());
@@ -874,11 +898,20 @@ fn populate_relations(tx: &Transaction, event_id: &str, room_id: &str, sender_us
         }
     };
 
+    let target_room: Option<String> = tx
+        .query_row("SELECT room_id FROM events WHERE event_id = ?1", params![target_id], |row| row.get(0))
+        .optional()?;
+    match target_room {
+        Some(ref found_room) if found_room == room_id => {}
+        _ => return Err(MatrixStoreError::InvalidRelationTarget(target_id)),
+    }
+
     if rel_type == "m.annotation" {
         let duplicate: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM relations r JOIN events e ON e.event_id = r.event_id
                  WHERE r.target_id = ?1 AND r.rel_type = 'm.annotation' AND r.agg_key IS ?2 AND e.sender_user_id = ?3
+                    AND e.redacted_by IS NULL
                  LIMIT 1",
                 params![target_id, agg_key, sender_user_id],
                 |row| row.get(0),
@@ -968,8 +1001,22 @@ fn redact_content_per_v11(event_type: &str, content: &str) -> Result<String, Mat
 /// Redact `target_event_id`: store the `m.room.redaction` event itself
 /// (`redacts = target_event_id`), set the target's `redacted_by`, and
 /// strip the target's `content` per [`redact_content_per_v11`]. All inside
-/// one transaction. Refuses with [`MatrixStoreError::UnknownEventId`] if
-/// `target_event_id` does not exist.
+/// one transaction.
+///
+/// Refuses with:
+/// - [`MatrixStoreError::UnknownEventId`] if `target_event_id` does not
+///   exist;
+/// - [`MatrixStoreError::WrongRoom`] if it exists but is in a different
+///   room than `room_id`;
+/// - [`MatrixStoreError::UnredactableEvent`] for `m.room.create` or
+///   `m.room.encryption` — `m.room.create` is the room's own identity
+///   anchor (its v11 allow-list already keeps every key, so "redacting" it
+///   would be a no-op at best), and `m.room.encryption`'s v11 allow-list
+///   has NO keys at all, meaning a redacted encryption event strips to
+///   `{}` — indistinguishable from an unencrypted room to anything reading
+///   current state. This server's rule is that encryption never turns off
+///   once set (`rooms.is_encrypted`'s own doc comment says the same), so
+///   the event that turned it on must never become redactable.
 pub fn redact_event(
     conn: &mut Connection,
     room_id: &str,
@@ -981,14 +1028,20 @@ pub fn redact_event(
 ) -> Result<MatrixEvent, MatrixStoreError> {
     let tx = conn.transaction()?;
 
-    let target: Option<(String, String)> = tx
+    let target: Option<(String, String, String)> = tx
         .query_row(
-            "SELECT event_type, content FROM events WHERE event_id = ?1",
+            "SELECT event_type, content, room_id FROM events WHERE event_id = ?1",
             params![target_event_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let (target_type, target_content) = target.ok_or_else(|| MatrixStoreError::UnknownEventId(target_event_id.to_string()))?;
+    let (target_type, target_content, target_room) = target.ok_or_else(|| MatrixStoreError::UnknownEventId(target_event_id.to_string()))?;
+    if target_room != room_id {
+        return Err(MatrixStoreError::WrongRoom(target_event_id.to_string()));
+    }
+    if target_type == "m.room.create" || target_type == "m.room.encryption" {
+        return Err(MatrixStoreError::UnredactableEvent(target_type));
+    }
 
     let stream_id = next_stream_id(&tx)?;
     let redaction_content = match reason {
@@ -1128,6 +1181,11 @@ pub fn get_receipt(conn: &Connection, room_id: &str, user_id: i64, receipt_type:
 /// orders receipt *writes* for `/sync`'s ephemeral-since-last-batch filter,
 /// a different axis). Returns the resulting `stream_id` stamped on the
 /// row — the existing one, unchanged, on a refused backward move.
+///
+/// Refuses with [`MatrixStoreError::UnknownEventId`] if `event_id` does not
+/// exist, or [`MatrixStoreError::WrongRoom`] if it exists but is in a
+/// different room than `room_id` — a receipt can never point at an event
+/// outside the room it is filed in.
 pub fn upsert_receipt(
     conn: &mut Connection,
     room_id: &str,
@@ -1138,10 +1196,15 @@ pub fn upsert_receipt(
 ) -> Result<i64, MatrixStoreError> {
     let tx = conn.transaction()?;
 
-    let target_position: Option<i64> = tx
-        .query_row("SELECT stream_id FROM events WHERE event_id = ?1", params![event_id], |row| row.get(0))
+    let target: Option<(i64, String)> = tx
+        .query_row("SELECT stream_id, room_id FROM events WHERE event_id = ?1", params![event_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .optional()?;
-    let target_position = target_position.ok_or_else(|| MatrixStoreError::UnknownEventId(event_id.to_string()))?;
+    let (target_position, target_room) = target.ok_or_else(|| MatrixStoreError::UnknownEventId(event_id.to_string()))?;
+    if target_room != room_id {
+        return Err(MatrixStoreError::WrongRoom(event_id.to_string()));
+    }
 
     let existing: Option<(String, i64)> = tx
         .query_row(
@@ -1404,11 +1467,10 @@ mod tests {
                 r#"{"history_visibility":"shared","extra":"drop"}"#,
                 serde_json::json!({"history_visibility": "shared"}),
             ),
-            (
-                "m.room.create",
-                r#"{"room_version":"11","creator":"@a:mylittlechart.org"}"#,
-                serde_json::json!({"room_version": "11", "creator": "@a:mylittlechart.org"}),
-            ),
+            // `m.room.create` is NOT exercised end-to-end here: `redact_event`
+            // refuses it outright (see `redact_event_refuses_create_and_
+            // encryption_events`); its "keep everything" allow-list branch
+            // is covered directly below, against `redact_content_per_v11`.
             (
                 "m.room.message",
                 r#"{"body":"hi","msgtype":"m.text"}"#,
@@ -1427,6 +1489,14 @@ mod tests {
             assert_eq!(got, expected, "event_type={event_type}");
             assert_eq!(target.redacted_by.as_deref(), Some("$redaction"), "event_type={event_type}");
         }
+    }
+
+    #[test]
+    fn redact_content_per_v11_keeps_everything_for_m_room_create() {
+        let content = r#"{"room_version":"11","creator":"@a:mylittlechart.org"}"#;
+        let stripped = redact_content_per_v11("m.room.create", content).expect("strip");
+        let got: serde_json::Value = serde_json::from_str(&stripped).expect("parse");
+        assert_eq!(got, serde_json::json!({"room_version": "11", "creator": "@a:mylittlechart.org"}));
     }
 
     // ---- P1 test 4: txn dedup ----
@@ -1531,6 +1601,91 @@ mod tests {
         // accepted annotation (not covered by the refusal).
         let other = insert_timeline_event(&mut conn, "$react3", ROOM, 6, "m.reaction", content, 4000, None).expect("different sender reacts");
         assert_eq!(other.event_id, "$react3");
+    }
+
+    // ---- manager-review fixes (2026-09-24 follow-up) ----
+
+    #[test]
+    fn reannotation_after_redaction_is_allowed() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        insert_timeline_event(&mut conn, "$target", ROOM, 1, "m.room.message", "{}", 1000, None).expect("target");
+
+        let content = r#"{"m.relates_to":{"rel_type":"m.annotation","event_id":"$target","key":"a"}}"#;
+        let first = insert_timeline_event(&mut conn, "$react1", ROOM, 5, "m.reaction", content, 2000, None).expect("first reaction");
+
+        redact_event(&mut conn, ROOM, &first.event_id, "$redaction", 1, None, 2500).expect("redact the reaction");
+
+        // The same sender may now react with the same key again — the
+        // redacted prior annotation no longer counts as a duplicate.
+        let second = insert_timeline_event(&mut conn, "$react2", ROOM, 5, "m.reaction", content, 3000, None)
+            .expect("re-annotation after redaction must succeed");
+        assert_eq!(second.event_id, "$react2");
+    }
+
+    #[test]
+    fn relation_target_must_exist() {
+        let mut conn = test_conn();
+        make_room(&conn);
+
+        let content = r#"{"m.relates_to":{"rel_type":"m.annotation","event_id":"$missing","key":"a"}}"#;
+        let err = insert_timeline_event(&mut conn, "$react1", ROOM, 5, "m.reaction", content, 2000, None).unwrap_err();
+        assert!(matches!(err, MatrixStoreError::InvalidRelationTarget(ref id) if id == "$missing"));
+    }
+
+    #[test]
+    fn relation_target_must_be_in_the_same_room() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        let other_room = format!("!other:{MATRIX_SERVER_NAME}");
+        create_room(&conn, &other_room, RoomKind::Group, 1, T0, false, JoinRule::Invite, HistoryVisibility::Shared, None, None)
+            .expect("other room");
+        insert_timeline_event(&mut conn, "$target", &other_room, 1, "m.room.message", "{}", 1000, None).expect("target in other room");
+
+        let content = r#"{"m.relates_to":{"rel_type":"m.annotation","event_id":"$target","key":"a"}}"#;
+        let err = insert_timeline_event(&mut conn, "$react1", ROOM, 5, "m.reaction", content, 2000, None).unwrap_err();
+        assert!(matches!(err, MatrixStoreError::InvalidRelationTarget(ref id) if id == "$target"));
+    }
+
+    #[test]
+    fn redact_event_refuses_a_target_in_a_different_room() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        let other_room = format!("!other:{MATRIX_SERVER_NAME}");
+        create_room(&conn, &other_room, RoomKind::Group, 1, T0, false, JoinRule::Invite, HistoryVisibility::Shared, None, None)
+            .expect("other room");
+        insert_timeline_event(&mut conn, "$target", &other_room, 1, "m.room.message", "{}", 1000, None).expect("target in other room");
+
+        let err = redact_event(&mut conn, ROOM, "$target", "$redaction", 1, None, 2000).unwrap_err();
+        assert!(matches!(err, MatrixStoreError::WrongRoom(ref id) if id == "$target"));
+    }
+
+    #[test]
+    fn redact_event_refuses_create_and_encryption_events() {
+        for event_type in ["m.room.create", "m.room.encryption"] {
+            let mut conn = test_conn();
+            make_room(&conn);
+            apply_state_event(&mut conn, "$target", ROOM, 1, event_type, "", r#"{"a":1}"#, 1000, T0).expect("apply state event");
+
+            let err = redact_event(&mut conn, ROOM, "$target", "$redaction", 1, None, 2000).unwrap_err();
+            assert!(
+                matches!(err, MatrixStoreError::UnredactableEvent(ref t) if t == event_type),
+                "event_type={event_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_receipt_refuses_a_target_in_a_different_room() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        let other_room = format!("!other:{MATRIX_SERVER_NAME}");
+        create_room(&conn, &other_room, RoomKind::Group, 1, T0, false, JoinRule::Invite, HistoryVisibility::Shared, None, None)
+            .expect("other room");
+        let event = insert_timeline_event(&mut conn, "$e1", &other_room, 1, "m.room.message", "{}", 1000, None).expect("event in other room");
+
+        let err = upsert_receipt(&mut conn, ROOM, 9, ReceiptType::Read, &event.event_id, 5000).unwrap_err();
+        assert!(matches!(err, MatrixStoreError::WrongRoom(ref id) if id == &event.event_id));
     }
 
     // ---- extra test: mxid parsing refuses a foreign server ----
