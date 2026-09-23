@@ -623,8 +623,8 @@ async fn main() {
                 live: mylittlechart_server::live::LiveRegistry::new(),
             };
             tracing::info!(
-                "Live event registry ready ({} topic(s))",
-                control_plane.live.topic_count()
+                "Live event registry ready ({} key(s))",
+                control_plane.live.key_count()
             );
             Some(control_plane)
         }
