@@ -568,6 +568,79 @@ pub fn is_moderator_or_admin(classes: &[Class]) -> bool {
     caller_rank(classes) >= Class::Moderator.rank()
 }
 
+/// The highest ladder [`Class`] each of `is_paid`'s keys holds — the batched
+/// counterpart to [`caller_classes`] for serializing an AUTHOR's rank badge
+/// (`routes::forum_v2`'s `author_rank` field) rather than gating the
+/// caller's own request. `is_paid` is already resolved per user id on the
+/// identity connection (`db::users_paid_batch`) — same division of labour
+/// [`caller_classes`]'s doc comment describes for the single-caller case:
+/// this module never opens the identity connection itself. Two queries
+/// total (`forum_trusted`, `forum_roles`), each `WHERE user_id IN (...)`
+/// over every key of `is_paid` at once — never one query per author, no
+/// matter how many distinct authors a response names.
+///
+/// Every key of `is_paid` gets an entry in the result: a plain signed-in,
+/// unpaid account maps to [`Class::User`], the ladder floor for anyone who
+/// managed to post at all (only [`Class::Public`] ranks lower, and an
+/// anonymous caller cannot be an author). An id `is_paid` does not mention
+/// is simply absent from the identity connection's `users` table — the
+/// caller (`routes::forum_v2::resolve_author_ranks`) renders that absence as
+/// `author_rank: null` for a deleted/unknown author, the same case
+/// `db::forum_author_label` already falls back to `"deleted user"` for.
+pub fn author_classes_batch(conn_social: &Connection, is_paid: &std::collections::HashMap<i64, bool>) -> Result<std::collections::HashMap<i64, Class>> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut out = HashMap::with_capacity(is_paid.len());
+    if is_paid.is_empty() {
+        return Ok(out);
+    }
+    let ids: Vec<i64> = is_paid.keys().copied().collect();
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let bound: Vec<&dyn ToSql> = ids.iter().map(|id| id as &dyn ToSql).collect();
+
+    let trusted_sql = format!("SELECT user_id FROM forum_trusted WHERE user_id IN ({placeholders})");
+    let mut trusted_stmt = conn_social.prepare(&trusted_sql)?;
+    let mut trusted_rows = trusted_stmt.query(bound.as_slice())?;
+    let mut trusted: HashSet<i64> = HashSet::new();
+    while let Some(row) = trusted_rows.next()? {
+        trusted.insert(row.get(0)?);
+    }
+    drop(trusted_rows);
+    drop(trusted_stmt);
+
+    let roles_sql = format!("SELECT user_id, role FROM forum_roles WHERE user_id IN ({placeholders})");
+    let mut roles_stmt = conn_social.prepare(&roles_sql)?;
+    let mut roles_rows = roles_stmt.query(bound.as_slice())?;
+    let mut roles: HashMap<i64, Role> = HashMap::new();
+    while let Some(row) = roles_rows.next()? {
+        roles.insert(row.get(0)?, row.get(1)?);
+    }
+    drop(roles_rows);
+    drop(roles_stmt);
+
+    for (&user_id, &paid) in is_paid {
+        // Applied in strictly increasing ladder rank, same as
+        // `caller_classes`: `User` (1) is the floor, `Paid` (2) and
+        // `Trusted` (3) each only raise it, and a held role (4 or 5)
+        // always wins since both outrank `Trusted`.
+        let mut class = Class::User;
+        if paid {
+            class = Class::Paid;
+        }
+        if trusted.contains(&user_id) {
+            class = Class::Trusted;
+        }
+        if let Some(role) = roles.get(&user_id) {
+            class = match role {
+                Role::Moderator => Class::Moderator,
+                Role::Admin => Class::Admin,
+            };
+        }
+        out.insert(user_id, class);
+    }
+    Ok(out)
+}
+
 // ============================================================================
 // Boards
 // ============================================================================
@@ -1435,6 +1508,81 @@ mod tests {
                 Class::Admin
             ]
         );
+    }
+
+    // ---- author_classes_batch: one pair of queries for many authors ----
+
+    #[test]
+    fn author_classes_batch_ranks_plain_paid_moderator_and_admin_authors_in_one_pass() {
+        let conn = test_conn();
+        set_role(&conn, 4, Role::Moderator, "2026-09-06T00:00:00+00:00").expect("set role");
+        set_role(&conn, 5, Role::Admin, "2026-09-06T00:00:00+00:00").expect("set role");
+
+        let is_paid: std::collections::HashMap<i64, bool> =
+            [(1, false), (2, true), (4, false), (5, false)].into_iter().collect();
+        let classes = author_classes_batch(&conn, &is_paid).expect("author classes");
+
+        assert_eq!(classes.len(), 4);
+        assert_eq!(classes.get(&1), Some(&Class::User));
+        assert_eq!(classes.get(&2), Some(&Class::Paid));
+        assert_eq!(classes.get(&4), Some(&Class::Moderator));
+        assert_eq!(classes.get(&5), Some(&Class::Admin));
+    }
+
+    /// A held role outranks `Trusted`/`Paid` even when the account is
+    /// neither paid nor flagged trusted — same cumulative-ladder rule
+    /// `caller_classes_role_row_is_cumulative_through_moderator_and_admin`
+    /// proves for the single-caller path.
+    #[test]
+    fn author_classes_batch_trusted_standing_ranks_above_plain_paid() {
+        let conn = test_conn();
+        set_trusted(&conn, 3, None, "2026-09-09T00:00:00+00:00").expect("set trusted");
+
+        let is_paid: std::collections::HashMap<i64, bool> = [(2, true), (3, true)].into_iter().collect();
+        let classes = author_classes_batch(&conn, &is_paid).expect("author classes");
+
+        assert_eq!(classes.get(&2), Some(&Class::Paid));
+        assert_eq!(classes.get(&3), Some(&Class::Trusted));
+    }
+
+    #[test]
+    fn author_classes_batch_empty_input_makes_no_query_and_returns_empty() {
+        let conn = test_conn();
+        let classes = author_classes_batch(&conn, &std::collections::HashMap::new()).expect("author classes");
+        assert!(classes.is_empty());
+    }
+
+    /// Structural batching proof: `author_classes_batch`'s SIGNATURE is the
+    /// contract — it takes the whole `&HashMap<i64, bool>` of authors a
+    /// response names and returns every one of them from a single call, so
+    /// there is no way for a caller to invoke it per-author without
+    /// deliberately looping over single-entry maps (which
+    /// `routes::forum_v2::resolve_author_ranks` — the only call site — does
+    /// not do: it builds one `HashSet`/`HashMap` per response and calls this
+    /// function exactly once). `rusqlite` 0.32 as pinned by this workspace
+    /// exposes no statement-count hook without the (unenabled) `trace`
+    /// feature, so this proves batching by the black-box contract —
+    /// many distinct trusted/role rows, several different ranks, all
+    /// resolved correctly out of one call — rather than by counting
+    /// executed statements.
+    #[test]
+    fn author_classes_batch_resolves_many_distinct_authors_in_one_call() {
+        let conn = test_conn();
+        set_trusted(&conn, 3, None, "2026-09-09T00:00:00+00:00").expect("set trusted");
+        set_trusted(&conn, 13, None, "2026-09-09T00:00:00+00:00").expect("set trusted");
+        set_role(&conn, 7, Role::Moderator, "2026-09-06T00:00:00+00:00").expect("set role");
+        set_role(&conn, 17, Role::Admin, "2026-09-06T00:00:00+00:00").expect("set role");
+
+        let is_paid: std::collections::HashMap<i64, bool> = (1..=20).map(|id| (id, id % 2 == 0)).collect();
+        let classes = author_classes_batch(&conn, &is_paid).expect("author classes");
+
+        assert_eq!(classes.len(), 20, "every id in the batch must come back, from one call");
+        assert_eq!(classes.get(&1), Some(&Class::User)); // odd, unpaid
+        assert_eq!(classes.get(&2), Some(&Class::Paid)); // even, paid
+        assert_eq!(classes.get(&3), Some(&Class::Trusted)); // odd, unpaid, trusted row
+        assert_eq!(classes.get(&7), Some(&Class::Moderator)); // odd, unpaid, moderator role
+        assert_eq!(classes.get(&13), Some(&Class::Trusted)); // odd, unpaid, trusted row
+        assert_eq!(classes.get(&17), Some(&Class::Admin)); // odd, unpaid, admin role
     }
 
     // ---- ladder_boosted_user_ids ----

@@ -109,7 +109,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -294,6 +294,57 @@ async fn resolve_caller_classes(state: Arc<AppState>, caller: Option<i64>) -> Re
             Err(internal_error())
         }
         Err(_) => Err(internal_error()),
+    }
+}
+
+/// Batch-resolve `author_rank` for every id in `ids` — one query against the
+/// identity connection (`db::users_paid_batch`) and one pair of queries
+/// against the social connection (`social_db::author_classes_batch`),
+/// regardless of how many distinct authors the response names (a thread
+/// detail's own author plus every reply's author, or a whole page of
+/// thread-list rows) — never a query per author. Same cross-database
+/// discipline as [`resolve_caller_classes`]: the identity lock is dropped
+/// before the social lock is ever taken.
+///
+/// An id absent from the identity connection's `users` table (a
+/// deleted/unknown account — the same case `db::forum_author_label` already
+/// falls back to `"deleted user"` for) maps to `None`, which
+/// [`author_rank_json`] renders as JSON `null`.
+async fn resolve_author_ranks(state: Arc<AppState>, ids: HashSet<i64>) -> Result<HashMap<i64, Option<Class>>, Response> {
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<HashMap<i64, Option<Class>>> {
+        let ids: Vec<i64> = ids.into_iter().collect();
+        let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let paid = db::users_paid_batch(&identity_conn, &ids)?;
+        drop(identity_conn);
+
+        let social_conn = state.control_plane().social_conn();
+        let classes = social_db::author_classes_batch(&social_conn, &paid)?;
+        drop(social_conn);
+
+        Ok(ids.into_iter().map(|id| (id, classes.get(&id).copied())).collect())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(ranks)) => Ok(ranks),
+        Ok(Err(e)) => {
+            tracing::error!("DB error resolving forum_v2 author ranks: {}", e);
+            Err(internal_error())
+        }
+        Err(_) => Err(internal_error()),
+    }
+}
+
+/// `author_rank`'s JSON value for `user_id` — the wire-name string of the
+/// highest [`Class`] [`resolve_author_ranks`] resolved for them, or `null`
+/// for a deleted/unknown author, or for an `user_id` this response never
+/// asked [`resolve_author_ranks`] to resolve at all (defensive default, not
+/// expected to trigger in practice — every call site passes the exact same
+/// id set to both functions).
+fn author_rank_json(ranks: &HashMap<i64, Option<Class>>, user_id: i64) -> serde_json::Value {
+    match ranks.get(&user_id).copied().flatten() {
+        Some(class) => serde_json::Value::String(class.as_str().to_string()),
+        None => serde_json::Value::Null,
     }
 }
 
@@ -516,7 +567,9 @@ pub async fn list_board_threads(
     };
 
     type ThreadRows = Vec<(social_db::ForumThreadV2, String)>;
+    let state_for_query = state.clone();
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<ThreadRows>> {
+        let state = state_for_query;
         let conn = state.control_plane().social_conn();
         let Some(board) = social_db::get_board_by_slug(&conn, &slug)? else {
             return Ok(None);
@@ -552,12 +605,18 @@ pub async fn list_board_threads(
             } else {
                 None
             };
+            let author_ids: HashSet<i64> = rows.iter().map(|(t, _)| t.author_user_id).collect();
+            let ranks = match resolve_author_ranks(state, author_ids).await {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
             Json(serde_json::json!({
                 "threads": rows.iter().map(|(t, author)| serde_json::json!({
                     "id": t.id,
                     "board_id": t.board_id,
                     "title": t.title,
                     "author": author,
+                    "author_rank": author_rank_json(&ranks, t.author_user_id),
                     "author_is_me": Some(t.author_user_id) == caller,
                     "created_at": t.created_at,
                     "updated_at": t.updated_at,
@@ -667,7 +726,12 @@ pub async fn create_board_thread(
 // GET /api/forum/v2/threads/{id}
 // ============================================================================
 
-fn render_reply_tree(nodes: &[social_db::ReplyNode], labels: &HashMap<i64, String>, caller: Option<i64>) -> Vec<serde_json::Value> {
+fn render_reply_tree(
+    nodes: &[social_db::ReplyNode],
+    labels: &HashMap<i64, String>,
+    ranks: &HashMap<i64, Option<Class>>,
+    caller: Option<i64>,
+) -> Vec<serde_json::Value> {
     nodes
         .iter()
         .map(|n| {
@@ -677,11 +741,12 @@ fn render_reply_tree(nodes: &[social_db::ReplyNode], labels: &HashMap<i64, Strin
                 "parent_reply_id": n.reply.parent_reply_id,
                 "depth": n.reply.depth,
                 "author": author,
+                "author_rank": author_rank_json(ranks, n.reply.author_user_id),
                 "author_is_me": Some(n.reply.author_user_id) == caller,
                 "body": n.reply.body,
                 "created_at": n.reply.created_at,
                 "hidden": n.reply.hidden,
-                "children": render_reply_tree(&n.children, labels, caller),
+                "children": render_reply_tree(&n.children, labels, ranks, caller),
             })
         })
         .collect()
@@ -699,7 +764,9 @@ pub async fn get_thread(State(state): State<Arc<AppState>>, headers: HeaderMap, 
     let is_mod = social_db::is_moderator_or_admin(&classes);
 
     type ThreadWithReplies = (social_db::ForumThreadV2, String, Vec<(social_db::ForumReplyV2, String)>);
+    let state_for_query = state.clone();
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<ThreadWithReplies>> {
+        let state = state_for_query;
         let conn = state.control_plane().social_conn();
         let Some(thread) = social_db::get_thread_v2(&conn, thread_id, is_mod)? else {
             return Ok(None);
@@ -727,6 +794,15 @@ pub async fn get_thread(State(state): State<Arc<AppState>>, headers: HeaderMap, 
     match result {
         Ok(Ok(Some((thread, thread_author, reply_rows)))) => {
             let labels: HashMap<i64, String> = reply_rows.iter().map(|(r, label)| (r.id, label.clone())).collect();
+            let author_ids: HashSet<i64> = reply_rows
+                .iter()
+                .map(|(r, _)| r.author_user_id)
+                .chain(std::iter::once(thread.author_user_id))
+                .collect();
+            let ranks = match resolve_author_ranks(state, author_ids).await {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
             let flat: Vec<social_db::ForumReplyV2> = reply_rows.into_iter().map(|(r, _)| r).collect();
             let tree = social_db::assemble_reply_tree(flat);
             Json(serde_json::json!({
@@ -735,6 +811,7 @@ pub async fn get_thread(State(state): State<Arc<AppState>>, headers: HeaderMap, 
                     "board_id": thread.board_id,
                     "title": thread.title,
                     "author": thread_author,
+                    "author_rank": author_rank_json(&ranks, thread.author_user_id),
                     "author_is_me": Some(thread.author_user_id) == caller,
                     "body": thread.body,
                     "created_at": thread.created_at,
@@ -743,7 +820,7 @@ pub async fn get_thread(State(state): State<Arc<AppState>>, headers: HeaderMap, 
                     "locked": thread.locked,
                     "hidden": thread.hidden,
                 },
-                "replies": render_reply_tree(&tree, &labels, caller),
+                "replies": render_reply_tree(&tree, &labels, &ranks, caller),
             }))
             .into_response()
         }

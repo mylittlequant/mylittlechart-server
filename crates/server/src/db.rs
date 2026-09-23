@@ -2612,6 +2612,39 @@ pub fn user_is_paid(conn: &Connection, user_id: i64) -> Result<bool> {
     Ok(user_paid_until(conn, user_id)?.is_some())
 }
 
+/// Paid status for many accounts at once — the batched counterpart to
+/// [`user_is_paid`] for `routes::forum_v2`'s `author_rank` field, which
+/// needs every distinct author a response names resolved in one round trip
+/// rather than one `user_is_paid` call per author. Same `paid_until`
+/// comparison against now as [`user_paid_until`], just over a whole `IN
+/// (...)` set.
+///
+/// A key is present in the result only if `user_id` still names a row in
+/// `users` — `social_db::author_classes_batch`'s caller
+/// (`routes::forum_v2::resolve_author_ranks`) uses that absence to tell a
+/// live account (some rank) apart from a deleted/unknown one (`author_rank:
+/// null`), the same account `db::forum_author_label` already falls back to
+/// `"deleted user"` for.
+pub fn users_paid_batch(conn: &Connection, user_ids: &[i64]) -> Result<std::collections::HashMap<i64, bool>> {
+    let mut out = std::collections::HashMap::with_capacity(user_ids.len());
+    if user_ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = user_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT id, paid_until FROM users WHERE id IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let bound: Vec<&dyn rusqlite::ToSql> = user_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let mut rows = stmt.query(bound.as_slice())?;
+    let now = chrono::Utc::now().to_rfc3339();
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let until: Option<String> = row.get(1)?;
+        let paid = until.is_some_and(|u| u.as_str() > now.as_str());
+        out.insert(id, paid);
+    }
+    Ok(out)
+}
+
 /// Grant or revoke paid access by writing the moment it ends.
 ///
 /// `None` revokes. Used by the admin endpoint today and by the billing
@@ -6580,6 +6613,35 @@ mod tests {
         // `now`: ~15 days out, well past what a bare 5-day grant from `now`
         // would give.
         assert!(new_until_dt > now + chrono::Duration::days(14));
+    }
+
+    #[test]
+    fn users_paid_batch_resolves_paid_unpaid_expired_and_omits_unknown_ids() {
+        let conn = share_test_conn();
+        let paid_uid = insert_share_user(&conn, "paidy", Some("pub-paidy"));
+        let unpaid_uid = insert_share_user(&conn, "plain", Some("pub-plain"));
+        let expired_uid = insert_share_user(&conn, "lapsed", Some("pub-lapsed"));
+
+        let future = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let past = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        super::set_user_paid_until(&conn, paid_uid, Some(&future)).expect("set paid");
+        super::set_user_paid_until(&conn, expired_uid, Some(&past)).expect("set expired");
+
+        let unknown_uid = 999_999;
+        let result =
+            super::users_paid_batch(&conn, &[paid_uid, unpaid_uid, expired_uid, unknown_uid]).expect("batch");
+
+        assert_eq!(result.get(&paid_uid), Some(&true));
+        assert_eq!(result.get(&unpaid_uid), Some(&false));
+        assert_eq!(result.get(&expired_uid), Some(&false));
+        assert_eq!(result.get(&unknown_uid), None, "an unknown user_id must be absent, not false");
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn users_paid_batch_empty_ids_returns_empty_map() {
+        let conn = share_test_conn();
+        assert!(super::users_paid_batch(&conn, &[]).expect("batch").is_empty());
     }
 
     #[test]
