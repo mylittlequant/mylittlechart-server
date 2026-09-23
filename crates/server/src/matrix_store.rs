@@ -472,18 +472,19 @@ pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Open (creating if absent) the SQLCipher-encrypted `messenger.db` at
-/// `path`, key it, and create this module's half of the schema. Mirrors
-/// `social_db::init_social_db` exactly: the key is the very first statement
-/// on the connection, then WAL + foreign keys, then schema. The
-/// devices/keys/backup half (`matrix_keys_store::create_matrix_keys_schema`)
-/// is a separate call the boot sequence makes on the same connection (plan
-/// §6.2) — not this function's job.
+/// `path`, key it, and create BOTH halves of the schema. Mirrors
+/// `social_db::init_social_db`: the key is the very first statement on the
+/// connection, then WAL + foreign keys, then schema. Calls
+/// `matrix_keys_store::create_matrix_keys_schema` right after this module's
+/// own [`create_matrix_schema`] — both idempotent, so this is the one place
+/// the whole `messenger.db` schema comes into existence on boot.
 pub fn init_messenger_db(path: &str, key_hex: &str) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))?;
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     create_matrix_schema(&conn)?;
+    crate::matrix_keys_store::create_matrix_keys_schema(&conn)?;
     Ok(conn)
 }
 
@@ -494,8 +495,11 @@ pub fn init_messenger_db(path: &str, key_hex: &str) -> rusqlite::Result<Connecti
 /// Take the next value from the single global counter, inside `tx` — always
 /// called in the SAME transaction as the row it stamps (this module's one
 /// hard invariant; see the module doc's single-writer note on why this
-/// stays race-free with no additional locking).
-fn next_stream_id(tx: &Transaction) -> rusqlite::Result<i64> {
+/// stays race-free with no additional locking). `pub(crate)` so
+/// `matrix_keys_store.rs` can stamp its own stream-ordered tables
+/// (`to_device_messages`, `device_list_changes`) off this same counter
+/// rather than minting a second one.
+pub(crate) fn next_stream_id(tx: &Transaction) -> rusqlite::Result<i64> {
     tx.query_row("UPDATE stream_counter SET value = value + 1 WHERE id = 1 RETURNING value", [], |row| row.get(0))
 }
 

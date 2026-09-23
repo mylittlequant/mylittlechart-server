@@ -28,4 +28,5 @@
 //! named. It depends on nothing in the binary crate's own module tree.
 
 pub mod live;
+pub mod matrix_keys_store;
 pub mod matrix_store;
