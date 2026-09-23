@@ -1,3 +1,8 @@
+// Retired 2026-09-24: superseded by the Matrix-subset messenger (plan
+// `nemo/docs/mlc/plans/community-messenger-arc-2026-09-24.md` §7.2). Not
+// compiled (moved out of `crates/server/src`, not `mod`-declared anywhere) —
+// kept for reference only.
+
 //! Community messenger storage — `conversations`/`kind IN ('dm','group',
 //! 'channel')`, one object model for direct messages, private groups, and
 //! public channels (owner-approved plan, `docs/mlc/plans/community-

@@ -95,8 +95,8 @@ mod build_attest;
 mod db;
 mod dm_db;
 mod entitlements;
-// `conversations_db`/`live` live in the library target (`lib.rs`), not
-// here — see that file's doc comment for why.
+// `live` lives in the library target (`lib.rs`), not here — see that
+// file's doc comment for why.
 mod models;
 mod nick_policy;
 mod notify;

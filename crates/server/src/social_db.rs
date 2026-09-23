@@ -56,12 +56,6 @@ pub fn init_social_db(path: &str, key_hex: &str) -> Result<Connection> {
     // separate module because the crypto/paid-gate posture is unrelated to
     // the forum's class ladder.
     crate::dm_db::create_dm_schema(&conn)?;
-    // Community messenger tables (`mylittlechart_server::conversations_db`,
-    // the library target — see that module's doc for why it lives there)
-    // — schema only here; the additive migration that copies `dm_*` rows
-    // into these tables is a separate, later boot step (plan §1.8, not
-    // wired yet).
-    mylittlechart_server::conversations_db::create_conversations_schema(&conn)?;
     Ok(conn)
 }
 
