@@ -446,21 +446,79 @@ pub fn create_message(
     Ok(id)
 }
 
-/// List messages in `conversation_id` with `id > after` (or from the start
-/// if `after` is `None`), oldest first, capped at `limit`.
-pub fn list_messages(conn: &Connection, conversation_id: i64, after: Option<i64>, limit: i64) -> Result<Vec<DmMessage>> {
-    let after = after.unwrap_or(0);
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {MESSAGE_SELECT_COLUMNS} FROM dm_messages
-         WHERE conversation_id = ?1 AND id > ?2
-         ORDER BY id ASC LIMIT ?3"
-    ))?;
-    let mut rows = stmt.query(params![conversation_id, after, limit])?;
+/// Which page of a conversation's messages [`list_messages`] should fetch.
+/// Mirrors the three cases `routes::dm::list_messages` exposes over HTTP as
+/// `after`/`before` query params — an illegal "both at once" request is not
+/// representable here at all; the route rejects that combination with a 400
+/// before ever building one of these (see
+/// `routes::dm::resolve_message_page`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessagePage {
+    /// No cursor: the newest `limit` messages, returned oldest-first. Also
+    /// what every shipped client gets on first open, since none of them
+    /// pass a cursor yet — see this module's history (2026-09-23 fix: this
+    /// used to silently mean "the OLDEST `limit` messages", which pinned
+    /// any conversation past `limit` total messages to its first page
+    /// forever).
+    Newest,
+    /// `id > after`, oldest-first, first `limit` — unchanged "poll for
+    /// what's new since the last message I already have" semantics.
+    After(i64),
+    /// The newest `limit` messages with `id < before`, returned
+    /// oldest-first — "load older" pagination.
+    Before(i64),
+}
+
+/// Drain a prepared, already-executed statement's rows into `DmMessage`s, in
+/// whatever order the query itself produced.
+fn collect_messages(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<DmMessage>> {
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         out.push(message_from_row(row)?);
     }
     Ok(out)
+}
+
+/// List one page of `conversation_id`'s messages per [`MessagePage`], always
+/// returned oldest-first regardless of which case fired, capped at `limit`.
+/// One query per call: [`MessagePage::After`] queries ascending directly;
+/// [`MessagePage::Newest`] and [`MessagePage::Before`] query the newest
+/// matches `ORDER BY id DESC LIMIT` (the only way to get "the newest N" at
+/// all) and then reverse the page in Rust to restore ascending order.
+pub fn list_messages(conn: &Connection, conversation_id: i64, page: MessagePage, limit: i64) -> Result<Vec<DmMessage>> {
+    match page {
+        MessagePage::After(after) => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLUMNS} FROM dm_messages
+                 WHERE conversation_id = ?1 AND id > ?2
+                 ORDER BY id ASC LIMIT ?3"
+            ))?;
+            let mut rows = stmt.query(params![conversation_id, after, limit])?;
+            collect_messages(&mut rows)
+        }
+        MessagePage::Newest => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLUMNS} FROM dm_messages
+                 WHERE conversation_id = ?1
+                 ORDER BY id DESC LIMIT ?2"
+            ))?;
+            let mut rows = stmt.query(params![conversation_id, limit])?;
+            let mut out = collect_messages(&mut rows)?;
+            out.reverse();
+            Ok(out)
+        }
+        MessagePage::Before(before) => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLUMNS} FROM dm_messages
+                 WHERE conversation_id = ?1 AND id < ?2
+                 ORDER BY id DESC LIMIT ?3"
+            ))?;
+            let mut rows = stmt.query(params![conversation_id, before, limit])?;
+            let mut out = collect_messages(&mut rows)?;
+            out.reverse();
+            Ok(out)
+        }
+    }
 }
 
 /// Mark every message in `conversation_id` sent by the OTHER party (not
@@ -640,16 +698,47 @@ mod tests {
         let id1 = create_message(&conn, conv.id, 1, &nonce, b"first", "2026-09-06T00:01:00+00:00").expect("insert 1");
         let id2 = create_message(&conn, conv.id, 2, &nonce, b"second", "2026-09-06T00:02:00+00:00").expect("insert 2");
 
-        let all = list_messages(&conn, conv.id, None, 10).expect("list all");
+        let all = list_messages(&conn, conv.id, MessagePage::Newest, 10).expect("list all");
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].id, id1);
         assert_eq!(all[0].ciphertext, b"first");
         assert_eq!(all[1].id, id2);
         assert_eq!(all[1].ciphertext, b"second");
 
-        let after_first = list_messages(&conn, conv.id, Some(id1), 10).expect("list after");
+        let after_first = list_messages(&conn, conv.id, MessagePage::After(id1), 10).expect("list after");
         assert_eq!(after_first.len(), 1);
         assert_eq!(after_first[0].id, id2);
+    }
+
+    #[test]
+    fn list_messages_newest_returns_the_latest_page_ascending_when_the_conversation_exceeds_the_limit() {
+        let conn = test_conn();
+        let conv = get_or_create_conversation(&conn, 1, 2, "2026-09-06T00:00:00+00:00").expect("create");
+        let nonce = [0u8; DM_NONCE_LEN];
+        let ids: Vec<i64> = (0..60)
+            .map(|i| {
+                create_message(&conn, conv.id, 1, &nonce, format!("m{i}").as_bytes(), "2026-09-06T00:00:00+00:00")
+                    .expect("insert")
+            })
+            .collect();
+        assert_eq!(ids.len(), 60);
+
+        // No cursor: the newest 50 of 60, ascending — ids 11..60 (1-indexed
+        // ids, so ids[10..60]). This is the F4 fix: previously `after`
+        // defaulted to 0 and this case returned the OLDEST 50 instead.
+        let newest = list_messages(&conn, conv.id, MessagePage::Newest, 50).expect("list newest");
+        let got: Vec<i64> = newest.iter().map(|m| m.id).collect();
+        assert_eq!(got, ids[10..60]);
+
+        // after=<the 55th id> (value 55): strictly newer, ascending — ids 56..60.
+        let after = list_messages(&conn, conv.id, MessagePage::After(ids[54]), 50).expect("list after");
+        let got: Vec<i64> = after.iter().map(|m| m.id).collect();
+        assert_eq!(got, ids[55..60]);
+
+        // before=<the 11th id> (value 11): strictly older, ascending — ids 1..10.
+        let before = list_messages(&conn, conv.id, MessagePage::Before(ids[10]), 50).expect("list before");
+        let got: Vec<i64> = before.iter().map(|m| m.id).collect();
+        assert_eq!(got, ids[0..10]);
     }
 
     #[test]
@@ -665,7 +754,7 @@ mod tests {
         let updated = mark_read(&conn, conv.id, 1, from_2, "2026-09-06T00:05:00+00:00").expect("mark read");
         assert_eq!(updated, 1);
 
-        let all = list_messages(&conn, conv.id, None, 10).expect("list");
+        let all = list_messages(&conn, conv.id, MessagePage::Newest, 10).expect("list");
         let mine = all.iter().find(|m| m.id == from_1).expect("own message");
         assert_eq!(mine.read_at, None);
         let peers = all.iter().find(|m| m.id == from_2).expect("peer message");

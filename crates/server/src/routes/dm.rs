@@ -874,13 +874,32 @@ pub async fn create_message(
 #[derive(serde::Deserialize)]
 pub struct ListMessagesQuery {
     pub after: Option<i64>,
+    pub before: Option<i64>,
     pub limit: Option<i64>,
 }
 
-/// `GET /dm/conversations/{id}/messages?after=&limit=` -> `{"messages":
+/// Resolve `after`/`before` query params into the [`dm_db::MessagePage`]
+/// [`list_messages`] should fetch — `None` if both were given, since they
+/// are mutually exclusive (the route turns that into a 400 rather than
+/// picking one silently). No cursor at all resolves to
+/// [`dm_db::MessagePage::Newest`] — see that variant's doc for why this
+/// case, not "from the start", is what an absent cursor now means.
+fn resolve_message_page(after: Option<i64>, before: Option<i64>) -> Option<dm_db::MessagePage> {
+    match (after, before) {
+        (Some(_), Some(_)) => None,
+        (Some(after), None) => Some(dm_db::MessagePage::After(after)),
+        (None, Some(before)) => Some(dm_db::MessagePage::Before(before)),
+        (None, None) => Some(dm_db::MessagePage::Newest),
+    }
+}
+
+/// `GET /dm/conversations/{id}/messages?after=&before=&limit=` -> `{"messages":
 /// [{"id","sender_public_id","sender_is_me","nonce_b64","ciphertext_b64",
-/// "created_at","read_at"}], "next_after"}`. 404 if the conversation does
-/// not exist or the caller is not a party.
+/// "created_at","read_at"}], "next_after"}`, always oldest-first. No cursor
+/// -> the newest `limit` messages (see [`dm_db::MessagePage::Newest`]);
+/// `after` -> unchanged "what's new" polling; `before` -> "load older";
+/// `after` and `before` together -> 400. 404 if the conversation does not
+/// exist or the caller is not a party.
 pub async fn list_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -890,6 +909,10 @@ pub async fn list_messages(
     let user_id = match require_dm_access(state.clone(), &headers).await {
         Ok(uid) => uid,
         Err(resp) => return resp,
+    };
+    let page = match resolve_message_page(query.after, query.before) {
+        Some(page) => page,
+        None => return bad_request("after and before are mutually exclusive"),
     };
     let limit = query.limit.unwrap_or(DEFAULT_MESSAGE_LIMIT).clamp(1, MAX_MESSAGE_LIMIT);
 
@@ -902,7 +925,7 @@ pub async fn list_messages(
         if conversation.peer_of(user_id).is_none() {
             return Ok(None);
         }
-        let messages = dm_db::list_messages(&social_conn, conversation_id, query.after, limit)?;
+        let messages = dm_db::list_messages(&social_conn, conversation_id, page, limit)?;
         drop(social_conn);
 
         let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
@@ -1000,6 +1023,24 @@ mod tests {
     fn require_peer_paid_allows_a_paid_peer_and_refuses_an_unpaid_one() {
         assert!(require_peer_paid(true).is_ok());
         assert!(require_peer_paid(false).is_err());
+    }
+
+    // ---- message pagination: resolve_message_page ----
+
+    #[test]
+    fn resolve_message_page_rejects_after_and_before_together() {
+        assert_eq!(resolve_message_page(Some(55), Some(11)), None);
+    }
+
+    #[test]
+    fn resolve_message_page_defaults_to_newest_with_no_cursor() {
+        assert_eq!(resolve_message_page(None, None), Some(dm_db::MessagePage::Newest));
+    }
+
+    #[test]
+    fn resolve_message_page_maps_after_and_before_to_their_own_variant() {
+        assert_eq!(resolve_message_page(Some(55), None), Some(dm_db::MessagePage::After(55)));
+        assert_eq!(resolve_message_page(None, Some(11)), Some(dm_db::MessagePage::Before(11)));
     }
 
     // ---- lookup: osa_distance ----

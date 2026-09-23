@@ -1283,7 +1283,7 @@ mod tests {
 
         // Case 2: from_p3's messages moved into into_p3; from_p3 itself is gone.
         assert_eq!(dm_db::get_conversation(&social, from_p3.id).expect("get"), None);
-        let messages = dm_db::list_messages(&social, into_p3.id, None, 10).expect("list");
+        let messages = dm_db::list_messages(&social, into_p3.id, dm_db::MessagePage::Newest, 10).expect("list");
         assert_eq!(messages.len(), 2);
         assert!(messages.iter().all(|m| m.sender_user_id == into));
         let survivor = dm_db::get_conversation(&social, into_p3.id).expect("get").expect("survives");
@@ -1292,7 +1292,7 @@ mod tests {
         // Case 3: repointed to (into, peer4) — same conversation id, new pair.
         let repointed = dm_db::get_conversation(&social, from_p4.id).expect("get").expect("still exists");
         assert_eq!((repointed.user_lo, repointed.user_hi), dm_db::ordered_pair(into, peer_with_no_into_conversation));
-        let messages = dm_db::list_messages(&social, from_p4.id, None, 10).expect("list");
+        let messages = dm_db::list_messages(&social, from_p4.id, dm_db::MessagePage::Newest, 10).expect("list");
         assert_eq!(messages[0].sender_user_id, into);
     }
 
