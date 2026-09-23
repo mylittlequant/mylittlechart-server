@@ -2790,6 +2790,22 @@ pub fn mint_gift_codes(
     Ok(codes)
 }
 
+/// `max(now, existing paid_until) + days` — the one place the "extend, never
+/// replace, never lose remaining time" rule is computed. Shared by
+/// [`redeem_gift_code`] (a gift code, one per account per code) and
+/// [`grant_paid_days`] (an admin grant, `routes::admin::grant_paid_days`'s DB
+/// half) — both give an account still under an earlier grant more time
+/// instead of losing whatever was left of it, and this is why the two can
+/// never disagree about what "extend" means.
+fn extend_paid_until(existing: Option<&str>, days: i64, now: chrono::DateTime<chrono::Utc>) -> String {
+    let base = existing
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .filter(|dt| *dt > now)
+        .unwrap_or(now);
+    (base + chrono::Duration::days(days)).to_rfc3339()
+}
+
 /// Outcome of a gift/trial code redemption attempt.
 pub enum RedeemOutcome {
     /// Redeemed successfully — carries the account's new `paid_until`.
@@ -2819,9 +2835,9 @@ pub enum RedeemOutcome {
 /// and the write — it exists only to size the grant, not to decide whether
 /// one happens.
 ///
-/// `paid_until` is extended, not replaced: `max(now, existing paid_until) +
-/// grants_days`, so an account still under an earlier grant gains time
-/// instead of losing whatever was left of it.
+/// `paid_until` is extended via [`extend_paid_until`], not replaced: an
+/// account still under an earlier grant gains time instead of losing
+/// whatever was left of it.
 pub fn redeem_gift_code(
     conn: &Connection,
     code: &str,
@@ -2856,18 +2872,41 @@ pub fn redeem_gift_code(
         )
         .optional()?
         .flatten();
-    let now_dt = chrono::Utc::now();
-    let base = existing_until
-        .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .filter(|dt| *dt > now_dt)
-        .unwrap_or(now_dt);
-    let new_until = (base + chrono::Duration::days(grants_days)).to_rfc3339();
+    let new_until = extend_paid_until(existing_until.as_deref(), grants_days, chrono::Utc::now());
 
     set_user_paid_until(conn, user_id, Some(&new_until))?;
 
     Ok(RedeemOutcome::Redeemed(new_until))
+}
+
+/// Extend `user_id`'s paid access by `days` days from `max(now, existing
+/// paid_until)` — `routes::admin::grant_paid_days`'s DB half, for operator
+/// accounts (or any support fix) that need paid time granted directly: a
+/// gift code needs the redeeming user's own session ([`redeem_gift_code`]),
+/// which does not exist for an account an operator is granting time to
+/// out-of-band. Same extension rule as a gift code redemption, via
+/// [`extend_paid_until`] — one shared implementation of "extend, never
+/// replace, never lose remaining time". `None` if `user_id` names no row in
+/// `users`; `days` bounds are the caller's job (`routes::admin`), not this
+/// function's.
+pub fn grant_paid_days(conn: &Connection, user_id: i64, days: i64) -> Result<Option<String>> {
+    // Outer `Option` is "does a `users` row exist at all" (`None` -> no such
+    // user); inner is `paid_until` itself, which is separately `Option` —
+    // one query answers both, no second existence check needed.
+    let row: Option<Option<String>> = conn
+        .query_row(
+            "SELECT paid_until FROM users WHERE id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(existing_until) = row else {
+        return Ok(None);
+    };
+
+    let new_until = extend_paid_until(existing_until.as_deref(), days, chrono::Utc::now());
+    set_user_paid_until(conn, user_id, Some(&new_until))?;
+    Ok(Some(new_until))
 }
 
 // ============================================================================
@@ -5801,6 +5840,73 @@ mod tests {
         assert!(super::get_share_link(&conn, &token).expect("query").is_none());
         // Revoking twice is not a success either.
         assert!(!super::revoke_share(&conn, uid, &token).expect("revoke"));
+    }
+
+    // ---- extend_paid_until / grant_paid_days (admin `paid-days` grant) ----
+
+    #[test]
+    fn extend_paid_until_extends_from_now_when_never_paid() {
+        let now = chrono::Utc::now();
+        let until = super::extend_paid_until(None, 7, now);
+        let until_dt = chrono::DateTime::parse_from_rfc3339(&until)
+            .expect("parse")
+            .with_timezone(&chrono::Utc);
+        assert_eq!(until_dt, now + chrono::Duration::days(7));
+    }
+
+    #[test]
+    fn extend_paid_until_extends_from_now_when_the_existing_grant_already_expired() {
+        let now = chrono::Utc::now();
+        let expired = (now - chrono::Duration::days(30)).to_rfc3339();
+        let until = super::extend_paid_until(Some(&expired), 5, now);
+        let until_dt = chrono::DateTime::parse_from_rfc3339(&until)
+            .expect("parse")
+            .with_timezone(&chrono::Utc);
+        assert_eq!(until_dt, now + chrono::Duration::days(5));
+    }
+
+    #[test]
+    fn extend_paid_until_extends_from_an_existing_future_paid_until() {
+        let now = chrono::Utc::now();
+        let existing = (now + chrono::Duration::days(10)).to_rfc3339();
+        let until = super::extend_paid_until(Some(&existing), 5, now);
+        let until_dt = chrono::DateTime::parse_from_rfc3339(&until)
+            .expect("parse")
+            .with_timezone(&chrono::Utc);
+        // Extends the existing future grant by 5 days, not from `now`.
+        assert_eq!(until_dt, now + chrono::Duration::days(15));
+    }
+
+    #[test]
+    fn grant_paid_days_refuses_an_unknown_user() {
+        let conn = share_test_conn();
+        assert!(super::grant_paid_days(&conn, 999, 7).expect("db ok").is_none());
+    }
+
+    #[test]
+    fn grant_paid_days_extends_from_now_and_writes_paid_until_through() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "nyx", Some("pub-nyx"));
+        let new_until = super::grant_paid_days(&conn, uid, 3).expect("db ok").expect("user exists");
+        assert_eq!(super::user_paid_until(&conn, uid).expect("query"), Some(new_until));
+    }
+
+    #[test]
+    fn grant_paid_days_extends_from_an_existing_future_paid_until() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "orin", Some("pub-orin"));
+        let now = chrono::Utc::now();
+        let existing = (now + chrono::Duration::days(10)).to_rfc3339();
+        super::set_user_paid_until(&conn, uid, Some(&existing)).expect("set paid_until");
+
+        let new_until = super::grant_paid_days(&conn, uid, 5).expect("db ok").expect("user exists");
+        let new_until_dt = chrono::DateTime::parse_from_rfc3339(&new_until)
+            .expect("parse")
+            .with_timezone(&chrono::Utc);
+        // Extended from the existing future grant (10 days out), not from
+        // `now`: ~15 days out, well past what a bare 5-day grant from `now`
+        // would give.
+        assert!(new_until_dt > now + chrono::Duration::days(14));
     }
 
     #[test]

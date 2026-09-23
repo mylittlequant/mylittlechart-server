@@ -23,6 +23,15 @@
 //!                                                 this is how a reservation
 //!                                                 above is actually handed
 //!                                                 to someone.
+//!  - `POST   /admin/users/{user_id}/paid-days`  — extend an account's paid
+//!                                                 access by N days directly
+//!                                                 (`grant_paid_days`), for
+//!                                                 operator accounts or a
+//!                                                 support fix — a gift code
+//!                                                 needs the redeeming
+//!                                                 account's own session,
+//!                                                 which this route does not
+//!                                                 need.
 
 use axum::{
     body::Bytes,
@@ -423,6 +432,101 @@ pub async fn mint_gift_codes(
         }
         Ok(Err(e)) => {
             tracing::error!("DB error minting gift codes: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+/// Request body for `POST /api/admin/users/{id}/paid-days`.
+#[derive(serde::Deserialize)]
+pub struct GrantPaidDaysRequest {
+    pub days: i64,
+}
+
+/// Closed range [`GrantPaidDaysRequest::days`] must fall in — the lower
+/// bound rules out a no-op/negative grant, the upper bound (10 years) rules
+/// out a typo turning into an effectively permanent account.
+const MIN_PAID_DAYS: i64 = 1;
+const MAX_PAID_DAYS: i64 = 3650;
+
+/// Whether `days` falls inside the closed `[MIN_PAID_DAYS, MAX_PAID_DAYS]`
+/// range `grant_paid_days` accepts — split out of the handler so the bound
+/// itself is unit-testable without a database.
+fn paid_days_in_bounds(days: i64) -> bool {
+    (MIN_PAID_DAYS..=MAX_PAID_DAYS).contains(&days)
+}
+
+/// POST /api/admin/users/{id}/paid-days
+///
+/// Extend `user_id`'s paid access by `days` days, from `max(now, existing
+/// paid_until)` (`db::grant_paid_days`, the same extension rule a gift-code
+/// redemption uses — see that function's doc comment). For operator
+/// accounts or a support fix that need paid time granted directly: a gift
+/// code (`POST /api/admin/gift-codes`) needs the redeeming account's own
+/// session, which does not exist for an account being granted time
+/// out-of-band. `days` must be in `[1, 3650]`. `404 {"error":"no such
+/// user"}` for an unknown `user_id`. Requires `Authorization: Bearer
+/// {ADMIN_SECRET}`.
+///
+/// Response: `{"user_id", "paid_until"}`.
+pub async fn grant_paid_days(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(user_id): Path<i64>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
+        return e;
+    }
+
+    let req: GrantPaidDaysRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Invalid JSON body"))).into_response();
+        }
+    };
+    if !paid_days_in_bounds(req.days) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(format!(
+                "days must be between {} and {}",
+                MIN_PAID_DAYS, MAX_PAID_DAYS
+            ))),
+        )
+            .into_response();
+    }
+
+    let days = req.days;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::grant_paid_days(&conn, user_id, days)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(paid_until))) => {
+            tracing::info!(
+                "Admin granted {} paid day(s) to user {} -> paid_until={}",
+                days,
+                user_id,
+                paid_until,
+            );
+            Json(serde_json::json!({ "user_id": user_id, "paid_until": paid_until })).into_response()
+        }
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(ErrorResponse::new("no such user"))).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error granting paid days: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new("Database error")),
@@ -942,5 +1046,22 @@ pub async fn admin_set_user_nick(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Database error"))).into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- paid_days_in_bounds (POST /admin/users/{id}/paid-days) ----
+
+    #[test]
+    fn paid_days_in_bounds_accepts_the_closed_range_and_rejects_outside_it() {
+        assert!(!paid_days_in_bounds(0));
+        assert!(paid_days_in_bounds(MIN_PAID_DAYS));
+        assert!(paid_days_in_bounds(365));
+        assert!(paid_days_in_bounds(MAX_PAID_DAYS));
+        assert!(!paid_days_in_bounds(MAX_PAID_DAYS + 1));
+        assert!(!paid_days_in_bounds(-5));
     }
 }

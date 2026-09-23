@@ -244,6 +244,12 @@ pub fn admin_api_router(state: Arc<AppState>) -> Router {
         // `/forum/threads/{id}/replies` coexists with `/forum/threads/{id}`
         // (in `control_api_router`).
         .route("/admin/users/{user_id}/nick", axum::routing::put(admin::admin_set_user_nick))
+        // Extend an account's paid access directly (operator accounts, or a
+        // support fix) — a gift code needs the redeeming account's own
+        // session, which does not exist here; a fourth path segment under
+        // `/admin/users/{user_id}`, same coexistence as the nick route
+        // right above it.
+        .route("/admin/users/{user_id}/paid-days", post(admin::grant_paid_days))
         // Owner outreach (2026-09-09) — static two-segment path under the
         // one-segment `/admin/notify` right above it, same static-vs-static
         // coexistence as `/admin/users` + `/admin/users/merge` above (see
