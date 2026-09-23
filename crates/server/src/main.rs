@@ -95,6 +95,8 @@ mod build_attest;
 mod db;
 mod dm_db;
 mod entitlements;
+// `conversations_db` lives in the library target (`lib.rs`), not here —
+// see that file's doc comment for why.
 mod models;
 mod nick_policy;
 mod notify;
@@ -607,7 +609,7 @@ async fn main() {
                 tracing::info!("Alert daemon disabled (MLC_ALERT_DAEMON not set)");
             }
 
-            Some(state::ControlPlane {
+            let control_plane = state::ControlPlane {
                 db: Mutex::new(db_conn),
                 social: Mutex::new(social_conn),
                 ops_db: Mutex::new(ops_conn),
@@ -618,7 +620,13 @@ async fn main() {
                 share_root: std::path::Path::new(&data_dir).join("share"),
                 data_dir: std::path::PathBuf::from(&data_dir),
                 reserved_nick_cache: std::sync::RwLock::new(reserved_nick_cache_entries),
-            })
+                live: mylittlechart_server::live::LiveRegistry::new(),
+            };
+            tracing::info!(
+                "Live event registry ready ({} topic(s))",
+                control_plane.live.topic_count()
+            );
+            Some(control_plane)
         }
         state::ServerRole::Edge => {
             tracing::info!("Edge role: no database, no hot sync store, no data directory");
