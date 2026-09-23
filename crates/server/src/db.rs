@@ -7936,6 +7936,513 @@ mod
         let uid = insert_share_user(&conn, "uma", Some("pub-uma"));
         assert_eq!(super::forum_author_label(&conn, uid).expect("label"), "uma");
     }
+
+    // ---- Shared presets (rooms) — Phase 1 ----
+    // (docs/mlc/plans/shared-presets-rights-and-live-sync-2026-09-23.md §8)
+
+    /// `share_test_conn`'s users/share_links schema, plus `object_grants`,
+    /// `shared_presets`, `shared_preset_entities` — the three tables Phase 1
+    /// adds. Same `PRAGMA foreign_keys=ON` discipline: a wrong FK (e.g. a
+    /// `shared_preset_entities.updated_by` naming no user) fails the same
+    /// way it would in production instead of silently passing in-memory —
+    /// exercised on purpose by
+    /// `apply_room_patch_db_error_rolls_back_whole_batch`.
+    fn rooms_test_conn() -> Connection {
+        let conn = share_test_conn();
+        conn.execute_batch(
+            "
+            CREATE TABLE object_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                object_kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                owner_user_id INTEGER NOT NULL REFERENCES users(id),
+                grantee_user_id INTEGER REFERENCES users(id),
+                right TEXT NOT NULL,
+                expires_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE shared_presets (
+                object_id     TEXT    PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL REFERENCES users(id),
+                title         TEXT    NOT NULL DEFAULT '',
+                visibility    TEXT    NOT NULL DEFAULT 'private',
+                seq           INTEGER NOT NULL DEFAULT 0,
+                created_at    TEXT    NOT NULL,
+                updated_at    TEXT    NOT NULL
+            );
+
+            CREATE TABLE shared_preset_entities (
+                room_id     TEXT    NOT NULL REFERENCES shared_presets(object_id),
+                kind        TEXT    NOT NULL,
+                -- Test-only trap for apply_room_patch_db_error_rolls_back_
+                -- the_whole_batch: every legitimate write an AUTHORIZED
+                -- caller can make already satisfies every real FK/PRIMARY
+                -- KEY constraint by construction (the rights gate itself
+                -- already refuses an unauthorized caller before any write is
+                -- attempted), so there is no naturally occurring DB error to
+                -- provoke from valid inputs alone. This CHECK is the
+                -- deliberate, narrow exception that lets one test prove the
+                -- transaction actually rolls back on a genuine backend
+                -- error, without weakening any real constraint.
+                entity_id   TEXT    NOT NULL CHECK (entity_id != 'FORCE_DB_ERROR'),
+                version     INTEGER NOT NULL DEFAULT 1,
+                updated_by  INTEGER NOT NULL REFERENCES users(id),
+                updated_at  TEXT    NOT NULL,
+                json        TEXT,
+                deleted     INTEGER NOT NULL DEFAULT 0,
+                seq         INTEGER NOT NULL,
+                parent_kind TEXT,
+                parent_id   TEXT,
+                PRIMARY KEY (room_id, kind, entity_id)
+            );
+            CREATE INDEX idx_shared_preset_entities_room_seq ON shared_preset_entities(room_id, seq);
+            CREATE INDEX idx_shared_preset_entities_parent ON shared_preset_entities(room_id, parent_kind, parent_id);
+            ",
+        )
+        .expect("rooms test schema");
+        conn
+    }
+
+    fn upsert_op(kind: &str, id: &str, base_version: i64, json: serde_json::Value) -> super::RoomOp {
+        super::RoomOp {
+            kind: kind.to_string(),
+            id: id.to_string(),
+            action: super::RoomOpAction::Upsert,
+            base_version,
+            json: Some(json),
+            parent_kind: None,
+            parent_id: None,
+        }
+    }
+
+    fn primitive_upsert_op(id: &str, base_version: i64, parent_kind: &str, parent_id: &str) -> super::RoomOp {
+        super::RoomOp {
+            kind: "primitive".to_string(),
+            id: id.to_string(),
+            action: super::RoomOpAction::Upsert,
+            base_version,
+            json: Some(serde_json::json!({ "collection": "drawings" })),
+            parent_kind: Some(parent_kind.to_string()),
+            parent_id: Some(parent_id.to_string()),
+        }
+    }
+
+    fn delete_op(kind: &str, id: &str, base_version: i64) -> super::RoomOp {
+        super::RoomOp {
+            kind: kind.to_string(),
+            id: id.to_string(),
+            action: super::RoomOpAction::Delete,
+            base_version,
+            json: None,
+            parent_kind: None,
+            parent_id: None,
+        }
+    }
+
+    #[test]
+    fn object_grant_upsert_list_count_and_revoke_roundtrip() {
+        let conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let grantee = insert_share_user(&conn, "grantee", Some("pub-grantee"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let id = super::upsert_object_grant(&conn, "preset", "room-1", owner, Some(grantee), "view", None, &now)
+            .expect("upsert");
+        assert_eq!(super::count_object_grants(&conn, "preset", "room-1").expect("count"), 1);
+
+        // Re-granting the SAME (kind, object_id, grantee, right) refreshes in
+        // place rather than creating a duplicate row.
+        let id2 = super::upsert_object_grant(&conn, "preset", "room-1", owner, Some(grantee), "view", None, &now)
+            .expect("upsert again");
+        assert_eq!(id, id2);
+        assert_eq!(super::count_object_grants(&conn, "preset", "room-1").expect("count"), 1);
+
+        let rows = super::list_object_grants(&conn, "preset", "room-1").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].grantee_user_id, Some(grantee));
+
+        // Revoke by a non-owner is refused.
+        assert!(!super::revoke_object_grant(&conn, id, grantee).expect("revoke"));
+        assert!(super::revoke_object_grant(&conn, id, owner).expect("revoke"));
+        assert_eq!(super::count_object_grants(&conn, "preset", "room-1").expect("count"), 0);
+    }
+
+    #[test]
+    fn effective_object_rights_owner_always_holds_every_right() {
+        let conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let rights = super::effective_object_rights(&conn, "preset", "room-1", owner, Some(owner)).expect("rights");
+        assert_eq!(rights, vec!["view", "clone", "edit"]);
+    }
+
+    #[test]
+    fn effective_object_rights_non_grantee_holds_nothing() {
+        let conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let stranger = insert_share_user(&conn, "stranger", Some("pub-stranger"));
+        let rights =
+            super::effective_object_rights(&conn, "preset", "room-1", owner, Some(stranger)).expect("rights");
+        assert!(rights.is_empty());
+    }
+
+    #[test]
+    fn effective_object_rights_reads_a_live_view_grant() {
+        let conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let grantee = insert_share_user(&conn, "grantee", Some("pub-grantee"));
+        let now = chrono::Utc::now().to_rfc3339();
+        super::upsert_object_grant(&conn, "preset", "room-1", owner, Some(grantee), "view", None, &now)
+            .expect("grant");
+
+        let rights =
+            super::effective_object_rights(&conn, "preset", "room-1", owner, Some(grantee)).expect("rights");
+        assert_eq!(rights, vec!["view"]);
+    }
+
+    #[test]
+    fn effective_object_rights_ignores_an_expired_grant() {
+        let conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let grantee = insert_share_user(&conn, "grantee", Some("pub-grantee"));
+        let now = chrono::Utc::now().to_rfc3339();
+        super::upsert_object_grant(&conn, "preset", "room-1", owner, Some(grantee), "edit", Some(&past_ts()), &now)
+            .expect("grant");
+
+        let rights =
+            super::effective_object_rights(&conn, "preset", "room-1", owner, Some(grantee)).expect("rights");
+        assert!(rights.is_empty());
+    }
+
+    #[test]
+    fn effective_object_rights_public_grant_applies_to_any_caller_including_anonymous() {
+        let conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let visitor = insert_share_user(&conn, "visitor", Some("pub-visitor"));
+        let now = chrono::Utc::now().to_rfc3339();
+        // grantee_user_id = None — "anyone with the link".
+        super::upsert_object_grant(&conn, "preset", "room-1", owner, None, "view", None, &now).expect("grant");
+        super::upsert_object_grant(&conn, "preset", "room-1", owner, None, "clone", None, &now).expect("grant");
+
+        let anon_rights = super::effective_object_rights(&conn, "preset", "room-1", owner, None).expect("rights");
+        assert_eq!(anon_rights, vec!["view", "clone"]);
+
+        let visitor_rights =
+            super::effective_object_rights(&conn, "preset", "room-1", owner, Some(visitor)).expect("rights");
+        assert_eq!(visitor_rights, vec!["view", "clone"]);
+    }
+
+    #[test]
+    fn apply_room_patch_fresh_create_batch_applies_windows_bubbles_and_primitives_together() {
+        let mut conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let ops = vec![
+            upsert_op("window", "10", 0, serde_json::json!({ "window_id": 10 })),
+            upsert_op("bubble", "20", 0, serde_json::json!({ "id": 20 })),
+            primitive_upsert_op("101", 0, "window", "10"),
+        ];
+        let (seq, results, cascades) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &ops, true).expect("apply");
+
+        assert_eq!(seq, 3);
+        assert!(cascades.is_empty());
+        assert_eq!(results.len(), 3);
+        for (_, outcome) in &results {
+            assert!(matches!(outcome, super::RoomOpOutcome::Applied { .. }), "expected Applied, got {outcome:?}");
+        }
+
+        let header = super::get_shared_preset(&conn, "room-1").expect("header").expect("row");
+        assert_eq!(header.owner_user_id, owner);
+        assert_eq!(header.seq, 3);
+    }
+
+    #[test]
+    fn apply_room_patch_two_editors_drawing_on_the_same_window_both_applied_window_untouched() {
+        let mut conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let editor = insert_share_user(&conn, "editor", Some("pub-editor"));
+        let now = chrono::Utc::now().to_rfc3339();
+        super::upsert_object_grant(&conn, "preset", "room-1", owner, Some(editor), "edit", None, &now)
+            .expect("grant");
+
+        // Room + window created by the owner first.
+        let create_ops = vec![upsert_op("window", "10", 0, serde_json::json!({ "window_id": 10 }))];
+        super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &create_ops, true).expect("create");
+
+        // Two editors independently draw a DIFFERENT primitive on the SAME
+        // window, each in their own patch batch (the concrete scenario this
+        // design exists for — see rooms_codec's module doc).
+        let owner_ops = vec![primitive_upsert_op("101", 0, "window", "10")];
+        let (_, owner_results, _) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &owner_ops, false).expect("owner draw");
+        let editor_ops = vec![primitive_upsert_op("102", 0, "window", "10")];
+        let (_, editor_results, _) = super::apply_room_patch(&mut conn, "preset", "room-1", editor, &now, &editor_ops, false)
+            .expect("editor draw");
+
+        assert!(matches!(owner_results[0].1, super::RoomOpOutcome::Applied { .. }));
+        assert!(matches!(editor_results[0].1, super::RoomOpOutcome::Applied { .. }));
+
+        // The window entity itself was never touched by either draw — still
+        // version 1, exactly as `create_ops` left it.
+        let window_version: i64 = conn
+            .query_row(
+                "SELECT version FROM shared_preset_entities WHERE room_id='room-1' AND kind='window' AND entity_id='10'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("window version");
+        assert_eq!(window_version, 1);
+    }
+
+    #[test]
+    fn apply_room_patch_two_edits_to_the_same_primitive_the_second_is_stale() {
+        let mut conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let create_ops = vec![primitive_upsert_op("101", 0, "window", "10")];
+        super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &create_ops, true).expect("create");
+
+        // Two ops in the SAME batch, both computed against version 1 — the
+        // second to actually apply within the transaction loses.
+        let ops = vec![
+            upsert_op("primitive", "101", 1, serde_json::json!({ "collection": "drawings", "x": 1 })),
+            upsert_op("primitive", "101", 1, serde_json::json!({ "collection": "drawings", "x": 2 })),
+        ];
+        let (_, results, _) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &ops, false).expect("apply");
+
+        assert!(matches!(results[0].1, super::RoomOpOutcome::Applied { version: 2, .. }));
+        match &results[1].1 {
+            super::RoomOpOutcome::Stale { current_version, .. } => assert_eq!(*current_version, 2),
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_room_patch_concurrent_create_of_the_same_new_entity_one_applied_one_stale() {
+        let mut conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let ops = vec![
+            upsert_op("indicator", "30", 0, serde_json::json!({ "id": 30, "variant": "a" })),
+            upsert_op("indicator", "30", 0, serde_json::json!({ "id": 30, "variant": "b" })),
+        ];
+        let (_, results, _) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &ops, true).expect("apply");
+
+        assert!(matches!(results[0].1, super::RoomOpOutcome::Applied { version: 1, .. }));
+        assert!(matches!(results[1].1, super::RoomOpOutcome::Stale { .. }));
+    }
+
+    #[test]
+    fn apply_room_patch_deleting_a_window_cascades_to_its_primitives() {
+        let mut conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let create_ops = vec![
+            upsert_op("window", "10", 0, serde_json::json!({ "window_id": 10 })),
+            primitive_upsert_op("101", 0, "window", "10"),
+            primitive_upsert_op("102", 0, "window", "10"),
+        ];
+        let (seq_after_create, _, _) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &create_ops, true).expect("create");
+        assert_eq!(seq_after_create, 3);
+
+        let delete_ops = vec![delete_op("window", "10", 1)];
+        let (seq_after_delete, results, cascades) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &delete_ops, false).expect("delete");
+
+        assert!(matches!(results[0].1, super::RoomOpOutcome::Applied { .. }));
+        assert_eq!(cascades.len(), 2, "both primitives parented to the deleted window are tombstoned");
+        let cascaded_ids: std::collections::BTreeSet<&str> = cascades.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(cascaded_ids, std::collections::BTreeSet::from(["101", "102"]));
+        for (_, outcome) in &cascades {
+            assert!(matches!(outcome, super::RoomOpOutcome::Applied { version: 2, .. }));
+        }
+        // One seq for the window delete + one each for the two cascaded
+        // tombstones — every cascaded row is a real applied write.
+        assert_eq!(seq_after_delete, seq_after_create + 3);
+
+        let live_primitives: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shared_preset_entities WHERE room_id='room-1' AND kind='primitive' AND deleted=0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(live_primitives, 0);
+    }
+
+    #[test]
+    fn apply_room_patch_seq_only_advances_on_applied_never_on_stale_or_gone() {
+        let mut conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let create_ops = vec![upsert_op("indicator", "30", 0, serde_json::json!({ "id": 30 }))];
+        let (seq0, _, _) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &create_ops, true).expect("create");
+        assert_eq!(seq0, 1);
+
+        let ops = vec![
+            upsert_op("indicator", "30", 1, serde_json::json!({ "id": 30, "changed": true })), // Applied
+            upsert_op("indicator", "30", 1, serde_json::json!({ "id": 30, "loses": true })),   // Stale (now v2)
+            delete_op("indicator", "999", 5),                                                 // Gone (never existed)
+        ];
+        let (seq1, results, _) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &ops, false).expect("apply");
+
+        assert!(matches!(results[0].1, super::RoomOpOutcome::Applied { .. }));
+        assert!(matches!(results[1].1, super::RoomOpOutcome::Stale { .. }));
+        assert!(matches!(results[2].1, super::RoomOpOutcome::Gone));
+        // Only ONE of the three ops actually applied.
+        assert_eq!(seq1, seq0 + 1);
+    }
+
+    #[test]
+    fn apply_room_patch_db_error_rolls_back_the_whole_batch() {
+        let mut conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let create_ops = vec![upsert_op("indicator", "30", 0, serde_json::json!({ "id": 30 }))];
+        super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &create_ops, true).expect("create");
+        let seq_before = super::get_shared_preset(&conn, "room-1").expect("header").expect("row").seq;
+
+        // The owner is fully authorized (implicit edit) — every FK/PRIMARY
+        // KEY constraint a real caller can hit is already satisfied by
+        // construction once the rights gate passes, so there is no
+        // naturally occurring DB error to provoke here. `entity_id =
+        // "FORCE_DB_ERROR"` trips the test-only CHECK constraint
+        // `rooms_test_conn` adds for exactly this purpose (see its doc
+        // comment) — a real backend error, not a per-op outcome. A second,
+        // otherwise unrelated op rides in the same batch to prove NEITHER
+        // lands.
+        let ops = vec![
+            upsert_op("indicator", "30", 1, serde_json::json!({ "id": 30, "changed": true })),
+            upsert_op("alert", "FORCE_DB_ERROR", 0, serde_json::json!({ "id": 999 })),
+        ];
+        let result = super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &ops, false);
+        assert!(result.is_err(), "a genuine backend error must surface as Err, not a per-op outcome");
+
+        // Nothing committed: the indicator is still at version 1 and the new
+        // alert entity was never created.
+        let indicator_version: i64 = conn
+            .query_row(
+                "SELECT version FROM shared_preset_entities WHERE room_id='room-1' AND kind='indicator' AND entity_id='30'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("indicator version");
+        assert_eq!(indicator_version, 1);
+        let alert_exists: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shared_preset_entities WHERE room_id='room-1' AND kind='alert'", [], |row| {
+                row.get(0)
+            })
+            .expect("alert count");
+        assert_eq!(alert_exists, 0);
+        let seq_after = super::get_shared_preset(&conn, "room-1").expect("header").expect("row").seq;
+        assert_eq!(seq_after, seq_before, "seq must not advance on a rolled-back batch");
+    }
+
+    #[test]
+    fn apply_room_patch_view_only_grantee_cannot_patch() {
+        let mut conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let viewer = insert_share_user(&conn, "viewer", Some("pub-viewer"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let create_ops = vec![upsert_op("indicator", "30", 0, serde_json::json!({ "id": 30 }))];
+        super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &create_ops, true).expect("create");
+        super::upsert_object_grant(&conn, "preset", "room-1", owner, Some(viewer), "view", None, &now)
+            .expect("grant");
+
+        let ops = vec![upsert_op("indicator", "31", 0, serde_json::json!({ "id": 31 }))];
+        let (_, results, _) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", viewer, &now, &ops, false).expect("apply");
+        assert!(matches!(results[0].1, super::RoomOpOutcome::Forbidden));
+
+        // Nothing was written.
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shared_preset_entities WHERE room_id='room-1' AND kind='indicator' AND entity_id='31'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(exists, 0);
+    }
+
+    #[test]
+    fn apply_room_patch_expired_edit_grant_is_denied() {
+        let mut conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let editor = insert_share_user(&conn, "editor", Some("pub-editor"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let create_ops = vec![upsert_op("indicator", "30", 0, serde_json::json!({ "id": 30 }))];
+        super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &create_ops, true).expect("create");
+        super::upsert_object_grant(&conn, "preset", "room-1", owner, Some(editor), "edit", Some(&past_ts()), &now)
+            .expect("grant");
+
+        let ops = vec![upsert_op("indicator", "31", 0, serde_json::json!({ "id": 31 }))];
+        let (_, results, _) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", editor, &now, &ops, false).expect("apply");
+        assert!(matches!(results[0].1, super::RoomOpOutcome::Forbidden));
+    }
+
+    #[test]
+    fn apply_room_patch_revoked_edit_grant_is_denied() {
+        let mut conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let editor = insert_share_user(&conn, "editor", Some("pub-editor"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let create_ops = vec![upsert_op("indicator", "30", 0, serde_json::json!({ "id": 30 }))];
+        super::apply_room_patch(&mut conn, "preset", "room-1", owner, &now, &create_ops, true).expect("create");
+        let grant_id = super::upsert_object_grant(&conn, "preset", "room-1", owner, Some(editor), "edit", None, &now)
+            .expect("grant");
+
+        // Confirm the grant works before revoking it.
+        let probe_ops = vec![upsert_op("indicator", "31", 0, serde_json::json!({ "id": 31 }))];
+        let (_, probe_results, _) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", editor, &now, &probe_ops, false).expect("apply");
+        assert!(matches!(probe_results[0].1, super::RoomOpOutcome::Applied { .. }));
+
+        assert!(super::revoke_object_grant(&conn, grant_id, owner).expect("revoke"));
+
+        let ops = vec![upsert_op("indicator", "32", 0, serde_json::json!({ "id": 32 }))];
+        let (_, results, _) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", editor, &now, &ops, false).expect("apply");
+        assert!(matches!(results[0].1, super::RoomOpOutcome::Forbidden));
+    }
+
+    #[test]
+    fn apply_room_patch_link_grant_gives_view_and_clone_but_never_edit_for_an_anonymous_visitor() {
+        let conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let now = chrono::Utc::now().to_rfc3339();
+        // "Anyone with the link" — grantee_user_id = None.
+        super::upsert_object_grant(&conn, "preset", "room-1", owner, None, "view", None, &now).expect("grant");
+        super::upsert_object_grant(&conn, "preset", "room-1", owner, None, "clone", None, &now).expect("grant");
+
+        let rights = super::effective_object_rights(&conn, "preset", "room-1", owner, None).expect("rights");
+        assert_eq!(rights, vec!["view", "clone"]);
+        assert!(!rights.contains(&"edit"));
+    }
+
+    #[test]
+    fn apply_room_patch_create_forbidden_when_room_create_not_allowed() {
+        let mut conn = rooms_test_conn();
+        let caller = insert_share_user(&conn, "caller", Some("pub-caller"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let ops = vec![upsert_op("indicator", "30", 0, serde_json::json!({ "id": 30 }))];
+        let (seq, results, _) =
+            super::apply_room_patch(&mut conn, "preset", "room-1", caller, &now, &ops, false).expect("apply");
+
+        assert_eq!(seq, 0);
+        assert!(matches!(results[0].1, super::RoomOpOutcome::Forbidden));
+        assert!(super::get_shared_preset(&conn, "room-1").expect("header").is_none(), "no room was created");
+    }
 }
 
 /// In-memory plaintext connection with the parts of the production schema the
