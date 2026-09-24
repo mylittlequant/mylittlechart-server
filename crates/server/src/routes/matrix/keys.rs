@@ -491,8 +491,8 @@ fn build_keys_changes_response(conn: &Connection, caller_user_id: i64, from_excl
 
 async fn keys_changes(State(state): State<Arc<AppState>>, headers: HeaderMap, Query(query): Query<KeysChangesQuery>) -> Result<impl IntoResponse, MatrixError> {
     let caller = auth::resolve_matrix_caller(&headers, &state).await?;
-    let from = sync_token::parse(query.from.as_deref().ok_or_else(|| MatrixError::invalid_param("from is required"))?)?;
-    let to = sync_token::parse(query.to.as_deref().ok_or_else(|| MatrixError::invalid_param("to is required"))?)?;
+    let from = sync_token::parse(query.from.as_deref().ok_or_else(|| MatrixError::invalid_param("from is required"))?)?.stream_id;
+    let to = sync_token::parse(query.to.as_deref().ok_or_else(|| MatrixError::invalid_param("to is required"))?)?.stream_id;
 
     let response = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
         let cp = state.control_plane();

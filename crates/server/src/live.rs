@@ -94,6 +94,27 @@
 //! instead of reading the clock itself, so callers (and this module's own
 //! tests) get a single, consistent notion of "now" per call without needing
 //! `tokio::time::pause`.
+//!
+//! ## The typing generation is GLOBAL, not per-room
+//!
+//! P10's `/sync` sync-token binds a `typing_gen` component
+//! (`routes::matrix::sync_token`) so a long-poll can tell "this room's
+//! typing changed since the client's token" apart from "nothing changed at
+//! all" without busy-looping. That only works if every room's serial is
+//! drawn from ONE shared counter: comparing a per-room-local counter against
+//! a token's single `typing_gen` cannot distinguish "room A ticked to 3
+//! before this token was issued" from "room A ticked to 3 after" once a
+//! DIFFERENT room B has also been ticking its own separate counter — the
+//! numbers alias. [`TypingRegistry`] therefore keeps one `next_gen: AtomicU64`
+//! and every EFFECTIVE change (a user starting or stopping counting as
+//! typing, including an expiry reap — never a throttled repeat or an
+//! already-active refresh) takes its room's new [`RoomTyping::serial`] from
+//! that same counter via [`TypingRegistry::next_typing_gen`]. A token's
+//! `typing_gen` then means exactly "the global tick count observed at token
+//! issuance", and `room.serial > token.typing_gen` correctly identifies
+//! every room whose typing set changed since — see
+//! [`TypingRegistry::current_typing_gen`]'s own doc for the one accepted
+//! limitation (an in-memory counter does not survive a process restart).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -330,10 +351,12 @@ struct TypingUserState {
     last_true_accepted_at: Option<Instant>,
 }
 
-/// One room's typing state plus a serial bumped on every EFFECTIVE change
-/// (a user starting or stopping counting as typing) — a refreshed-but-still-
-/// active `typing: true`, or a throttled repeat, bumps nothing, since
-/// nothing about what a peer would see has changed.
+/// One room's typing state plus a serial stamped from [`TypingRegistry`]'s
+/// GLOBAL `next_gen` counter on every EFFECTIVE change (a user starting or
+/// stopping counting as typing) — a refreshed-but-still-active `typing:
+/// true`, or a throttled repeat, bumps nothing, since nothing about what a
+/// peer would see has changed. See the module doc's "The typing generation
+/// is GLOBAL, not per-room" section for why this is not a local counter.
 #[derive(Default)]
 struct RoomTyping {
     users: HashMap<i64, TypingUserState>,
@@ -341,12 +364,12 @@ struct RoomTyping {
 }
 
 /// Marks every entry in `room` whose typing flag has timed out as no
-/// longer active (bumping `room.serial` once if at least one did), then
-/// drops entries that are both inactive and outside the throttle memory
-/// window (nothing left worth remembering). Returns whether the serial
-/// bumped, so callers can report "this room's typing set just changed"
-/// without the caller re-deriving it.
-fn reap_room(room: &mut RoomTyping, now: Instant) -> bool {
+/// longer active (stamping `room.serial` from `next_gen` once if at least
+/// one did), then drops entries that are both inactive and outside the
+/// throttle memory window (nothing left worth remembering). Returns whether
+/// the serial bumped, so callers can report "this room's typing set just
+/// changed" without the caller re-deriving it.
+fn reap_room(room: &mut RoomTyping, now: Instant, next_gen: &AtomicU64) -> bool {
     let mut bumped = false;
     for state in room.users.values_mut() {
         if state.is_active && state.expires_at <= now {
@@ -355,7 +378,7 @@ fn reap_room(room: &mut RoomTyping, now: Instant) -> bool {
         }
     }
     if bumped {
-        room.serial += 1;
+        room.serial = next_gen.fetch_add(1, Ordering::AcqRel) + 1;
     }
     room.users.retain(|_, state| {
         state.is_active
@@ -374,6 +397,10 @@ fn reap_room(room: &mut RoomTyping, now: Instant) -> bool {
 /// `LiveRegistry` keys to wake for it.
 pub struct TypingRegistry {
     rooms: Mutex<HashMap<String, RoomTyping>>,
+    /// The one counter every room's [`RoomTyping::serial`] is stamped from —
+    /// see the module doc's "The typing generation is GLOBAL, not per-room"
+    /// section.
+    next_gen: AtomicU64,
 }
 
 impl Default for TypingRegistry {
@@ -384,7 +411,7 @@ impl Default for TypingRegistry {
 
 impl TypingRegistry {
     pub fn new() -> Self {
-        Self { rooms: Mutex::new(HashMap::new()) }
+        Self { rooms: Mutex::new(HashMap::new()), next_gen: AtomicU64::new(0) }
     }
 
     /// Apply one `PUT /rooms/{roomId}/typing/{userId}` call. `timeout_ms`
@@ -436,9 +463,33 @@ impl TypingRegistry {
         };
 
         if changed {
-            room.serial += 1;
+            room.serial = self.next_gen.fetch_add(1, Ordering::AcqRel) + 1;
         }
         changed
+    }
+
+    /// The current global typing generation — every effective typing change
+    /// across every room takes its own room's [`RoomTyping::serial`] from
+    /// this SAME counter (see the module doc), so "room serial > token's
+    /// typing_gen" identifies exactly the rooms whose typing changed since
+    /// that token was issued. `0` means no typing change has EVER been
+    /// accepted by this registry instance — a fresh boot, or simply an idle
+    /// server; a token carrying `typing_gen: 0` (the bare `s{stream_id}`
+    /// legacy form `routes::matrix::sync_token` still accepts, or a token
+    /// issued before this server ever saw a single typing PUT) never
+    /// wrongly suppresses a real future change, since every real change
+    /// stamps a value `>= 1`.
+    ///
+    /// Resets to `0` on every process restart (in-memory only, like every
+    /// other fact this registry holds) — a token issued before a restart
+    /// can carry a `typing_gen` LARGER than anything the fresh registry has
+    /// assigned yet, which under-reports typing changes until fresh
+    /// activity climbs back past that stale value. Accepted as a known,
+    /// self-healing, low-impact limitation of treating typing state as
+    /// genuinely ephemeral (module doc) rather than persisting a counter
+    /// nothing else needs to survive a restart for.
+    pub fn current_typing_gen(&self) -> u64 {
+        self.next_gen.load(Ordering::Acquire)
     }
 
     /// Current (non-expired) typers in `room_id`, sorted for a deterministic
@@ -451,7 +502,7 @@ impl TypingRegistry {
         let mut users = Vec::new();
         let mut room_now_empty = false;
         if let Some(room) = rooms.get_mut(room_id) {
-            reap_room(room, now);
+            reap_room(room, now, &self.next_gen);
             users.extend(room.users.iter().filter(|(_, state)| state.is_active).map(|(id, _)| *id));
             room_now_empty = room.users.is_empty();
         }
@@ -462,16 +513,19 @@ impl TypingRegistry {
         users
     }
 
-    /// `room_id`'s current typing serial — bumped on every effective change
-    /// (§3.6's "for the sync token's typing part"); `0` for a room this
-    /// registry has never heard of. Reaps expired entries first, so this is
-    /// never stale relative to `now`.
+    /// `room_id`'s current typing serial — stamped from the SAME global
+    /// counter [`Self::current_typing_gen`] reads (see the module doc) on
+    /// every effective change; `0` for a room this registry has never heard
+    /// of, or one whose typing set has never actually changed since boot.
+    /// Reaps expired entries first, so this is never stale relative to
+    /// `now`. `routes::matrix::sync`'s own per-room condition is `is_initial
+    /// || typing_serial(room, now) > token.typing_gen`.
     pub fn typing_serial(&self, room_id: &str, now: Instant) -> u64 {
         let mut rooms = self.rooms.lock().unwrap_or_else(|e| e.into_inner());
         let mut serial = 0;
         let mut room_now_empty = false;
         if let Some(room) = rooms.get_mut(room_id) {
-            reap_room(room, now);
+            reap_room(room, now, &self.next_gen);
             serial = room.serial;
             room_now_empty = room.users.is_empty();
         }
@@ -492,7 +546,7 @@ impl TypingRegistry {
         let mut rooms = self.rooms.lock().unwrap_or_else(|e| e.into_inner());
         let mut changed = Vec::new();
         rooms.retain(|room_id, room| {
-            if reap_room(room, now) {
+            if reap_room(room, now, &self.next_gen) {
                 changed.push(room_id.clone());
             }
             !room.users.is_empty()
@@ -710,6 +764,29 @@ mod tests {
         // Repeat false while already stopped — no bump.
         assert!(!registry.set_typing("room:1", 42, false, 0, t1));
         assert_eq!(registry.typing_serial("room:1", t1), 2);
+    }
+
+    #[test]
+    fn typing_gen_is_global_across_rooms_not_per_room() {
+        let registry = TypingRegistry::new();
+        let t0 = Instant::now();
+        assert_eq!(registry.current_typing_gen(), 0);
+
+        assert!(registry.set_typing("room:1", 1, true, 5_000, t0));
+        let gen_after_room1 = registry.current_typing_gen();
+        assert_eq!(registry.typing_serial("room:1", t0), gen_after_room1);
+
+        assert!(registry.set_typing("room:2", 2, true, 5_000, t0));
+        let gen_after_room2 = registry.current_typing_gen();
+        assert!(
+            gen_after_room2 > gen_after_room1,
+            "a second room's own effective change must take a LATER tick from the SAME global counter"
+        );
+        assert_eq!(registry.typing_serial("room:2", t0), gen_after_room2);
+        // room:1's own serial must be untouched by room:2's unrelated change
+        // — this is exactly what lets "serial > token.typing_gen" tell two
+        // DIFFERENT rooms' changes apart instead of aliasing them.
+        assert_eq!(registry.typing_serial("room:1", t0), gen_after_room1);
     }
 
     // ---- ClaimRateLimiter -------------------------------------------------

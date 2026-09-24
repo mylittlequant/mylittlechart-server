@@ -20,8 +20,10 @@
 //! merges [`rooms::routes`] in before that fallback; P8 (`account`, private —
 //! nothing outside this module needs to name it) adds account data (global +
 //! per-room), tags, filters, profile, `user_directory/search`, and
-//! `publicRooms`. Every other endpoint in the plan's §4 table is a later
-//! piece (P6, P7, P9-P11).
+//! `publicRooms`; P9 (`keys`) adds `keys/*`, `sendToDevice`, `devices`,
+//! `room_keys/*`; P10 ([`sync`]) adds the core `GET /sync` long-poll
+//! endpoint. Every other endpoint in the plan's §4 table is a later piece
+//! (P11).
 //!
 //! `MatrixError::not_json` is deliberately NOT built yet (a not-JSON errcode
 //! has no caller until a body-parsing piece needs it) — `-D warnings`'
@@ -47,6 +49,7 @@ pub mod ephemeral;
 mod keys;
 mod messaging;
 mod rooms;
+mod sync;
 mod sync_token;
 
 /// This deployment's one supported Client-Server API version (plan §1,
@@ -385,6 +388,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(ephemeral::routes())
         .merge(account::routes())
         .merge(keys::routes())
+        .merge(sync::routes())
         .fallback(matrix_unrecognized)
         .with_state(state)
 }

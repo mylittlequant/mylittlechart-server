@@ -1247,7 +1247,15 @@ pub fn validate_power_levels_change(old: &serde_json::Value, new: &serde_json::V
 
 /// One `{content, state_key, type, sender}` Matrix `StrippedStateEvent` —
 /// `sender` already resolved to an mxid, `content` already parsed JSON.
-fn stripped_state_json(conn: &Connection, event: &MatrixEvent) -> Result<serde_json::Value, MatrixStoreError> {
+/// `pub` (beyond this module's own [`stripped_invite_state`]) for the
+/// binary crate's `routes::matrix::sync` module: `GET /sync`'s
+/// `invite_state.events` needs the SAME stripped shape for the invitee's
+/// OWN `m.room.member` event, which [`stripped_invite_state`] does not
+/// itself include (see that function's own doc — it strips the INVITER's
+/// state, not the invitee's own invite event, since its other call site,
+/// `routes::matrix::client_event_json`'s `unsigned.invite_room_state`, is
+/// already attaching it TO that very event).
+pub fn stripped_state_json(conn: &Connection, event: &MatrixEvent) -> Result<serde_json::Value, MatrixStoreError> {
     let sender = mxid_of(conn, event.sender_user_id)?.unwrap_or_default();
     let content: serde_json::Value = serde_json::from_str(&event.content)?;
     Ok(serde_json::json!({
@@ -1325,6 +1333,51 @@ pub fn state_events_of_type_at(conn: &Connection, room_id: &str, event_type: &st
            )"
     ))?;
     let mut rows = stmt.query(params![room_id, event_type, at_stream_id])?;
+    collect_events(&mut rows)
+}
+
+/// Every `m.room.member` state event whose CURRENT value as of
+/// `upto_inclusive` was itself set within `(since_exclusive,
+/// upto_inclusive]` — `routes::matrix::sync`'s §3.3 clause-(b) lazy-load
+/// "gap rule" (matrix-spec#942): a member who joined/left/changed profile
+/// inside a truncated timeline gap must still be reported even when they
+/// never sent anything into the visible window. Bounded to
+/// `upto_inclusive` throughout (never the LIVE `current_state` projection,
+/// which could have moved past a `/sync` build's own snapshot) so this
+/// stays part of one consistent cut.
+pub fn member_state_changed_in_window(conn: &Connection, room_id: &str, since_exclusive: i64, upto_inclusive: i64) -> rusqlite::Result<Vec<MatrixEvent>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {EVENT_SELECT_COLUMNS_ALIASED} FROM events e
+         WHERE e.room_id = ?1 AND e.event_type = 'm.room.member' AND e.state_key IS NOT NULL
+           AND e.stream_id = (
+             SELECT MAX(e2.stream_id) FROM events e2
+             WHERE e2.room_id = e.room_id AND e2.event_type = 'm.room.member' AND e2.state_key = e.state_key AND e2.stream_id <= ?3
+           )
+           AND e.stream_id > ?2"
+    ))?;
+    let mut rows = stmt.query(params![room_id, since_exclusive, upto_inclusive])?;
+    collect_events(&mut rows)
+}
+
+/// Every state event type OTHER than `m.room.member` whose CURRENT value as
+/// of `upto_inclusive` was itself set within `(since_exclusive,
+/// upto_inclusive]` — `routes::matrix::sync`'s per-room state delta for
+/// every state type this server does not lazy-load ("every OTHER
+/// state-event type changed since `since` ... always included in full").
+/// `since_exclusive = 0` naturally reproduces every current state event of
+/// these types (the initial-sync/`full_state` case), since every such
+/// event's own `stream_id` is `> 0` — one code path serves both.
+pub fn non_member_state_changed_in_window(conn: &Connection, room_id: &str, since_exclusive: i64, upto_inclusive: i64) -> rusqlite::Result<Vec<MatrixEvent>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {EVENT_SELECT_COLUMNS_ALIASED} FROM events e
+         WHERE e.room_id = ?1 AND e.event_type != 'm.room.member' AND e.state_key IS NOT NULL
+           AND e.stream_id = (
+             SELECT MAX(e2.stream_id) FROM events e2
+             WHERE e2.room_id = e.room_id AND e2.event_type = e.event_type AND e2.state_key = e.state_key AND e2.stream_id <= ?3
+           )
+           AND e.stream_id > ?2"
+    ))?;
+    let mut rows = stmt.query(params![room_id, since_exclusive, upto_inclusive])?;
     collect_events(&mut rows)
 }
 
@@ -1722,6 +1775,19 @@ pub fn forget_membership(conn: &Connection, room_id: &str, user_id: i64) -> rusq
     )
 }
 
+/// Up to `limit` other members (`join`/`invite`) of `room_id`, oldest
+/// membership-change first, excluding `exclude_user_id` — `/sync`'s
+/// `m.heroes` (plan §3.4).
+pub fn room_heroes(conn: &Connection, room_id: &str, exclude_user_id: i64, limit: i64) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT user_id FROM room_members
+         WHERE room_id = ?1 AND user_id != ?2 AND membership IN ('join', 'invite')
+         ORDER BY updated_at ASC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![room_id, exclude_user_id, limit], |row| row.get(0))?;
+    rows.collect()
+}
+
 /// Every room id `user_id` has a `room_members` row in, optionally filtered
 /// to one `membership` — the "which rooms is this user in" query behind
 /// `/sync`'s room list and `on_credential_revoked`'s wake fan-out.
@@ -1931,6 +1997,19 @@ pub fn get_receipt(conn: &Connection, room_id: &str, user_id: i64, receipt_type:
         receipt_from_row,
     )
     .optional()
+}
+
+/// Every receipt row in `room_id` whose own write-order `stream_id` (NOT the
+/// TARGET event's position — see [`upsert_receipt`]'s own doc on that
+/// distinction) falls in `(since_exclusive, upto_inclusive]` —
+/// `routes::matrix::sync`'s per-room `m.receipt` ephemeral delta (plan
+/// §3.6).
+pub fn receipts_changed_in_room(conn: &Connection, room_id: &str, since_exclusive: i64, upto_inclusive: i64) -> rusqlite::Result<Vec<ReceiptRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RECEIPT_SELECT_COLUMNS} FROM receipts WHERE room_id = ?1 AND stream_id > ?2 AND stream_id <= ?3"
+    ))?;
+    let rows = stmt.query_map(params![room_id, since_exclusive, upto_inclusive], receipt_from_row)?;
+    rows.collect()
 }
 
 /// Upsert `user_id`'s `receipt_type` receipt in `room_id`, refusing to move
