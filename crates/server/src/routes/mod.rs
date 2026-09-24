@@ -214,6 +214,10 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
             get(dm::list_messages).post(dm::create_message),
         )
         .route("/dm/conversations/{id}/read", post(dm::mark_read))
+        // Matrix messenger — site moderation lever (P11, outside `/_matrix`;
+        // see routes/matrix/moderation.rs's module doc for the gate and why
+        // it lives here rather than in `matrix_api_router`).
+        .merge(matrix::moderation::routes())
         .with_state(state)
 }
 

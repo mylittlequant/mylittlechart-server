@@ -483,9 +483,12 @@ fn apply_invite(
 }
 
 /// What state a kick/ban/unban target must currently be in for the action
-/// to proceed.
+/// to proceed. `pub(super)` — also `routes::matrix::moderation`'s (P11) own
+/// room-power fallback path reuses this exact rule set, so a kick/ban/unban
+/// reached through `/api/matrix-admin/.../moderate` never drifts from the
+/// same action reached through this module's own `/kick`/`/ban`/`/unban`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TargetStateRule {
+pub(super) enum TargetStateRule {
     /// kick: the target must currently be an active member (`join`/`invite`).
     MustBeActiveMember,
     /// ban: any current state is fine (banning a non-member pre-empts a
@@ -495,7 +498,7 @@ enum TargetStateRule {
     MustBeBanned,
 }
 
-fn check_target_state_rule(rule: TargetStateRule, membership: Option<Membership>) -> Result<(), MatrixError> {
+pub(super) fn check_target_state_rule(rule: TargetStateRule, membership: Option<Membership>) -> Result<(), MatrixError> {
     match rule {
         TargetStateRule::MustBeActiveMember => {
             if matches!(membership, Some(Membership::Join) | Some(Membership::Invite)) {
@@ -518,14 +521,15 @@ fn check_target_state_rule(rule: TargetStateRule, membership: Option<Membership>
 /// The pieces [`apply_membership_power_action`] needs beyond the caller and
 /// the connection — grouped so the function itself stays under a plain
 /// four-parameter signature instead of needing
-/// `#[allow(clippy::too_many_arguments)]`.
-struct MembershipPowerAction<'a> {
-    room_id: &'a str,
-    action: PowerAction,
-    target_user_id: i64,
-    target_rule: TargetStateRule,
-    new_membership: Membership,
-    reason: Option<&'a str>,
+/// `#[allow(clippy::too_many_arguments)]`. `pub(super)` alongside
+/// [`apply_membership_power_action`] — see that function's own doc for why.
+pub(super) struct MembershipPowerAction<'a> {
+    pub(super) room_id: &'a str,
+    pub(super) action: PowerAction,
+    pub(super) target_user_id: i64,
+    pub(super) target_rule: TargetStateRule,
+    pub(super) new_membership: Membership,
+    pub(super) reason: Option<&'a str>,
 }
 
 /// The shared core of kick/ban/unban (plan §4: Member + PowerCheck(kick/
@@ -536,7 +540,13 @@ struct MembershipPowerAction<'a> {
 /// see the module doc's "testable cores" note). Returns the wake set
 /// (post-write joined+invited members plus the target, even though the
 /// target may no longer be one of those after this write).
-fn apply_membership_power_action(
+///
+/// `pub(super)` — `routes::matrix::moderation`'s (P11) room-power fallback
+/// gate ("otherwise the caller needs the room's own power," plan §4's
+/// `/moderate` row) reuses this verbatim rather than re-deriving the
+/// `can_act_on` target-level rule a second time, matching this module's own
+/// precedent for [`member_and_invited_ids`] (reused by `messaging.rs`).
+pub(super) fn apply_membership_power_action(
     conn: &mut Connection,
     caller_user_id: i64,
     caller_mxid: &str,

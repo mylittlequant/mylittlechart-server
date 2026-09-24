@@ -48,6 +48,12 @@ pub mod auth;
 pub mod ephemeral;
 mod keys;
 mod messaging;
+// `pub(crate)`, not `mod` — `routes::mod`'s own `control_api_router` mounts
+// `moderation::routes()` directly at `/api/matrix-admin/...` (P11: this
+// route lives OUTSIDE `/_matrix` — see that module's own doc for why), and
+// `moderation` in turn reaches into [`rooms`]'s `pub(super)` power-level
+// helpers (its own room-power fallback gate).
+pub(crate) mod moderation;
 // `pub(crate)`, not `mod` — the binary crate's own `matrix_migration` module
 // (a sibling of `routes`, outside this `matrix` module tree) reuses this
 // module's `power_levels_content`/`room_kind_settings`/`invite_power_level`/

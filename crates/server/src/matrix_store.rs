@@ -1685,6 +1685,40 @@ pub fn redact_event(
     Ok(event)
 }
 
+/// [`redact_event`], but merges `extra_content` into the resulting
+/// `m.room.redaction` event's own content, in the SAME transaction as the
+/// redaction itself — `routes::matrix::moderation`'s (P11) ONLY caller,
+/// which stamps `{"org.mylittlechart.site_moderation": true}` on a
+/// site-moderator's redaction of a public-room message (plan §4's
+/// `/api/matrix-admin/rooms/{roomId}/moderate` row) so every client can
+/// render it distinctly from an ordinary member-initiated redaction. Every
+/// other redaction path ([`redact_event`], [`redact_event_deduped`]) never
+/// needs this and stays untouched.
+pub fn redact_event_marked(
+    conn: &mut Connection,
+    room_id: &str,
+    target_event_id: &str,
+    redaction_event_id: &str,
+    sender_user_id: i64,
+    reason: Option<&str>,
+    extra_content: &serde_json::Value,
+    origin_server_ts: i64,
+) -> Result<MatrixEvent, MatrixStoreError> {
+    let tx = conn.transaction()?;
+    let mut event = redact_event_in_tx(&tx, room_id, target_event_id, redaction_event_id, sender_user_id, reason, origin_server_ts)?;
+    let mut content: serde_json::Value = serde_json::from_str(&event.content)?;
+    if let (Some(content_obj), Some(extra_obj)) = (content.as_object_mut(), extra_content.as_object()) {
+        for (key, value) in extra_obj {
+            content_obj.insert(key.clone(), value.clone());
+        }
+    }
+    let content_str = content.to_string();
+    tx.execute("UPDATE events SET content = ?1 WHERE event_id = ?2", params![content_str, redaction_event_id])?;
+    event.content = content_str;
+    tx.commit()?;
+    Ok(event)
+}
+
 /// [`redact_event`], but dedup-checked and recorded in the SAME transaction
 /// as the redaction (P6 binding rule, mirroring
 /// [`insert_timeline_event_deduped`] — see its own doc for the race-freedom
