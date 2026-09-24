@@ -12,7 +12,7 @@
 //! burst of ten writes against the same key coalesces into exactly one
 //! rebuilt response, not ten queued frames.
 //!
-//! # `LiveRegistry` — one `Notify` + one generation counter per key
+//! # `LiveRegistry` — register interest, THEN read the DB, THEN wait
 //!
 //! Every key (this arc's convention: `"user:{user_id}"`, one `/sync`
 //! long-poll loop per signed-in user; a later shared-presets live sync can
@@ -20,51 +20,60 @@
 //! maps to a `u64` generation counter and a `tokio::sync::Notify`. A write
 //! handler calls [`LiveRegistry::wake`]/[`LiveRegistry::wake_many`] once its
 //! `messenger.db` commit has returned (never while still holding the
-//! connection mutex); a long-poll loop calls [`LiveRegistry::wait_for_change`].
+//! connection mutex).
+//!
+//! A long-poll loop's own three steps must run in exactly this order:
+//! [`LiveRegistry::register`] (creates the key's entry if needed, records
+//! this caller as interested, and snapshots the current generation) — THEN
+//! its own `messenger.db` read — THEN [`Registration::wait`] on the guard
+//! `register` returned. This order is load-bearing, not a style choice: a
+//! write-then-wake that lands after `register` but before the DB read is
+//! still caught, because `wake` can already see this caller's entry (it was
+//! created by `register`, before the DB read ever ran) and `wait` re-checks
+//! the generation against the snapshot `register` took. Reading the DB
+//! first and only registering afterwards (the shape an earlier version of
+//! this module used, collapsed into one `wait_for_change` call) leaves
+//! exactly that gap open: a wake landing between the DB read and the
+//! registration has no entry to bump yet, is silently dropped, and the
+//! caller sleeps out its full poll `timeout` for a message that already
+//! landed — unacceptable latency for chat. Splitting "register" from "wait"
+//! is what lets registration happen before the DB read while the DB read
+//! still happens before any actual blocking.
 //!
 //! The one subtlety `tokio::sync::Notify::notify_waiters` has, and the
-//! entire reason this module carries a generation counter instead of a bare
+//! reason this module carries a generation counter instead of a bare
 //! `Notify`: `notify_waiters` has no memory. If it fires while nobody has a
 //! `Notified` future registered, that wake is gone — the next `notified()`
 //! call has to wait for a *later* `notify_waiters`/`notify_one` call, it
-//! never sees the one it missed. A naive "check the DB, then `.await` a
-//! fresh `notified()`" loop can miss a write that lands in exactly that gap.
-//! The generation counter closes it: [`LiveRegistry::wait_for_change`]
-//! creates its `Notified` future and calls `enable()` on it (registering it
-//! with `Notify` immediately, before doing anything else — this is the
-//! stdlib-recommended way to register interest from synchronous code, see
-//! `tokio::sync::Notify`'s own docs on `enable()`), and only *then* compares
-//! the current generation against the value the caller observed before its
-//! own DB read. If a wake already bumped the generation in that window, the
-//! call returns [`WaitOutcome::Woken`] immediately without ever needing the
-//! `Notify` to fire — the wake is never lost, even though `notify_waiters`
-//! itself has no memory of it.
+//! never sees the one it missed. [`Registration::wait`] closes that gap the
+//! same way `register` closes the DB-read gap: it creates its `Notified`
+//! future and calls `enable()` on it (registering it with `Notify`
+//! immediately, before doing anything else — the stdlib-recommended way to
+//! register interest from synchronous code, see `tokio::sync::Notify`'s own
+//! docs on `enable()`), and only *then* compares the current generation
+//! against the value `register` snapshotted. If a wake already bumped the
+//! generation by that point, the call returns [`WaitOutcome::Woken`]
+//! immediately without ever needing the `Notify` to fire.
 //!
-//! # Pruning — an entry only exists while someone is waiting on it
+//! # Pruning — an entry only exists while a [`Registration`] guard is alive
 //!
 //! [`LiveRegistry::wake`]/[`LiveRegistry::wake_many`] are a no-op for a key
-//! nobody has ever called [`LiveRegistry::wait_for_change`] on — there is no
-//! generation counter to bump and no waiter to notify, and creating one
-//! just to immediately have zero waiters would be the unbounded-growth
-//! trap this design has to avoid (a room with hundreds of members would
+//! nobody currently holds a [`Registration`] for — there is no generation
+//! counter to bump and no waiter to notify, and creating one just to
+//! immediately have no interested guard would be the unbounded-growth trap
+//! this design has to avoid (a room with hundreds of members would
 //! otherwise mint one entry per member per write, most of whom are not
-//! currently blocked in `/sync` at all). The only method that creates an
-//! entry is `wait_for_change`, and it removes its own entry once it is the
-//! last waiter leaving (checked again under the lock right before removal,
-//! so a new waiter that registers in the meantime keeps the entry alive
+//! currently blocked in `/sync` at all). [`LiveRegistry::register`] is the
+//! only method that creates an entry; dropping its returned [`Registration`]
+//! decrements that entry's interest count and removes the entry once the
+//! count reaches zero (re-checked under the lock right before removal, so a
+//! fresh `register` call that lands in the meantime keeps the entry alive
 //! instead of racing the removal). The result: the map can never hold more
-//! entries than there are concurrently blocked `wait_for_change` calls.
-//!
-//! One accepted consequence: a key's generation counter resets to 0 when
-//! its entry is pruned and later recreated. This cannot lose a write —
-//! `/sync`'s response is always rebuilt from `messenger.db`, which already
-//! has the write durably committed by the time any wake was ever sent for
-//! it — it can, in the narrowest case (a `wake` landing in the brief window
-//! between an entry's last waiter leaving and a new call recreating it),
-//! cost that one still-waiting caller the rest of its own poll `timeout`
-//! before it naturally rebuilds and sees the same data anyway. That is a
-//! bounded latency cost, never a dropped event, so it is not worth an extra
-//! `#[cfg]`-free background sweep task or an LRU to close.
+//! entries than there are currently live `Registration` guards, and —
+//! critically, unlike the earlier `wait_for_change`-only shape — an entry
+//! exists for a caller's *entire* register-then-read-then-wait span, not
+//! just while it happens to be inside the `.await`, so there is no gap left
+//! in which a wake can be lost for that caller at all.
 //!
 //! # `TypingRegistry` — the one ephemeral fact never written to `messenger.db`
 //!
@@ -88,21 +97,27 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// One key's shared wake state: a generation counter bumped by every
-/// [`LiveRegistry::wake`], the `Notify` that wakes any registered
-/// [`LiveRegistry::wait_for_change`] call, and a live-waiter count used
-/// purely to decide when this entry can be pruned (see the module doc).
+/// [`LiveRegistry::wake`], the `Notify` that wakes any live
+/// [`Registration::wait`] call, and an interest count used purely to decide
+/// when this entry can be pruned (see the module doc).
 struct KeyEntry {
     notify: Notify,
     generation: AtomicU64,
-    waiters: AtomicUsize,
+    interest: AtomicUsize,
 }
 
-/// What a [`LiveRegistry::wait_for_change`] call resolved to.
+impl KeyEntry {
+    fn new() -> Self {
+        Self { notify: Notify::new(), generation: AtomicU64::new(0), interest: AtomicUsize::new(0) }
+    }
+}
+
+/// What a [`Registration::wait`] call resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
     /// The key's generation moved — either observed immediately (it had
-    /// already moved before this call finished registering) or via an
-    /// actual `Notify` wake while waiting.
+    /// already moved before or during registration) or via an actual
+    /// `Notify` wake while waiting.
     Woken,
     /// `timeout` elapsed with no generation change.
     TimedOut,
@@ -126,23 +141,27 @@ impl LiveRegistry {
         Self { keys: Mutex::new(HashMap::new()) }
     }
 
-    /// `key`'s current generation, or `0` if nobody has ever waited on it
-    /// (see the module doc's pruning policy — that is indistinguishable
-    /// from "an entry exists and nothing has woken it yet", which is
-    /// exactly the value a fresh [`Self::wait_for_change`] call also starts
-    /// from). Callers read this BEFORE re-deriving their own state (e.g. a
-    /// `messenger.db` query) and pass it back into [`Self::wait_for_change`]
-    /// so a wake landing in between is never silently missed.
-    pub fn generation(&self, key: &str) -> u64 {
-        let keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-        keys.get(key).map(|entry| entry.generation.load(Ordering::Acquire)).unwrap_or(0)
+    /// Register interest in `key`, creating its entry if this is the first
+    /// live registration for it. Call this BEFORE re-deriving state (e.g. a
+    /// `messenger.db` read) — see the module doc for why the order matters.
+    /// The returned [`Registration`] snapshots the current generation and
+    /// must be kept alive across that read; dropping it releases interest
+    /// in `key` and may prune the entry (see the module doc).
+    pub fn register(&self, key: &str) -> Registration<'_> {
+        let entry = {
+            let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(keys.entry(key.to_string()).or_insert_with(|| Arc::new(KeyEntry::new())))
+        };
+        entry.interest.fetch_add(1, Ordering::AcqRel);
+        let seen_generation = entry.generation.load(Ordering::Acquire);
+        Registration { registry: self, key: key.to_string(), entry, seen_generation }
     }
 
     /// Bump `key`'s generation and wake every current waiter via
     /// `notify_waiters` (not `notify_one` — every device/tab of the same
-    /// user waiting on the same key must all wake). A no-op if nobody has
-    /// ever called [`Self::wait_for_change`] on `key` — see the module doc
-    /// on why that is safe and deliberate, not a missed wake.
+    /// user waiting on the same key must all wake). A no-op if nobody
+    /// currently holds a [`Registration`] for `key` — see the module doc on
+    /// why that is safe and deliberate, not a missed wake.
     pub fn wake(&self, key: &str) {
         let keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = keys.get(key) {
@@ -159,66 +178,60 @@ impl LiveRegistry {
         }
     }
 
-    /// Wait for `key`'s generation to move past `seen_generation`, or for
-    /// `timeout` to elapse. Registers with `key`'s `Notify` before checking
-    /// the generation (see the module doc's "no memory" note on
-    /// `notify_waiters`) so a wake racing this call is never lost; prunes
-    /// its own entry if it is the last waiter to leave.
-    pub async fn wait_for_change(
-        &self,
-        key: &str,
-        seen_generation: u64,
-        timeout: Duration,
-    ) -> WaitOutcome {
-        let entry = {
-            let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-            Arc::clone(keys.entry(key.to_string()).or_insert_with(|| {
-                Arc::new(KeyEntry {
-                    notify: Notify::new(),
-                    generation: AtomicU64::new(0),
-                    waiters: AtomicUsize::new(0),
-                })
-            }))
-        };
-        entry.waiters.fetch_add(1, Ordering::AcqRel);
+    /// Number of keys currently tracked — always equal to the number of
+    /// distinct keys with at least one live [`Registration`] right now (see
+    /// the module doc's pruning policy). Ops visibility only (a boot log
+    /// today) — no route depends on it.
+    pub fn key_count(&self) -> usize {
+        self.keys.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
 
-        // Register interest and enable it BEFORE re-checking the
-        // generation — the standard `Notify` check-then-register idiom for
-        // a condition that is itself checked synchronously.
-        let notified = entry.notify.notified();
+/// A live interest registration for one key, returned by
+/// [`LiveRegistry::register`]. Keeping this alive is what keeps the key's
+/// entry alive — see the module doc for why that must span the caller's own
+/// DB read, not just its call to [`Self::wait`].
+pub struct Registration<'a> {
+    registry: &'a LiveRegistry,
+    key: String,
+    entry: Arc<KeyEntry>,
+    seen_generation: u64,
+}
+
+impl Registration<'_> {
+    /// Wait for the key's generation to move past what [`LiveRegistry::
+    /// register`] observed, or for `timeout` to elapse. Registers with the
+    /// key's `Notify` and enables it BEFORE re-checking the generation (see
+    /// the module doc's "no memory" note on `notify_waiters`), so a wake
+    /// racing this call is never lost.
+    pub async fn wait(&self, timeout: Duration) -> WaitOutcome {
+        let notified = self.entry.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        let outcome = if entry.generation.load(Ordering::Acquire) != seen_generation {
-            WaitOutcome::Woken
-        } else {
-            match tokio::time::timeout(timeout, notified).await {
-                Ok(()) => WaitOutcome::Woken,
-                Err(_) => WaitOutcome::TimedOut,
-            }
-        };
+        if self.entry.generation.load(Ordering::Acquire) != self.seen_generation {
+            return WaitOutcome::Woken;
+        }
+        match tokio::time::timeout(timeout, notified).await {
+            Ok(()) => WaitOutcome::Woken,
+            Err(_) => WaitOutcome::TimedOut,
+        }
+    }
+}
 
-        // Last waiter leaving prunes the entry — re-checked under the lock
-        // so a waiter that registered in the gap keeps it alive instead of
-        // racing this removal (see the module doc).
-        if entry.waiters.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(current) = keys.get(key) {
-                if Arc::ptr_eq(current, &entry) && current.waiters.load(Ordering::Acquire) == 0 {
-                    keys.remove(key);
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        // Last registration leaving prunes the entry — re-checked under the
+        // lock so a fresh `register` call that lands in the gap keeps the
+        // entry alive instead of racing this removal (see the module doc).
+        if self.entry.interest.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let mut keys = self.registry.keys.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(current) = keys.get(&self.key) {
+                if Arc::ptr_eq(current, &self.entry) && current.interest.load(Ordering::Acquire) == 0 {
+                    keys.remove(&self.key);
                 }
             }
         }
-
-        outcome
-    }
-
-    /// Number of keys currently tracked — always equal to the number of
-    /// distinct keys with at least one live [`Self::wait_for_change`] call
-    /// blocked on them right now (see the module doc's pruning policy).
-    /// Ops visibility only (a boot log today) — no route depends on it.
-    pub fn key_count(&self) -> usize {
-        self.keys.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -421,117 +434,80 @@ mod tests {
 
     #[tokio::test]
     async fn waking_one_user_key_does_not_wake_a_different_users_waiter() {
-        let registry = Arc::new(LiveRegistry::new());
+        let registry = LiveRegistry::new();
+        let w1 = registry.register("user:1");
+        let w2 = registry.register("user:2");
 
-        let r1 = Arc::clone(&registry);
-        let user1 = tokio::spawn(async move {
-            r1.wait_for_change("user:1", 0, Duration::from_secs(5)).await
-        });
-        let r2 = Arc::clone(&registry);
-        let user2 = tokio::spawn(async move {
-            r2.wait_for_change("user:2", 0, Duration::from_millis(50)).await
-        });
-
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
         registry.wake("user:1");
 
-        assert_eq!(user1.await.expect("user1 task"), WaitOutcome::Woken);
-        assert_eq!(user2.await.expect("user2 task"), WaitOutcome::TimedOut);
+        assert_eq!(w1.wait(Duration::from_secs(5)).await, WaitOutcome::Woken);
+        assert_eq!(w2.wait(Duration::from_millis(20)).await, WaitOutcome::TimedOut);
     }
 
     #[tokio::test]
     async fn two_concurrent_waiters_on_the_same_key_both_wake_on_one_notify_waiters_call() {
-        let registry = Arc::new(LiveRegistry::new());
+        let registry = LiveRegistry::new();
+        let w1 = registry.register("user:1");
+        let w2 = registry.register("user:1");
 
-        let r1 = Arc::clone(&registry);
-        let waiter1 = tokio::spawn(async move {
-            r1.wait_for_change("user:1", 0, Duration::from_secs(5)).await
+        // Both `wait` calls must actually be pending (registered on
+        // `Notify`, not resolved via the immediate generation-check
+        // shortcut) when `wake` fires, to exercise `notify_waiters`
+        // reaching more than one registered waiter from one call.
+        let (o1, o2, ()) = tokio::join!(w1.wait(Duration::from_secs(5)), w2.wait(Duration::from_secs(5)), async {
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            registry.wake("user:1");
         });
-        let r2 = Arc::clone(&registry);
-        let waiter2 = tokio::spawn(async move {
-            r2.wait_for_change("user:1", 0, Duration::from_secs(5)).await
-        });
 
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        registry.wake("user:1");
-
-        assert_eq!(waiter1.await.expect("waiter1 task"), WaitOutcome::Woken);
-        assert_eq!(waiter2.await.expect("waiter2 task"), WaitOutcome::Woken);
+        assert_eq!(o1, WaitOutcome::Woken);
+        assert_eq!(o2, WaitOutcome::Woken);
     }
 
     #[tokio::test]
-    async fn wait_returns_immediately_when_generation_already_moved() {
-        let registry = Arc::new(LiveRegistry::new());
+    async fn wake_between_register_and_wait_is_not_lost() {
+        let registry = LiveRegistry::new();
+        let w = registry.register("user:1");
 
-        // Keep one long-lived waiter registered so the key's entry (and its
-        // generation counter) survives the wake below instead of being
-        // pruned immediately.
-        let keep_alive = Arc::clone(&registry);
-        let keep_alive_task = tokio::spawn(async move {
-            keep_alive.wait_for_change("user:1", 0, Duration::from_secs(5)).await
-        });
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
-
-        let seen = registry.generation("user:1");
+        // Simulate a write + wake landing between the handler's own DB read
+        // and its call to `wait` — the exact gap `register`-before-the-
+        // read must close (this is the correctness fix over the earlier
+        // single-call `wait_for_change` shape, which had no entry to bump
+        // in this window).
         registry.wake("user:1");
 
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(1),
-            registry.wait_for_change("user:1", seen, Duration::from_secs(5)),
-        )
-        .await
-        .expect("must not hit the outer 1s test timeout — the wake already happened");
+        let outcome = tokio::time::timeout(Duration::from_millis(50), w.wait(Duration::from_secs(5)))
+            .await
+            .expect("must resolve immediately — the wake must not be lost");
         assert_eq!(outcome, WaitOutcome::Woken);
-
-        registry.wake("user:1");
-        assert_eq!(keep_alive_task.await.expect("keep_alive task"), WaitOutcome::Woken);
     }
 
     #[tokio::test]
     async fn a_wake_that_races_ahead_of_the_next_registration_is_not_lost_across_loop_iterations() {
-        let registry = Arc::new(LiveRegistry::new());
+        let registry = LiveRegistry::new();
 
-        let keep_alive = Arc::clone(&registry);
-        let keep_alive_task = tokio::spawn(async move {
-            keep_alive.wait_for_change("user:1", 0, Duration::from_secs(5)).await
-        });
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
-
-        // Simulate one loop iteration observing `seen`, then a write racing
-        // ahead and waking the key BEFORE the loop's next iteration ever
-        // calls `wait_for_change` again.
-        let seen = registry.generation("user:1");
+        // Iteration 1: a wake races ahead of `wait`, which must still catch
+        // it immediately.
+        let w1 = registry.register("user:1");
         registry.wake("user:1");
+        assert_eq!(w1.wait(Duration::from_secs(5)).await, WaitOutcome::Woken);
+        drop(w1);
 
-        // The next iteration's registration must still see it — not lost
-        // just because nothing was actively `.await`ing `notified()` yet
-        // when `wake` ran.
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(1),
-            registry.wait_for_change("user:1", seen, Duration::from_secs(5)),
-        )
-        .await
-        .expect("the raced-ahead wake must not be lost");
-        assert_eq!(outcome, WaitOutcome::Woken);
-
+        // Iteration 2: a fresh registration after the first guard fully
+        // dropped (and its entry was pruned) must not spuriously report the
+        // PREVIOUS iteration's already-consumed wake as still pending, and
+        // must still correctly catch a NEW wake racing ahead of it.
+        let w2 = registry.register("user:1");
         registry.wake("user:1");
-        assert_eq!(keep_alive_task.await.expect("keep_alive task"), WaitOutcome::Woken);
+        assert_eq!(w2.wait(Duration::from_secs(5)).await, WaitOutcome::Woken);
     }
 
     #[tokio::test]
     async fn wait_times_out_without_a_wake() {
         let registry = LiveRegistry::new();
-        let outcome =
-            registry.wait_for_change("user:1", 0, Duration::from_millis(20)).await;
-        assert_eq!(outcome, WaitOutcome::TimedOut);
+        let w = registry.register("user:1");
+        assert_eq!(w.wait(Duration::from_millis(20)).await, WaitOutcome::TimedOut);
     }
 
     #[tokio::test]
@@ -539,14 +515,28 @@ mod tests {
         let registry = LiveRegistry::new();
         assert_eq!(registry.key_count(), 0);
 
-        let outcome =
-            registry.wait_for_change("user:1", 0, Duration::from_millis(20)).await;
-        assert_eq!(outcome, WaitOutcome::TimedOut);
+        let w = registry.register("user:1");
+        assert_eq!(registry.key_count(), 1);
+        assert_eq!(w.wait(Duration::from_millis(20)).await, WaitOutcome::TimedOut);
+        drop(w);
 
-        // The only waiter left — nothing should still reference the key.
         assert_eq!(registry.key_count(), 0);
         // A wake on the now-pruned key must stay a harmless no-op.
         registry.wake("user:1");
+    }
+
+    #[test]
+    fn entry_pruned_after_last_guard_drops() {
+        let registry = LiveRegistry::new();
+        let w1 = registry.register("user:1");
+        let w2 = registry.register("user:1");
+        assert_eq!(registry.key_count(), 1);
+
+        drop(w1);
+        assert_eq!(registry.key_count(), 1, "w2 is still interested");
+
+        drop(w2);
+        assert_eq!(registry.key_count(), 0, "the last guard dropped");
     }
 
     // ---- TypingRegistry -------------------------------------------------
