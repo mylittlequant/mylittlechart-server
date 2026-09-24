@@ -154,6 +154,16 @@ pub struct ControlPlane {
     /// Constructed once at boot next to `reserved_nick_cache`; no SSE
     /// handler mounts on it yet (that is a later piece).
     pub live: mylittlechart_server::live::LiveRegistry,
+
+    /// In-memory typing-indicator state for the Matrix messenger (plan §3.6)
+    /// — see `mylittlechart_server::live::TypingRegistry`'s own module doc
+    /// for why this is the one ephemeral fact never written to
+    /// `messenger.db`. Constructed once at boot next to `live`, which every
+    /// `routes::matrix::ephemeral` write reaches through the SAME
+    /// `ControlPlane`, so a typing change and its `LiveRegistry` wake always
+    /// see the same in-process state regardless of which request handled
+    /// the write.
+    pub typing: mylittlechart_server::live::TypingRegistry,
 }
 
 impl ControlPlane {

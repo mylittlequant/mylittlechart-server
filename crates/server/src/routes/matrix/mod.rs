@@ -39,6 +39,7 @@ use axum::{Json, Router};
 use crate::state::AppState;
 
 pub mod auth;
+pub mod ephemeral;
 mod messaging;
 mod rooms;
 
@@ -335,13 +336,15 @@ async fn matrix_unrecognized() -> MatrixError {
 /// `/api`). P4: `GET /client/versions`, `GET /client/v3/capabilities`, and
 /// the `M_UNRECOGNIZED` fallback; P5 ([`rooms`]) adds room/membership/state
 /// routes; P6 ([`messaging`]) adds send/messages/event/redact/relations;
-/// P7-P11 add the rest of plan §4's endpoint table here.
+/// P7 ([`ephemeral`]) adds typing/receipt/read_markers; P8-P11 add the rest
+/// of plan §4's endpoint table here.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/client/versions", get(versions))
         .route("/client/v3/capabilities", get(capabilities))
         .merge(rooms::routes())
         .merge(messaging::routes())
+        .merge(ephemeral::routes())
         .fallback(matrix_unrecognized)
         .with_state(state)
 }

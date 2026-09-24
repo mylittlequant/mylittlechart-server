@@ -642,6 +642,7 @@ async fn main() {
                 data_dir: std::path::PathBuf::from(&data_dir),
                 reserved_nick_cache: std::sync::RwLock::new(reserved_nick_cache_entries),
                 live: mylittlechart_server::live::LiveRegistry::new(),
+                typing: mylittlechart_server::live::TypingRegistry::new(),
             };
             tracing::info!(
                 "Live event registry ready ({} key(s))",
@@ -801,6 +802,28 @@ async fn main() {
                     }
                     Err(e) => tracing::error!("Background cleanup task panicked: {}", e),
                 }
+            }
+        });
+    }
+
+    // Matrix typing-indicator expiry sweep (plan §3.6), control role only —
+    // P7's own minimal wiring of `routes::matrix::ephemeral::
+    // wake_rooms_with_expired_typing` (a real periodic tick is what that
+    // function's own doc calls "P14's job"; P14 may retune the interval or
+    // relocate this once the rest of the boot-wiring piece lands, but the
+    // function needs a real caller from the moment it exists — see that
+    // module's own doc on why an uncalled `pub fn` cannot land on its own in
+    // this binary crate). A short interval matters here: a client's own
+    // typing timeout is commonly a few seconds, so a slow sweep would leave
+    // a stale "still typing" indicator visible to peers well past when the
+    // typer actually stopped.
+    if role == state::ServerRole::Control {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                routes::matrix::ephemeral::wake_rooms_with_expired_typing(&state, std::time::Instant::now()).await;
             }
         });
     }

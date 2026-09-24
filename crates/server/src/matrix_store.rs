@@ -1942,6 +1942,64 @@ pub fn upsert_receipt(
 }
 
 // ============================================================================
+// Unread notifications (plan §3.5) — `/sync`'s `unread_notifications` block
+// ============================================================================
+
+/// Message-like timeline event types that count toward
+/// `unread_notifications.notification_count` (plan §3.5) — everything else
+/// (state events, `m.reaction`, `m.room.redaction`) is excluded. A legacy DM
+/// migrated from `dm_conversations` (plan §7) lands as
+/// `org.mylittlechart.legacy_dm`, which counts the same as a live message.
+const NOTIFICATION_MESSAGE_TYPES_SQL: &str = "('m.room.message', 'm.room.encrypted', 'org.mylittlechart.legacy_dm')";
+
+/// `unread_notifications.notification_count` for `user_id` in `room` (plan
+/// §3.5): the count of message-like timeline events (see
+/// [`NOTIFICATION_MESSAGE_TYPES_SQL`]) strictly after the FURTHER-AHEAD of
+/// the caller's own `m.read`/`m.read.private` receipt — resolved by the
+/// target events' own `stream_id` (timeline position), never by a receipt
+/// row's own `stream_id` column (a different axis — see [`upsert_receipt`]'s
+/// own doc) — and bounded above by [`visible_upper_bound`] (a `leave`/
+/// `ban`'d member's count never includes anything past their own
+/// departure). Excludes the caller's own sends (nobody is notified about
+/// their own message) and, being restricted to
+/// [`NOTIFICATION_MESSAGE_TYPES_SQL`], every state event and `m.reaction`.
+/// Not a member of the room at all ([`HistoryWindow::Nothing`]) is always
+/// `0` — there is nothing this caller could be notified about.
+///
+/// `highlight_count` is always `0` from this server (plan §3.5: no push-
+/// rule/keyword-highlight engine in v1, encrypted or not) — that is a
+/// constant the `/sync` response builder (P10) sets directly, not a second
+/// query here.
+pub fn notification_count(conn: &Connection, room: &Room, user_id: i64) -> Result<i64, MatrixStoreError> {
+    let upper_bound = match visible_upper_bound(conn, room, user_id)? {
+        HistoryWindow::Nothing => return Ok(0),
+        HistoryWindow::All => i64::MAX,
+        HistoryWindow::UpTo(upper) => upper,
+    };
+
+    let mut after_stream_id: i64 = 0;
+    for receipt_type in [ReceiptType::Read, ReceiptType::ReadPrivate] {
+        if let Some(receipt) = get_receipt(conn, &room.id, user_id, receipt_type)? {
+            if let Some(target) = get_event(conn, &receipt.event_id)? {
+                after_stream_id = after_stream_id.max(target.stream_id);
+            }
+        }
+    }
+
+    let count = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM events
+             WHERE room_id = ?1 AND state_key IS NULL AND sender_user_id != ?2
+               AND stream_id > ?3 AND stream_id <= ?4
+               AND event_type IN {NOTIFICATION_MESSAGE_TYPES_SQL}"
+        ),
+        params![room.id, user_id, after_stream_id, upper_bound],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+// ============================================================================
 // Account data
 // ============================================================================
 
@@ -2300,6 +2358,67 @@ mod tests {
 
         let receipt = get_receipt(&conn, ROOM, 9, ReceiptType::Read).expect("get").expect("row exists");
         assert_eq!(receipt.event_id, e2.event_id, "a receipt must never move back to an earlier event");
+    }
+
+    // ---- P7 tests: notification_count (plan §3.5) ----
+
+    #[test]
+    fn receipt_further_ahead_of_the_two_types_wins_for_notification_count() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000001", T0).expect("alice");
+        apply_state_event(&mut conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 900, T0).expect("alice joins");
+
+        insert_timeline_event(&mut conn, "$e1", ROOM, 2, "m.room.message", "{}", 1000, None).expect("e1");
+        let e2 = insert_timeline_event(&mut conn, "$e2", ROOM, 2, "m.room.message", "{}", 2000, None).expect("e2");
+        insert_timeline_event(&mut conn, "$e3", ROOM, 2, "m.room.message", "{}", 3000, None).expect("e3");
+        let e4 = insert_timeline_event(&mut conn, "$e4", ROOM, 2, "m.room.message", "{}", 4000, None).expect("e4");
+        let e5 = insert_timeline_event(&mut conn, "$e5", ROOM, 2, "m.room.message", "{}", 5000, None).expect("e5");
+
+        // m.read at e2, m.read.private FURTHER AHEAD at e4 — the private
+        // receipt must win even though "private" has nothing to do with
+        // ordering: notification_count takes the MAX of the two positions.
+        upsert_receipt(&mut conn, ROOM, 1, ReceiptType::Read, &e2.event_id, 2500).expect("read receipt");
+        upsert_receipt(&mut conn, ROOM, 1, ReceiptType::ReadPrivate, &e4.event_id, 4500).expect("private receipt further ahead");
+
+        let room = get_room(&conn, ROOM).expect("get room").expect("room exists");
+        assert_eq!(notification_count(&conn, &room, 1).expect("count"), 1, "only $e5 is after the further-ahead receipt ($e4)");
+
+        // Reverse: m.read now further ahead than m.read.private — m.read
+        // must win this time.
+        upsert_receipt(&mut conn, ROOM, 1, ReceiptType::Read, &e5.event_id, 5500).expect("read receipt advances past e5");
+        assert_eq!(notification_count(&conn, &room, 1).expect("count"), 0, "m.read now covers every message");
+    }
+
+    #[test]
+    fn notification_count_ignores_own_state_and_reactions() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000001", T0).expect("alice");
+        apply_state_event(&mut conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 900, T0).expect("alice joins");
+
+        // Bob's message-like sends — these count.
+        insert_timeline_event(&mut conn, "$bob-msg", ROOM, 2, "m.room.message", "{}", 1000, None).expect("bob message");
+        insert_timeline_event(&mut conn, "$bob-enc", ROOM, 2, "m.room.encrypted", "{}", 1100, None).expect("bob encrypted");
+        insert_timeline_event(&mut conn, "$bob-legacy", ROOM, 2, "org.mylittlechart.legacy_dm", "{}", 1200, None).expect("bob legacy dm");
+
+        // Excluded: alice's own message, a state event, and a reaction.
+        insert_timeline_event(&mut conn, "$alice-msg", ROOM, 1, "m.room.message", "{}", 1300, None).expect("alice's own message");
+        apply_state_event(&mut conn, "$name", ROOM, 2, "m.room.name", "", r#"{"name":"x"}"#, 1400, T0).expect("state event");
+        insert_timeline_event(&mut conn, "$reaction", ROOM, 2, "m.reaction", "{}", 1500, None).expect("reaction");
+
+        let room = get_room(&conn, ROOM).expect("get room").expect("room exists");
+        assert_eq!(notification_count(&conn, &room, 1).expect("count"), 3, "only bob's 3 message-like sends count");
+    }
+
+    #[test]
+    fn notification_count_is_zero_for_a_non_member() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        insert_timeline_event(&mut conn, "$e1", ROOM, 2, "m.room.message", "{}", 1000, None).expect("e1");
+
+        let room = get_room(&conn, ROOM).expect("get room").expect("room exists");
+        assert_eq!(notification_count(&conn, &room, 999).expect("count"), 0, "a caller with no membership row at all sees nothing");
     }
 
     // ---- extra test: duplicate annotation refused ----
