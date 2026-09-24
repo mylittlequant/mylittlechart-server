@@ -642,7 +642,13 @@ async fn main() {
                 data_dir: std::path::PathBuf::from(&data_dir),
                 reserved_nick_cache: std::sync::RwLock::new(reserved_nick_cache_entries),
                 live: mylittlechart_server::live::LiveRegistry::new(),
-                typing: mylittlechart_server::live::TypingRegistry::new(),
+                // Seeded from wall-clock milliseconds, not `TypingRegistry::new()`'s
+                // zero start — see `TypingRegistry::with_seed`'s own doc: this is
+                // what keeps a `/sync` token minted before THIS restart always
+                // comparing as strictly behind anything the fresh registry can
+                // ever assign, so a typing change is never under-reported right
+                // after a restart.
+                typing: mylittlechart_server::live::TypingRegistry::with_seed(chrono::Utc::now().timestamp_millis().max(0) as u64),
                 matrix_claim_rate_limiter: mylittlechart_server::live::ClaimRateLimiter::new(),
             };
             tracing::info!(

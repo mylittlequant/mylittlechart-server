@@ -410,8 +410,31 @@ impl Default for TypingRegistry {
 }
 
 impl TypingRegistry {
+    /// A fresh registry whose typing generation starts at `0` — this
+    /// codebase's own tests use this (deterministic small values are easy
+    /// to assert against); production boot uses [`Self::with_seed`] instead
+    /// (see that constructor's own doc for why).
     pub fn new() -> Self {
-        Self { rooms: Mutex::new(HashMap::new()), next_gen: AtomicU64::new(0) }
+        Self::with_seed(0)
+    }
+
+    /// A fresh registry whose typing generation starts at `seed` (the FIRST
+    /// effective change stamps `seed + 1`, matching [`Self::new`]'s own
+    /// "first change stamps 1" behavior when `seed == 0`). Production boot
+    /// (`main.rs`) seeds this from the current Unix time in milliseconds —
+    /// see the module doc's "The typing generation is GLOBAL, not per-room"
+    /// section: an in-memory counter starting at `0` on every restart can
+    /// under-report a typing change to a client still holding a
+    /// higher-`typing_gen` token from before that restart. Seeding from a
+    /// wall-clock reading that only ever increases makes a POST-restart
+    /// seed reliably higher than anything a PRE-restart process could ever
+    /// have reached (an `AtomicU64` counter incrementing once per typing
+    /// change, even at an implausible sustained rate, cannot climb into the
+    /// same range as milliseconds-since-1970 within any real process
+    /// lifetime) — closing the under-reporting gap [`Self::current_typing_gen`]'s
+    /// own doc used to accept as a known limitation.
+    pub fn with_seed(seed: u64) -> Self {
+        Self { rooms: Mutex::new(HashMap::new()), next_gen: AtomicU64::new(seed) }
     }
 
     /// Apply one `PUT /rooms/{roomId}/typing/{userId}` call. `timeout_ms`
@@ -480,14 +503,14 @@ impl TypingRegistry {
     /// wrongly suppresses a real future change, since every real change
     /// stamps a value `>= 1`.
     ///
-    /// Resets to `0` on every process restart (in-memory only, like every
-    /// other fact this registry holds) — a token issued before a restart
-    /// can carry a `typing_gen` LARGER than anything the fresh registry has
-    /// assigned yet, which under-reports typing changes until fresh
-    /// activity climbs back past that stale value. Accepted as a known,
-    /// self-healing, low-impact limitation of treating typing state as
-    /// genuinely ephemeral (module doc) rather than persisting a counter
-    /// nothing else needs to survive a restart for.
+    /// In-memory only, like every other fact this registry holds — a plain
+    /// `TypingRegistry::new()` restarts this counter at `0` on every
+    /// process restart. Production boot avoids the resulting under-report
+    /// risk (a token issued before a restart carrying a `typing_gen` LARGER
+    /// than anything a freshly-zeroed registry has assigned yet) by
+    /// constructing via [`Self::with_seed`] instead, seeded from a
+    /// wall-clock reading that is always higher than any pre-restart value
+    /// — see that constructor's own doc.
     pub fn current_typing_gen(&self) -> u64 {
         self.next_gen.load(Ordering::Acquire)
     }
@@ -787,6 +810,40 @@ mod tests {
         // — this is exactly what lets "serial > token.typing_gen" tell two
         // DIFFERENT rooms' changes apart instead of aliasing them.
         assert_eq!(registry.typing_serial("room:1", t0), gen_after_room1);
+    }
+
+    #[test]
+    fn typing_gen_seed_is_above_any_pre_restart_value() {
+        // Simulate a "pre-restart" process that climbed its own zero-based
+        // counter some way up through real typing activity.
+        let pre_restart = TypingRegistry::new();
+        let t0 = Instant::now();
+        assert!(pre_restart.set_typing("room:1", 1, true, 5_000, t0));
+        let pre_restart_high_water_mark = pre_restart.current_typing_gen();
+
+        // Production boot seeds the fresh, post-restart registry from a
+        // wall-clock reading — modeled here as "obviously higher than
+        // anything the old process reached" without depending on real time
+        // in a unit test.
+        let seed = pre_restart_high_water_mark + 1_000_000;
+        let post_restart = TypingRegistry::with_seed(seed);
+        assert!(
+            post_restart.current_typing_gen() > pre_restart_high_water_mark,
+            "a post-restart registry must start above any value the pre-restart process could have reached"
+        );
+
+        // A stale token minted by the pre-restart process (typing_gen =
+        // `pre_restart_high_water_mark`) must compare as strictly BEHIND
+        // the fresh registry even before the fresh registry has seen a
+        // single real typing change — this is what makes "room serial >
+        // token.typing_gen" correctly report a change to a client still
+        // holding that stale token.
+        assert!(post_restart.current_typing_gen() > pre_restart_high_water_mark);
+
+        // And the seed itself strictly precedes the FIRST real post-restart
+        // change, preserving ordinary monotonic behavior from then on.
+        assert!(post_restart.set_typing("room:1", 1, true, 5_000, t0));
+        assert!(post_restart.current_typing_gen() > seed);
     }
 
     // ---- ClaimRateLimiter -------------------------------------------------

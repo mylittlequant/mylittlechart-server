@@ -38,6 +38,7 @@
 //! identity database on every response).
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use std::collections::HashSet;
 use std::fmt;
 
 // ============================================================================
@@ -1804,6 +1805,67 @@ pub fn rooms_for_user(conn: &Connection, user_id: i64, membership: Option<Member
             rows.collect()
         }
     }
+}
+
+/// Every room in `room_ids` (typically the caller's currently joined rooms)
+/// with at least one `events`, `receipts`, or room-scoped `account_data` row
+/// whose `stream_id` falls in `(since_exclusive, upto_inclusive]` —
+/// `routes::matrix::sync`'s changed-room prefilter: an incremental sync must
+/// not run a room block builder's own dozen-odd queries against EVERY
+/// joined room just to discover that most did not change (with a few
+/// hundred rooms that is thousands of queries per wake, all held under the
+/// single `messenger.db` mutex). This set is EXACT, not merely a safe
+/// over-approximation: every field a room's `/sync` block can ever report
+/// (`timeline`, `state`, per-room `account_data`, and `m.receipt`) derives
+/// from exactly these three tables — the one exception, typing, is an
+/// in-memory `live::TypingRegistry` fact this function has no visibility
+/// into and the caller checks separately. Returns an empty set without
+/// querying when `room_ids` is empty.
+pub fn rooms_changed_in_window(
+    conn: &Connection,
+    room_ids: &[String],
+    caller_user_id: i64,
+    since_exclusive: i64,
+    upto_inclusive: i64,
+) -> rusqlite::Result<HashSet<String>> {
+    let mut changed = HashSet::new();
+    if room_ids.is_empty() {
+        return Ok(changed);
+    }
+    let placeholders = vec!["?"; room_ids.len()].join(",");
+
+    // `events` and `receipts` are not scoped to `caller_user_id` at all
+    // (any member's write counts), so both need the `room_id IN (...)`
+    // restriction to the caller's own joined-room set.
+    for table in ["events", "receipts"] {
+        let sql = format!("SELECT DISTINCT room_id FROM {table} WHERE stream_id > ? AND stream_id <= ? AND room_id IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&since_exclusive, &upto_inclusive];
+        for room_id in room_ids {
+            bound.push(room_id as &dyn rusqlite::ToSql);
+        }
+        let mut rows = stmt.query(bound.as_slice())?;
+        while let Some(row) = rows.next()? {
+            changed.insert(row.get::<_, String>(0)?);
+        }
+    }
+
+    // `account_data` rows are already scoped to ONE user — narrowing by
+    // `user_id` first (its own indexed column, `idx_account_data_user_stream`)
+    // is cheaper than another `room_id IN (...)` list, then intersect with
+    // `room_ids` in Rust (global account data, `room_id = ''`, never
+    // matches a real room id and is naturally excluded by that intersection).
+    let room_id_set: HashSet<&str> = room_ids.iter().map(String::as_str).collect();
+    let mut stmt = conn.prepare("SELECT DISTINCT room_id FROM account_data WHERE user_id = ?1 AND stream_id > ?2 AND stream_id <= ?3")?;
+    let mut rows = stmt.query(params![caller_user_id, since_exclusive, upto_inclusive])?;
+    while let Some(row) = rows.next()? {
+        let room_id: String = row.get(0)?;
+        if room_id_set.contains(room_id.as_str()) {
+            changed.insert(room_id);
+        }
+    }
+
+    Ok(changed)
 }
 
 /// Every `user_id` whose `m.room.member` state transitioned to `leave` or

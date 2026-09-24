@@ -46,19 +46,44 @@
 //! `cp.messenger`'s mutex across an `.await`); the wait itself runs in the
 //! async context directly.
 //!
-//! # Per-incremental-sync query count (a user in `R` joined rooms)
+//! # Changed-room prefilter
+//!
+//! [`build_sync_response`] never runs [`build_join_room_block`] (a dozen-odd
+//! queries on its own) against a joined room that provably has nothing new
+//! to report. On an incremental sync it first computes the SUBSET of joined
+//! rooms that changed at all — [`mylittlechart_server::matrix_store::
+//! rooms_changed_in_window`] (three queries total, not per room, since
+//! `timeline`/`state`/room `account_data`/`m.receipt` derive from exactly
+//! the `events`/`receipts`/`account_data` tables) plus an in-memory
+//! [`mylittlechart_server::live::TypingRegistry::typing_serial`] check per
+//! room (no query at all) — and only builds THOSE rooms. This set is
+//! EXACT, not a safe over-approximation with false positives: a room with
+//! zero rows across all three tables in `(since, upto]` and no typing
+//! change is exactly the set [`build_join_room_block`]'s own "nothing
+//! changed" gate would have thrown away anyway, just without paying for
+//! the dozen queries to find that out. Initial and `full_state` syncs skip
+//! this prefilter entirely and build every joined room, since there is no
+//! `since` boundary to prefilter against.
+//!
+//! # Per-incremental-sync query count (a user in `R` joined rooms, `C` of
+//! which actually changed)
 //!
 //! One `max_stream_id`, one `rooms_for_user` per membership kind (join/
-//! invite/leave-candidates), then per JOINED room: `get_room` +
-//! `current_state_event` (own membership) + one timeline page query +
-//! (2 queries per DISTINCT lazy-loaded sender: `mxid_of` +
-//! `current_state_event`) + one `non_member_state_changed_in_window` +
-//! (one `member_state_changed_in_window` only when `limited`) + one
+//! invite/leave-candidates), THREE queries total (not per room) for the
+//! changed-room prefilter ([`mylittlechart_server::matrix_store::
+//! rooms_changed_in_window`] — see "Changed-room prefilter" above), then per
+//! CHANGED joined room only: `get_room` + `current_state_event` (own
+//! membership) + one timeline page query + (2 queries per DISTINCT
+//! lazy-loaded sender: `mxid_of` + `current_state_event`) + one
+//! `non_member_state_changed_in_window` + (one
+//! `member_state_changed_in_window` only when `limited`) + one
 //! `receipts_changed_in_room` + one `account_data_since` +
 //! `notification_count`'s own ~3-4 queries + `room_heroes` + two
 //! `room_members` counts — roughly a dozen queries plus two per lazy
-//! sender, times `R`. Global work (account data, to-device, device lists,
-//! OTK counts, fallback types) is a fixed handful of queries independent of
+//! sender, times `C`, NOT `R` (the `R - C` untouched rooms cost nothing
+//! beyond the three prefilter queries). Global work (account data,
+//! to-device, device lists, OTK counts, fallback types) is a fixed handful
+//! of queries independent of
 //! `R`. No query ever scans the whole `events` table unbounded — every one
 //! is indexed by `(room_id, stream_id)` or `(room_id, event_type,
 //! state_key)`.
@@ -400,9 +425,19 @@ fn build_join_room_block(
     } else {
         state_events.extend(matrix_store::state_events_of_type_at(conn, &room.id, "m.room.member", upto)?);
     }
-    // Every OTHER state type: always the delta since `effective_since`
-    // (never gated on `limited` — see the module doc).
+    // Every OTHER state type: the delta since `effective_since` (never
+    // gated on `limited` — see the module doc), MINUS anything already
+    // present in the returned `timeline` (manager review, 2026-09-24):
+    // `state` is the state at the START of the timeline window, not a
+    // second copy of state changes the client is ALREADY receiving as
+    // timeline entries. On a non-limited incremental sync this makes
+    // non-member `state` collapse to empty (every state change in the
+    // window is, by definition, already IN that unlimited timeline); on a
+    // limited one, only the gap's changes — the ones the truncated
+    // timeline did NOT cover — survive the exclusion below.
     state_events.extend(matrix_store::non_member_state_changed_in_window(conn, &room.id, effective_since, upto)?);
+    let timeline_event_ids: std::collections::HashSet<&str> = timeline_events.iter().map(|e| e.event_id.as_str()).collect();
+    state_events.retain(|e| !timeline_event_ids.contains(e.event_id.as_str()));
 
     // EPHEMERAL: typing + receipts
     let mut ephemeral_events = Vec::new();
@@ -563,8 +598,32 @@ fn build_sync_response(
 
     let timeline_limit = filter.timeline_limit();
 
+    let joined_room_ids = matrix_store::rooms_for_user(conn, caller_user_id, Some(Membership::Join))?;
+    // Changed-room prefilter (manager review, 2026-09-24): on an initial/
+    // `full_state` sync every joined room is built regardless (there is no
+    // `since` boundary to prefilter against). On an incremental sync,
+    // building EVERY joined room's block just to discover most did not
+    // change costs a room block builder's own dozen-odd queries per room —
+    // with a few hundred rooms that is thousands of queries per wake, all
+    // held under the single `messenger.db` mutex, blocking every other
+    // user. `rooms_changed_in_window` answers "did anything happen here at
+    // all" in three cheap, indexed queries total (not per room), and the
+    // in-memory typing check costs nothing; only rooms in the resulting set
+    // ever reach [`build_join_room_block`].
+    let rooms_to_build: Vec<String> = if is_initial {
+        joined_room_ids.clone()
+    } else {
+        let mut changed = matrix_store::rooms_changed_in_window(conn, &joined_room_ids, caller_user_id, since_stream, upto)?;
+        for room_id in &joined_room_ids {
+            if typing.typing_serial(room_id, now) > typing_gen_since {
+                changed.insert(room_id.clone());
+            }
+        }
+        joined_room_ids.iter().filter(|room_id| changed.contains(*room_id)).cloned().collect()
+    };
+
     let mut rooms_join = serde_json::Map::new();
-    for room_id in matrix_store::rooms_for_user(conn, caller_user_id, Some(Membership::Join))? {
+    for room_id in rooms_to_build {
         let Some(room) = matrix_store::get_room(conn, &room_id)? else { continue };
         if let Some(block) = build_join_room_block(
             conn,
@@ -1037,24 +1096,36 @@ mod tests {
         let (room_a, alice) = make_joined_room(&mut conn, 1);
         let since = matrix_store::max_stream_id(&conn).expect("max stream id after room A");
 
-        // Room B is created and alice joins it AFTER `since`.
+        // Room B is created (with a little history) and alice joins it
+        // AFTER `since`.
         matrix_store::ensure_matrix_user(&conn, 2, "creator0000000000000000000000001", T0).expect("ensure room B's creator");
         let room_b = "!roomB:mylittlechart.org".to_string();
         matrix_store::create_room(&conn, &room_b, matrix_store::RoomKind::Group, 2, T0, false, matrix_store::JoinRule::Invite, matrix_store::HistoryVisibility::Shared, None, None)
             .expect("create room B");
         matrix_store::apply_state_event(&mut conn, "$createB", &room_b, 2, "m.room.create", "", r#"{"room_version":"11"}"#, 700, T0).expect("create event B");
+        matrix_store::insert_timeline_event(&mut conn, "$msgB1", &room_b, 2, "m.room.message", "{}", 750, None).expect("a message before alice joins");
         matrix_store::apply_state_event(&mut conn, "$joinB", &room_b, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 800, T0).expect("alice joins B");
 
+        // A tiny timeline limit so room B's visible window (its OWN join
+        // event only) does NOT already cover `m.room.create` — otherwise
+        // `state` correctly excludes it as already-delivered-via-timeline
+        // (manager review: state must not duplicate the timeline), and this
+        // test would be asserting nothing meaningful.
+        let mut filter = SyncFilter::default();
+        filter.room.timeline.limit = Some(1);
         let typing = live::TypingRegistry::new();
-        let filter = SyncFilter::default();
         let response =
             build_sync_response(&conn, &typing, 1, &alice, "DEV1", Some(sync_token::SyncToken { stream_id: since, typing_gen: 0 }), &filter, false, Instant::now())
                 .expect("incremental sync");
 
         assert!(join_room_block(&response, &room_a).is_none(), "room A had no changes since `since` and must be omitted");
         let block_b = join_room_block(&response, &room_b).expect("newly joined room B must be present");
+        assert!(block_b["timeline"]["limited"].as_bool().expect("limited"), "the fixture must actually cap room B's timeline below its full history");
         let state_events = block_b["state"]["events"].as_array().expect("state events");
-        assert!(state_events.iter().any(|e| e["type"] == "m.room.create"), "a newly joined room must get its full non-member state: {state_events:?}");
+        assert!(
+            state_events.iter().any(|e| e["type"] == "m.room.create"),
+            "a newly joined room must backfill state NOT already covered by its (capped) visible timeline: {state_events:?}"
+        );
     }
 
     // ---- to_device_redelivered_when_since_does_not_advance ----
@@ -1132,6 +1203,70 @@ mod tests {
         let changed = matrix_store::non_member_state_changed_in_window(&conn, &room_id, before, mid).expect("query");
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].event_id, "$name1", "a change after `upto` must never leak into a cut bounded at an earlier point");
+    }
+
+    // ---- state_block_excludes_events_present_in_timeline ----
+
+    #[test]
+    fn state_block_excludes_events_present_in_timeline() {
+        let mut conn = test_conn();
+        let (room_id, alice) = make_joined_room(&mut conn, 1);
+        let since = matrix_store::max_stream_id(&conn).expect("max stream id");
+        matrix_store::apply_state_event(&mut conn, "$name1", &room_id, 1, "m.room.name", "", r#"{"name":"first"}"#, 1000, T0).expect("name change");
+
+        let typing = live::TypingRegistry::new();
+        let filter = SyncFilter::default();
+        let response =
+            build_sync_response(&conn, &typing, 1, &alice, "DEV1", Some(sync_token::SyncToken { stream_id: since, typing_gen: 0 }), &filter, false, Instant::now())
+                .expect("non-limited incremental sync");
+        let block = join_room_block(&response, &room_id).expect("room present — the name change is a new event");
+
+        let timeline_ids: Vec<&str> = block["timeline"]["events"].as_array().expect("timeline events").iter().map(|e| e["event_id"].as_str().expect("event_id")).collect();
+        assert!(timeline_ids.contains(&"$name1"), "the name change must appear in the timeline: {timeline_ids:?}");
+
+        let state_ids: Vec<&str> = block["state"]["events"].as_array().expect("state events").iter().map(|e| e["event_id"].as_str().expect("event_id")).collect();
+        assert!(
+            !state_ids.contains(&"$name1"),
+            "an event already present in the (non-limited) timeline must not be duplicated into state: {state_ids:?}"
+        );
+    }
+
+    // ---- incremental_sync_touches_only_changed_rooms ----
+
+    #[test]
+    fn incremental_sync_touches_only_changed_rooms() {
+        let mut conn = test_conn();
+        let (room_a, alice) = make_joined_room(&mut conn, 1);
+        let extra_room_ids: Vec<String> = (0..4).map(|i| format!("!extra{i}:mylittlechart.org")).collect();
+        for (i, room_id) in extra_room_ids.iter().enumerate() {
+            matrix_store::create_room(&conn, room_id, matrix_store::RoomKind::Group, 1, T0, false, matrix_store::JoinRule::Invite, matrix_store::HistoryVisibility::Shared, None, None)
+                .expect("create extra room");
+            matrix_store::apply_state_event(&mut conn, &format!("$extrajoin{i}"), room_id, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 100, T0)
+                .expect("alice joins extra room");
+        }
+        let since = matrix_store::max_stream_id(&conn).expect("max stream id");
+
+        // Only room_a changes after `since`.
+        matrix_store::insert_timeline_event(&mut conn, "$only_change", &room_a, 1, "m.room.message", "{}", 1000, None).expect("alice sends in room A");
+        let upto = matrix_store::max_stream_id(&conn).expect("max stream id after the write");
+
+        let joined_room_ids = matrix_store::rooms_for_user(&conn, 1, Some(Membership::Join)).expect("joined rooms");
+        assert_eq!(joined_room_ids.len(), 5, "fixture must actually create 5 joined rooms");
+
+        // The prefilter itself must identify EXACTLY the one room that
+        // actually changed — this is the mechanism that keeps the full
+        // room-block builder from ever running against the other four.
+        let changed = matrix_store::rooms_changed_in_window(&conn, &joined_room_ids, 1, since, upto).expect("changed rooms");
+        assert_eq!(changed, std::collections::HashSet::from([room_a.clone()]), "the prefilter must report exactly the one changed room: {changed:?}");
+
+        let typing = live::TypingRegistry::new();
+        let filter = SyncFilter::default();
+        let response =
+            build_sync_response(&conn, &typing, 1, &alice, "DEV1", Some(sync_token::SyncToken { stream_id: since, typing_gen: 0 }), &filter, false, Instant::now())
+                .expect("incremental sync");
+        let join_rooms = response["rooms"]["join"].as_object().expect("join map");
+        assert_eq!(join_rooms.len(), 1, "only the one changed room may be reported: {join_rooms:?}");
+        assert!(join_rooms.contains_key(&room_a));
     }
 
     // ---- lazy_load_includes_timeline_senders_only ----
