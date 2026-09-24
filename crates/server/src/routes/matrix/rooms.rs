@@ -239,6 +239,35 @@ fn check_encryption_state_change(event_type: &str, join_rule: JoinRule, already_
     Ok(())
 }
 
+/// `PUT state` must never touch `m.room.create` or `m.room.member` (manager
+/// review, 2026-09-24 — a real gap: the generic `PUT state/{type}/{key}`
+/// route had no type-specific refusal at all, so a Member with enough
+/// `state_default` power could rewrite `m.room.create`'s content, or
+/// silently kick/invite/ban a target by PUTting their `m.room.member`
+/// event directly, bypassing every kick/ban/invite-specific rule this
+/// module otherwise enforces (target-level checks, txn-dedup, the right
+/// wake set, ...). The ONE exception: a joined user updating their OWN
+/// `m.room.member` event while its `membership` stays `join` (a
+/// displayname/profile change) — membership itself only ever changes
+/// through join/leave/invite/kick/ban.
+fn check_state_event_type_allowed(event_type: &str, state_key: &str, caller_mxid: &str, content_str: &str) -> Result<(), MatrixError> {
+    if event_type == "m.room.create" {
+        return Err(MatrixError::forbidden("m.room.create cannot be modified"));
+    }
+    if event_type == "m.room.member" {
+        let membership: Option<String> = serde_json::from_str::<serde_json::Value>(content_str)
+            .ok()
+            .and_then(|v| v.get("membership").and_then(|m| m.as_str()).map(str::to_string));
+        let is_own_join_update = state_key == caller_mxid && membership.as_deref() == Some("join");
+        if !is_own_join_update {
+            return Err(MatrixError::forbidden(
+                "m.room.member only changes via join/leave/invite/kick/ban, except your own profile update while still joined",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `(lo, hi)`-ordered pair key for a DM between two internal user ids — the
 /// same trick `dm_conversations` already uses (`dm_db.rs`), reused here for
 /// `rooms.dm_pair_key`.
@@ -281,6 +310,19 @@ fn require_member(membership: Option<Membership>) -> Result<(), MatrixError> {
 
 fn require_power(power_levels: &serde_json::Value, mxid: &str, action: PowerAction) -> Result<(), MatrixError> {
     if matrix_store::can(power_levels, action, mxid) {
+        Ok(())
+    } else {
+        Err(MatrixError::forbidden("insufficient power level for this action"))
+    }
+}
+
+/// kick/ban/unban's own gate (manager review, 2026-09-24): beyond the flat
+/// [`require_power`] threshold, the caller's level must be STRICTLY
+/// GREATER than the target's current level — see
+/// [`matrix_store::can_act_on`]'s own doc for why a level-50 admin must
+/// never be able to touch a level-100 owner or an equal-level peer.
+fn require_power_over_target(power_levels: &serde_json::Value, caller_mxid: &str, target_mxid: &str, action: PowerAction, self_leave: bool) -> Result<(), MatrixError> {
+    if matrix_store::can_act_on(power_levels, action, caller_mxid, target_mxid, self_leave) {
         Ok(())
     } else {
         Err(MatrixError::forbidden("insufficient power level for this action"))
@@ -495,12 +537,14 @@ fn apply_membership_power_action(
     let caller_membership = matrix_store::room_member(conn, room_id, caller_user_id)?.map(|m| m.membership);
     require_member(caller_membership)?;
     let power_levels = power_levels_of(conn, room_id)?;
-    require_power(&power_levels, caller_mxid, action.action)?;
+
+    let target_mxid = matrix_store::mxid_of(conn, action.target_user_id)?.ok_or_else(MatrixError::internal)?;
+    let self_leave = action.new_membership == Membership::Leave;
+    require_power_over_target(&power_levels, caller_mxid, &target_mxid, action.action, self_leave)?;
 
     let target_membership = matrix_store::room_member(conn, room_id, action.target_user_id)?.map(|m| m.membership);
     check_target_state_rule(action.target_rule, target_membership)?;
 
-    let target_mxid = matrix_store::mxid_of(conn, action.target_user_id)?.ok_or_else(MatrixError::internal)?;
     let mut content = serde_json::json!({ "membership": action.new_membership.as_str() });
     if let Some(reason) = action.reason {
         content["reason"] = serde_json::Value::String(reason.to_string());
@@ -530,13 +574,19 @@ fn apply_join(conn: &mut Connection, room_id: &str, caller_user_id: i64, caller_
     Ok(member_and_invited_ids(conn, room_id)?)
 }
 
-/// `POST /leave`'s write — requires the plan's plain "Member" gate (a
-/// current `join`; declining a bare invite is not this endpoint per the
-/// gate table). Wake set is captured BEFORE the leave lands, so the leaver's
-/// own other devices are included too.
+/// `POST /leave`'s write (manager review, 2026-09-24: the plan's plain
+/// "Member" gate table entry undersold this — Matrix's own spec behaviour
+/// for `/leave` is "leave OR reject a pending invite," so an INVITED, not
+/// yet joined, caller must be accepted too). Wake set is captured BEFORE
+/// the leave lands, so the leaver's own other devices are included, and —
+/// since [`member_and_invited_ids`] already covers every joined+invited
+/// member — the inviter (who must be a joined member to have sent the
+/// invite at all) is naturally woken as well.
 fn apply_leave(conn: &mut Connection, room_id: &str, caller_user_id: i64, caller_mxid: &str, now: &str, origin_ts: i64) -> Result<HashSet<i64>, MatrixError> {
     let caller_membership = matrix_store::room_member(conn, room_id, caller_user_id)?.map(|m| m.membership);
-    require_member(caller_membership)?;
+    if !matches!(caller_membership, Some(Membership::Join) | Some(Membership::Invite)) {
+        return Err(MatrixError::forbidden("not a member or invitee of this room"));
+    }
     let wake_ids = member_and_invited_ids(conn, room_id)?;
     matrix_store::apply_state_event(
         conn,
@@ -1039,11 +1089,17 @@ async fn put_state_inner(
             (room, caller_membership, power_levels, already_encrypted)
         };
         require_member(caller_membership)?;
+        check_state_event_type_allowed(&event_type_for_blocking, &state_key_for_blocking, &caller.mxid, &content_str)?;
         check_encryption_state_change(&event_type_for_blocking, room.join_rule, already_encrypted)?;
 
         let sufficient = matrix_store::user_level(&power_levels, &caller.mxid) >= matrix_store::event_level(&power_levels, &event_type_for_blocking, true);
         if !sufficient {
             return Err(MatrixError::forbidden("insufficient power level to set this state event"));
+        }
+
+        if event_type_for_blocking == "m.room.power_levels" {
+            let new_power_levels: serde_json::Value = serde_json::from_str(&content_str)?;
+            matrix_store::validate_power_levels_change(&power_levels, &new_power_levels, &caller.mxid).map_err(MatrixError::forbidden)?;
         }
 
         let now = chrono::Utc::now().to_rfc3339();
@@ -1233,6 +1289,31 @@ mod tests {
         assert!(check_encryption_state_change("m.room.name", JoinRule::Public, false).is_ok(), "any other event type is unaffected by this rule");
     }
 
+    // ---- manager review 2026-09-24: PUT state refuses m.room.create/member ----
+
+    #[test]
+    fn state_put_refuses_m_room_create() {
+        let err = check_state_event_type_allowed("m.room.create", "", "@alice:mylittlechart.org", "{}").unwrap_err();
+        assert_eq!(err.errcode, "M_FORBIDDEN");
+    }
+
+    #[test]
+    fn state_put_member_allows_only_own_join_update() {
+        let alice = "@alice:mylittlechart.org";
+        let bob = "@bob:mylittlechart.org";
+
+        // Own event, membership still "join" (a displayname/profile update) — allowed.
+        assert!(check_state_event_type_allowed("m.room.member", alice, alice, r#"{"membership":"join","displayname":"Alice"}"#).is_ok());
+
+        // Own event, but changing membership away from "join" — refused
+        // (must go through leave/kick/ban instead).
+        assert!(check_state_event_type_allowed("m.room.member", alice, alice, r#"{"membership":"leave"}"#).is_err());
+
+        // Someone else's event — refused outright, even with membership "join".
+        assert!(check_state_event_type_allowed("m.room.member", bob, alice, r#"{"membership":"join"}"#).is_err());
+        assert!(check_state_event_type_allowed("m.room.member", bob, alice, r#"{"membership":"invite"}"#).is_err());
+    }
+
     // ---- plan §9 P5 test 3: power gate uses events[type] before falling back ----
 
     #[test]
@@ -1355,6 +1436,111 @@ mod tests {
         );
     }
 
+    // ---- manager review 2026-09-24: kick/ban/unban require a STRICTLY
+    // greater level than the target, not just the flat threshold ----
+
+    #[test]
+    fn admin_cannot_kick_owner() {
+        let mut conn = test_conn();
+        make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
+        let owner = matrix_store::ensure_matrix_user(&conn, 1, "owner000000000000000000000041", T0).expect("owner");
+        let admin = matrix_store::ensure_matrix_user(&conn, 2, "admin000000000000000000000041", T0).expect("admin");
+        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &owner, r#"{"membership":"join"}"#, 1000, T0)
+            .expect("owner joins");
+        matrix_store::apply_state_event(&mut conn, "$m2", "!r:mylittlechart.org", 1, "m.room.member", &admin, r#"{"membership":"join"}"#, 1100, T0)
+            .expect("admin joins");
+        let power_levels_content = serde_json::json!({ "users": { owner.clone(): 100, admin.clone(): 50 }, "kick": 50 }).to_string();
+        matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1200, T0)
+            .expect("power levels");
+
+        // admin (level 50) reaches the flat kick threshold (50) but must
+        // NOT be able to kick the level-100 owner.
+        let err = apply_membership_power_action(
+            &mut conn,
+            2,
+            &admin,
+            MembershipPowerAction {
+                room_id: "!r:mylittlechart.org",
+                action: PowerAction::Kick,
+                target_user_id: 1,
+                target_rule: TargetStateRule::MustBeActiveMember,
+                new_membership: Membership::Leave,
+                reason: None,
+            },
+            T0,
+            2000,
+        )
+        .unwrap_err();
+        assert_eq!(err.errcode, "M_FORBIDDEN");
+        assert_eq!(
+            matrix_store::room_member(&conn, "!r:mylittlechart.org", 1).expect("owner's row").expect("row exists").membership,
+            Membership::Join,
+            "the owner must remain joined"
+        );
+    }
+
+    #[test]
+    fn equal_levels_cannot_kick_each_other() {
+        let mut conn = test_conn();
+        make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000042", T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000042", T0).expect("bob");
+        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+            .expect("alice joins");
+        matrix_store::apply_state_event(&mut conn, "$m2", "!r:mylittlechart.org", 1, "m.room.member", &bob, r#"{"membership":"join"}"#, 1100, T0)
+            .expect("bob joins");
+        let power_levels_content = serde_json::json!({ "users": { alice.clone(): 50, bob.clone(): 50 }, "kick": 50 }).to_string();
+        matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1200, T0)
+            .expect("power levels");
+
+        let err = apply_membership_power_action(
+            &mut conn,
+            1,
+            &alice,
+            MembershipPowerAction {
+                room_id: "!r:mylittlechart.org",
+                action: PowerAction::Kick,
+                target_user_id: 2,
+                target_rule: TargetStateRule::MustBeActiveMember,
+                new_membership: Membership::Leave,
+                reason: None,
+            },
+            T0,
+            2000,
+        )
+        .unwrap_err();
+        assert_eq!(err.errcode, "M_FORBIDDEN");
+    }
+
+    #[test]
+    fn a_member_can_always_self_kick_regardless_of_level() {
+        let mut conn = test_conn();
+        make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000043", T0).expect("alice");
+        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+            .expect("alice joins");
+        // No power_levels event at all — alice's level defaults to 0, far
+        // below the default kick threshold of 50 — yet she may still
+        // "kick" (leave as) herself.
+        let wake_ids = apply_membership_power_action(
+            &mut conn,
+            1,
+            &alice,
+            MembershipPowerAction {
+                room_id: "!r:mylittlechart.org",
+                action: PowerAction::Kick,
+                target_user_id: 1,
+                target_rule: TargetStateRule::MustBeActiveMember,
+                new_membership: Membership::Leave,
+                reason: None,
+            },
+            T0,
+            2000,
+        )
+        .expect("a member may always remove themselves");
+        assert!(wake_ids.contains(&1));
+    }
+
     // ---- brief test: invite wakes the invitee ----
 
     #[test]
@@ -1394,6 +1580,41 @@ mod tests {
 
         let err = apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, 2, T0, 2000).unwrap_err();
         assert_eq!(err.errcode, "M_INVALID_PARAM");
+    }
+
+    // ---- manager review 2026-09-24: /leave also accepts an invited caller ----
+
+    #[test]
+    fn invited_user_can_reject_via_leave() {
+        let mut conn = test_conn();
+        make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000031", T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000031", T0).expect("bob");
+        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+            .expect("alice (the inviter) joins");
+        matrix_store::apply_state_event(&mut conn, "$m2", "!r:mylittlechart.org", 1, "m.room.member", &bob, r#"{"membership":"invite"}"#, 1100, T0)
+            .expect("alice invites bob");
+
+        let wake_ids = apply_leave(&mut conn, "!r:mylittlechart.org", 2, &bob, T0, 2000).expect("bob rejects the invite via leave");
+        assert!(wake_ids.contains(&1), "the inviter must be woken");
+        assert!(wake_ids.contains(&2), "bob's own other devices must be woken too");
+        assert_eq!(
+            matrix_store::room_member(&conn, "!r:mylittlechart.org", 2).expect("bob's row").expect("row exists").membership,
+            Membership::Leave
+        );
+    }
+
+    #[test]
+    fn a_non_member_cannot_leave() {
+        let mut conn = test_conn();
+        make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000032", T0).expect("alice");
+        matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000032", T0).expect("bob");
+        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+            .expect("alice joins");
+
+        let err = apply_leave(&mut conn, "!r:mylittlechart.org", 2, "@bob:mylittlechart.org", T0, 2000).unwrap_err();
+        assert_eq!(err.errcode, "M_FORBIDDEN");
     }
 
     // ---- brief test: client_event_json uses mxids ----

@@ -1066,6 +1066,132 @@ pub fn can(power_levels: &serde_json::Value, action: PowerAction, mxid: &str) ->
     user_level(power_levels, mxid) >= required
 }
 
+/// Matrix's room-v11 membership-change authorization rule for acting on
+/// ANOTHER user (manager review, 2026-09-24 — a real gap in the first cut of
+/// [`can`] alone): reaching the flat `action` threshold via [`can`] is
+/// necessary but not sufficient — the sender's own level must ALSO be
+/// STRICTLY GREATER than the target's current level, so a level-50 admin
+/// can never kick/ban/unban a level-100 owner or an equal-level peer, even
+/// though 50 reaches the flat kick/ban threshold. `self_leave` is the one
+/// exception the spec carves out: a member may always change their OWN
+/// membership to `leave` (declining an invite, or a self-kick, is just a
+/// leave) regardless of level — pass `true` only when `new_membership` for
+/// this call is `leave` and let the identity check below decide whether it
+/// actually applies.
+pub fn can_act_on(power_levels: &serde_json::Value, action: PowerAction, sender_mxid: &str, target_mxid: &str, self_leave: bool) -> bool {
+    if self_leave && sender_mxid == target_mxid {
+        return true;
+    }
+    can(power_levels, action, sender_mxid) && user_level(power_levels, sender_mxid) > user_level(power_levels, target_mxid)
+}
+
+/// The default an `m.room.power_levels` scalar field resolves to when
+/// absent — `50` for every threshold field, `0` for the two `*_default`
+/// fields (matches [`PowerAction::field_and_default`] for the fields that
+/// enum names, plus the two it does not).
+fn power_levels_scalar_default(key: &str) -> i64 {
+    match key {
+        "events_default" | "users_default" => 0,
+        _ => 50,
+    }
+}
+
+/// Every top-level scalar field of `m.room.power_levels` this server
+/// enforces a change rule on (manager review, 2026-09-24). `events[type]`
+/// entries and `notifications.room` are handled separately below (they are
+/// nested, not top-level scalars).
+const POWER_LEVELS_SCALAR_KEYS: [&str; 7] = ["ban", "kick", "redact", "invite", "state_default", "events_default", "users_default"];
+
+/// Reject a scalar field change whose OLD or NEW value exceeds `sender_level`
+/// — shared by every scalar/nested-scalar field [`validate_power_levels_change`]
+/// checks (the top-level keys, each `events[type]` entry, and
+/// `notifications.room` all follow the identical "both sides must be ≤ your
+/// own level" rule; only `users` has the different, asymmetric rule).
+fn reject_if_either_side_exceeds(old_value: Option<i64>, new_value: Option<i64>, sender_level: i64) -> Result<(), &'static str> {
+    if old_value != new_value && (old_value.is_some_and(|v| v > sender_level) || new_value.is_some_and(|v| v > sender_level)) {
+        return Err("cannot change a power-level field at or above your own level");
+    }
+    Ok(())
+}
+
+/// The `m.room.power_levels` v11 change-authorization rules beyond the flat
+/// `PUT state` PowerCheck already gating who may send this event type at
+/// all (manager review, 2026-09-24 — a real gap: without this, any admin
+/// who merely reaches `state_default` could PUT themselves straight to
+/// `100`). `sender_mxid`'s level is read from `old` (their authority BEFORE
+/// this change takes effect):
+///
+/// - Every top-level scalar field ([`POWER_LEVELS_SCALAR_KEYS`]) that
+///   CHANGES: both the old and the new (Matrix-default-resolved) value must
+///   be at or below the sender's level.
+/// - Every `events[type]` entry and `notifications.room` that CHANGES:
+///   same rule, but with NO invented default for a side where the key is
+///   simply absent (an absent side is not compared against the sender's
+///   level at all — only a side that is actually PRESENT and exceeds it
+///   is refused).
+/// - `users`: for every mxid whose EFFECTIVE level ([`user_level`], which
+///   already falls back to `users_default`) differs between `old` and
+///   `new`: a target OTHER than the sender may never be touched if their
+///   CURRENT (old) level is already at or above the sender's own level
+///   (even to lower them) — a peer can never act on an equal-or-higher
+///   peer; AND no entry's NEW level may exceed the sender's own level
+///   (the sender may lower their own level, but never raise it, and can
+///   never promote anyone above themselves).
+pub fn validate_power_levels_change(old: &serde_json::Value, new: &serde_json::Value, sender_mxid: &str) -> Result<(), &'static str> {
+    let sender_level = user_level(old, sender_mxid);
+
+    for key in POWER_LEVELS_SCALAR_KEYS {
+        let default = power_levels_scalar_default(key);
+        let old_value = old.get(key).and_then(serde_json::Value::as_i64).unwrap_or(default);
+        let new_value = new.get(key).and_then(serde_json::Value::as_i64).unwrap_or(default);
+        reject_if_either_side_exceeds(Some(old_value), Some(new_value), sender_level)?;
+    }
+
+    let old_events = old.get("events").and_then(serde_json::Value::as_object);
+    let new_events = new.get("events").and_then(serde_json::Value::as_object);
+    let mut event_type_keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    if let Some(map) = old_events {
+        event_type_keys.extend(map.keys().map(String::as_str));
+    }
+    if let Some(map) = new_events {
+        event_type_keys.extend(map.keys().map(String::as_str));
+    }
+    for event_type in event_type_keys {
+        let old_value = old_events.and_then(|m| m.get(event_type)).and_then(serde_json::Value::as_i64);
+        let new_value = new_events.and_then(|m| m.get(event_type)).and_then(serde_json::Value::as_i64);
+        reject_if_either_side_exceeds(old_value, new_value, sender_level)?;
+    }
+
+    let old_notif_room = old.get("notifications").and_then(|v| v.get("room")).and_then(serde_json::Value::as_i64);
+    let new_notif_room = new.get("notifications").and_then(|v| v.get("room")).and_then(serde_json::Value::as_i64);
+    reject_if_either_side_exceeds(old_notif_room, new_notif_room, sender_level)?;
+
+    let old_users = old.get("users").and_then(serde_json::Value::as_object);
+    let new_users = new.get("users").and_then(serde_json::Value::as_object);
+    let mut user_keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    if let Some(map) = old_users {
+        user_keys.extend(map.keys().map(String::as_str));
+    }
+    if let Some(map) = new_users {
+        user_keys.extend(map.keys().map(String::as_str));
+    }
+    for target_mxid in user_keys {
+        let old_effective = user_level(old, target_mxid);
+        let new_effective = user_level(new, target_mxid);
+        if old_effective == new_effective {
+            continue;
+        }
+        if target_mxid != sender_mxid && old_effective >= sender_level {
+            return Err("cannot change the level of a user at or above your own level");
+        }
+        if new_effective > sender_level {
+            return Err("cannot set a user's level above your own");
+        }
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // Stripped invite-room-state (plan P5 correction: `unsigned.invite_room_state`
 // on an invite's own `m.room.member` event, computed at read/serialize time —
@@ -2162,6 +2288,84 @@ mod tests {
         assert_eq!(event_level(&pl, "m.room.name", true), 60, "an explicit events[type] override wins");
         assert_eq!(event_level(&pl, "m.room.topic", true), 50, "an unlisted state type falls back to state_default");
         assert_eq!(event_level(&pl, "m.room.message", false), 0, "an unlisted timeline type falls back to events_default");
+    }
+
+    // ---- manager review 2026-09-24: can_act_on / validate_power_levels_change ----
+
+    #[test]
+    fn can_act_on_requires_strictly_greater_level_except_self_leave() {
+        let pl = serde_json::json!({
+            "users": { "@owner:mylittlechart.org": 100, "@admin:mylittlechart.org": 50, "@peer:mylittlechart.org": 50 },
+            "kick": 50,
+            "ban": 50,
+        });
+
+        // A level-50 admin reaches the flat kick threshold (50) but must
+        // NOT be able to kick the level-100 owner.
+        assert!(!can_act_on(&pl, PowerAction::Kick, "@admin:mylittlechart.org", "@owner:mylittlechart.org", false));
+        // Nor an equal-level peer.
+        assert!(!can_act_on(&pl, PowerAction::Kick, "@admin:mylittlechart.org", "@peer:mylittlechart.org", false));
+        // The owner CAN kick the admin (100 > 50).
+        assert!(can_act_on(&pl, PowerAction::Kick, "@owner:mylittlechart.org", "@admin:mylittlechart.org", false));
+        // A member may always leave (reject an invite / self-kick) regardless
+        // of level, when self_leave is set and sender == target.
+        assert!(can_act_on(&pl, PowerAction::Kick, "@admin:mylittlechart.org", "@admin:mylittlechart.org", true));
+        // ...but NOT when the action does not actually result in a leave.
+        assert!(!can_act_on(&pl, PowerAction::Ban, "@admin:mylittlechart.org", "@admin:mylittlechart.org", false));
+    }
+
+    #[test]
+    fn validate_power_levels_change_refuses_raising_self_above_own_level() {
+        let old = serde_json::json!({ "users": { "@admin:mylittlechart.org": 50 } });
+        let new = serde_json::json!({ "users": { "@admin:mylittlechart.org": 100 } });
+        assert!(validate_power_levels_change(&old, &new, "@admin:mylittlechart.org").is_err());
+    }
+
+    #[test]
+    fn validate_power_levels_change_refuses_demoting_a_peer_at_an_equal_level() {
+        let old = serde_json::json!({ "users": { "@a:mylittlechart.org": 50, "@b:mylittlechart.org": 50 } });
+        let new = serde_json::json!({ "users": { "@a:mylittlechart.org": 50, "@b:mylittlechart.org": 0 } });
+        assert!(validate_power_levels_change(&old, &new, "@a:mylittlechart.org").is_err());
+    }
+
+    #[test]
+    fn validate_power_levels_change_allows_demoting_self() {
+        let old = serde_json::json!({ "users": { "@admin:mylittlechart.org": 50 } });
+        let new = serde_json::json!({ "users": { "@admin:mylittlechart.org": 10 } });
+        assert!(validate_power_levels_change(&old, &new, "@admin:mylittlechart.org").is_ok());
+    }
+
+    #[test]
+    fn validate_power_levels_change_refuses_raising_events_default_above_own_level() {
+        let old = serde_json::json!({ "users": { "@admin:mylittlechart.org": 50 }, "events_default": 0 });
+        let new = serde_json::json!({ "users": { "@admin:mylittlechart.org": 50 }, "events_default": 60 });
+        assert!(validate_power_levels_change(&old, &new, "@admin:mylittlechart.org").is_err());
+    }
+
+    #[test]
+    fn validate_power_levels_change_allows_the_owner_changing_anything_up_to_their_own_level() {
+        let old = serde_json::json!({ "users": { "@owner:mylittlechart.org": 100, "@a:mylittlechart.org": 50 } });
+        let new = serde_json::json!({
+            "users": { "@owner:mylittlechart.org": 100, "@a:mylittlechart.org": 90 },
+            "ban": 100,
+            "kick": 100,
+            "events_default": 100,
+        });
+        assert!(validate_power_levels_change(&old, &new, "@owner:mylittlechart.org").is_ok());
+    }
+
+    #[test]
+    fn validate_power_levels_change_refuses_a_scalar_field_change_above_own_level() {
+        let old = serde_json::json!({ "users": { "@admin:mylittlechart.org": 50 }, "ban": 50 });
+        let new = serde_json::json!({ "users": { "@admin:mylittlechart.org": 50 }, "ban": 75 });
+        assert!(validate_power_levels_change(&old, &new, "@admin:mylittlechart.org").is_err());
+    }
+
+    #[test]
+    fn validate_power_levels_change_ignores_unchanged_fields() {
+        let old = serde_json::json!({ "users": { "@admin:mylittlechart.org": 50 }, "ban": 50, "events": { "m.room.name": 40 } });
+        let new = old.clone();
+        assert!(validate_power_levels_change(&old, &new, "@admin:mylittlechart.org").is_ok());
     }
 
     // ---- P5 test: create_room_with_state is one transaction ----
