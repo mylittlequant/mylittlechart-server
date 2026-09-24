@@ -81,6 +81,25 @@ pub(crate) fn routes() -> Router<Arc<AppState>> {
         )
         .route("/client/v3/user_directory/search", post(user_directory_search))
         .route("/client/v3/publicRooms", get(get_public_rooms).post(post_public_rooms))
+        .route("/client/v3/account/whoami", get(whoami))
+}
+
+// ============================================================================
+// GET /_matrix/client/v3/account/whoami
+// ============================================================================
+
+/// `GET /account/whoami`'s wire shape: the caller's own mxid and the device
+/// this credential resolved to (minting it on first use — see
+/// [`auth::device_id_for`]'s own doc). This is how a client with no
+/// `/login` flow (this server has none — plan §1) learns its own device id.
+/// `is_guest` is always `false`: this server has no guest accounts.
+fn whoami_response(mxid: &str, device_id: &str) -> serde_json::Value {
+    serde_json::json!({ "user_id": mxid, "device_id": device_id, "is_guest": false })
+}
+
+async fn whoami(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, MatrixError> {
+    let caller = auth::resolve_matrix_caller(&headers, &state).await?;
+    Ok(Json(whoami_response(&caller.mxid, &caller.device_id)))
 }
 
 // ============================================================================
@@ -981,5 +1000,28 @@ mod tests {
         assert_eq!(json["name"], "General");
         assert_eq!(json["join_rule"], "public");
         assert!(json.get("topic").is_none(), "an unset topic must be omitted, not null");
+    }
+
+    // ---- whoami ----
+
+    #[test]
+    fn whoami_returns_mxid_and_the_credentials_device() {
+        use mylittlechart_server::matrix_keys_store::{self, CredentialKind};
+
+        let conn = test_conn();
+        matrix_keys_store::create_matrix_keys_schema(&conn).expect("keys schema");
+        let mxid = matrix_store::ensure_matrix_user(&conn, 1, "alice000000000000000000000000a1", T0).expect("ensure matrix user");
+
+        let device_first = auth::device_id_for(&conn, 1, CredentialKind::Bearer, "cred-a", T0).expect("mint device for cred-a");
+        let response_first = whoami_response(&mxid, &device_first);
+        assert_eq!(response_first["user_id"], mxid);
+        assert_eq!(response_first["device_id"], device_first);
+        assert_eq!(response_first["is_guest"], false);
+
+        let device_again = auth::device_id_for(&conn, 1, CredentialKind::Bearer, "cred-a", T0).expect("resolve cred-a again");
+        assert_eq!(device_again, device_first, "resolving the same credential twice must return the same device id");
+
+        let device_other_cred = auth::device_id_for(&conn, 1, CredentialKind::Bearer, "cred-b", T0).expect("mint device for cred-b");
+        assert_ne!(device_other_cred, device_first, "a second credential of the same user must get a different device id");
     }
 }
