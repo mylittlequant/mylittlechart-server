@@ -1,22 +1,24 @@
-//! Matrix Client-Server API subset — router assembly and the shared
-//! [`MatrixError`] response shape every handler in this module tree answers
-//! with. See
+//! Matrix Client-Server API subset — router assembly, the shared
+//! [`MatrixError`] response shape, and [`client_event_json`] (the one place
+//! every route formats a stored event for a client) every handler in this
+//! module tree answers with. See
 //! `docs/mlc/plans/messenger-proto-server-matrix-subset-2026-09-24.md` for
-//! the full plan this implements; this piece (P4) lands the foundation
-//! every other `/_matrix/client/v3/*` route (P5-P10) builds on: caller/
-//! device resolution and the credential-revoke hooks live in [`auth`].
+//! the full plan this implements; P4 (caller/device resolution, credential-
+//! revoke hooks — [`auth`]) landed the foundation; P5 ([`rooms`]) adds
+//! `createRoom`, membership (join/leave/invite/kick/ban/unban/forget),
+//! `joined_rooms`, room state (GET/PUT), members/joined_members.
 //!
 //! **Naming collision note**: `routes::rooms` (existing, `routes/rooms.rs`)
 //! is the unrelated shared-presets "objects/rooms" feature. The Matrix chat
-//! rooms this plan adds live in `routes::matrix::rooms` (a later piece), a
-//! disjoint module path — do not conflate the two.
+//! rooms this plan adds live in `routes::matrix::rooms`, a disjoint module
+//! path — do not conflate the two.
 //!
 //! P4 mounts `GET /_matrix/client/versions`, `GET /_matrix/client/v3/capabilities`
 //! (the smallest Auth-only read in the plan's §4 table — the natural first
-//! production caller for [`auth::resolve_matrix_caller`], since every other
-//! endpoint needing it is a later piece), and the catch-all `M_UNRECOGNIZED`
-//! fallback for everything else under `/_matrix/*`. Every other endpoint in
-//! the plan's §4 table is a later piece (P5-P11).
+//! production caller for [`auth::resolve_matrix_caller`]) and the catch-all
+//! `M_UNRECOGNIZED` fallback for everything else under `/_matrix/*`. P5
+//! merges [`rooms::routes`] in before that fallback. Every other endpoint in
+//! the plan's §4 table is a later piece (P6-P11).
 //!
 //! `MatrixError::not_json`/`::limit_exceeded` are deliberately NOT built yet
 //! (`retry_after_ms`/a not-JSON errcode have no caller until a body-parsing
@@ -36,6 +38,7 @@ use axum::{Json, Router};
 use crate::state::AppState;
 
 pub mod auth;
+mod rooms;
 
 /// This deployment's one supported Client-Server API version (plan §1,
 /// manager decision 1: v1.19, not the body's original v1.13 pin).
@@ -177,6 +180,84 @@ impl From<mylittlechart_server::matrix_keys_store::MatrixKeysStoreError> for Mat
     }
 }
 
+impl From<serde_json::Error> for MatrixError {
+    fn from(e: serde_json::Error) -> Self {
+        tracing::error!("JSON error in a Matrix route: {}", e);
+        Self::bad_json("Malformed JSON")
+    }
+}
+
+// ============================================================================
+// client_event_json — the one place every route formats a stored
+// `MatrixEvent` for a client (mxids, never internal `user_id`s; see the
+// module doc and P5's own scope note for why this lives here rather than
+// once per route module).
+// ============================================================================
+
+/// Format one stored [`mylittlechart_server::matrix_store::MatrixEvent`] the
+/// way every `/_matrix/client/v3/*` response must shape it: `event_id`,
+/// `type`, `sender` (mxid), `origin_server_ts`, `content`, `room_id`,
+/// `state_key` (state events only), and `unsigned.age`. `unsigned` also
+/// carries:
+/// - `redacted_because` — the formatted redaction event, when this event has
+///   been redacted (recurses one level; a redaction event redacting another
+///   redaction event does not occur through this server's own write paths).
+/// - `invite_room_state` — for an `m.room.member` event whose `content`
+///   currently reads `membership: "invite"`, the room's stripped state
+///   ([`mylittlechart_server::matrix_store::stripped_invite_state`]),
+///   recomputed fresh on every call rather than stored (see that function's
+///   own doc for why).
+/// - `transaction_id` — only when `own_txn_id` is `Some`, i.e. the caller is
+///   re-reading their own just-sent event on the SAME device that sent it;
+///   Matrix never reveals a sender's own transaction id to anyone else.
+pub fn client_event_json(
+    conn: &rusqlite::Connection,
+    event: &mylittlechart_server::matrix_store::MatrixEvent,
+    own_txn_id: Option<&str>,
+) -> Result<serde_json::Value, MatrixError> {
+    use mylittlechart_server::matrix_store;
+
+    let sender = matrix_store::mxid_of(conn, event.sender_user_id)?.ok_or_else(|| {
+        tracing::error!("client_event_json: sender {} has no matrix_users row", event.sender_user_id);
+        MatrixError::internal()
+    })?;
+    let content: serde_json::Value = serde_json::from_str(&event.content).unwrap_or_else(|_| serde_json::json!({}));
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let age = (now_ms - event.origin_server_ts).max(0);
+
+    let mut unsigned = serde_json::json!({ "age": age });
+    if let Some(redaction_event_id) = &event.redacted_by {
+        if let Some(redaction_event) = matrix_store::get_event(conn, redaction_event_id)? {
+            unsigned["redacted_because"] = client_event_json(conn, &redaction_event, None)?;
+        }
+    }
+    if event.event_type == "m.room.member" {
+        if let Ok(member_content) = serde_json::from_str::<serde_json::Value>(&event.content) {
+            if member_content.get("membership").and_then(|v| v.as_str()) == Some("invite") {
+                let stripped = matrix_store::stripped_invite_state(conn, &event.room_id, event.sender_user_id)?;
+                unsigned["invite_room_state"] = serde_json::Value::Array(stripped);
+            }
+        }
+    }
+    if let Some(txn_id) = own_txn_id {
+        unsigned["transaction_id"] = serde_json::Value::String(txn_id.to_string());
+    }
+
+    let mut value = serde_json::json!({
+        "event_id": event.event_id,
+        "type": event.event_type,
+        "sender": sender,
+        "origin_server_ts": event.origin_server_ts,
+        "content": content,
+        "room_id": event.room_id,
+        "unsigned": unsigned,
+    });
+    if let Some(state_key) = &event.state_key {
+        value["state_key"] = serde_json::Value::String(state_key.clone());
+    }
+    Ok(value)
+}
+
 // ============================================================================
 // GET /_matrix/client/versions
 // ============================================================================
@@ -249,6 +330,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/client/versions", get(versions))
         .route("/client/v3/capabilities", get(capabilities))
+        .merge(rooms::routes())
         .fallback(matrix_unrecognized)
         .with_state(state)
 }

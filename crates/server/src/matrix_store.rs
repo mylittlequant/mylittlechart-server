@@ -55,6 +55,13 @@ pub const MATRIX_SERVER_NAME: &str = "mylittlechart.org";
 /// does not adopt.
 pub const MATRIX_ROOM_VERSION: &str = "11";
 
+/// Ceiling on the serialized `content` of any state/timeline event this
+/// server accepts (plan §3.8, mirroring `dm_db::DM_MAX_CIPHERTEXT_BYTES`) —
+/// checked by every route that takes client-supplied event content
+/// (`routes::matrix::rooms::put_state` first; messaging/to-device pieces
+/// reuse the same constant rather than minting their own).
+pub const MATRIX_EVENT_CONTENT_MAX_BYTES: usize = 16 * 1024;
+
 /// Localpart prefix reserved for a future Application Service (bridge)
 /// namespace (plan §10 item 6). `matrix_store`'s own id generators never
 /// mint a localpart starting with this — see [`ensure_matrix_user`] — so a
@@ -581,11 +588,14 @@ fn room_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Room> {
     })
 }
 
-/// Insert a room's metadata row only — no bootstrap state events (those go
-/// through [`apply_state_event`] separately, e.g. `m.room.create`,
-/// `m.room.member`, `m.room.power_levels`, per plan §5/§7).
+/// The shared core of [`create_room`]/[`create_room_with_state`]: one INSERT
+/// into `rooms`. Takes a plain `&Connection` — callable as `insert_room_row(conn, ...)`
+/// from the standalone [`create_room`] or as `insert_room_row(&tx, ...)` from
+/// inside [`create_room_with_state`]'s transaction (`rusqlite::Transaction`
+/// derefs to `Connection`, so the same function body serves both, per this
+/// module's "single-event API and the batch share code" rule).
 #[allow(clippy::too_many_arguments)]
-pub fn create_room(
+fn insert_room_row(
     conn: &Connection,
     room_id: &str,
     kind: RoomKind,
@@ -616,9 +626,50 @@ pub fn create_room(
     Ok(())
 }
 
+/// Insert a room's metadata row only — no bootstrap state events (those go
+/// through [`apply_state_event`] separately, e.g. `m.room.create`,
+/// `m.room.member`, `m.room.power_levels`, per plan §5/§7). Kept as a
+/// standalone single-row entry point for a future non-transactional caller
+/// and for this module's own tests; [`create_room_with_state`] is the P5
+/// batch entry point everything under `routes::matrix::rooms` uses instead.
+#[allow(clippy::too_many_arguments)]
+pub fn create_room(
+    conn: &Connection,
+    room_id: &str,
+    kind: RoomKind,
+    creator_user_id: i64,
+    created_at: &str,
+    is_encrypted: bool,
+    join_rule: JoinRule,
+    history_visibility: HistoryVisibility,
+    dm_pair_key: Option<&str>,
+    legacy_dm_id: Option<i64>,
+) -> rusqlite::Result<()> {
+    insert_room_row(conn, room_id, kind, creator_user_id, created_at, is_encrypted, join_rule, history_visibility, dm_pair_key, legacy_dm_id)
+}
+
 pub fn get_room(conn: &Connection, room_id: &str) -> rusqlite::Result<Option<Room>> {
     conn.query_row(&format!("SELECT {ROOM_SELECT_COLUMNS} FROM rooms WHERE id = ?1"), params![room_id], room_from_row)
         .optional()
+}
+
+/// The room currently holding `pair_key` as its `dm_pair_key`, if any — the
+/// binary crate's `routes::matrix::rooms::create_room`'s DM-reuse lookup
+/// (plan P5 correction: "a second DM between the same pair returns the
+/// existing room id only if it is still a live DM for both").
+pub fn room_by_dm_pair_key(conn: &Connection, pair_key: &str) -> rusqlite::Result<Option<Room>> {
+    conn.query_row(&format!("SELECT {ROOM_SELECT_COLUMNS} FROM rooms WHERE dm_pair_key = ?1"), params![pair_key], room_from_row)
+        .optional()
+}
+
+/// Free `room_id`'s `dm_pair_key` slot (set it to `NULL`) — called when a
+/// prior DM between the same pair is no longer live (one party left), so a
+/// freshly created room between the same two users can claim that pair key
+/// without violating `rooms.dm_pair_key`'s `UNIQUE` constraint. The old room
+/// keeps every other field; only its claim on the pair key is released.
+pub fn clear_dm_pair_key(conn: &Connection, room_id: &str) -> rusqlite::Result<()> {
+    conn.execute("UPDATE rooms SET dm_pair_key = NULL WHERE id = ?1", params![room_id])?;
+    Ok(())
 }
 
 // ============================================================================
@@ -670,6 +721,46 @@ fn collect_events(rows: &mut rusqlite::Rows<'_>) -> rusqlite::Result<Vec<MatrixE
     Ok(out)
 }
 
+/// The `&Transaction`-scoped core of [`insert_timeline_event`]. Room
+/// creation (`createRoom`) never sends a message, so [`create_room_with_state`]
+/// has no timeline events to insert and this function's only caller today is
+/// [`insert_timeline_event`] itself — it is split out anyway, matching
+/// [`apply_state_event_in_tx`]'s shape, so a future batch that DOES need to
+/// mix timeline and state events (e.g. the P12 migration's legacy-message
+/// replay) can call it directly instead of re-deriving a transaction-scoped
+/// version of this logic.
+fn insert_timeline_event_in_tx(
+    tx: &Transaction,
+    event_id: &str,
+    room_id: &str,
+    sender_user_id: i64,
+    event_type: &str,
+    content: &str,
+    origin_server_ts: i64,
+    txn_id: Option<&str>,
+) -> Result<MatrixEvent, MatrixStoreError> {
+    let stream_id = next_stream_id(tx)?;
+    tx.execute(
+        "INSERT INTO events (stream_id, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts, txn_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
+        params![stream_id, event_id, room_id, sender_user_id, event_type, content, origin_server_ts, txn_id],
+    )?;
+    populate_relations(tx, event_id, room_id, sender_user_id, content)?;
+    Ok(MatrixEvent {
+        stream_id,
+        event_id: event_id.to_string(),
+        room_id: room_id.to_string(),
+        sender_user_id,
+        event_type: event_type.to_string(),
+        state_key: None,
+        content: content.to_string(),
+        origin_server_ts,
+        txn_id: txn_id.map(str::to_string),
+        redacts: None,
+        redacted_by: None,
+    })
+}
+
 /// Insert one timeline event (`state_key` always `NULL`) inside its own
 /// transaction: mint the next stream id, insert the row, and — if
 /// `content` carries a top-level `m.relates_to` (cleartext even for
@@ -687,24 +778,57 @@ pub fn insert_timeline_event(
     txn_id: Option<&str>,
 ) -> Result<MatrixEvent, MatrixStoreError> {
     let tx = conn.transaction()?;
-    let stream_id = next_stream_id(&tx)?;
+    let event = insert_timeline_event_in_tx(&tx, event_id, room_id, sender_user_id, event_type, content, origin_server_ts, txn_id)?;
+    tx.commit()?;
+    Ok(event)
+}
+
+/// The shared core of [`apply_state_event`] and the P5 batch entry point
+/// [`create_room_with_state`] — every bootstrap state event a room creation
+/// inserts (`m.room.create`, both `m.room.member`s, `m.room.power_levels`,
+/// ...) goes through this SAME function, once per event, all inside the
+/// batch's one transaction, so a failure on any one of them rolls back the
+/// entire room creation (plan P5 correction: "Room creation is ONE
+/// transaction").
+#[allow(clippy::too_many_arguments)]
+fn apply_state_event_in_tx(
+    tx: &Transaction,
+    event_id: &str,
+    room_id: &str,
+    sender_user_id: i64,
+    event_type: &str,
+    state_key: &str,
+    content: &str,
+    origin_server_ts: i64,
+    now: &str,
+) -> Result<MatrixEvent, MatrixStoreError> {
+    let stream_id = next_stream_id(tx)?;
     tx.execute(
         "INSERT INTO events (stream_id, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts, txn_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
-        params![stream_id, event_id, room_id, sender_user_id, event_type, content, origin_server_ts, txn_id],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+        params![stream_id, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts],
     )?;
-    populate_relations(&tx, event_id, room_id, sender_user_id, content)?;
-    tx.commit()?;
+    tx.execute(
+        "INSERT INTO current_state (room_id, event_type, state_key, event_id) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(room_id, event_type, state_key) DO UPDATE SET event_id = excluded.event_id",
+        params![room_id, event_type, state_key, event_id],
+    )?;
+    if event_type == "m.room.member" {
+        refresh_room_member(tx, room_id, state_key, content, now)?;
+    }
+    if event_type == "m.room.power_levels" {
+        refresh_power_levels(tx, room_id, content)?;
+    }
     Ok(MatrixEvent {
         stream_id,
         event_id: event_id.to_string(),
         room_id: room_id.to_string(),
         sender_user_id,
         event_type: event_type.to_string(),
-        state_key: None,
+        state_key: Some(state_key.to_string()),
         content: content.to_string(),
         origin_server_ts,
-        txn_id: txn_id.map(str::to_string),
+        txn_id: None,
         redacts: None,
         redacted_by: None,
     })
@@ -726,37 +850,108 @@ pub fn apply_state_event(
     now: &str,
 ) -> Result<MatrixEvent, MatrixStoreError> {
     let tx = conn.transaction()?;
-    let stream_id = next_stream_id(&tx)?;
-    tx.execute(
-        "INSERT INTO events (stream_id, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts, txn_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
-        params![stream_id, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts],
+    let event = apply_state_event_in_tx(&tx, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts, now)?;
+    tx.commit()?;
+    Ok(event)
+}
+
+// ============================================================================
+// Room creation batch (plan P5 correction: room + every bootstrap state
+// event, in ONE transaction)
+// ============================================================================
+
+/// One state event queued for [`create_room_with_state`] — the same shape
+/// [`apply_state_event`] takes per-field, minus `room_id`/`origin_server_ts`/
+/// `now` (shared by the whole batch, passed once to
+/// [`create_room_with_state`] itself rather than repeated per event).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewStateEvent {
+    pub event_id: String,
+    pub sender_user_id: i64,
+    pub event_type: String,
+    pub state_key: String,
+    pub content: String,
+}
+
+/// The room-metadata half of [`create_room_with_state`]'s input — every
+/// field [`insert_room_row`] needs, grouped into one value instead of nine
+/// positional arguments (this function's own params stay lint-clean without
+/// an `#[allow(clippy::too_many_arguments)]`, unlike the legacy single-row
+/// [`create_room`]/[`insert_room_row`] this batch shares its INSERT with).
+#[derive(Debug, Clone, Copy)]
+pub struct RoomBootstrap<'a> {
+    pub room_id: &'a str,
+    pub kind: RoomKind,
+    pub creator_user_id: i64,
+    pub created_at: &'a str,
+    pub is_encrypted: bool,
+    pub join_rule: JoinRule,
+    pub history_visibility: HistoryVisibility,
+    pub dm_pair_key: Option<&'a str>,
+    pub legacy_dm_id: Option<i64>,
+}
+
+/// Create a room AND its full bootstrap event set in ONE transaction (plan
+/// P5 correction) — the room row ([`insert_room_row`]), then every entry of
+/// `state_events` in order via [`apply_state_event_in_tx`] (so, e.g., the
+/// creator's own `m.room.member` MUST precede `m.room.power_levels` in
+/// `state_events` for [`refresh_power_levels`] to see them as an existing
+/// member to stamp — see that function's own doc comment), then commit. A
+/// failure on the room insert OR on any one state event leaves NEITHER a
+/// room row NOR any event row behind (rusqlite rolls back a `Transaction`
+/// dropped without `commit()`, the same guarantee
+/// [`populate_relations`]'s duplicate-annotation refusal already relies on).
+pub fn create_room_with_state(
+    conn: &mut Connection,
+    bootstrap: RoomBootstrap<'_>,
+    state_events: &[NewStateEvent],
+    origin_server_ts: i64,
+) -> Result<(Room, Vec<MatrixEvent>), MatrixStoreError> {
+    let tx = conn.transaction()?;
+    insert_room_row(
+        &tx,
+        bootstrap.room_id,
+        bootstrap.kind,
+        bootstrap.creator_user_id,
+        bootstrap.created_at,
+        bootstrap.is_encrypted,
+        bootstrap.join_rule,
+        bootstrap.history_visibility,
+        bootstrap.dm_pair_key,
+        bootstrap.legacy_dm_id,
     )?;
-    tx.execute(
-        "INSERT INTO current_state (room_id, event_type, state_key, event_id) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(room_id, event_type, state_key) DO UPDATE SET event_id = excluded.event_id",
-        params![room_id, event_type, state_key, event_id],
-    )?;
-    if event_type == "m.room.member" {
-        refresh_room_member(&tx, room_id, state_key, content, now)?;
-    }
-    if event_type == "m.room.power_levels" {
-        refresh_power_levels(&tx, room_id, content)?;
+
+    let mut applied = Vec::with_capacity(state_events.len());
+    for event in state_events {
+        applied.push(apply_state_event_in_tx(
+            &tx,
+            &event.event_id,
+            bootstrap.room_id,
+            event.sender_user_id,
+            &event.event_type,
+            &event.state_key,
+            &event.content,
+            origin_server_ts,
+            bootstrap.created_at,
+        )?);
     }
     tx.commit()?;
-    Ok(MatrixEvent {
-        stream_id,
-        event_id: event_id.to_string(),
-        room_id: room_id.to_string(),
-        sender_user_id,
-        event_type: event_type.to_string(),
-        state_key: Some(state_key.to_string()),
-        content: content.to_string(),
-        origin_server_ts,
-        txn_id: None,
-        redacts: None,
-        redacted_by: None,
-    })
+
+    Ok((
+        Room {
+            id: bootstrap.room_id.to_string(),
+            kind: bootstrap.kind,
+            room_version: MATRIX_ROOM_VERSION.to_string(),
+            creator_user_id: bootstrap.creator_user_id,
+            created_at: bootstrap.created_at.to_string(),
+            is_encrypted: bootstrap.is_encrypted,
+            join_rule: bootstrap.join_rule,
+            history_visibility: bootstrap.history_visibility,
+            dm_pair_key: bootstrap.dm_pair_key.map(str::to_string),
+            legacy_dm_id: bootstrap.legacy_dm_id,
+        },
+        applied,
+    ))
 }
 
 /// Refresh `room_members` off an `m.room.member` state event. `state_key`
@@ -871,6 +1066,51 @@ pub fn can(power_levels: &serde_json::Value, action: PowerAction, mxid: &str) ->
     user_level(power_levels, mxid) >= required
 }
 
+// ============================================================================
+// Stripped invite-room-state (plan P5 correction: `unsigned.invite_room_state`
+// on an invite's own `m.room.member` event, computed at read/serialize time —
+// see this function's own doc for why, and `routes::matrix::client_event_json`
+// (mod.rs) for its one call site today).
+// ============================================================================
+
+/// One `{content, state_key, type, sender}` Matrix `StrippedStateEvent` —
+/// `sender` already resolved to an mxid, `content` already parsed JSON.
+fn stripped_state_json(conn: &Connection, event: &MatrixEvent) -> Result<serde_json::Value, MatrixStoreError> {
+    let sender = mxid_of(conn, event.sender_user_id)?.unwrap_or_default();
+    let content: serde_json::Value = serde_json::from_str(&event.content)?;
+    Ok(serde_json::json!({
+        "content": content,
+        "state_key": event.state_key.clone().unwrap_or_default(),
+        "type": event.event_type,
+        "sender": sender,
+    }))
+}
+
+/// The stripped state Matrix attaches as `unsigned.invite_room_state` on an
+/// invite's own `m.room.member` event (name/join_rules/encryption/create,
+/// plus the inviter's own membership event) — recomputed fresh every time
+/// it is served, NEVER stored on the member event itself: `unsigned` is not
+/// part of the canonical, signed event, and this server's `events.content`
+/// column holds only the canonical, signed shape. Computing it at read time
+/// also means it always reflects the room's CURRENT state (e.g. a rename
+/// after the invite was sent), which is what a client opening an invite it
+/// received a while ago actually wants to see. `inviter_user_id` is the
+/// member event's own `sender_user_id` — the caller already has it.
+pub fn stripped_invite_state(conn: &Connection, room_id: &str, inviter_user_id: i64) -> Result<Vec<serde_json::Value>, MatrixStoreError> {
+    let mut out = Vec::new();
+    for event_type in ["m.room.create", "m.room.join_rules", "m.room.encryption", "m.room.name"] {
+        if let Some(event) = current_state_event(conn, room_id, event_type, "")? {
+            out.push(stripped_state_json(conn, &event)?);
+        }
+    }
+    if let Some(inviter_mxid) = mxid_of(conn, inviter_user_id)? {
+        if let Some(event) = current_state_event(conn, room_id, "m.room.member", &inviter_mxid)? {
+            out.push(stripped_state_json(conn, &event)?);
+        }
+    }
+    Ok(out)
+}
+
 pub fn get_event(conn: &Connection, event_id: &str) -> rusqlite::Result<Option<MatrixEvent>> {
     conn.query_row(&format!("SELECT {EVENT_SELECT_COLUMNS} FROM events WHERE event_id = ?1"), params![event_id], event_from_row)
         .optional()
@@ -893,6 +1133,26 @@ pub fn current_state_all(conn: &Connection, room_id: &str) -> rusqlite::Result<V
         "SELECT {EVENT_SELECT_COLUMNS_ALIASED} FROM current_state cs JOIN events e ON e.event_id = cs.event_id WHERE cs.room_id = ?1"
     ))?;
     let mut rows = stmt.query(params![room_id])?;
+    collect_events(&mut rows)
+}
+
+/// The point-in-time projection of every `event_type` state event as of
+/// `at_stream_id` — the latest such event per `state_key` with
+/// `stream_id <= at_stream_id` — for `GET /rooms/{roomId}/members?at=`
+/// (plan §3.3: a client fetching the full member list as of a given `/sync`
+/// token, rather than the live [`current_state_all`] projection). A
+/// `state_key` whose first event lands AFTER `at_stream_id` is correctly
+/// absent (it did not exist yet at that point in the room's history).
+pub fn state_events_of_type_at(conn: &Connection, room_id: &str, event_type: &str, at_stream_id: i64) -> rusqlite::Result<Vec<MatrixEvent>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {EVENT_SELECT_COLUMNS_ALIASED} FROM events e
+         WHERE e.room_id = ?1 AND e.event_type = ?2 AND e.state_key IS NOT NULL AND e.stream_id <= ?3
+           AND e.stream_id = (
+             SELECT MAX(stream_id) FROM events e2
+             WHERE e2.room_id = e.room_id AND e2.event_type = e.event_type AND e2.state_key = e.state_key AND e2.stream_id <= ?3
+           )"
+    ))?;
+    let mut rows = stmt.query(params![room_id, event_type, at_stream_id])?;
     collect_events(&mut rows)
 }
 
@@ -1185,6 +1445,32 @@ pub fn room_members(conn: &Connection, room_id: &str, membership: Option<Members
             rows.collect()
         }
     }
+}
+
+/// `(room_id, user_id)`'s single `room_members` row, if any — the targeted
+/// counterpart of [`room_members`] for a "is this one user a member, and
+/// what membership/power level do they hold" check (every gate in
+/// `routes::matrix::rooms` needs exactly this, not a full-room scan).
+pub fn room_member(conn: &Connection, room_id: &str, user_id: i64) -> rusqlite::Result<Option<RoomMember>> {
+    conn.query_row(
+        &format!("SELECT {ROOM_MEMBER_SELECT_COLUMNS} FROM room_members WHERE room_id = ?1 AND user_id = ?2"),
+        params![room_id, user_id],
+        room_member_from_row,
+    )
+    .optional()
+}
+
+/// Delete `user_id`'s `room_members` row in `room_id`, but ONLY if its
+/// current membership is `leave` — `POST /rooms/{roomId}/forget`'s own gate
+/// AND its effect are the same one-row conditional delete, so there is no
+/// separate read-then-write race to worry about. Returns the number of rows
+/// deleted (`0` if the row was absent or not currently `leave`), so the
+/// route layer can tell a genuine forget from a no-op gate refusal.
+pub fn forget_membership(conn: &Connection, room_id: &str, user_id: i64) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM room_members WHERE room_id = ?1 AND user_id = ?2 AND membership = 'leave'",
+        params![room_id, user_id],
+    )
 }
 
 /// Every room id `user_id` has a `room_members` row in, optionally filtered
@@ -1876,5 +2162,171 @@ mod tests {
         assert_eq!(event_level(&pl, "m.room.name", true), 60, "an explicit events[type] override wins");
         assert_eq!(event_level(&pl, "m.room.topic", true), 50, "an unlisted state type falls back to state_default");
         assert_eq!(event_level(&pl, "m.room.message", false), 0, "an unlisted timeline type falls back to events_default");
+    }
+
+    // ---- P5 test: create_room_with_state is one transaction ----
+
+    fn bootstrap<'a>(room_id: &'a str, kind: RoomKind, creator: i64) -> RoomBootstrap<'a> {
+        RoomBootstrap {
+            room_id,
+            kind,
+            creator_user_id: creator,
+            created_at: T0,
+            is_encrypted: kind != RoomKind::Channel,
+            join_rule: if kind == RoomKind::Channel { JoinRule::Public } else { JoinRule::Invite },
+            history_visibility: HistoryVisibility::Shared,
+            dm_pair_key: None,
+            legacy_dm_id: None,
+        }
+    }
+
+    fn state_event(event_id: &str, sender: i64, event_type: &str, state_key: &str, content: &str) -> NewStateEvent {
+        NewStateEvent {
+            event_id: event_id.to_string(),
+            sender_user_id: sender,
+            event_type: event_type.to_string(),
+            state_key: state_key.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn create_room_with_state_inserts_the_room_and_every_bootstrap_event_atomically() {
+        let mut conn = test_conn();
+        let creator_mxid = ensure_matrix_user(&conn, 1, "creator0000000000000000000001", T0).expect("creator");
+        let room_id = "!batch:mylittlechart.org";
+
+        let events = vec![
+            state_event("$create", 1, "m.room.create", "", r#"{"room_version":"11"}"#),
+            state_event("$m1", 1, "m.room.member", &creator_mxid, r#"{"membership":"join"}"#),
+            state_event(
+                "$pl",
+                1,
+                "m.room.power_levels",
+                "",
+                &serde_json::json!({"users": {creator_mxid.clone(): 100}, "users_default": 0}).to_string(),
+            ),
+        ];
+
+        let (room, applied) = create_room_with_state(&mut conn, bootstrap(room_id, RoomKind::Group, 1), &events, 1000).expect("create batch");
+        assert_eq!(room.id, room_id);
+        assert_eq!(applied.len(), 3);
+        assert!(get_room(&conn, room_id).expect("get room").is_some());
+        for event in &applied {
+            assert!(get_event(&conn, &event.event_id).expect("get event").is_some());
+        }
+        let creator_row = room_member(&conn, room_id, 1).expect("member row").expect("row exists");
+        assert_eq!(creator_row.power_level, Some(100), "power_levels applied after the member row existed");
+    }
+
+    #[test]
+    fn create_room_is_atomic_on_failure() {
+        let mut conn = test_conn();
+        let creator_mxid = ensure_matrix_user(&conn, 1, "creator0000000000000000000002", T0).expect("creator");
+        let room_id = "!atomic:mylittlechart.org";
+
+        let events = vec![
+            state_event("$create", 1, "m.room.create", "", r#"{"room_version":"11"}"#),
+            state_event("$m1", 1, "m.room.member", &creator_mxid, r#"{"membership":"join"}"#),
+            // Never `ensure_matrix_user`'d — `refresh_room_member` must
+            // refuse this with `UnknownMxid`, rolling back the WHOLE batch.
+            state_event("$bad", 1, "m.room.member", "@ghost:mylittlechart.org", r#"{"membership":"invite"}"#),
+        ];
+
+        let err = create_room_with_state(&mut conn, bootstrap(room_id, RoomKind::Group, 1), &events, 1000).unwrap_err();
+        assert!(matches!(err, MatrixStoreError::UnknownMxid(ref m) if m == "@ghost:mylittlechart.org"));
+
+        assert_eq!(get_room(&conn, room_id).expect("get room"), None, "a failed batch must leave no room row");
+        assert_eq!(get_event(&conn, "$create").expect("get"), None, "a failed batch must leave no event rows at all");
+        assert_eq!(get_event(&conn, "$m1").expect("get"), None);
+    }
+
+    // ---- P5 test: DM pair-key reuse frees a dead pair's slot ----
+
+    #[test]
+    fn dm_pair_key_reuse_is_freed_once_the_room_is_not_reused() {
+        let conn = test_conn();
+        create_room(&conn, "!dm1:mylittlechart.org", RoomKind::Dm, 1, T0, true, JoinRule::Invite, HistoryVisibility::Shared, Some("1:2"), None)
+            .expect("first dm room");
+        assert_eq!(room_by_dm_pair_key(&conn, "1:2").expect("lookup").map(|r| r.id), Some("!dm1:mylittlechart.org".to_string()));
+
+        clear_dm_pair_key(&conn, "!dm1:mylittlechart.org").expect("clear");
+        assert_eq!(room_by_dm_pair_key(&conn, "1:2").expect("lookup after clear"), None);
+
+        // The freed pair key can now be claimed by a second room.
+        create_room(&conn, "!dm2:mylittlechart.org", RoomKind::Dm, 1, T0, true, JoinRule::Invite, HistoryVisibility::Shared, Some("1:2"), None)
+            .expect("second dm room reuses the freed pair key");
+        assert_eq!(room_by_dm_pair_key(&conn, "1:2").expect("lookup").map(|r| r.id), Some("!dm2:mylittlechart.org".to_string()));
+    }
+
+    // ---- P5 test: room_member / forget_membership ----
+
+    #[test]
+    fn room_member_finds_the_one_row_forget_membership_deletes_only_when_left() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000099", T0).expect("alice");
+        apply_state_event(&mut conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("join");
+
+        assert_eq!(room_member(&conn, ROOM, 1).expect("member").map(|m| m.membership), Some(Membership::Join));
+        assert_eq!(room_member(&conn, ROOM, 999).expect("no such member"), None);
+
+        // Still joined — forget must refuse (0 rows deleted), matching the
+        // route-layer gate "Member with membership='leave'".
+        assert_eq!(forget_membership(&conn, ROOM, 1).expect("forget while joined"), 0);
+        assert!(room_member(&conn, ROOM, 1).expect("still a member").is_some());
+
+        apply_state_event(&mut conn, "$m2", ROOM, 1, "m.room.member", &alice, r#"{"membership":"leave"}"#, 2000, T0).expect("leave");
+        assert_eq!(forget_membership(&conn, ROOM, 1).expect("forget after leaving"), 1);
+        assert_eq!(room_member(&conn, ROOM, 1).expect("gone"), None);
+    }
+
+    // ---- P5 test: state_events_of_type_at reconstructs a point-in-time projection ----
+
+    #[test]
+    fn state_events_of_type_at_excludes_state_keys_created_after_the_cutoff() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000098", T0).expect("alice");
+        let bob = ensure_matrix_user(&conn, 2, "bob0000000000000000000000000098", T0).expect("bob");
+
+        let e1 = apply_state_event(&mut conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
+        let cutoff = e1.stream_id;
+        apply_state_event(&mut conn, "$m2", ROOM, 1, "m.room.member", &bob, r#"{"membership":"invite"}"#, 1100, T0).expect("bob invited later");
+
+        let at_cutoff = state_events_of_type_at(&conn, ROOM, "m.room.member", cutoff).expect("at cutoff");
+        assert_eq!(at_cutoff.len(), 1, "bob's invite lands strictly after the cutoff and must be excluded");
+        assert_eq!(at_cutoff[0].event_id, "$m1");
+
+        let after_both = state_events_of_type_at(&conn, ROOM, "m.room.member", cutoff + 1).expect("after both");
+        assert_eq!(after_both.len(), 2);
+    }
+
+    // ---- P5 test: stripped_invite_state ----
+
+    #[test]
+    fn stripped_invite_state_includes_room_basics_and_the_inviters_own_member_event() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000097", T0).expect("alice");
+        let bob = ensure_matrix_user(&conn, 2, "bob0000000000000000000000000097", T0).expect("bob");
+
+        apply_state_event(&mut conn, "$create", ROOM, 1, "m.room.create", "", r#"{"room_version":"11"}"#, 900, T0).expect("create");
+        apply_state_event(&mut conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
+        apply_state_event(&mut conn, "$jr", ROOM, 1, "m.room.join_rules", "", r#"{"join_rule":"invite"}"#, 1100, T0).expect("join rules");
+        apply_state_event(&mut conn, "$m2", ROOM, 1, "m.room.member", &bob, r#"{"membership":"invite"}"#, 1200, T0).expect("bob invited");
+
+        let stripped = stripped_invite_state(&conn, ROOM, 1).expect("stripped state");
+        let types: Vec<&str> = stripped.iter().map(|v| v["type"].as_str().expect("type")).collect();
+        assert!(types.contains(&"m.room.create"));
+        assert!(types.contains(&"m.room.join_rules"));
+        assert!(!types.contains(&"m.room.encryption"), "no encryption event exists in this room");
+
+        let inviter_member = stripped
+            .iter()
+            .find(|v| v["type"] == "m.room.member" && v["state_key"] == alice)
+            .expect("the inviter's own member event is included");
+        assert_eq!(inviter_member["sender"], alice);
+        assert_eq!(inviter_member["content"]["membership"], "join");
     }
 }
