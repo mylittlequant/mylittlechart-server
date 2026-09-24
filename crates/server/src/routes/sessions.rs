@@ -417,7 +417,11 @@ pub async fn delete_account(
             match web_session_ids {
                 Ok(ids) => {
                     for session_id in ids {
-                        if let Err(e) = crate::routes::matrix::auth::on_credential_revoked(&mut messenger, &cp.live, CredentialKind::Web, &session_id, &now) {
+                        // messenger.db never holds a raw session id at rest
+                        // (manager review, 2026-09-24) — hash it the same
+                        // way `on_credential_revoked`'s own device row does.
+                        let credential_ref = crate::routes::matrix::auth::web_credential_ref(&session_id);
+                        if let Err(e) = crate::routes::matrix::auth::on_credential_revoked(&mut messenger, &cp.live, CredentialKind::Web, &credential_ref, &now) {
                             tracing::error!("Failed to revoke a Matrix device before account delete: {}", e);
                         }
                     }

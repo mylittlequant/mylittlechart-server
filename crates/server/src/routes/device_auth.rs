@@ -510,8 +510,12 @@ pub async fn logout(
         let revoke_result = tokio::task::spawn_blocking(move || {
             let cp = revoke_state.control_plane();
             let now = chrono::Utc::now().to_rfc3339();
+            // messenger.db never holds a raw session id at rest (manager
+            // review, 2026-09-24) — hash it the same way `resolve_matrix_
+            // caller`'s own AuthCredential::Web does.
+            let credential_ref = crate::routes::matrix::auth::web_credential_ref(&session_id_for_revoke);
             let mut messenger = cp.messenger_conn();
-            crate::routes::matrix::auth::on_credential_revoked(&mut messenger, &cp.live, CredentialKind::Web, &session_id_for_revoke, &now)
+            crate::routes::matrix::auth::on_credential_revoked(&mut messenger, &cp.live, CredentialKind::Web, &credential_ref, &now)
         })
         .await;
         if let Ok(Err(e)) = revoke_result {

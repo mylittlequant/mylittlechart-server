@@ -42,7 +42,7 @@ use mylittlechart_server::matrix_keys_store::{self, CredentialKind};
 use mylittlechart_server::{live, matrix_store};
 
 use super::MatrixError;
-use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash};
+use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_token};
 use crate::db;
 use crate::social_db::{self, Class};
 use crate::state::AppState;
@@ -57,22 +57,45 @@ const DEVICE_TOUCH_THROTTLE_SECS: i64 = 60;
 // ============================================================================
 
 /// Which of the two existing auth mechanisms (plan §1.1) authenticated a
-/// call, carrying the credential's own natural key.
+/// call, carrying the credential's own natural key — always the SAME value
+/// stored as `matrix_keys_store.devices.credential_ref`, never a raw
+/// value `messenger.db` must not hold at rest (manager review, 2026-09-24):
+/// `Bearer` carries the SHA-256 hash of the raw header token (matching
+/// `auth_tokens.token_hash`, never the raw bearer value itself — see
+/// [`resolve_bearer_credential_from_raw`]), and `Web` carries
+/// [`web_credential_ref`]'s hash of the session id, never the raw
+/// `web_sessions.session_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthCredential {
-    /// `auth_tokens.token_hash` (native app / agent key).
+    /// SHA-256 of the raw `Authorization: Bearer` value — equal to
+    /// `auth_tokens.token_hash`.
     Bearer { token_hash: String },
-    /// `web_sessions.session_id` (cookie session).
-    Web { session_id: String },
+    /// [`web_credential_ref`] of the cookie's `session_id` — NOT
+    /// `web_sessions.session_id` itself.
+    Web { session_ref: String },
 }
 
 impl AuthCredential {
     fn kind_and_ref(&self) -> (CredentialKind, &str) {
         match self {
             AuthCredential::Bearer { token_hash } => (CredentialKind::Bearer, token_hash.as_str()),
-            AuthCredential::Web { session_id } => (CredentialKind::Web, session_id.as_str()),
+            AuthCredential::Web { session_ref } => (CredentialKind::Web, session_ref.as_str()),
         }
     }
+}
+
+/// The value stored as `matrix_keys_store.devices.credential_ref` for a web
+/// session: SHA-256 of the session id ([`hash_token`], the same primitive
+/// `routes::dm::resolve_user_id`/[`resolve_bearer_credential_from_raw`] use
+/// for a bearer token), never the raw `web_sessions.session_id` itself —
+/// `messenger.db` must never hold a live credential at rest (manager review,
+/// 2026-09-24): a raw session id there would let anyone who can read
+/// `messenger.db` forge the cookie it names. Every caller that names a web
+/// session to [`on_credential_revoked`] (this module's own
+/// [`resolve_web_credential`], `routes::sessions::delete_account`,
+/// `routes::device_auth::logout`) goes through this function first.
+pub fn web_credential_ref(session_id: &str) -> String {
+    hash_token(session_id)
 }
 
 /// The fully-resolved caller of a `/_matrix/*` request: internal identity,
@@ -134,6 +157,28 @@ fn resolve_bearer_credential(
     }
 }
 
+/// The one place a RAW `Authorization: Bearer` header value gets hashed
+/// before it is ever compared against `auth_tokens.token_hash` or stored as
+/// a `matrix_keys_store.devices.credential_ref` — [`resolve_matrix_caller`]'s
+/// only caller. Passing the raw token through unhashed was a real bug
+/// (manager review, 2026-09-24): every native-app call would fail lookup
+/// against the stored hash, and had it ever matched, the raw token would
+/// have been written into `messenger.db` at rest. Returns the computed hash
+/// alongside [`resolve_bearer_credential`]'s own
+/// `Ok(Some(user_id))`/`Ok(None)` classification — the caller needs the hash
+/// either way, to build [`AuthCredential::Bearer`].
+fn resolve_bearer_credential_from_raw(
+    identity_conn: &Connection,
+    messenger_conn: &mut Connection,
+    live: &live::LiveRegistry,
+    raw_token: &str,
+    now: &str,
+) -> rusqlite::Result<(String, Option<i64>)> {
+    let token_hash = hash_token(raw_token);
+    let user_id = resolve_bearer_credential(identity_conn, messenger_conn, live, &token_hash, now)?;
+    Ok((token_hash, user_id))
+}
+
 /// Same classification as [`BearerLookup`], for a web session. A `ua_hash`
 /// mismatch (still-live session, wrong browser fingerprint) is deliberately
 /// folded into `NotFound`, not `Expired` — only a genuine expiry revokes the
@@ -149,9 +194,15 @@ fn lookup_web_credential(identity_conn: &Connection, session_id: &str, ua_hash: 
     if let Some(user_id) = db::resolve_web_session(identity_conn, session_id, ua_hash)? {
         return Ok(WebLookup::Valid(user_id));
     }
+    // `datetime(expires_at)` normalizes the stored RFC-3339 value
+    // (`to_rfc3339()`, e.g. "2026-10-24T03:15:31+00:00") to SQLite's own
+    // `YYYY-MM-DD HH:MM:SS` shape before comparing — a raw string compare
+    // against `datetime('now')`'s own output would put 'T' (0x54) up
+    // against ' ' (0x20) on the expiry date, making every same-day time
+    // compare as later than it really is (manager review, 2026-09-24).
     let expired: Option<i64> = identity_conn
         .query_row(
-            "SELECT 1 FROM web_sessions WHERE session_id = ?1 AND expires_at <= datetime('now')",
+            "SELECT 1 FROM web_sessions WHERE session_id = ?1 AND datetime(expires_at) <= datetime('now')",
             params![session_id],
             |row| row.get(0),
         )
@@ -159,7 +210,11 @@ fn lookup_web_credential(identity_conn: &Connection, session_id: &str, ua_hash: 
     Ok(if expired.is_some() { WebLookup::Expired } else { WebLookup::NotFound })
 }
 
-/// The web-credential counterpart of [`resolve_bearer_credential`].
+/// The web-credential counterpart of [`resolve_bearer_credential`]. Takes
+/// the RAW `session_id` (needed for [`db::resolve_web_session`]'s own
+/// lookup) but never passes it to [`on_credential_revoked`] — only
+/// [`web_credential_ref`]'s hash of it, matching what
+/// `matrix_keys_store.devices.credential_ref` actually holds.
 fn resolve_web_credential(
     identity_conn: &Connection,
     messenger_conn: &mut Connection,
@@ -171,7 +226,7 @@ fn resolve_web_credential(
     match lookup_web_credential(identity_conn, session_id, ua_hash)? {
         WebLookup::Valid(user_id) => Ok(Some(user_id)),
         WebLookup::Expired => {
-            on_credential_revoked(messenger_conn, live, CredentialKind::Web, session_id, now)?;
+            on_credential_revoked(messenger_conn, live, CredentialKind::Web, &web_credential_ref(session_id), now)?;
             Ok(None)
         }
         WebLookup::NotFound => Ok(None),
@@ -250,15 +305,15 @@ pub async fn resolve_matrix_caller(headers: &HeaderMap, state: &Arc<AppState>) -
                 resolve_web_credential(&identity_conn, &mut messenger_conn, &cp.live, &session_id, &ua_hash, &now)?
             };
             if let Some(user_id) = outcome {
-                return Ok((user_id, AuthCredential::Web { session_id }));
+                return Ok((user_id, AuthCredential::Web { session_ref: web_credential_ref(&session_id) }));
             }
         }
 
-        if let Some(token_hash) = bearer_token {
-            let outcome = {
+        if let Some(raw_bearer) = bearer_token {
+            let (token_hash, outcome) = {
                 let identity_conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
                 let mut messenger_conn = cp.messenger_conn();
-                resolve_bearer_credential(&identity_conn, &mut messenger_conn, &cp.live, &token_hash, &now)?
+                resolve_bearer_credential_from_raw(&identity_conn, &mut messenger_conn, &cp.live, &raw_bearer, &now)?
             };
             if let Some(user_id) = outcome {
                 return Ok((user_id, AuthCredential::Bearer { token_hash }));
@@ -355,25 +410,41 @@ pub fn on_credential_revoked(
 
 /// Whether `(credential_kind, credential_ref)` still names a live, unexpired
 /// row in the identity database — [`reap_expired_devices`]'s own "is this
-/// device's credential still good?" test.
+/// device's credential still good?" test. `datetime(expires_at)` normalizes
+/// the stored RFC-3339 value before comparing against `datetime('now')` —
+/// see [`lookup_web_credential`]'s doc comment for why a raw string compare
+/// is wrong on the expiry date (manager review, 2026-09-24).
+///
+/// `credential_ref` for `Web` is [`web_credential_ref`]'s hash, never the
+/// raw `web_sessions.session_id` (`messenger.db` must not hold one at rest)
+/// — so, unlike `Bearer` (`auth_tokens.token_hash` already IS the value
+/// `credential_ref` holds, a direct `WHERE` match), there is no SQL query
+/// that goes straight from a hash back to a row: every still-unexpired
+/// session id is hashed here and compared in Rust instead.
 fn credential_is_valid(identity_conn: &Connection, credential_kind: CredentialKind, credential_ref: &str) -> rusqlite::Result<bool> {
-    let found: Option<i64> = match credential_kind {
-        CredentialKind::Bearer => identity_conn
-            .query_row(
-                "SELECT 1 FROM auth_tokens WHERE token_hash = ?1 AND (expires_at IS NULL OR expires_at > datetime('now'))",
-                params![credential_ref],
-                |row| row.get(0),
-            )
-            .optional()?,
-        CredentialKind::Web => identity_conn
-            .query_row(
-                "SELECT 1 FROM web_sessions WHERE session_id = ?1 AND expires_at > datetime('now')",
-                params![credential_ref],
-                |row| row.get(0),
-            )
-            .optional()?,
-    };
-    Ok(found.is_some())
+    match credential_kind {
+        CredentialKind::Bearer => {
+            let found: Option<i64> = identity_conn
+                .query_row(
+                    "SELECT 1 FROM auth_tokens WHERE token_hash = ?1 AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
+                    params![credential_ref],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(found.is_some())
+        }
+        CredentialKind::Web => {
+            let mut stmt = identity_conn.prepare("SELECT session_id FROM web_sessions WHERE datetime(expires_at) > datetime('now')")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let session_id: String = row.get(0)?;
+                if web_credential_ref(&session_id) == credential_ref {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
 }
 
 /// Sweep every device in `messenger_conn` and revoke any whose credential is
@@ -512,6 +583,50 @@ mod tests {
         assert!(require_paid_matrix(false).is_err());
     }
 
+    // ---- manager review 2026-09-24: credentials are hashed before use or storage ----
+
+    #[test]
+    fn bearer_raw_token_resolves_through_hash() {
+        let identity_conn = identity_test_conn();
+        let raw = "raw-bearer-token-value";
+        let hash = hash_token(raw);
+        identity_conn
+            .execute(
+                "INSERT INTO auth_tokens (token_hash, user_id, created_at, expires_at) VALUES (?1, 7, ?2, NULL)",
+                params![hash, T0],
+            )
+            .expect("insert token keyed by its hash, not the raw value");
+
+        let mut messenger_conn = keys_test_conn();
+        let live = live::LiveRegistry::new();
+        let (computed_hash, user_id) =
+            resolve_bearer_credential_from_raw(&identity_conn, &mut messenger_conn, &live, raw, T0).expect("resolve");
+
+        assert_eq!(computed_hash, hash, "the raw token must be hashed before ever being compared or stored");
+        assert_eq!(user_id, Some(7));
+    }
+
+    #[test]
+    fn messenger_db_never_holds_raw_credentials() {
+        let conn = keys_test_conn();
+
+        let raw_bearer = "raw-bearer-value";
+        let bearer_hash = hash_token(raw_bearer);
+        device_id_for(&conn, 1, CredentialKind::Bearer, &bearer_hash, T0).expect("mint bearer device");
+
+        let raw_session = "raw-session-id-value";
+        let session_ref = web_credential_ref(raw_session);
+        device_id_for(&conn, 2, CredentialKind::Web, &session_ref, T0).expect("mint web device");
+
+        let bearer_devices = matrix_keys_store::list_devices(&conn, 1).expect("list bearer devices");
+        assert_eq!(bearer_devices[0].credential_ref, bearer_hash);
+        assert_ne!(bearer_devices[0].credential_ref, raw_bearer, "the raw bearer token must never reach messenger.db");
+
+        let web_devices = matrix_keys_store::list_devices(&conn, 2).expect("list web devices");
+        assert_eq!(web_devices[0].credential_ref, session_ref);
+        assert_ne!(web_devices[0].credential_ref, raw_session, "the raw session id must never reach messenger.db");
+    }
+
     // ---- P4 test: device_id_for mints once, reuses, and separates by credential ----
 
     #[test]
@@ -604,5 +719,44 @@ mod tests {
         assert_eq!(matrix_keys_store::list_devices(&messenger_conn, 1).expect("list").len(), 1, "a still-valid credential keeps its device");
         assert!(matrix_keys_store::list_devices(&messenger_conn, 2).expect("list").is_empty());
         assert!(matrix_keys_store::list_devices(&messenger_conn, 3).expect("list").is_empty());
+    }
+
+    // ---- manager review 2026-09-24: expiry comparison must not use raw RFC-3339 string ordering ----
+
+    #[test]
+    fn expired_same_day_credential_is_expired() {
+        let identity_conn = identity_test_conn();
+        let now = chrono::Utc::now();
+        let expires_at = (now - chrono::Duration::hours(1)).to_rfc3339();
+        identity_conn
+            .execute(
+                "INSERT INTO auth_tokens (token_hash, user_id, created_at, expires_at) VALUES ('same-day-expired', 1, ?1, ?2)",
+                params![now.to_rfc3339(), expires_at],
+            )
+            .expect("insert a token that expired 1h ago, same UTC date");
+
+        assert!(
+            !credential_is_valid(&identity_conn, CredentialKind::Bearer, "same-day-expired").expect("check"),
+            "a token that expired 1h ago on today's UTC date must be invalid — a raw RFC-3339-vs-SQLite-datetime \
+             string compare puts 'T' (0x54) ahead of ' ' (0x20) on the expiry date and would wrongly call this one \
+             still valid"
+        );
+    }
+
+    #[test]
+    fn credential_is_valid_web_hashes_every_unexpired_session_id_to_find_a_match() {
+        let identity_conn = identity_test_conn();
+        let raw_session = "raw-session-still-live";
+        let far_future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        identity_conn
+            .execute(
+                "INSERT INTO web_sessions (session_id, user_id, created_at, expires_at) VALUES (?1, 1, ?2, ?3)",
+                params![raw_session, T0, far_future],
+            )
+            .expect("insert a live web session");
+
+        let credential_ref = web_credential_ref(raw_session);
+        assert!(credential_is_valid(&identity_conn, CredentialKind::Web, &credential_ref).expect("check"));
+        assert!(!credential_is_valid(&identity_conn, CredentialKind::Web, "some-other-hash").expect("check"));
     }
 }
