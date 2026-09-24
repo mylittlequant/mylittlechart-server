@@ -2409,7 +2409,7 @@ pub fn insert_auth_token_with_expiry(
 #[allow(dead_code)]
 pub fn resolve_token_hash_with_expiry(conn: &Connection, token_hash: &str) -> Result<Option<i64>> {
     let mut stmt = conn.prepare(
-        "SELECT user_id FROM auth_tokens WHERE token_hash = ?1 AND (expires_at IS NULL OR expires_at > datetime('now'))",
+        "SELECT user_id FROM auth_tokens WHERE token_hash = ?1 AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
     )?;
     let mut rows = stmt.query(params![token_hash])?;
     if let Some(row) = rows.next()? {
@@ -2469,7 +2469,7 @@ pub fn consume_oauth_state(
 /// Clean up expired OAuth states (older than 10 minutes).
 pub fn cleanup_oauth_states(conn: &Connection) -> Result<()> {
     conn.execute(
-        "DELETE FROM oauth_states WHERE created_at < datetime('now', '-10 minutes')",
+        "DELETE FROM oauth_states WHERE datetime(created_at) < datetime('now', '-10 minutes')",
         [],
     )?;
     Ok(())
@@ -4098,7 +4098,7 @@ pub fn create_web_session(conn: &Connection, user_id: i64, now: &str, expires_at
 /// Returns None if expired, not found, or if the ua_hash does not match.
 pub fn resolve_web_session(conn: &Connection, session_id: &str, ua_hash: &str) -> Result<Option<i64>> {
     let mut stmt = conn.prepare(
-        "SELECT user_id FROM web_sessions WHERE session_id = ?1 AND ua_hash = ?2 AND expires_at > datetime('now')",
+        "SELECT user_id FROM web_sessions WHERE session_id = ?1 AND ua_hash = ?2 AND datetime(expires_at) > datetime('now')",
     )?;
     let mut rows = stmt.query(params![session_id, ua_hash])?;
     if let Some(row) = rows.next()? {
@@ -4183,11 +4183,11 @@ pub fn claim_device_code(conn: &Connection, code: &str) -> Result<()> {
 /// Cleanup expired device codes and web sessions.
 pub fn cleanup_expired_sessions(conn: &Connection) -> Result<()> {
     conn.execute(
-        "DELETE FROM device_codes WHERE expires_at < datetime('now')",
+        "DELETE FROM device_codes WHERE datetime(expires_at) < datetime('now')",
         [],
     )?;
     conn.execute(
-        "DELETE FROM web_sessions WHERE expires_at < datetime('now')",
+        "DELETE FROM web_sessions WHERE datetime(expires_at) < datetime('now')",
         [],
     )?;
     cleanup_agent_key_requests(conn)?;
@@ -4586,7 +4586,7 @@ pub fn count_active_keys_for_user(conn: &Connection, user_id: i64) -> Result<i64
     conn.query_row(
         "SELECT COUNT(*) FROM auth_tokens
          WHERE user_id = ?1 AND label != ''
-           AND (expires_at IS NULL OR expires_at > datetime('now'))",
+           AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
         params![user_id],
         |row| row.get(0),
     )
@@ -4602,7 +4602,7 @@ pub fn list_keys_for_user(conn: &Connection, user_id: i64) -> Result<Vec<AgentKe
          FROM auth_tokens
          WHERE user_id = ?1
            AND label != ''
-           AND (expires_at IS NULL OR expires_at > datetime('now'))
+           AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
          ORDER BY created_at DESC",
     )?;
     let mut rows = stmt.query(params![user_id])?;
@@ -4631,7 +4631,7 @@ pub fn list_key_hashes_for_sync(
         "SELECT token_hash, label, permissions, expires_at
          FROM auth_tokens
          WHERE user_id = ?1
-           AND (expires_at IS NULL OR expires_at > datetime('now'))
+           AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
          ORDER BY created_at DESC",
     )?;
     let mut rows = stmt.query(params![user_id])?;
@@ -5350,7 +5350,7 @@ pub fn list_sessions_for_user(
                 a.created_at, a.expires_at, a.last_used_at, a.last_ip, a.device_id
          FROM auth_tokens a
          WHERE a.user_id = ?1
-           AND (a.expires_at IS NULL OR a.expires_at > datetime('now'))
+           AND (a.expires_at IS NULL OR datetime(a.expires_at) > datetime('now'))
          ORDER BY a.created_at DESC",
     )?;
     let mut rows = stmt.query(params![user_id])?;
@@ -8504,6 +8504,256 @@ mod
         assert_eq!(seq, 0);
         assert!(matches!(results[0].1, super::RoomOpOutcome::Forbidden));
         assert!(super::get_shared_preset(&conn, "room-1").expect("header").is_none(), "no room was created");
+    }
+
+    // ------------------------------------------------------------------
+    // Expiry comparisons — day-boundary regressions
+    //
+    // `expires_at`/`paid_until`/`created_at` are always written via
+    // `to_rfc3339()` (`2026-09-24T03:15:31+00:00`), but several queries
+    // used to compare that text directly against SQLite's own
+    // `datetime('now')`, which renders `2026-09-24 03:15:31` (a space, no
+    // offset). Lexicographically `T` (0x54) sorts after ` ` (0x20), so on
+    // any day the two share a date prefix, `expires_at > datetime('now')`
+    // read as true no matter the time of day — up to ~24h of extra
+    // validity. Fixed by wrapping the stored column in `datetime(...)` too,
+    // so SQLite parses and re-compares both sides in its own normalized
+    // form. Fixed sites: db.rs's `resolve_token_hash_with_expiry`,
+    // `resolve_web_session`, `cleanup_expired_sessions`,
+    // `cleanup_oauth_states`, `count_active_keys_for_user`,
+    // `list_keys_for_user`, `list_key_hashes_for_sync`,
+    // `list_sessions_for_user`, and `routes::dashboard::query_summary`'s
+    // `device_metrics` 24h-active count.
+    // ------------------------------------------------------------------
+
+    /// Standalone `auth_tokens`/`web_sessions`/`device_codes`/
+    /// `agent_key_requests` schema — exactly the tables/columns
+    /// `resolve_token_hash_with_expiry`, `resolve_web_session` and
+    /// `cleanup_expired_sessions` (which also sweeps `agent_key_requests`)
+    /// touch. No `users` FK: none of these functions ever join against
+    /// `users`.
+    fn expiry_test_conn() -> Connection {
+        let conn = super::init_test_conn();
+        conn.execute_batch(
+            "
+            CREATE TABLE auth_tokens (
+                token_hash TEXT PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                created_at TEXT    NOT NULL,
+                expires_at TEXT
+            );
+
+            CREATE TABLE web_sessions (
+                session_id TEXT    PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                created_at TEXT    NOT NULL,
+                expires_at TEXT    NOT NULL,
+                ua_hash    TEXT    NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE device_codes (
+                code       TEXT    PRIMARY KEY,
+                device_id  TEXT    NOT NULL,
+                user_id    INTEGER,
+                status     TEXT    NOT NULL DEFAULT 'pending',
+                created_at TEXT    NOT NULL,
+                expires_at TEXT    NOT NULL
+            );
+
+            CREATE TABLE agent_key_requests (
+                code       TEXT    PRIMARY KEY,
+                status     TEXT    NOT NULL DEFAULT 'pending',
+                expires_at TEXT    NOT NULL
+            );
+            ",
+        )
+        .expect("expiry test schema");
+        conn
+    }
+
+    /// An instant on the SAME UTC calendar date `datetime('now')` renders at
+    /// test time, but chronologically before it — 00:00:01 UTC that day.
+    /// This is exactly the shape the `datetime('now')` text-comparison bug
+    /// needs to manifest (matching date prefix, earlier time), and it can
+    /// never itself cross back into "yesterday", so the test stays valid
+    /// even when run within the first hour of the UTC day.
+    fn today_before_now_ts() -> String {
+        let now = chrono::Utc::now();
+        let early = now
+            .date_naive()
+            .and_hms_opt(0, 0, 1)
+            .expect("00:00:01 is a valid time");
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(early, chrono::Utc).to_rfc3339()
+    }
+
+    #[test]
+    fn token_expired_earlier_the_same_utc_day_is_rejected() {
+        let conn = expiry_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let expires_at = today_before_now_ts();
+        conn.execute(
+            "INSERT INTO auth_tokens (token_hash, user_id, created_at, expires_at) VALUES ('tok', 7, ?1, ?2)",
+            rusqlite::params![now, expires_at],
+        )
+        .expect("insert token");
+
+        assert_eq!(
+            super::resolve_token_hash_with_expiry(&conn, "tok").expect("query"),
+            None,
+            "a token that expired earlier today must read as expired"
+        );
+    }
+
+    #[test]
+    fn token_expiring_later_is_accepted() {
+        let conn = expiry_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO auth_tokens (token_hash, user_id, created_at, expires_at) VALUES ('tok', 7, ?1, ?2)",
+            rusqlite::params![now, expires_at],
+        )
+        .expect("insert token");
+
+        assert_eq!(
+            super::resolve_token_hash_with_expiry(&conn, "tok").expect("query"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn web_session_expired_earlier_the_same_day_is_rejected() {
+        let conn = expiry_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let expires_at = today_before_now_ts();
+        conn.execute(
+            "INSERT INTO web_sessions (session_id, user_id, created_at, expires_at, ua_hash) \
+             VALUES ('sess', 7, ?1, ?2, 'ua')",
+            rusqlite::params![now, expires_at],
+        )
+        .expect("insert session");
+
+        assert_eq!(
+            super::resolve_web_session(&conn, "sess", "ua").expect("query"),
+            None,
+            "a web session that expired earlier today must read as expired"
+        );
+    }
+
+    #[test]
+    fn web_session_expiring_later_is_accepted() {
+        let conn = expiry_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO web_sessions (session_id, user_id, created_at, expires_at, ua_hash) \
+             VALUES ('sess', 7, ?1, ?2, 'ua')",
+            rusqlite::params![now, expires_at],
+        )
+        .expect("insert session");
+
+        assert_eq!(
+            super::resolve_web_session(&conn, "sess", "ua").expect("query"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn cleanup_expired_sessions_deletes_a_web_session_expired_earlier_today() {
+        let conn = expiry_test_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let expired_at = today_before_now_ts();
+        let live_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO web_sessions (session_id, user_id, created_at, expires_at, ua_hash) \
+             VALUES ('expired', 7, ?1, ?2, 'ua')",
+            rusqlite::params![now, expired_at],
+        )
+        .expect("insert expired session");
+        conn.execute(
+            "INSERT INTO web_sessions (session_id, user_id, created_at, expires_at, ua_hash) \
+             VALUES ('live', 7, ?1, ?2, 'ua')",
+            rusqlite::params![now, live_at],
+        )
+        .expect("insert live session");
+
+        super::cleanup_expired_sessions(&conn).expect("cleanup");
+
+        let mut stmt = conn.prepare("SELECT session_id FROM web_sessions").expect("prepare");
+        let remaining: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect");
+        assert_eq!(remaining, vec!["live".to_string()]);
+    }
+
+    #[test]
+    fn paid_until_expiring_earlier_the_same_day_reads_as_not_paid() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+        super::set_user_paid_until(&conn, uid, Some(&today_before_now_ts())).expect("set paid_until");
+
+        assert_eq!(super::user_paid_until(&conn, uid).expect("query"), None);
+        assert!(!super::user_is_paid(&conn, uid).expect("query"));
+    }
+
+    #[test]
+    fn paid_until_expiring_later_reads_as_paid() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+        let until = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        super::set_user_paid_until(&conn, uid, Some(&until)).expect("set paid_until");
+
+        assert_eq!(super::user_paid_until(&conn, uid).expect("query"), Some(until));
+        assert!(super::user_is_paid(&conn, uid).expect("query"));
+    }
+
+    #[test]
+    fn object_grant_expiring_earlier_the_same_day_is_not_counted_live() {
+        let conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let grantee = insert_share_user(&conn, "grantee", Some("pub-grantee"));
+        let now = chrono::Utc::now().to_rfc3339();
+        super::upsert_object_grant(
+            &conn,
+            "preset",
+            "room-1",
+            owner,
+            Some(grantee),
+            "view",
+            Some(&today_before_now_ts()),
+            &now,
+        )
+        .expect("grant");
+
+        assert_eq!(super::count_object_grants(&conn, "preset", "room-1").expect("count"), 0);
+        let rights = super::effective_object_rights(&conn, "preset", "room-1", owner, Some(grantee)).expect("rights");
+        assert!(rights.is_empty());
+    }
+
+    #[test]
+    fn object_grant_expiring_later_is_counted_live() {
+        let conn = rooms_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let grantee = insert_share_user(&conn, "grantee", Some("pub-grantee"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        super::upsert_object_grant(
+            &conn,
+            "preset",
+            "room-1",
+            owner,
+            Some(grantee),
+            "view",
+            Some(&expires_at),
+            &now,
+        )
+        .expect("grant");
+
+        assert_eq!(super::count_object_grants(&conn, "preset", "room-1").expect("count"), 1);
+        let rights = super::effective_object_rights(&conn, "preset", "room-1", owner, Some(grantee)).expect("rights");
+        assert_eq!(rights, vec!["view"]);
     }
 }
 
