@@ -103,6 +103,7 @@ mod notify;
 mod opswriter;
 mod pathutil;
 mod ratelimit;
+mod recipient_search;
 mod rooms_codec;
 mod routes;
 mod social_db;
