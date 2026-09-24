@@ -24,6 +24,7 @@ use crate::models::types::{
     ProviderInfo,
 };
 use crate::state::AppState;
+use mylittlechart_server::matrix_keys_store::CredentialKind;
 
 // ============================================================================
 // POST /api/auth/device-code
@@ -495,11 +496,27 @@ pub async fn logout(
     headers: HeaderMap,
 ) -> Response {
     if let Some(session_id) = extract_session_id(&headers) {
+        let revoke_state = state.clone();
+        let session_id_for_revoke = session_id.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
             crate::db::delete_web_session(&conn, &session_id)
         })
         .await;
+
+        // Strip the Matrix device this web session minted, if any (plan
+        // §1.1's revoke hook — see routes/matrix/auth.rs's
+        // `on_credential_revoked`).
+        let revoke_result = tokio::task::spawn_blocking(move || {
+            let cp = revoke_state.control_plane();
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut messenger = cp.messenger_conn();
+            crate::routes::matrix::auth::on_credential_revoked(&mut messenger, &cp.live, CredentialKind::Web, &session_id_for_revoke, &now)
+        })
+        .await;
+        if let Ok(Err(e)) = revoke_result {
+            tracing::error!("Failed to revoke the Matrix device on logout: {}", e);
+        }
     }
 
     // Clear the cookie by setting Max-Age=0.

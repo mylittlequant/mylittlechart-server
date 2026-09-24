@@ -512,6 +512,25 @@ async fn main() {
             };
             tracing::info!("Social database initialized at {}", social_db_path);
 
+            // Initialize the messenger database (SQLCipher, same key, separate
+            // file — Matrix Client-Server API subset, see
+            // `docs/mlc/plans/messenger-proto-server-matrix-subset-2026-09-24.md`
+            // §6.2). `init_messenger_db` creates both schema halves (rooms/
+            // events/state and devices/keys/backup); no migration call yet
+            // (P12/P14) and no router mounted on it beyond `/_matrix/client/
+            // versions` and its `M_UNRECOGNIZED` fallback (see
+            // `routes::matrix_api_router`, nested further down).
+            let messenger_db_path = format!("{}/messenger.db", data_dir);
+            let messenger_conn =
+                match mylittlechart_server::matrix_store::init_messenger_db(&messenger_db_path, &key_hex) {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        tracing::error!("Failed to initialize messenger database at {}: {}", messenger_db_path, e);
+                        std::process::exit(1);
+                    }
+                };
+            tracing::info!("Messenger database initialized at {}", messenger_db_path);
+
             // Initialize the operational database (plain SQLite, no key wait —
             // see state::ControlPlane::ops_db). Then run the one-time move of
             // `devices`/`releases` out of identity, if their identity copies
@@ -613,6 +632,7 @@ async fn main() {
             let control_plane = state::ControlPlane {
                 db: Mutex::new(db_conn),
                 social: Mutex::new(social_conn),
+                messenger: Mutex::new(messenger_conn),
                 ops_db: Mutex::new(ops_conn),
                 ops_writer,
                 sync_store: crate::syncstore::SyncStore::new(
@@ -655,6 +675,27 @@ async fn main() {
         telemetry_daily_cap,
         alert_daemon_stats,
     ));
+
+    // One-shot Matrix device reap at boot (control role only) — devices
+    // whose credential is already gone or expired (e.g. from before this
+    // feature existed, or from a revoke path that does not go through
+    // `routes::matrix::auth::on_credential_revoked` directly, such as
+    // `routes::agent_keys::revoke_key`) get cleaned up immediately rather
+    // than waiting for the first `/_matrix/*` call that happens to touch
+    // them. The recurring hourly sweep is P14's job (plan §1.1, manager
+    // decision 3) — this is only the boot half.
+    if role == state::ServerRole::Control {
+        let cp = app_state.control_plane();
+        let now = chrono::Utc::now().to_rfc3339();
+        let identity_conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+        let mut messenger_conn = cp.messenger_conn();
+        let reaped = routes::matrix::auth::reap_expired_devices(&identity_conn, &mut messenger_conn, &cp.live, &now);
+        drop(messenger_conn);
+        drop(identity_conn);
+        if reaped > 0 {
+            tracing::info!("Reaped {} Matrix device(s) with a gone or expired credential at boot", reaped);
+        }
+    }
 
     // Start the Telegram login bot (background task) — control role only.
     // The bot calls db::confirm_tg_login_token synchronously via the closure,
@@ -873,6 +914,18 @@ async fn main() {
         .route("/health", axum::routing::get(health_handler))
         .with_state(app_state.clone());
 
+    // Matrix Client-Server API subset under `/_matrix` — control role only
+    // (see `routes::matrix`'s module doc; an edge process holds no
+    // `ControlPlane` to resolve a caller or a room against). P4 mounts only
+    // `GET /client/versions` and the `M_UNRECOGNIZED` fallback; later pieces
+    // add the rest of the endpoint table under this same nest. Cloned ahead
+    // of the `api_router` match below, which otherwise consumes `app_state`
+    // by value. Not yet layered with `ratelimit`/`no_store_api_headers` the
+    // way `api_router` is further down — that lands with the rest of the
+    // endpoint table (plan §6.2).
+    let matrix_router =
+        (role == state::ServerRole::Control).then(|| routes::matrix_api_router(app_state.clone()));
+
     // Assemble the full router. `/api` mounts the role-appropriate route
     // table — see `routes::control_api_router` / `routes::edge_api_router`.
     let api_router = match role {
@@ -904,6 +957,10 @@ async fn main() {
         // it is ever restored on disk by mistake, still cannot answer here.
         .route("/", axum::routing::get(redirect_to_app_root))
         .nest("/api", api_router);
+    let app = match matrix_router {
+        Some(matrix_router) => app.nest("/_matrix", matrix_router),
+        None => app,
+    };
     // Literal routes (`/blog/posts.json`, `/blog/feed.xml`, `/blog/`, and
     // `/health` below) always win over `outside_api`'s `/{dir}/{page}`
     // parameter route and its `ServeDir` fallback regardless of merge order

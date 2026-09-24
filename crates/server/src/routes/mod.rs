@@ -42,6 +42,7 @@ pub mod forum;
 pub mod forum_v2;
 pub mod heartbeat;
 pub mod link;
+pub mod matrix;
 pub mod notify;
 pub mod oauth;
 pub mod posts;
@@ -344,6 +345,16 @@ pub fn admin_api_router(state: Arc<AppState>) -> Router {
 /// db-shaped hole opened today.
 pub fn edge_api_router(_state: Arc<AppState>) -> Router {
     Router::new().route("/proxy/entitlement", get(proxy::entitlement))
+}
+
+/// Build the `/_matrix` sub-router for a control-role process — the Matrix
+/// Client-Server API subset (see `routes::matrix`'s module doc and
+/// `docs/mlc/plans/messenger-proto-server-matrix-subset-2026-09-24.md`).
+/// Mounted as `.nest("/_matrix", …)` in `main.rs`, a sibling of
+/// `.nest("/api", …)` — never called for an edge-role process, which holds
+/// no `ControlPlane` to resolve a caller or a room against.
+pub fn matrix_api_router(state: Arc<AppState>) -> Router {
+    matrix::router(state)
 }
 
 #[cfg(test)]

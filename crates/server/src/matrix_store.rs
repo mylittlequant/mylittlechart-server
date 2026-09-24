@@ -808,6 +808,69 @@ fn refresh_power_levels(tx: &Transaction, room_id: &str, content: &str) -> Resul
     Ok(())
 }
 
+// ============================================================================
+// Power levels (m.room.power_levels content) — plan §5, used by
+// `routes::matrix::auth`'s PowerCheck gate. Pure `serde_json::Value` logic,
+// no identity/messenger connection needed, hence living here (a lib-crate
+// module with no bin-crate dependency) rather than in the binary crate's own
+// `routes/matrix/auth.rs` alongside the rest of that module's caller/device
+// resolution.
+// ============================================================================
+
+/// An action `m.room.power_levels` gates by a named threshold field, plus
+/// `StateDefault` for "may send an otherwise-unlisted state event type".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerAction {
+    Invite,
+    Kick,
+    Ban,
+    Redact,
+    StateDefault,
+}
+
+impl PowerAction {
+    fn field_and_default(self) -> (&'static str, i64) {
+        match self {
+            PowerAction::Invite => ("invite", 50),
+            PowerAction::Kick => ("kick", 50),
+            PowerAction::Ban => ("ban", 50),
+            PowerAction::Redact => ("redact", 50),
+            PowerAction::StateDefault => ("state_default", 50),
+        }
+    }
+}
+
+/// `power_levels.users[mxid]`, falling back to `users_default` (Matrix
+/// default `0`) when either field is missing.
+pub fn user_level(power_levels: &serde_json::Value, mxid: &str) -> i64 {
+    power_levels
+        .get("users")
+        .and_then(|users| users.get(mxid))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| power_levels.get("users_default").and_then(serde_json::Value::as_i64).unwrap_or(0))
+}
+
+/// The power level required to send an event of `event_type`:
+/// `power_levels.events[event_type]` if present, else `state_default`
+/// (Matrix default `50`) for a state event or `events_default` (Matrix
+/// default `0`) for a timeline event.
+pub fn event_level(power_levels: &serde_json::Value, event_type: &str, is_state: bool) -> i64 {
+    if let Some(level) = power_levels.get("events").and_then(|events| events.get(event_type)).and_then(serde_json::Value::as_i64) {
+        return level;
+    }
+    let (key, default) = if is_state { ("state_default", 50) } else { ("events_default", 0) };
+    power_levels.get(key).and_then(serde_json::Value::as_i64).unwrap_or(default)
+}
+
+/// Whether `mxid`'s [`user_level`] reaches the threshold `action` names
+/// (falling back to the Matrix default when the corresponding field is
+/// missing — see [`PowerAction::field_and_default`]).
+pub fn can(power_levels: &serde_json::Value, action: PowerAction, mxid: &str) -> bool {
+    let (field, default) = action.field_and_default();
+    let required = power_levels.get(field).and_then(serde_json::Value::as_i64).unwrap_or(default);
+    user_level(power_levels, mxid) >= required
+}
+
 pub fn get_event(conn: &Connection, event_id: &str) -> rusqlite::Result<Option<MatrixEvent>> {
     conn.query_row(&format!("SELECT {EVENT_SELECT_COLUMNS} FROM events WHERE event_id = ?1"), params![event_id], event_from_row)
         .optional()
@@ -1788,5 +1851,30 @@ mod tests {
         insert_legacy_dm_message_map(&conn, 42, &event.event_id).expect("map insert");
         assert_eq!(legacy_dm_message_event_id(&conn, 42).expect("map get"), Some(event.event_id));
         assert_eq!(legacy_dm_message_event_id(&conn, 999).expect("missing"), None);
+    }
+
+    // ---- P4 test: power-level defaults ----
+
+    #[test]
+    fn power_level_defaults_apply_when_fields_missing() {
+        let pl = serde_json::json!({});
+        assert_eq!(user_level(&pl, "@nobody:mylittlechart.org"), 0, "users_default defaults to 0");
+        assert_eq!(event_level(&pl, "m.room.message", false), 0, "events_default defaults to 0");
+        assert_eq!(event_level(&pl, "m.room.name", true), 50, "state_default defaults to 50");
+        for action in [PowerAction::Invite, PowerAction::Kick, PowerAction::Ban, PowerAction::Redact, PowerAction::StateDefault] {
+            assert!(!can(&pl, action, "@nobody:mylittlechart.org"), "level 0 must not reach the default 50 threshold for {action:?}");
+        }
+
+        let pl_with_creator = serde_json::json!({ "users": { "@creator:mylittlechart.org": 100 } });
+        assert!(can(&pl_with_creator, PowerAction::Ban, "@creator:mylittlechart.org"));
+        assert!(can(&pl_with_creator, PowerAction::StateDefault, "@creator:mylittlechart.org"));
+    }
+
+    #[test]
+    fn event_level_uses_the_events_type_override_before_falling_back_to_a_default() {
+        let pl = serde_json::json!({ "events": { "m.room.name": 60 }, "events_default": 0, "state_default": 50 });
+        assert_eq!(event_level(&pl, "m.room.name", true), 60, "an explicit events[type] override wins");
+        assert_eq!(event_level(&pl, "m.room.topic", true), 50, "an unlisted state type falls back to state_default");
+        assert_eq!(event_level(&pl, "m.room.message", false), 0, "an unlisted timeline type falls back to events_default");
     }
 }

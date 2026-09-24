@@ -22,6 +22,7 @@ use crate::auth::{extract_session_id, extract_ua_hash};
 use crate::db::DeleteKeyOutcome;
 use crate::models::types::ErrorResponse;
 use crate::state::AppState;
+use mylittlechart_server::matrix_keys_store::CredentialKind;
 
 // ============================================================================
 // Cookie-only auth helper (intentionally stricter than sync's resolve_user_id)
@@ -176,9 +177,34 @@ pub async fn revoke_session(
             .into_response();
     }
 
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::revoke_key(&conn, user_id, &hash_prefix)
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<DeleteKeyOutcome> {
+        let cp = state.control_plane();
+        // Fetch the full hash before deleting — `revoke_key` only knows the
+        // LIKE prefix, but `matrix_keys_store.devices.credential_ref` is
+        // keyed on the full `token_hash` (plan §1.1), so this is the only
+        // chance to learn which Matrix device this credential minted.
+        let full_token_hash = {
+            let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+            crate::db::token_hash_for_prefix(&conn, user_id, &hash_prefix)?
+        };
+        let outcome = {
+            let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+            crate::db::revoke_key(&conn, user_id, &hash_prefix)?
+        };
+        // Strip the Matrix device this credential minted, if the revoke
+        // actually matched a unique row (plan §1.1's revoke hook) — a
+        // revoked native-app bearer token must not leave a live device
+        // peers keep encrypting room keys to.
+        if outcome == DeleteKeyOutcome::Ok {
+            if let Some(token_hash) = full_token_hash {
+                let now = chrono::Utc::now().to_rfc3339();
+                let mut messenger = cp.messenger_conn();
+                if let Err(e) = crate::routes::matrix::auth::on_credential_revoked(&mut messenger, &cp.live, CredentialKind::Bearer, &token_hash, &now) {
+                    tracing::error!("Failed to revoke the Matrix device for a revoked session: {}", e);
+                }
+            }
+        }
+        Ok(outcome)
     })
     .await;
 
@@ -366,6 +392,40 @@ pub async fn delete_account(
 
     let result = tokio::task::spawn_blocking(move || {
         let cp = state.control_plane();
+
+        // Strip every Matrix device this account's credentials ever minted
+        // BEFORE the identity-side delete below removes the
+        // `auth_tokens`/`web_sessions` rows (plan §1.1) — once those rows are
+        // gone, there is nothing left here to enumerate.
+        let now = chrono::Utc::now().to_rfc3339();
+        let (bearer_hashes, web_session_ids) = {
+            let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+            (crate::db::all_token_hashes_for_user(&conn, user_id), crate::db::all_web_session_ids_for_user(&conn, user_id))
+        };
+        {
+            let mut messenger = cp.messenger_conn();
+            match bearer_hashes {
+                Ok(hashes) => {
+                    for token_hash in hashes {
+                        if let Err(e) = crate::routes::matrix::auth::on_credential_revoked(&mut messenger, &cp.live, CredentialKind::Bearer, &token_hash, &now) {
+                            tracing::error!("Failed to revoke a Matrix device before account delete: {}", e);
+                        }
+                    }
+                }
+                Err(e) => tracing::error!("Failed to list bearer credentials before account delete: {}", e),
+            }
+            match web_session_ids {
+                Ok(ids) => {
+                    for session_id in ids {
+                        if let Err(e) = crate::routes::matrix::auth::on_credential_revoked(&mut messenger, &cp.live, CredentialKind::Web, &session_id, &now) {
+                            tracing::error!("Failed to revoke a Matrix device before account delete: {}", e);
+                        }
+                    }
+                }
+                Err(e) => tracing::error!("Failed to list web-session credentials before account delete: {}", e),
+            }
+        }
+
         let outcome = {
             let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
             crate::db::delete_account(&conn, user_id)

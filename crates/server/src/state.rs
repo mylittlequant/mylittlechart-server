@@ -90,6 +90,17 @@ pub struct ControlPlane {
     /// blocking-mutex idiom as `db` — reach it through [`ControlPlane::social_conn`].
     pub social: Mutex<rusqlite::Connection>,
 
+    /// Matrix-shaped messenger connection: `messenger.db`, the Matrix
+    /// Client-Server API subset's own store (rooms/events/state/members —
+    /// `mylittlechart_server::matrix_store` — plus devices/keys/backup —
+    /// `mylittlechart_server::matrix_keys_store`). Same key as `db`/`social`
+    /// above, its own file, opened by `matrix_store::init_messenger_db` right
+    /// after `social` in `main.rs` — see
+    /// `docs/mlc/plans/messenger-proto-server-matrix-subset-2026-09-24.md`
+    /// §6.2. One writer, same blocking-mutex idiom as `db`/`social` — reach
+    /// it through [`ControlPlane::messenger_conn`].
+    pub messenger: Mutex<rusqlite::Connection>,
+
     /// The only writer for the operational database, running on its own OS
     /// thread (see `opswriter.rs`).
     ///
@@ -152,6 +163,14 @@ impl ControlPlane {
     /// every call site.
     pub fn social_conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         self.social.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lock and return the messenger connection (see the `messenger` field's
+    /// doc comment) — the accessor `routes::matrix::*` uses instead of
+    /// spelling out `.messenger.lock().unwrap_or_else(|e| e.into_inner())` at
+    /// every call site.
+    pub fn messenger_conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.messenger.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A cloned snapshot of the reserved-nick cache (see the field's doc
