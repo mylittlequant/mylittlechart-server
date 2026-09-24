@@ -783,6 +783,52 @@ pub fn insert_timeline_event(
     Ok(event)
 }
 
+/// What [`insert_timeline_event_deduped`]/[`redact_event_deduped`] found: a
+/// brand-new write, or the SAME event a prior submission of this
+/// `(user, device, txn_id)` already produced (plan §4 `send`/`redact` rows:
+/// "idempotent per (user, device, txn_id): a repeat returns the SAME
+/// event_id with no second insert").
+#[derive(Debug, Clone, PartialEq)]
+pub enum DedupedWrite {
+    New(MatrixEvent),
+    Existing(MatrixEvent),
+}
+
+/// [`insert_timeline_event`], but dedup-checked and recorded in the SAME
+/// transaction as the insert (P6 binding rule) — a repeat of
+/// `(sender_user_id, device_id, txn_id)` returns the ORIGINAL event without a
+/// second `events` row, and this is race-free even under a hypothetical
+/// second writer (never actually possible under this module's single-writer
+/// discipline) because the lookup, the insert, and the dedup record all
+/// commit or roll back together. `txn_dedup_lookup`/`txn_dedup_record` take
+/// `&Connection`; passing `&tx` (a `Transaction`) works via `Deref` — see
+/// `apply_state_event_in_tx`'s own sibling functions for the same pattern.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_timeline_event_deduped(
+    conn: &mut Connection,
+    device_id: &str,
+    txn_id: &str,
+    event_id: &str,
+    room_id: &str,
+    sender_user_id: i64,
+    event_type: &str,
+    content: &str,
+    origin_server_ts: i64,
+    now: &str,
+) -> Result<DedupedWrite, MatrixStoreError> {
+    let tx = conn.transaction()?;
+    if let TxnDedupEntry::Seen(existing_event_id) = txn_dedup_lookup(&tx, sender_user_id, device_id, txn_id)? {
+        let existing_event_id = existing_event_id.ok_or_else(|| MatrixStoreError::UnknownEventId(txn_id.to_string()))?;
+        let event = get_event(&tx, &existing_event_id)?.ok_or_else(|| MatrixStoreError::UnknownEventId(existing_event_id.clone()))?;
+        tx.commit()?;
+        return Ok(DedupedWrite::Existing(event));
+    }
+    let event = insert_timeline_event_in_tx(&tx, event_id, room_id, sender_user_id, event_type, content, origin_server_ts, Some(txn_id))?;
+    txn_dedup_record(&tx, sender_user_id, device_id, txn_id, Some(event_id), now)?;
+    tx.commit()?;
+    Ok(DedupedWrite::New(event))
+}
+
 /// The shared core of [`apply_state_event`] and the P5 batch entry point
 /// [`create_room_with_state`] — every bootstrap state event a room creation
 /// inserts (`m.room.create`, both `m.room.member`s, `m.room.power_levels`,
@@ -1382,6 +1428,41 @@ fn populate_relations(tx: &Transaction, event_id: &str, room_id: &str, sender_us
     Ok(())
 }
 
+/// Every event related to `target_event_id`, newest-first (Matrix's own
+/// default order for `GET /relations`), optionally narrowed to one
+/// `rel_type` and/or one `event_type`, strictly before `before_stream`
+/// (pass [`i64::MAX`] for a first page), capped at `limit` — P6's
+/// `routes::matrix::messaging::get_relations`.
+pub fn relations_of(
+    conn: &Connection,
+    target_event_id: &str,
+    rel_type: Option<&str>,
+    event_type: Option<&str>,
+    before_stream: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<MatrixEvent>> {
+    // Anonymous `?` placeholders (not `?N`) — purely positional, so building
+    // the SQL text and the bound-value list in the SAME order below can
+    // never desync the way explicit numbered placeholders would if a
+    // variant's text skipped a number.
+    let mut sql = format!("SELECT {EVENT_SELECT_COLUMNS_ALIASED} FROM relations r JOIN events e ON e.event_id = r.event_id WHERE r.target_id = ? AND e.stream_id < ?");
+    let mut values: Vec<&dyn rusqlite::ToSql> = vec![&target_event_id, &before_stream];
+    if let Some(rt) = &rel_type {
+        sql.push_str(" AND r.rel_type = ?");
+        values.push(rt);
+    }
+    if let Some(et) = &event_type {
+        sql.push_str(" AND e.event_type = ?");
+        values.push(et);
+    }
+    sql.push_str(" ORDER BY e.stream_id DESC LIMIT ?");
+    values.push(&limit);
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(values.as_slice())?;
+    collect_events(&mut rows)
+}
+
 // ============================================================================
 // Redaction (room v11 content allow-list)
 // ============================================================================
@@ -1470,8 +1551,8 @@ fn redact_content_per_v11(event_type: &str, content: &str) -> Result<String, Mat
 ///   current state. This server's rule is that encryption never turns off
 ///   once set (`rooms.is_encrypted`'s own doc comment says the same), so
 ///   the event that turned it on must never become redactable.
-pub fn redact_event(
-    conn: &mut Connection,
+fn redact_event_in_tx(
+    tx: &Transaction,
     room_id: &str,
     target_event_id: &str,
     redaction_event_id: &str,
@@ -1479,8 +1560,6 @@ pub fn redact_event(
     reason: Option<&str>,
     origin_server_ts: i64,
 ) -> Result<MatrixEvent, MatrixStoreError> {
-    let tx = conn.transaction()?;
-
     let target: Option<(String, String, String)> = tx
         .query_row(
             "SELECT event_type, content, room_id FROM events WHERE event_id = ?1",
@@ -1496,7 +1575,7 @@ pub fn redact_event(
         return Err(MatrixStoreError::UnredactableEvent(target_type));
     }
 
-    let stream_id = next_stream_id(&tx)?;
+    let stream_id = next_stream_id(tx)?;
     let redaction_content = match reason {
         Some(r) => serde_json::json!({ "reason": r }).to_string(),
         None => "{}".to_string(),
@@ -1513,7 +1592,6 @@ pub fn redact_event(
         params![stripped_content, redaction_event_id, target_event_id],
     )?;
 
-    tx.commit()?;
     Ok(MatrixEvent {
         stream_id,
         event_id: redaction_event_id.to_string(),
@@ -1527,6 +1605,51 @@ pub fn redact_event(
         redacts: Some(target_event_id.to_string()),
         redacted_by: None,
     })
+}
+
+pub fn redact_event(
+    conn: &mut Connection,
+    room_id: &str,
+    target_event_id: &str,
+    redaction_event_id: &str,
+    sender_user_id: i64,
+    reason: Option<&str>,
+    origin_server_ts: i64,
+) -> Result<MatrixEvent, MatrixStoreError> {
+    let tx = conn.transaction()?;
+    let event = redact_event_in_tx(&tx, room_id, target_event_id, redaction_event_id, sender_user_id, reason, origin_server_ts)?;
+    tx.commit()?;
+    Ok(event)
+}
+
+/// [`redact_event`], but dedup-checked and recorded in the SAME transaction
+/// as the redaction (P6 binding rule, mirroring
+/// [`insert_timeline_event_deduped`] — see its own doc for the race-freedom
+/// argument).
+#[allow(clippy::too_many_arguments)]
+pub fn redact_event_deduped(
+    conn: &mut Connection,
+    device_id: &str,
+    txn_id: &str,
+    room_id: &str,
+    target_event_id: &str,
+    redaction_event_id: &str,
+    sender_user_id: i64,
+    reason: Option<&str>,
+    origin_server_ts: i64,
+    now: &str,
+) -> Result<DedupedWrite, MatrixStoreError> {
+    let tx = conn.transaction()?;
+    if let TxnDedupEntry::Seen(existing_event_id) = txn_dedup_lookup(&tx, sender_user_id, device_id, txn_id)? {
+        let existing_event_id = existing_event_id.ok_or_else(|| MatrixStoreError::UnknownEventId(txn_id.to_string()))?;
+        let event = get_event(&tx, &existing_event_id)?.ok_or_else(|| MatrixStoreError::UnknownEventId(existing_event_id.clone()))?;
+        tx.commit()?;
+        return Ok(DedupedWrite::Existing(event));
+    }
+    let event = redact_event_in_tx(&tx, room_id, target_event_id, redaction_event_id, sender_user_id, reason, origin_server_ts)?;
+    txn_dedup_record(&tx, sender_user_id, device_id, txn_id, Some(redaction_event_id), now)?;
+    tx.commit()?;
+    Ok(DedupedWrite::New(event))
 }
 
 // ============================================================================
@@ -1614,6 +1737,110 @@ pub fn rooms_for_user(conn: &Connection, user_id: i64, membership: Option<Member
             let rows = stmt.query_map(params![user_id], |row| row.get(0))?;
             rows.collect()
         }
+    }
+}
+
+/// Timeline (non-state, non-redaction) events `sender_user_id` has sent into
+/// any PRIVATE room (`join_rule = 'invite'`) with `origin_server_ts >=
+/// since_ms` — `routes::matrix::messaging`'s per-sender daily send-rate
+/// counter (plan §3.8: "mirroring `DM_MESSAGE_DAILY_LIMIT`... own copy of
+/// the constant" — the constant itself lives in the route module per this
+/// codebase's convention; this function is only the count query, since raw
+/// SQL against `events`/`rooms` stays inside this module). State events
+/// (`state_key IS NOT NULL`, sent via `/state`) and redactions are excluded
+/// — this counts actual message-shaped sends, not every write a sender
+/// makes.
+pub fn private_room_messages_sent_since(conn: &Connection, sender_user_id: i64, since_ms: i64) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM events e JOIN rooms r ON r.id = e.room_id
+         WHERE e.sender_user_id = ?1 AND e.state_key IS NULL AND e.event_type != 'm.room.redaction'
+           AND e.origin_server_ts >= ?2 AND r.join_rule = 'invite'",
+        params![sender_user_id, since_ms],
+        |row| row.get(0),
+    )
+}
+
+/// How many `(user_id, device_id)` sends/redacts were recorded since `since`
+/// (an RFC-3339 timestamp, compared as a plain string against `created_at`
+/// values this server ALWAYS writes in that same shape — safe without the
+/// `datetime()` normalization `lookup_web_credential`'s own doc warns about,
+/// which is specifically about comparing against SQLite's own `datetime()`
+/// output, a different textual shape) — `routes::matrix::messaging`'s
+/// short-window burst-rate counter (plan §3.8: "20 events / 10s per
+/// device"). Reads `txn_dedup`, the one table that already carries a
+/// per-DEVICE identity for a write (`events` itself has no `device_id`
+/// column).
+pub fn txn_dedup_count_since(conn: &Connection, user_id: i64, device_id: &str, since: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM txn_dedup WHERE user_id = ?1 AND device_id = ?2 AND created_at >= ?3",
+        params![user_id, device_id, since],
+        |row| row.get(0),
+    )
+}
+
+// ============================================================================
+// History visibility (P6 binding rule, shared by `/messages`, `/event`,
+// `/relations`, and exported for P10's `/sync`)
+// ============================================================================
+
+/// How much of a room's timeline a caller may read, per
+/// [`visible_upper_bound`]. `UpTo` is INCLUSIVE (a caller who left the room
+/// still sees the `m.room.member` leave event itself, since that is the last
+/// event they witnessed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryWindow {
+    /// No read access to this room's timeline at all.
+    Nothing,
+    /// Every event, unbounded.
+    All,
+    /// Every event with `stream_id <= this`.
+    UpTo(i64),
+}
+
+impl HistoryWindow {
+    pub fn contains(self, stream_id: i64) -> bool {
+        match self {
+            HistoryWindow::Nothing => false,
+            HistoryWindow::All => true,
+            HistoryWindow::UpTo(upto) => stream_id <= upto,
+        }
+    }
+}
+
+/// The history-visibility rule every timeline-reading route enforces
+/// (`routes::matrix::messaging`'s `/messages`, `/event`, `/relations`; P10's
+/// `/sync` reuses this too):
+///
+/// - `world_readable`: ANY signed-in caller sees the WHOLE timeline
+///   ([`HistoryWindow::All`]), regardless of their own membership — this is
+///   the one case where a caller who was never a member of the room at all
+///   still reads it.
+/// - Every other `history_visibility` value (`shared`, and this server's
+///   simplified handling of `invited`/`joined` — v1 does not implement their
+///   finer per-event lower bound, see the module doc): a currently `join`ed
+///   member sees the whole timeline ([`HistoryWindow::All`]); a member whose
+///   CURRENT membership is `leave`/`ban` sees only up to the stream position
+///   of that leave/ban event itself ([`HistoryWindow::UpTo`], read off the
+///   `m.room.member` state event's own `stream_id` — it is, by definition,
+///   the LATEST such event for that member, since that is what "current
+///   membership" means); anyone else (never touched this room's membership
+///   at all, or is merely `invite`d without ever having joined) sees
+///   [`HistoryWindow::Nothing`].
+pub fn visible_upper_bound(conn: &Connection, room: &Room, caller_user_id: i64) -> Result<HistoryWindow, MatrixStoreError> {
+    if room.history_visibility == HistoryVisibility::WorldReadable {
+        return Ok(HistoryWindow::All);
+    }
+    let Some(mxid) = mxid_of(conn, caller_user_id)? else {
+        return Ok(HistoryWindow::Nothing);
+    };
+    let Some(member_event) = current_state_event(conn, &room.id, "m.room.member", &mxid)? else {
+        return Ok(HistoryWindow::Nothing);
+    };
+    let content: serde_json::Value = serde_json::from_str(&member_event.content)?;
+    match content.get("membership").and_then(|v| v.as_str()) {
+        Some("join") => Ok(HistoryWindow::All),
+        Some("leave") | Some("ban") => Ok(HistoryWindow::UpTo(member_event.stream_id)),
+        _ => Ok(HistoryWindow::Nothing),
     }
 }
 
@@ -1820,6 +2047,22 @@ pub fn txn_dedup_record(conn: &Connection, user_id: i64, device_id: &str, txn_id
         params![user_id, device_id, txn_id, event_id, now],
     )?;
     Ok(())
+}
+
+/// The `txn_id` `(user_id, device_id)` used to produce `event_id`, if any —
+/// [`client_event_json`](crate::routes::matrix::client_event_json)'s
+/// `unsigned.transaction_id`, which Matrix reveals ONLY to the same device
+/// that sent the event, never to any other viewer (including the sender's
+/// OTHER devices). A miss (`None`) is the overwhelmingly common case (every
+/// event not authored by this exact device on this exact send) and costs a
+/// single indexed `txn_dedup` primary-key lookup.
+pub fn txn_id_for_event(conn: &Connection, user_id: i64, device_id: &str, event_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT txn_id FROM txn_dedup WHERE user_id = ?1 AND device_id = ?2 AND event_id = ?3",
+        params![user_id, device_id, event_id],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 // ============================================================================

@@ -344,8 +344,10 @@ fn require_pub_read(conn: &Connection, room: &Room, user_id: i64) -> Result<(), 
 
 /// Every user id currently `join`ed OR `invite`d in `room_id` — the wake
 /// fan-out set for a write that affects the whole room (plan §3.1/§4:
-/// "wakes every joined AND invited member").
-fn member_and_invited_ids(conn: &Connection, room_id: &str) -> rusqlite::Result<HashSet<i64>> {
+/// "wakes every joined AND invited member"). `pub(super)` so
+/// `routes::matrix::messaging` (P6) reuses the SAME wake-set computation
+/// rather than a second copy — see that module's own doc.
+pub(super) fn member_and_invited_ids(conn: &Connection, room_id: &str) -> rusqlite::Result<HashSet<i64>> {
     let mut ids = HashSet::new();
     for member in matrix_store::room_members(conn, room_id, Some(Membership::Join))? {
         ids.insert(member.user_id);

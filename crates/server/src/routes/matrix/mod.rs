@@ -20,13 +20,14 @@
 //! merges [`rooms::routes`] in before that fallback. Every other endpoint in
 //! the plan's §4 table is a later piece (P6-P11).
 //!
-//! `MatrixError::not_json`/`::limit_exceeded` are deliberately NOT built yet
-//! (`retry_after_ms`/a not-JSON errcode have no caller until a body-parsing
-//! or rate-limit-integration piece needs them) — `-D warnings`' dead-code
-//! lint flags a pub constructor with zero callers anywhere in this binary
-//! crate (unlike a library crate's pub API, exempt by design; see
-//! `lib.rs`'s own module doc for the same rule applied to `live`). Add them
-//! back the moment a real call site exists.
+//! `MatrixError::not_json` is deliberately NOT built yet (a not-JSON errcode
+//! has no caller until a body-parsing piece needs it) — `-D warnings`'
+//! dead-code lint flags a pub constructor with zero callers anywhere in this
+//! binary crate (unlike a library crate's pub API, exempt by design; see
+//! `lib.rs`'s own module doc for the same rule applied to `live`). Add it
+//! back the moment a real call site exists. `::limit_exceeded` (below) is no
+//! longer in that category — P6's send-rate limits (plan §3.8) are its first
+//! caller.
 
 use std::sync::Arc;
 
@@ -38,6 +39,7 @@ use axum::{Json, Router};
 use crate::state::AppState;
 
 pub mod auth;
+mod messaging;
 mod rooms;
 
 /// This deployment's one supported Client-Server API version (plan §1,
@@ -115,6 +117,13 @@ impl MatrixError {
     /// mapping of [`mylittlechart_server::matrix_store::MatrixStoreError::DuplicateAnnotation`]).
     pub fn duplicate_annotation() -> Self {
         Self::new(StatusCode::BAD_REQUEST, "M_DUPLICATE_ANNOTATION", "Already reacted with this key")
+    }
+
+    /// `M_LIMIT_EXCEEDED` (429) — the caller is rate-limited; `retry_after_ms`
+    /// tells them how long to back off (plan §3.8: P6's own per-sender
+    /// daily/burst send caps are this constructor's first caller).
+    pub fn limit_exceeded(retry_after_ms: u64) -> Self {
+        Self { retry_after_ms: Some(retry_after_ms), ..Self::new(StatusCode::TOO_MANY_REQUESTS, "M_LIMIT_EXCEEDED", "Too many requests") }
     }
 
     /// `M_UNKNOWN` (500) — an internal failure with no more specific Matrix
@@ -324,13 +333,15 @@ async fn matrix_unrecognized() -> MatrixError {
 /// Build the `/_matrix` sub-router — nested at that prefix by `main.rs`
 /// (`.nest("/_matrix", …)`, mirroring how `control_api_router` is nested at
 /// `/api`). P4: `GET /client/versions`, `GET /client/v3/capabilities`, and
-/// the `M_UNRECOGNIZED` fallback; P5-P11 add the rest of plan §4's endpoint
-/// table here.
+/// the `M_UNRECOGNIZED` fallback; P5 ([`rooms`]) adds room/membership/state
+/// routes; P6 ([`messaging`]) adds send/messages/event/redact/relations;
+/// P7-P11 add the rest of plan §4's endpoint table here.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/client/versions", get(versions))
         .route("/client/v3/capabilities", get(capabilities))
         .merge(rooms::routes())
+        .merge(messaging::routes())
         .fallback(matrix_unrecognized)
         .with_state(state)
 }
