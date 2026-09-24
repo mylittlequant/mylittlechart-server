@@ -842,17 +842,32 @@ async fn main() {
         });
     }
 
-    // Matrix typing-indicator expiry sweep (plan §3.6), control role only —
-    // P7's own minimal wiring of `routes::matrix::ephemeral::
-    // wake_rooms_with_expired_typing` (a real periodic tick is what that
-    // function's own doc calls "P14's job"; P14 may retune the interval or
-    // relocate this once the rest of the boot-wiring piece lands, but the
-    // function needs a real caller from the moment it exists — see that
-    // module's own doc on why an uncalled `pub fn` cannot land on its own in
-    // this binary crate). A short interval matters here: a client's own
-    // typing timeout is commonly a few seconds, so a slow sweep would leave
-    // a stale "still typing" indicator visible to peers well past when the
-    // typer actually stopped.
+    // Matrix background sweeps (P14, final cadences — plan §1.1 manager
+    // decision 3 and §3.6): two independent periodic tasks, each control
+    // role only (both reach into `ControlPlane`), each logging ONLY when it
+    // actually changed something (a line per tick would be pure noise for an
+    // idle server — this codebase's own "log state changes, not ticks"
+    // convention, matched by the 12-hour cleanup task above).
+    //
+    // - Typing expiry, every 5s (`routes::matrix::ephemeral::
+    //   wake_rooms_with_expired_typing`, plan §3.6): a client's own typing
+    //   timeout is commonly a few seconds, so anything slower would leave a
+    //   stale "still typing" indicator visible to peers well past when the
+    //   typer actually stopped. Cheap regardless of cadence — it only
+    //   touches the in-memory `TypingRegistry`, no database read.
+    // - Expired-device reap, hourly (`routes::matrix::auth::
+    //   reap_expired_devices`, plan §1.1 manager decision 3): the boot-time
+    //   reap above only catches a credential that was ALREADY gone or
+    //   expired at startup; this is the backstop for one that ages past its
+    //   own `expires_at` mid-run without its holder ever making another
+    //   `/_matrix/*` call to trigger `resolve_bearer_credential`'s/
+    //   `resolve_web_credential`'s own opportunistic revoke on next use. An
+    //   hour is coarse on purpose (unlike typing, a stale device only costs
+    //   peers a wasted Megolm share until the next sweep, not a visibly
+    //   wrong UI state), and it does a real database scan
+    //   (`valid_bearer_token_hashes`/`valid_web_credential_refs` against
+    //   every device row), so a tighter interval would just be needless
+    //   load for no user-visible benefit.
     if role == state::ServerRole::Control {
         let state = app_state.clone();
         tokio::spawn(async move {
@@ -860,6 +875,32 @@ async fn main() {
             loop {
                 interval.tick().await;
                 routes::matrix::ephemeral::wake_rooms_with_expired_typing(&state, std::time::Instant::now()).await;
+            }
+        });
+    }
+    if role == state::ServerRole::Control {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+            // The boot-time reap above already ran once; skip `interval`'s
+            // own immediate first tick so this task's first real sweep
+            // lands an hour later, not right away.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let state = state.clone();
+                let reaped = tokio::task::spawn_blocking(move || {
+                    let cp = state.control_plane();
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let identity_conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut messenger_conn = cp.messenger_conn();
+                    routes::matrix::auth::reap_expired_devices(&identity_conn, &mut messenger_conn, &cp.live, &now)
+                })
+                .await
+                .unwrap_or(0);
+                if reaped > 0 {
+                    tracing::info!("Matrix device reap (hourly sweep): {} device(s) with a gone or expired credential", reaped);
+                }
             }
         });
     }
@@ -975,13 +1016,14 @@ async fn main() {
 
     // Matrix Client-Server API subset under `/_matrix` — control role only
     // (see `routes::matrix`'s module doc; an edge process holds no
-    // `ControlPlane` to resolve a caller or a room against). P4 mounts only
-    // `GET /client/versions` and the `M_UNRECOGNIZED` fallback; later pieces
-    // add the rest of the endpoint table under this same nest. Cloned ahead
+    // `ControlPlane` to resolve a caller or a room against). Carries the
+    // full plan §4 endpoint table (P4-P13 landed it); P14's own job here is
+    // only the boot wiring below — layering it with the SAME
+    // `ratelimit`/`no_store_api_headers` pair `api_router` gets (plan §6.2),
+    // so `/_matrix/*` is neither unthrottled per-IP nor cacheable by an
+    // intermediary, the same invariant `/api/*` already holds. Cloned ahead
     // of the `api_router` match below, which otherwise consumes `app_state`
-    // by value. Not yet layered with `ratelimit`/`no_store_api_headers` the
-    // way `api_router` is further down — that lands with the rest of the
-    // endpoint table (plan §6.2).
+    // by value.
     let matrix_router =
         (role == state::ServerRole::Control).then(|| routes::matrix_api_router(app_state.clone()));
 
@@ -1003,13 +1045,24 @@ async fn main() {
     // does: without this ordering, a rate-limited response would skip
     // `no_store_api_headers` entirely and reach the caller without
     // `cache-control: no-store` — the one thing this ordering exists to
-    // prevent.
+    // prevent. `matrix_router` shares this SAME limiter (one per-IP bucket
+    // set across both `/api` and `/_matrix`, not two independent ones — both
+    // surfaces answer the same caller population) and gets the identical
+    // two-layer stack, same ordering, for the same reason.
     let api_router = api_router
         .layer(axum::middleware::from_fn_with_state(
-            rate_limiter,
+            rate_limiter.clone(),
             ratelimit::rate_limit_middleware,
         ))
         .layer(axum::middleware::from_fn(no_store_api_headers));
+    let matrix_router = matrix_router.map(|router| {
+        router
+            .layer(axum::middleware::from_fn_with_state(
+                rate_limiter,
+                ratelimit::rate_limit_middleware,
+            ))
+            .layer(axum::middleware::from_fn(no_store_api_headers))
+    });
     let app = axum::Router::new()
         // Root redirect (see redirect_to_app_root's doc comment) — ahead of
         // the static fallback so the deleted landing page's index.html, if

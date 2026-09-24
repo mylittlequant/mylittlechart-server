@@ -362,9 +362,16 @@ async fn post_read_markers(
 /// its joined+invited member set. Split out from the `spawn_blocking`
 /// wrapper below so it is unit-tested against a plain `Connection` +
 /// [`live::TypingRegistry`], no `AppState`/`ControlPlane` involved at all —
-/// this module's own "testable cores" convention.
-fn expired_typing_wake_ids(conn: &Connection, typing_registry: &live::TypingRegistry, now: Instant) -> HashSet<i64> {
+/// this module's own "testable cores" convention. Returns the number of
+/// rooms that had an expired typing flag cleared alongside the wake set —
+/// [`wake_rooms_with_expired_typing`]'s own caller (`main.rs`'s periodic
+/// tick) logs that count, never a line per tick, so this is the one place
+/// that count is actually known (`rooms_with_expired_typing` itself is
+/// stateful — calling it a second time to recover the count would not see
+/// the same rooms again).
+fn expired_typing_wake_ids(conn: &Connection, typing_registry: &live::TypingRegistry, now: Instant) -> (usize, HashSet<i64>) {
     let expired_rooms = typing_registry.rooms_with_expired_typing(now);
+    let room_count = expired_rooms.len();
     let mut ids = HashSet::new();
     for room_id in expired_rooms {
         match super::rooms::member_and_invited_ids(conn, &room_id) {
@@ -372,7 +379,7 @@ fn expired_typing_wake_ids(conn: &Connection, typing_registry: &live::TypingRegi
             Err(e) => tracing::error!("expired_typing_wake_ids: failed to list members of {}: {}", room_id, e),
         }
     }
-    ids
+    (room_count, ids)
 }
 
 /// Sweep every room whose typing state has timed out and wake its
@@ -382,11 +389,14 @@ fn expired_typing_wake_ids(conn: &Connection, typing_registry: &live::TypingRegi
 /// sweep, a peer's typing indicator would stay stuck on for anyone currently
 /// blocked in a long poll (see [`live::TypingRegistry::
 /// rooms_with_expired_typing`]'s own doc). P14 schedules this on a periodic
-/// tick; P10's own `/sync` handler may also call it opportunistically on
-/// every request.
+/// 5s tick (`main.rs`); P10's own `/sync` handler may also call it
+/// opportunistically on every request. Logs only when at least one room
+/// actually had its typing state change (`main.rs`'s own "state changes,
+/// never a line per tick" convention) — an idle server produces no log
+/// output from this sweep at all.
 pub async fn wake_rooms_with_expired_typing(state: &Arc<AppState>, now: Instant) {
     let state_for_blocking = state.clone();
-    let wake_ids = tokio::task::spawn_blocking(move || -> HashSet<i64> {
+    let (room_count, wake_ids) = tokio::task::spawn_blocking(move || -> (usize, HashSet<i64>) {
         let cp = state_for_blocking.control_plane();
         let messenger_conn = cp.messenger_conn();
         expired_typing_wake_ids(&messenger_conn, &cp.typing, now)
@@ -396,6 +406,9 @@ pub async fn wake_rooms_with_expired_typing(state: &Arc<AppState>, now: Instant)
 
     if !wake_ids.is_empty() {
         state.control_plane().live.wake_many(wake_ids.into_iter().map(|id| format!("user:{id}")));
+    }
+    if room_count > 0 {
+        tracing::info!("Typing sweep: {} room(s) had an expired typing indicator cleared", room_count);
     }
 }
 
@@ -597,11 +610,13 @@ mod tests {
         let t0 = Instant::now();
         assert!(typing.set_typing(ROOM, 1, true, 100, t0));
 
-        let ids = expired_typing_wake_ids(&conn, &typing, t0 + Duration::from_millis(500));
+        let (room_count, ids) = expired_typing_wake_ids(&conn, &typing, t0 + Duration::from_millis(500));
+        assert_eq!(room_count, 1, "exactly one room had its typing state expire");
         assert_eq!(ids, HashSet::from([1, 2]), "every joined member of the expired room must be woken");
 
         // A second sweep with nothing newly expired reports nothing.
-        let ids_again = expired_typing_wake_ids(&conn, &typing, t0 + Duration::from_millis(600));
+        let (room_count_again, ids_again) = expired_typing_wake_ids(&conn, &typing, t0 + Duration::from_millis(600));
+        assert_eq!(room_count_again, 0, "a room with no NEWLY expired typing flag must not be reported again");
         assert!(ids_again.is_empty(), "a room with no NEWLY expired typing flag must not be reported again");
     }
 
@@ -609,6 +624,8 @@ mod tests {
     fn expired_typing_wake_ids_is_empty_when_nothing_is_typing() {
         let conn = test_conn();
         let typing = live::TypingRegistry::new();
-        assert!(expired_typing_wake_ids(&conn, &typing, Instant::now()).is_empty());
+        let (room_count, ids) = expired_typing_wake_ids(&conn, &typing, Instant::now());
+        assert_eq!(room_count, 0);
+        assert!(ids.is_empty());
     }
 }
