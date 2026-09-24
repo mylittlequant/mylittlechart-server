@@ -95,6 +95,7 @@ mod build_attest;
 mod db;
 mod dm_db;
 mod entitlements;
+mod matrix_migration;
 // `live` lives in the library target (`lib.rs`), not here — see that
 // file's doc comment for why.
 mod models;
@@ -521,7 +522,7 @@ async fn main() {
             // versions` and its `M_UNRECOGNIZED` fallback (see
             // `routes::matrix_api_router`, nested further down).
             let messenger_db_path = format!("{}/messenger.db", data_dir);
-            let messenger_conn =
+            let mut messenger_conn =
                 match mylittlechart_server::matrix_store::init_messenger_db(&messenger_db_path, &key_hex) {
                     Ok(conn) => conn,
                     Err(e) => {
@@ -530,6 +531,34 @@ async fn main() {
                     }
                 };
             tracing::info!("Messenger database initialized at {}", messenger_db_path);
+
+            // Legacy 1:1 DM migration (P12, plan §7) — boot-time, idempotent:
+            // reads `social.db`'s `dm_conversations`/`dm_messages`/
+            // `dm_identity_keys` (never writes to them) and creates the
+            // Matrix DM rooms/events/receipts/`m.direct` hints they are
+            // missing. Runs BEFORE `ControlPlane` exists, on the plain
+            // connections above, same as every other one-time boot migration
+            // in this file (`db::migrate_legacy_ops_tables`). A failure
+            // reading the conversation list itself is fatal (mirrors every
+            // other `init_*_db` failure above); a failure migrating any ONE
+            // conversation is logged by `migrate_legacy_dms` itself and does
+            // not stop boot.
+            let migration_now = chrono::Utc::now().to_rfc3339();
+            match matrix_migration::migrate_legacy_dms(&mut messenger_conn, &social_conn, &db_conn, &migration_now) {
+                Ok(report) => {
+                    if report.conversations_skipped > 0 {
+                        tracing::warn!(
+                            "Legacy DM migration skipped {} conversation(s): {:?}",
+                            report.conversations_skipped,
+                            report.skipped
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Legacy DM migration failed to read social.db: {}", e);
+                    std::process::exit(1);
+                }
+            }
 
             // Initialize the operational database (plain SQLite, no key wait —
             // see state::ControlPlane::ops_db). Then run the one-time move of

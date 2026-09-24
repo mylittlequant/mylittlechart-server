@@ -48,7 +48,12 @@ pub mod auth;
 pub mod ephemeral;
 mod keys;
 mod messaging;
-mod rooms;
+// `pub(crate)`, not `mod` — the binary crate's own `matrix_migration` module
+// (a sibling of `routes`, outside this `matrix` module tree) reuses this
+// module's `power_levels_content`/`room_kind_settings`/`invite_power_level`/
+// `state_event`/`dm_pair_key` so a migrated DM room's bootstrap state is
+// built by the exact same code a native `createRoom` call uses (P12 scope).
+pub(crate) mod rooms;
 mod sync;
 mod sync_token;
 

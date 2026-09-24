@@ -663,6 +663,15 @@ pub fn room_by_dm_pair_key(conn: &Connection, pair_key: &str) -> rusqlite::Resul
         .optional()
 }
 
+/// The room already migrated from `dm_conversations.id = legacy_dm_id`, if
+/// any — the binary crate's own `matrix_migration` module's idempotency gate
+/// (plan §7 step 2: "For each `dm_conversations` row without a
+/// `rooms.legacy_dm_id` match").
+pub fn room_by_legacy_dm_id(conn: &Connection, legacy_dm_id: i64) -> rusqlite::Result<Option<Room>> {
+    conn.query_row(&format!("SELECT {ROOM_SELECT_COLUMNS} FROM rooms WHERE legacy_dm_id = ?1"), params![legacy_dm_id], room_from_row)
+        .optional()
+}
+
 /// Free `room_id`'s `dm_pair_key` slot (set it to `NULL`) — called when a
 /// prior DM between the same pair is no longer live (one party left), so a
 /// freshly created room between the same two users can claim that pair key
@@ -2356,6 +2365,213 @@ pub fn legacy_dm_message_event_id(conn: &Connection, legacy_message_id: i64) -> 
         |row| row.get(0),
     )
     .optional()
+}
+
+// ============================================================================
+// Legacy DM migration batch (P12) — the binary crate's own `matrix_migration`
+// module is the only caller. Everything one `dm_conversations` row needs
+// (room + bootstrap state events + every not-yet-imported message + read
+// receipts + the `m.direct` account-data hint for both parties) lands in
+// ONE transaction here, for the same reason `create_room_with_state` is a
+// batch entry point rather than several independent calls (P5 correction):
+// a crash partway through must never leave a room with some but not all of
+// its own bootstrap state, or a room with some but not all of its messages.
+// This reuses the SAME private `_in_tx` helpers `create_room_with_state`
+// itself uses (`insert_room_row`, `apply_state_event_in_tx`,
+// `insert_timeline_event_in_tx`), so a migrated room's rows are written by
+// the exact same code paths a live `createRoom`/`send` call would use.
+// ============================================================================
+
+/// One legacy `dm_messages` row queued for import (plan §7 step 5).
+/// `event_id` is minted by the caller ([`crate::matrix_migration`] in the
+/// binary crate) so it can be recorded in the caller's own bookkeeping (the
+/// idempotency proof compares event ids across two runs) without a second
+/// round trip back into this module. `content` is already the full
+/// `org.mylittlechart.legacy_dm` JSON body
+/// (`{"legacy_message_id","nonce_b64","ciphertext_b64"}`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegacyDmMessageImport {
+    pub legacy_message_id: i64,
+    pub event_id: String,
+    pub sender_user_id: i64,
+    pub content: String,
+    pub origin_server_ts: i64,
+}
+
+/// One reader's `m.read` receipt to set once its target message has been
+/// imported — `up_to_legacy_message_id` is the LAST `dm_messages.id` this
+/// reader actually had `read_at` stamped for in `social.db` (never a later
+/// one — plan P12 scope: "never over-count as read"). `ts_ms` is that same
+/// message's own `read_at`, converted to epoch milliseconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegacyDmReadReceipt {
+    pub reader_user_id: i64,
+    pub up_to_legacy_message_id: i64,
+    pub ts_ms: i64,
+}
+
+/// One `m.direct` merge hint (plan P12 scope: "merge into their existing
+/// `m.direct`, do not overwrite other entries") — `user_id`'s global
+/// `m.direct` account data gains `peer_mxid` mapped to the migrated room id,
+/// alongside whatever entries it already has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegacyDmDirectHint {
+    pub user_id: i64,
+    pub peer_mxid: String,
+}
+
+/// Everything [`migrate_dm_conversation`] needs beyond the room bootstrap
+/// itself, grouped into one value for the same "stays lint-clean without
+/// `#[allow(clippy::too_many_arguments)]`" reason [`RoomBootstrap`]'s own doc
+/// comment states.
+#[derive(Debug, Clone, Copy)]
+pub struct DmMigrationExtras<'a> {
+    pub messages: &'a [LegacyDmMessageImport],
+    pub receipts: &'a [LegacyDmReadReceipt],
+    pub direct_hints: &'a [LegacyDmDirectHint],
+}
+
+/// What one [`migrate_dm_conversation`] call actually wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DmMigrationCounts {
+    pub messages_imported: usize,
+    pub receipts_set: usize,
+}
+
+/// Merge `{peer_mxid: [room_id]}` into `user_id`'s existing GLOBAL `m.direct`
+/// account data, inside `tx` — every other peer's entry already in the
+/// object is left untouched, and a `room_id` already present under
+/// `peer_mxid` is not duplicated.
+fn merge_m_direct_in_tx(tx: &Transaction, user_id: i64, peer_mxid: &str, room_id: &str) -> Result<(), MatrixStoreError> {
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT content FROM account_data WHERE user_id = ?1 AND room_id = ?2 AND data_type = 'm.direct'",
+            params![user_id, GLOBAL_ACCOUNT_DATA_ROOM],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let mut direct: serde_json::Map<String, serde_json::Value> = match existing {
+        Some(content) => serde_json::from_str(&content)?,
+        None => serde_json::Map::new(),
+    };
+    let rooms_entry = direct.entry(peer_mxid.to_string()).or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !rooms_entry.is_array() {
+        *rooms_entry = serde_json::Value::Array(Vec::new());
+    }
+    if let serde_json::Value::Array(list) = rooms_entry {
+        if !list.iter().any(|v| v.as_str() == Some(room_id)) {
+            list.push(serde_json::Value::String(room_id.to_string()));
+        }
+    }
+
+    let stream_id = next_stream_id(tx)?;
+    tx.execute(
+        "INSERT INTO account_data (user_id, room_id, data_type, content, stream_id) VALUES (?1, ?2, 'm.direct', ?3, ?4)
+         ON CONFLICT(user_id, room_id, data_type) DO UPDATE SET content = excluded.content, stream_id = excluded.stream_id",
+        params![user_id, GLOBAL_ACCOUNT_DATA_ROOM, serde_json::Value::Object(direct).to_string(), stream_id],
+    )?;
+    Ok(())
+}
+
+/// The P12 migration's own batch entry point: `bootstrap`'s room row, then
+/// every entry of `state_events` (identical shape to
+/// [`create_room_with_state`]'s own loop — same order requirement: a
+/// member's `m.room.member` must precede `m.room.power_levels` for
+/// [`refresh_power_levels`] to see them, see that function's own doc), then
+/// every `extras.messages` entry as an `org.mylittlechart.legacy_dm`
+/// timeline event plus its `legacy_dm_message_map` row, then
+/// `extras.receipts`, then `extras.direct_hints` — all in ONE transaction.
+/// `extras.messages` must already be filtered by the caller to exclude any
+/// `legacy_message_id` already present in `legacy_dm_message_map` and
+/// ordered ascending by `legacy_message_id`; this function does not
+/// re-check either, since the binary crate's own `matrix_migration` module
+/// already established the room does not exist yet via
+/// [`room_by_legacy_dm_id`] before ever calling this.
+pub fn migrate_dm_conversation(
+    conn: &mut Connection,
+    bootstrap: RoomBootstrap<'_>,
+    state_events: &[NewStateEvent],
+    bootstrap_origin_server_ts: i64,
+    extras: DmMigrationExtras<'_>,
+) -> Result<(Room, DmMigrationCounts), MatrixStoreError> {
+    let tx = conn.transaction()?;
+
+    insert_room_row(
+        &tx,
+        bootstrap.room_id,
+        bootstrap.kind,
+        bootstrap.creator_user_id,
+        bootstrap.created_at,
+        bootstrap.is_encrypted,
+        bootstrap.join_rule,
+        bootstrap.history_visibility,
+        bootstrap.dm_pair_key,
+        bootstrap.legacy_dm_id,
+    )?;
+    for event in state_events {
+        apply_state_event_in_tx(
+            &tx,
+            &event.event_id,
+            bootstrap.room_id,
+            event.sender_user_id,
+            &event.event_type,
+            &event.state_key,
+            &event.content,
+            bootstrap_origin_server_ts,
+            bootstrap.created_at,
+        )?;
+    }
+
+    let mut event_id_by_legacy_id: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    for message in extras.messages {
+        insert_timeline_event_in_tx(
+            &tx,
+            &message.event_id,
+            bootstrap.room_id,
+            message.sender_user_id,
+            "org.mylittlechart.legacy_dm",
+            &message.content,
+            message.origin_server_ts,
+            None,
+        )?;
+        insert_legacy_dm_message_map(&tx, message.legacy_message_id, &message.event_id)?;
+        event_id_by_legacy_id.insert(message.legacy_message_id, message.event_id.clone());
+    }
+
+    let mut receipts_set = 0usize;
+    for receipt in extras.receipts {
+        let Some(target_event_id) = event_id_by_legacy_id.get(&receipt.up_to_legacy_message_id) else { continue };
+        let target_stream_id: i64 =
+            tx.query_row("SELECT stream_id FROM events WHERE event_id = ?1", params![target_event_id], |row| row.get(0))?;
+        tx.execute(
+            "INSERT INTO receipts (room_id, user_id, receipt_type, event_id, ts, stream_id) VALUES (?1, ?2, 'm.read', ?3, ?4, ?5)",
+            params![bootstrap.room_id, receipt.reader_user_id, target_event_id, receipt.ts_ms, target_stream_id],
+        )?;
+        receipts_set += 1;
+    }
+
+    for hint in extras.direct_hints {
+        merge_m_direct_in_tx(&tx, hint.user_id, &hint.peer_mxid, bootstrap.room_id)?;
+    }
+
+    tx.commit()?;
+
+    Ok((
+        Room {
+            id: bootstrap.room_id.to_string(),
+            kind: bootstrap.kind,
+            room_version: MATRIX_ROOM_VERSION.to_string(),
+            creator_user_id: bootstrap.creator_user_id,
+            created_at: bootstrap.created_at.to_string(),
+            is_encrypted: bootstrap.is_encrypted,
+            join_rule: bootstrap.join_rule,
+            history_visibility: bootstrap.history_visibility,
+            dm_pair_key: bootstrap.dm_pair_key.map(str::to_string),
+            legacy_dm_id: bootstrap.legacy_dm_id,
+        },
+        DmMigrationCounts { messages_imported: extras.messages.len(), receipts_set },
+    ))
 }
 
 // ============================================================================

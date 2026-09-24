@@ -165,7 +165,9 @@ fn derive_room_kind(is_direct: bool, invite_count: usize, visibility_public: boo
 }
 
 /// `join_rule`, `history_visibility`, `is_encrypted` per plan §5's table.
-fn room_kind_settings(kind: RoomKind) -> (JoinRule, HistoryVisibility, bool) {
+/// `pub(crate)` — also the P12 legacy-DM migration's bootstrap builder (see
+/// `routes::matrix::mod`'s own doc comment on `pub(crate) mod rooms`).
+pub(crate) fn room_kind_settings(kind: RoomKind) -> (JoinRule, HistoryVisibility, bool) {
     match kind {
         RoomKind::Dm => (JoinRule::Invite, HistoryVisibility::Shared, true),
         RoomKind::Group => (JoinRule::Invite, HistoryVisibility::Shared, true),
@@ -198,7 +200,8 @@ fn validate_power_level_override(kind: RoomKind, override_value: &Option<serde_j
 /// `power_levels.invite` for a fresh room (plan §5): `dm`/`channel` are
 /// fixed at `50`; `group` defaults to `50` unless
 /// [`validate_power_level_override`] returned an explicit override.
-fn invite_power_level(kind: RoomKind, override_value: Option<i64>) -> i64 {
+/// `pub(crate)` — also used by the P12 legacy-DM migration.
+pub(crate) fn invite_power_level(kind: RoomKind, override_value: Option<i64>) -> i64 {
     match kind {
         RoomKind::Dm | RoomKind::Channel => 50,
         RoomKind::Group => override_value.unwrap_or(50),
@@ -208,7 +211,10 @@ fn invite_power_level(kind: RoomKind, override_value: Option<i64>) -> i64 {
 /// The `m.room.power_levels` content for a fresh room (plan §5): the
 /// creator at `100`, every other field at the table's fixed defaults except
 /// `events_default` (raised to `50` for a `channel` — announcement-only).
-fn power_levels_content(creator_mxid: &str, kind: RoomKind, invite_level: i64) -> serde_json::Value {
+/// `pub(crate)` — reused verbatim by the P12 legacy-DM migration, so a
+/// migrated room's power levels are byte-for-byte what a native `createRoom`
+/// call would have produced.
+pub(crate) fn power_levels_content(creator_mxid: &str, kind: RoomKind, invite_level: i64) -> serde_json::Value {
     let events_default = if kind == RoomKind::Channel { 50 } else { 0 };
     serde_json::json!({
         "users": { creator_mxid: 100 },
@@ -270,13 +276,16 @@ fn check_state_event_type_allowed(event_type: &str, state_key: &str, caller_mxid
 
 /// `(lo, hi)`-ordered pair key for a DM between two internal user ids — the
 /// same trick `dm_conversations` already uses (`dm_db.rs`), reused here for
-/// `rooms.dm_pair_key`.
-fn dm_pair_key(a: i64, b: i64) -> String {
+/// `rooms.dm_pair_key`. `pub(crate)` — also used by the P12 legacy-DM
+/// migration.
+pub(crate) fn dm_pair_key(a: i64, b: i64) -> String {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
     format!("{lo}:{hi}")
 }
 
-fn state_event(event_type: &str, state_key: &str, sender_user_id: i64, content: serde_json::Value) -> matrix_store::NewStateEvent {
+/// `pub(crate)` — also used by the P12 legacy-DM migration to build its own
+/// bootstrap state events through the same helper `create_room` uses.
+pub(crate) fn state_event(event_type: &str, state_key: &str, sender_user_id: i64, content: serde_json::Value) -> matrix_store::NewStateEvent {
     matrix_store::NewStateEvent {
         event_id: matrix_store::new_event_id(),
         sender_user_id,
