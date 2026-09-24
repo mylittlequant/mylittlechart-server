@@ -161,7 +161,7 @@ fn query_summary(
 
     let active_last_24h: i64 = ops_conn.query_row(
         "SELECT COUNT(DISTINCT device_id) FROM device_metrics \
-         WHERE received_at >= datetime('now', '-24 hours')",
+         WHERE datetime(received_at) >= datetime('now', '-24 hours')",
         [],
         |row| row.get(0),
     )?;
