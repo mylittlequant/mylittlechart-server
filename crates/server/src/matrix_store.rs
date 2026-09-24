@@ -2165,6 +2165,96 @@ pub fn legacy_dm_message_event_id(conn: &Connection, legacy_message_id: i64) -> 
     .optional()
 }
 
+// ============================================================================
+// Public room directory (P8: `routes::matrix::account`'s `GET`/`POST
+// /publicRooms`)
+// ============================================================================
+
+/// One row of `GET /publicRooms`'s `chunk` — a public-`join_rule` room's
+/// directory summary. `name`/`topic` are `None` when the room never had an
+/// `m.room.name`/`m.room.topic` state event (plan §5: only a `channel`-kind
+/// room is ever `join_rule = 'public'`, but this reads the column directly
+/// rather than also filtering on `kind`, so it stays correct even if a
+/// future piece ever makes a `group` room public).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublicRoomSummary {
+    pub room_id: String,
+    pub name: Option<String>,
+    pub topic: Option<String>,
+    pub num_joined_members: i64,
+    pub world_readable: bool,
+}
+
+/// One page of the public-room directory, ordered by `rooms.id` — a stable
+/// pagination key (a room id never changes once minted). `after_room_id` is
+/// the previous page's own last room id (`None` for the first page);
+/// `search_term`, when non-empty, keeps only rooms whose current
+/// `m.room.name` contains it (case-insensitive substring — Matrix's own
+/// `generic_search_term`).
+///
+/// This scans every public room in Rust rather than pushing the search/
+/// pagination interaction into SQL: a non-federated single server's public-
+/// channel count is small and moderator-managed (channels are not something
+/// a bot mass-creates), so an O(public rooms) scan per call is cheaper to
+/// keep correct than a SQL query that would otherwise have to paginate
+/// `LIMIT`-first and then discover a `search_term` filtered a whole page
+/// down to nothing.
+///
+/// Returns `(page, has_more, total_room_count_estimate)` — `has_more` is
+/// whether another page exists beyond this one (the route layer's own
+/// `next_batch` decision); `total_room_count_estimate` is the count of every
+/// public room regardless of `search_term`/pagination, matching the spec's
+/// "estimate of the total number of public rooms" wording.
+pub fn public_rooms_page(
+    conn: &Connection,
+    after_room_id: Option<&str>,
+    limit: usize,
+    search_term: Option<&str>,
+) -> Result<(Vec<PublicRoomSummary>, bool, i64), MatrixStoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.history_visibility,
+                (SELECT COUNT(*) FROM room_members WHERE room_id = r.id AND membership = 'join')
+         FROM rooms r WHERE r.join_rule = 'public' ORDER BY r.id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut all = Vec::new();
+    while let Some(row) = rows.next()? {
+        let room_id: String = row.get(0)?;
+        let history_visibility_raw: String = row.get(1)?;
+        let num_joined_members: i64 = row.get(2)?;
+        let world_readable = history_visibility_raw == HistoryVisibility::WorldReadable.as_str();
+
+        let name = current_state_event(conn, &room_id, "m.room.name", "")?
+            .and_then(|e| serde_json::from_str::<serde_json::Value>(&e.content).ok())
+            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string));
+        let topic = current_state_event(conn, &room_id, "m.room.topic", "")?
+            .and_then(|e| serde_json::from_str::<serde_json::Value>(&e.content).ok())
+            .and_then(|v| v.get("topic").and_then(|t| t.as_str()).map(str::to_string));
+
+        all.push(PublicRoomSummary { room_id, name, topic, num_joined_members, world_readable });
+    }
+    drop(rows);
+    drop(stmt);
+
+    let total_room_count_estimate = all.len() as i64;
+
+    let filtered: Vec<PublicRoomSummary> = match search_term {
+        Some(term) if !term.is_empty() => {
+            let term_lower = term.to_lowercase();
+            all.into_iter().filter(|room| room.name.as_deref().is_some_and(|n| n.to_lowercase().contains(&term_lower))).collect()
+        }
+        _ => all,
+    };
+
+    let start = match after_room_id {
+        Some(cursor) => filtered.iter().position(|r| r.room_id == cursor).map_or(0, |idx| idx + 1),
+        None => 0,
+    };
+    let has_more = filtered.len() > start + limit;
+    let page: Vec<PublicRoomSummary> = filtered.into_iter().skip(start).take(limit).collect();
+    Ok((page, has_more, total_room_count_estimate))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

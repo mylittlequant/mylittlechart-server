@@ -17,8 +17,11 @@
 //! (the smallest Auth-only read in the plan's §4 table — the natural first
 //! production caller for [`auth::resolve_matrix_caller`]) and the catch-all
 //! `M_UNRECOGNIZED` fallback for everything else under `/_matrix/*`. P5
-//! merges [`rooms::routes`] in before that fallback. Every other endpoint in
-//! the plan's §4 table is a later piece (P6-P11).
+//! merges [`rooms::routes`] in before that fallback; P8 (`account`, private —
+//! nothing outside this module needs to name it) adds account data (global +
+//! per-room), tags, filters, profile, `user_directory/search`, and
+//! `publicRooms`. Every other endpoint in the plan's §4 table is a later
+//! piece (P6, P7, P9-P11).
 //!
 //! `MatrixError::not_json` is deliberately NOT built yet (a not-JSON errcode
 //! has no caller until a body-parsing piece needs it) — `-D warnings`'
@@ -38,6 +41,7 @@ use axum::{Json, Router};
 
 use crate::state::AppState;
 
+mod account;
 pub mod auth;
 pub mod ephemeral;
 mod messaging;
@@ -105,6 +109,17 @@ impl MatrixError {
     /// this endpoint expects.
     pub fn bad_json(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "M_BAD_JSON", msg)
+    }
+
+    /// `M_BAD_JSON` (405) — a write to an account-data type this server
+    /// manages entirely through its own dedicated endpoint rather than raw
+    /// account-data storage (`m.fully_read`, via `POST .../read_markers` —
+    /// see `account::check_account_data_type_allowed`). 405 (Method Not
+    /// Allowed) rather than 403/400 per this plan's own P8 brief: the type
+    /// name itself is fine, it is this HTTP verb against this path for that
+    /// type that is refused.
+    pub fn managed_account_data_type(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::METHOD_NOT_ALLOWED, "M_BAD_JSON", msg)
     }
 
     /// `M_INVALID_PARAM` (400) — a path/query parameter or a JSON field's
@@ -345,6 +360,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(rooms::routes())
         .merge(messaging::routes())
         .merge(ephemeral::routes())
+        .merge(account::routes())
         .fallback(matrix_unrecognized)
         .with_state(state)
 }
