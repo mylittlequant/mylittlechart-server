@@ -102,6 +102,60 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
+/// Capacity (and per-minute steady rate) of [`ClaimRateLimiter`]'s per-caller
+/// bucket — plan P9 brief: "Rate-limit claims per caller (OTK exhaustion
+/// attack): e.g. ≤ 100 device claims / minute per caller".
+const CLAIM_RATE_CAPACITY: f64 = 100.0;
+const CLAIM_RATE_REFILL_PER_SEC: f64 = CLAIM_RATE_CAPACITY / 60.0;
+
+/// Per-caller token bucket for `POST /_matrix/client/v3/keys/claim`'s
+/// device-claim rate limit — an OTK-exhaustion-attack guard independent of
+/// `ratelimit::RateLimiter` (which buckets by client IP and cannot
+/// distinguish two callers behind the same NAT/proxy, nor would it be
+/// correct to bucket a per-user API limit by IP in the first place). One
+/// bucket per `user_id`, keyed and refilled the same way
+/// `ratelimit::TokenBucket` is (that type stays private to its own module —
+/// this is a fresh, small implementation of the same math rather than a
+/// `pub` reach-through, since a per-IP bucket kind and a per-user claim cost
+/// are different enough axes that sharing the type would only add
+/// cross-module coupling for a few lines of arithmetic).
+pub struct ClaimRateLimiter {
+    /// `user_id -> (tokens remaining, last refill instant)`.
+    buckets: Mutex<HashMap<i64, (f64, Instant)>>,
+}
+
+impl Default for ClaimRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClaimRateLimiter {
+    pub fn new() -> Self {
+        Self { buckets: Mutex::new(HashMap::new()) }
+    }
+
+    /// Try to spend `cost` tokens (one per device claimed in a single
+    /// `/keys/claim` call) from `user_id`'s bucket. `true` means the whole
+    /// call is allowed (and the cost is spent); `false` refuses the WHOLE
+    /// call — a batch that would exceed the cap is refused outright, never
+    /// partially served, so a caller never has to reconcile which of its
+    /// claimed keys "actually landed" against a partial rate-limit refusal.
+    pub fn try_consume(&self, user_id: i64, cost: f64, now: Instant) -> bool {
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let (tokens, last_refill) = buckets.entry(user_id).or_insert((CLAIM_RATE_CAPACITY, now));
+        let elapsed = now.saturating_duration_since(*last_refill).as_secs_f64();
+        *tokens = (*tokens + elapsed * CLAIM_RATE_REFILL_PER_SEC).min(CLAIM_RATE_CAPACITY);
+        *last_refill = now;
+        if *tokens >= cost {
+            *tokens -= cost;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// One key's shared wake state: a generation counter bumped by every
 /// [`LiveRegistry::wake`], the `Notify` that wakes any live
 /// [`Registration::wait`] call, and an interest count used purely to decide
@@ -656,6 +710,31 @@ mod tests {
         // Repeat false while already stopped — no bump.
         assert!(!registry.set_typing("room:1", 42, false, 0, t1));
         assert_eq!(registry.typing_serial("room:1", t1), 2);
+    }
+
+    // ---- ClaimRateLimiter -------------------------------------------------
+
+    #[test]
+    fn keys_claim_is_rate_limited() {
+        let limiter = ClaimRateLimiter::new();
+        let t0 = Instant::now();
+
+        assert!(limiter.try_consume(1, 100.0, t0), "the full capacity is available up front");
+        assert!(!limiter.try_consume(1, 1.0, t0), "the bucket is empty immediately after spending it all");
+        assert!(limiter.try_consume(2, 100.0, t0), "a different caller has its own, independent bucket");
+    }
+
+    #[test]
+    fn claim_rate_limiter_refills_over_time() {
+        let limiter = ClaimRateLimiter::new();
+        let t0 = Instant::now();
+        assert!(limiter.try_consume(1, 100.0, t0));
+        assert!(!limiter.try_consume(1, 1.0, t0));
+
+        // One second later, at 100/60 tokens/sec: a little under 2 tokens back.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(limiter.try_consume(1, 1.0, t1));
+        assert!(!limiter.try_consume(1, 1.0, t1));
     }
 
     #[test]

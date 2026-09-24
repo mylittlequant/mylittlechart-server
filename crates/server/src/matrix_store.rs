@@ -1740,6 +1740,58 @@ pub fn rooms_for_user(conn: &Connection, user_id: i64, membership: Option<Member
     }
 }
 
+/// Every `user_id` whose `m.room.member` state transitioned to `leave` or
+/// `ban` in one of `room_ids`, with `stream_id` in `(from_exclusive,
+/// to_inclusive]` — `routes::matrix::keys`'s `GET /keys/changes`
+/// `device_lists.left` set (plan §3.7): a user who no longer shares any room
+/// with the caller. This function only finds the CANDIDATE departures inside
+/// the given room set; the caller (which already knows its own current
+/// shared-room membership) is responsible for the second half of the plan's
+/// rule — excluding anyone who still shares SOME OTHER room with it today.
+/// Bounded to `room_ids` (typically every room the caller is or was in)
+/// rather than scanning every room this server has ever created. Returns an
+/// empty vec without querying when `room_ids` is empty.
+pub fn user_ids_with_leave_transition_in_rooms(
+    conn: &Connection,
+    room_ids: &[String],
+    from_exclusive: i64,
+    to_inclusive: i64,
+) -> rusqlite::Result<Vec<i64>> {
+    if room_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; room_ids.len()].join(",");
+    let sql = format!(
+        "SELECT DISTINCT e.state_key, e.content FROM events e
+         WHERE e.event_type = 'm.room.member' AND e.state_key IS NOT NULL
+           AND e.stream_id > ? AND e.stream_id <= ?
+           AND e.room_id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&from_exclusive, &to_inclusive];
+    for room_id in room_ids {
+        bound.push(room_id as &dyn rusqlite::ToSql);
+    }
+    let mut rows = stmt.query(bound.as_slice())?;
+    let mut mxids = Vec::new();
+    while let Some(row) = rows.next()? {
+        let mxid: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+            if matches!(value.get("membership").and_then(|m| m.as_str()), Some("leave") | Some("ban")) {
+                mxids.push(mxid);
+            }
+        }
+    }
+    let mut user_ids = Vec::new();
+    for mxid in mxids {
+        if let Some(user_id) = user_id_of(conn, &mxid)? {
+            user_ids.push(user_id);
+        }
+    }
+    Ok(user_ids)
+}
+
 /// Timeline (non-state, non-redaction) events `sender_user_id` has sent into
 /// any PRIVATE room (`join_rule = 'invite'`) with `origin_server_ts >=
 /// since_ms` — `routes::matrix::messaging`'s per-sender daily send-rate
@@ -2984,5 +3036,31 @@ mod tests {
             .expect("the inviter's own member event is included");
         assert_eq!(inviter_member["sender"], alice);
         assert_eq!(inviter_member["content"]["membership"], "join");
+    }
+
+    // ---- P9 support: user_ids_with_leave_transition_in_rooms ----
+
+    #[test]
+    fn user_ids_with_leave_transition_in_rooms_finds_only_leave_and_ban_inside_the_window() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        let alice = ensure_matrix_user(&conn, 2, "alice00000000000000000000000097", T0).expect("alice");
+        let bob = ensure_matrix_user(&conn, 3, "bob0000000000000000000000000097", T0).expect("bob");
+        let carol = ensure_matrix_user(&conn, 4, "carol0000000000000000000000097a", T0).expect("carol");
+
+        apply_state_event(&mut conn, "$a1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
+        let boundary = apply_state_event(&mut conn, "$b1", ROOM, 1, "m.room.member", &bob, r#"{"membership":"join"}"#, 1100, T0)
+            .expect("bob joins")
+            .stream_id;
+        apply_state_event(&mut conn, "$a2", ROOM, 1, "m.room.member", &alice, r#"{"membership":"leave"}"#, 1200, T0).expect("alice leaves");
+        apply_state_event(&mut conn, "$b2", ROOM, 1, "m.room.member", &bob, r#"{"membership":"ban"}"#, 1300, T0).expect("bob banned");
+        apply_state_event(&mut conn, "$c1", ROOM, 1, "m.room.member", &carol, r#"{"membership":"join"}"#, 1400, T0).expect("carol joins (not a departure)");
+
+        let mut left = user_ids_with_leave_transition_in_rooms(&conn, &[ROOM.to_string()], boundary, i64::MAX).expect("query");
+        left.sort_unstable();
+        assert_eq!(left, vec![2, 3], "alice (leave) and bob (ban) both count; carol's join does not");
+
+        let empty = user_ids_with_leave_transition_in_rooms(&conn, &[], 0, i64::MAX).expect("empty room set");
+        assert!(empty.is_empty());
     }
 }

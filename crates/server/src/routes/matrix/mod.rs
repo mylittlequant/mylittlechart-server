@@ -44,8 +44,10 @@ use crate::state::AppState;
 mod account;
 pub mod auth;
 pub mod ephemeral;
+mod keys;
 mod messaging;
 mod rooms;
+mod sync_token;
 
 /// This deployment's one supported Client-Server API version (plan §1,
 /// manager decision 1: v1.19, not the body's original v1.13 pin).
@@ -66,11 +68,17 @@ pub struct MatrixError {
     pub retry_after_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub soft_logout: Option<bool>,
+    /// `M_WRONG_ROOM_KEYS_VERSION`'s own extra field (plan P9 brief) — the
+    /// caller's actual current key-backup version, as a string per the wire
+    /// type every other `room_keys/version` field uses. `None` only when the
+    /// caller has no backup at all yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<String>,
 }
 
 impl MatrixError {
     fn new(status: StatusCode, errcode: &'static str, error: impl Into<String>) -> Self {
-        Self { status, errcode, error: error.into(), retry_after_ms: None, soft_logout: None }
+        Self { status, errcode, error: error.into(), retry_after_ms: None, soft_logout: None, current_version: None }
     }
 
     /// `M_MISSING_TOKEN` (401) — no credential (cookie session or bearer) was
@@ -133,6 +141,17 @@ impl MatrixError {
     /// mapping of [`mylittlechart_server::matrix_store::MatrixStoreError::DuplicateAnnotation`]).
     pub fn duplicate_annotation() -> Self {
         Self::new(StatusCode::BAD_REQUEST, "M_DUPLICATE_ANNOTATION", "Already reacted with this key")
+    }
+
+    /// `M_WRONG_ROOM_KEYS_VERSION` (403) — a `room_keys/keys` call named a
+    /// `version` that is not the caller's current one (plan P9 brief).
+    /// `current_version` is `None` only when the caller has no backup at all
+    /// yet, so there is nothing to compare against.
+    pub fn wrong_room_keys_version(current_version: Option<i64>) -> Self {
+        Self {
+            current_version: current_version.map(|v| v.to_string()),
+            ..Self::new(StatusCode::FORBIDDEN, "M_WRONG_ROOM_KEYS_VERSION", "Wrong backup version")
+        }
     }
 
     /// `M_LIMIT_EXCEEDED` (429) — the caller is rate-limited; `retry_after_ms`
@@ -200,7 +219,11 @@ impl From<mylittlechart_server::matrix_keys_store::MatrixKeysStoreError> for Mat
             E::OneTimeKeyConflict(key_id) => {
                 MatrixError::invalid_param(format!("One-time key {key_id} already exists with different content"))
             }
-            E::WrongBackupVersion => MatrixError::invalid_param("Not the current key-backup version"),
+            // Fallback for a `?`-propagated call site with no `current_version`
+            // to report — `routes::matrix::keys`'s own PUT-backup-sessions
+            // handler matches `WrongBackupVersion` explicitly instead, so it
+            // can look up and attach the caller's actual current version.
+            E::WrongBackupVersion => MatrixError::wrong_room_keys_version(None),
         }
     }
 }
@@ -361,6 +384,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(messaging::routes())
         .merge(ephemeral::routes())
         .merge(account::routes())
+        .merge(keys::routes())
         .fallback(matrix_unrecognized)
         .with_state(state)
 }

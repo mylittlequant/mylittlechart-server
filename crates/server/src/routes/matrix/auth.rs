@@ -405,6 +405,54 @@ pub fn on_credential_revoked(
 }
 
 // ============================================================================
+// revoke_identity_credential — the identity-side half of a manual device revoke
+// ============================================================================
+
+/// Revoke the identity-side credential that minted a Matrix device — the one
+/// step [`on_credential_revoked`] does NOT itself perform (that function only
+/// touches `messenger.db`). `DELETE /devices/{deviceId}`
+/// (`routes::matrix::keys`, P9 — "the credential that minted it is also
+/// revoked in the identity DB so the next request with it fails") calls this
+/// FIRST, then [`on_credential_revoked`], so the credential can never be
+/// reused even if the messenger-side delete somehow failed first.
+///
+/// `Bearer`'s `credential_ref` IS `auth_tokens.token_hash` — a direct lookup.
+/// `Web`'s `credential_ref` is a HASH of the session id ([`web_credential_ref`]),
+/// never the raw `web_sessions.session_id` itself (`messenger.db` must not
+/// hold one at rest — see [`AuthCredential`]'s own doc), so there is no query
+/// that goes straight from it back to a row: every `web_sessions` row is
+/// scanned once, hashing its own `session_id` and comparing — the same
+/// one-time full-scan trade [`valid_web_credential_refs`] already accepts for
+/// the periodic reaper, acceptable here too since a manual "log out this
+/// device" click is a rare, deliberate action, not a hot path. A credential
+/// that no longer exists (already logged out, already expired and reaped) is
+/// a silent no-op — the caller's own goal ("this credential must not work
+/// anymore") is already satisfied either way.
+pub fn revoke_identity_credential(identity_conn: &Connection, credential_kind: CredentialKind, credential_ref: &str) -> rusqlite::Result<()> {
+    match credential_kind {
+        CredentialKind::Bearer => {
+            identity_conn.execute("DELETE FROM auth_tokens WHERE token_hash = ?1", params![credential_ref])?;
+        }
+        CredentialKind::Web => {
+            let mut stmt = identity_conn.prepare("SELECT session_id FROM web_sessions")?;
+            let mut rows = stmt.query([])?;
+            let mut matching_session_id: Option<String> = None;
+            while let Some(row) = rows.next()? {
+                let session_id: String = row.get(0)?;
+                if web_credential_ref(&session_id) == credential_ref {
+                    matching_session_id = Some(session_id);
+                    break;
+                }
+            }
+            if let Some(session_id) = matching_session_id {
+                identity_conn.execute("DELETE FROM web_sessions WHERE session_id = ?1", params![session_id])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
 // reap_expired_devices — the P14-scheduled boot+hourly backstop
 // ============================================================================
 
@@ -702,6 +750,48 @@ mod tests {
             1,
             "a credential that never existed must not revoke an unrelated device"
         );
+    }
+
+    // ---- revoke_identity_credential ----
+
+    #[test]
+    fn revoke_identity_credential_deletes_the_bearer_token_row() {
+        let identity_conn = identity_test_conn();
+        identity_conn
+            .execute("INSERT INTO auth_tokens (token_hash, user_id, created_at, expires_at) VALUES ('tok-hash', 1, ?1, NULL)", params![T0])
+            .expect("insert token");
+
+        revoke_identity_credential(&identity_conn, CredentialKind::Bearer, "tok-hash").expect("revoke");
+
+        let remaining: i64 = identity_conn
+            .query_row("SELECT COUNT(*) FROM auth_tokens WHERE token_hash = 'tok-hash'", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn revoke_identity_credential_finds_the_web_session_by_its_hash() {
+        let identity_conn = identity_test_conn();
+        let raw_session = "raw-session-to-revoke";
+        let far_future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        identity_conn
+            .execute(
+                "INSERT INTO web_sessions (session_id, user_id, created_at, expires_at) VALUES (?1, 1, ?2, ?3)",
+                params![raw_session, T0, far_future],
+            )
+            .expect("insert session");
+
+        revoke_identity_credential(&identity_conn, CredentialKind::Web, &web_credential_ref(raw_session)).expect("revoke");
+
+        let remaining: i64 = identity_conn.query_row("SELECT COUNT(*) FROM web_sessions", [], |row| row.get(0)).expect("count");
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn revoke_identity_credential_is_a_no_op_for_an_already_gone_credential() {
+        let identity_conn = identity_test_conn();
+        revoke_identity_credential(&identity_conn, CredentialKind::Bearer, "never-existed").expect("no-op revoke");
+        revoke_identity_credential(&identity_conn, CredentialKind::Web, "never-existed-either").expect("no-op revoke");
     }
 
     // ---- reap_expired_devices ----

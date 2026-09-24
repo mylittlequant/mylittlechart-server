@@ -164,6 +164,14 @@ pub struct ControlPlane {
     /// see the same in-process state regardless of which request handled
     /// the write.
     pub typing: mylittlechart_server::live::TypingRegistry,
+
+    /// Per-caller rate limiter for `POST /_matrix/client/v3/keys/claim`
+    /// (plan P9 brief: "≤ 100 device claims / minute per caller") — see
+    /// `mylittlechart_server::live::ClaimRateLimiter`'s own doc for why this
+    /// is a separate, per-user bucket rather than a reuse of the per-IP
+    /// `ratelimit::RateLimiter`. Constructed once at boot next to
+    /// `live`/`typing`.
+    pub matrix_claim_rate_limiter: mylittlechart_server::live::ClaimRateLimiter,
 }
 
 impl ControlPlane {

@@ -685,6 +685,52 @@ pub fn enqueue_to_device(conn: &mut Connection, sender_user_id: i64, messages: &
     Ok(last_stream_id)
 }
 
+/// What [`enqueue_to_device_deduped`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToDeviceDedupOutcome {
+    /// `messages` were inserted and the `(user_id, device_id, txn_id)` was
+    /// recorded.
+    New,
+    /// This `(user_id, device_id, txn_id)` was already recorded — nothing
+    /// was inserted (idempotent repeat).
+    AlreadySent,
+}
+
+/// [`enqueue_to_device`], but dedup-checked and recorded in the SAME
+/// transaction as the inserts — mirrors
+/// [`matrix_store::insert_timeline_event_deduped`]'s own shape for the
+/// to-device case, which records `NULL` for `txn_dedup.event_id` (that
+/// column's own doc, `matrix_store`'s DDL, states this is the to-device
+/// case). A repeat of `(sender_user_id, sender_device_id, txn_id)` is a
+/// no-op: no second set of `to_device_messages` rows, matching `PUT
+/// /sendToDevice/{eventType}/{txnId}`'s own idempotency contract
+/// (`routes::matrix::keys`, P9).
+pub fn enqueue_to_device_deduped(
+    conn: &mut Connection,
+    sender_user_id: i64,
+    sender_device_id: &str,
+    txn_id: &str,
+    messages: &[(i64, String, String, String)],
+    now: &str,
+) -> rusqlite::Result<ToDeviceDedupOutcome> {
+    let tx = conn.transaction()?;
+    if let matrix_store::TxnDedupEntry::Seen(_) = matrix_store::txn_dedup_lookup(&tx, sender_user_id, sender_device_id, txn_id)? {
+        tx.commit()?;
+        return Ok(ToDeviceDedupOutcome::AlreadySent);
+    }
+    for (recipient_user_id, recipient_device_id, event_type, content) in messages {
+        let stream_id = matrix_store::next_stream_id(&tx)?;
+        tx.execute(
+            "INSERT INTO to_device_messages (stream_id, recipient_user_id, recipient_device_id, sender_user_id, event_type, content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![stream_id, recipient_user_id, recipient_device_id, sender_user_id, event_type, content],
+        )?;
+    }
+    matrix_store::txn_dedup_record(&tx, sender_user_id, sender_device_id, txn_id, None, now)?;
+    tx.commit()?;
+    Ok(ToDeviceDedupOutcome::New)
+}
+
 /// Every to-device message still pending for `(user_id, device_id)` after
 /// `after_stream`, oldest first — `/sync`'s `to_device.events`.
 pub fn to_device_for(conn: &Connection, user_id: i64, device_id: &str, after_stream: i64, limit: i64) -> rusqlite::Result<Vec<ToDeviceMessage>> {
@@ -781,6 +827,21 @@ pub fn upsert_cross_signing_key(conn: &mut Connection, user_id: i64, usage: Cros
     log_device_list_change_tx(&tx, user_id, now)?;
     tx.commit()?;
     Ok(())
+}
+
+/// One user's cross-signing key of a specific `usage`, if uploaded —
+/// `routes::matrix::keys`'s own lookup when it needs exactly one (verifying
+/// a self/user-signing key against a caller's stored master key; deciding
+/// whether a master key already exists before a `/keys/device_signing/upload`
+/// call). [`cross_signing_keys_for`] stays the batch entry point `/keys/query`
+/// uses.
+pub fn cross_signing_key_for(conn: &Connection, user_id: i64, usage: CrossSigningUsage) -> rusqlite::Result<Option<CrossSigningKey>> {
+    conn.query_row(
+        &format!("SELECT {CROSS_SIGNING_KEY_SELECT_COLUMNS} FROM cross_signing_keys WHERE user_id = ?1 AND usage = ?2"),
+        params![user_id, usage.as_str()],
+        cross_signing_key_from_row,
+    )
+    .optional()
 }
 
 /// Every cross-signing key belonging to any of `user_ids` — the
@@ -1485,6 +1546,31 @@ mod tests {
         let mut changed = device_list_changes_between(&conn, boundary, matrix_store::max_stream_id(&conn).expect("max")).expect("query");
         changed.sort();
         assert_eq!(changed, vec![1, 2]);
+    }
+
+    #[test]
+    fn cross_signing_key_for_finds_exactly_the_named_usage() {
+        let mut conn = test_conn();
+        upsert_cross_signing_key(&mut conn, 1, CrossSigningUsage::Master, r#"{"usage":["master"]}"#, T0).expect("master");
+
+        let master = cross_signing_key_for(&conn, 1, CrossSigningUsage::Master).expect("query").expect("row exists");
+        assert_eq!(master.usage, CrossSigningUsage::Master);
+        assert_eq!(cross_signing_key_for(&conn, 1, CrossSigningUsage::SelfSigning).expect("query"), None);
+        assert_eq!(cross_signing_key_for(&conn, 2, CrossSigningUsage::Master).expect("different user"), None);
+    }
+
+    #[test]
+    fn enqueue_to_device_deduped_is_idempotent_per_txn() {
+        let mut conn = test_conn();
+        let messages = [(1_i64, "DEV1".to_string(), "m.room_key".to_string(), r#"{"k":1}"#.to_string())];
+
+        let first = enqueue_to_device_deduped(&mut conn, 9, "SENDER_DEV", "txn-1", &messages, T0).expect("first send");
+        assert_eq!(first, ToDeviceDedupOutcome::New);
+        assert_eq!(to_device_for(&conn, 1, "DEV1", 0, 10).expect("after first").len(), 1);
+
+        let second = enqueue_to_device_deduped(&mut conn, 9, "SENDER_DEV", "txn-1", &messages, T0).expect("repeat send");
+        assert_eq!(second, ToDeviceDedupOutcome::AlreadySent);
+        assert_eq!(to_device_for(&conn, 1, "DEV1", 0, 10).expect("after repeat").len(), 1, "a repeated txn_id must not enqueue a second copy");
     }
 
     #[test]

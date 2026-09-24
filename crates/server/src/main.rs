@@ -643,6 +643,7 @@ async fn main() {
                 reserved_nick_cache: std::sync::RwLock::new(reserved_nick_cache_entries),
                 live: mylittlechart_server::live::LiveRegistry::new(),
                 typing: mylittlechart_server::live::TypingRegistry::new(),
+                matrix_claim_rate_limiter: mylittlechart_server::live::ClaimRateLimiter::new(),
             };
             tracing::info!(
                 "Live event registry ready ({} key(s))",
