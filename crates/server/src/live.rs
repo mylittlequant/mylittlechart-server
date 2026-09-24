@@ -75,6 +75,12 @@
 //! just while it happens to be inside the `.await`, so there is no gap left
 //! in which a wake can be lost for that caller at all.
 //!
+//! `register`'s lookup-or-create and its interest increment must happen
+//! under the very same lock acquisition (not lookup, unlock, *then*
+//! increment) — see [`LiveRegistry::register`]'s own doc for the exact
+//! orphaned-registration failure that a separated version of those two
+//! steps allows a concurrent `drop` to trigger.
+//!
 //! # `TypingRegistry` — the one ephemeral fact never written to `messenger.db`
 //!
 //! Typing indicators are the spec-sanctioned exception to "everything is
@@ -148,11 +154,26 @@ impl LiveRegistry {
     /// must be kept alive across that read; dropping it releases interest
     /// in `key` and may prune the entry (see the module doc).
     pub fn register(&self, key: &str) -> Registration<'_> {
+        // The lookup-or-create AND the interest increment happen under the
+        // SAME lock acquisition — not lookup-then-unlock-then-increment.
+        // Otherwise a concurrent `Registration::drop` for the last other
+        // holder can see this entry's interest still at its pre-increment
+        // value, conclude (correctly, at that instant) that it is the last
+        // one out, and prune the entry from the map before this call ever
+        // gets to increment it — leaving this registration holding a clone
+        // of an `Arc<KeyEntry>` that `wake` can no longer reach through the
+        // map at all. Incrementing inside the lock closes that: by the time
+        // this call releases the lock, either the entry it is holding is
+        // guaranteed visible-and-correctly-counted in the map, or (if a
+        // concurrent drop's own prune already ran and removed the prior
+        // entry first) `or_insert_with` here creates a fresh one that goes
+        // straight into the map already counted — never a orphaned clone.
         let entry = {
             let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-            Arc::clone(keys.entry(key.to_string()).or_insert_with(|| Arc::new(KeyEntry::new())))
+            let entry = Arc::clone(keys.entry(key.to_string()).or_insert_with(|| Arc::new(KeyEntry::new())));
+            entry.interest.fetch_add(1, Ordering::AcqRel);
+            entry
         };
-        entry.interest.fetch_add(1, Ordering::AcqRel);
         let seen_generation = entry.generation.load(Ordering::Acquire);
         Registration { registry: self, key: key.to_string(), entry, seen_generation }
     }
@@ -537,6 +558,55 @@ mod tests {
 
         drop(w2);
         assert_eq!(registry.key_count(), 0, "the last guard dropped");
+    }
+
+    /// Regression guard for the `register`/`Drop` orphaning race: `register`
+    /// must increment interest under the SAME lock acquisition as its
+    /// lookup-or-create, not after releasing it (see [`LiveRegistry::
+    /// register`]'s doc). `register` and `Drop` are both plain synchronous
+    /// functions with no `.await` inside them, so the only way to actually
+    /// hit the instruction-level window a wrong implementation would open
+    /// is genuine OS-thread parallelism, not cooperative task scheduling —
+    /// this spawns real `std::thread`s hammering `register`+immediate-drop
+    /// on the SAME key in a tight, uninterrupted loop (no `yield_now`, no
+    /// delay — maximizing how often that window is actually contended)
+    /// while the test's own task repeatedly does `register` then
+    /// immediately `wake` (same-thread, so `wake` always runs after
+    /// `register` returns — plain sequential execution needs no extra
+    /// synchronization to prove that ordering) and asserts the resulting
+    /// `wait` is always `Woken`, never `TimedOut`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wake_after_register_is_never_lost_under_concurrent_churn() {
+        let registry = Arc::new(LiveRegistry::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let churn_threads: Vec<_> = (0..8)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        drop(registry.register("user:1"));
+                    }
+                })
+            })
+            .collect();
+
+        for _ in 0..5_000 {
+            let guard = registry.register("user:1");
+            registry.wake("user:1");
+            let outcome = guard.wait(Duration::from_millis(20)).await;
+            assert_eq!(
+                outcome,
+                WaitOutcome::Woken,
+                "a wake sent right after register() must never be lost to concurrent churn",
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for handle in churn_threads {
+            handle.join().expect("churn thread");
+        }
     }
 
     // ---- TypingRegistry -------------------------------------------------
