@@ -408,43 +408,37 @@ pub fn on_credential_revoked(
 // reap_expired_devices — the P14-scheduled boot+hourly backstop
 // ============================================================================
 
-/// Whether `(credential_kind, credential_ref)` still names a live, unexpired
-/// row in the identity database — [`reap_expired_devices`]'s own "is this
-/// device's credential still good?" test. `datetime(expires_at)` normalizes
-/// the stored RFC-3339 value before comparing against `datetime('now')` —
-/// see [`lookup_web_credential`]'s doc comment for why a raw string compare
-/// is wrong on the expiry date (manager review, 2026-09-24).
-///
-/// `credential_ref` for `Web` is [`web_credential_ref`]'s hash, never the
-/// raw `web_sessions.session_id` (`messenger.db` must not hold one at rest)
-/// — so, unlike `Bearer` (`auth_tokens.token_hash` already IS the value
-/// `credential_ref` holds, a direct `WHERE` match), there is no SQL query
-/// that goes straight from a hash back to a row: every still-unexpired
-/// session id is hashed here and compared in Rust instead.
-fn credential_is_valid(identity_conn: &Connection, credential_kind: CredentialKind, credential_ref: &str) -> rusqlite::Result<bool> {
-    match credential_kind {
-        CredentialKind::Bearer => {
-            let found: Option<i64> = identity_conn
-                .query_row(
-                    "SELECT 1 FROM auth_tokens WHERE token_hash = ?1 AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
-                    params![credential_ref],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            Ok(found.is_some())
-        }
-        CredentialKind::Web => {
-            let mut stmt = identity_conn.prepare("SELECT session_id FROM web_sessions WHERE datetime(expires_at) > datetime('now')")?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let session_id: String = row.get(0)?;
-                if web_credential_ref(&session_id) == credential_ref {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
+/// Every currently-unexpired `auth_tokens.token_hash` — [`reap_expired_devices`]'s
+/// one-shot Bearer validity set, loaded ONCE per run (not once per device;
+/// manager review, 2026-09-24 flagged a per-device query as O(devices ×
+/// sessions)). `datetime(expires_at)` normalizes the stored RFC-3339 value
+/// before comparing against `datetime('now')` — see
+/// [`lookup_web_credential`]'s doc comment for why a raw string compare is
+/// wrong on the expiry date.
+fn valid_bearer_token_hashes(identity_conn: &Connection) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt =
+        identity_conn.prepare("SELECT token_hash FROM auth_tokens WHERE expires_at IS NULL OR datetime(expires_at) > datetime('now')")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    rows.collect()
+}
+
+/// Every currently-unexpired web session, hashed to the same
+/// [`web_credential_ref`] form `matrix_keys_store.devices.credential_ref`
+/// stores — [`reap_expired_devices`]'s one-shot Web validity set, loaded
+/// ONCE per run. `credential_ref` is a hash, never the raw
+/// `web_sessions.session_id` (`messenger.db` must not hold one at rest), so
+/// there is no SQL query that goes straight from a hash back to a row: every
+/// still-unexpired session id is hashed here, once, into the set a device's
+/// `credential_ref` is then checked against by plain `HashSet::contains`.
+fn valid_web_credential_refs(identity_conn: &Connection) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = identity_conn.prepare("SELECT session_id FROM web_sessions WHERE datetime(expires_at) > datetime('now')")?;
+    let mut rows = stmt.query([])?;
+    let mut refs = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let session_id: String = row.get(0)?;
+        refs.insert(web_credential_ref(&session_id));
     }
+    Ok(refs)
 }
 
 /// Sweep every device in `messenger_conn` and revoke any whose credential is
@@ -455,8 +449,15 @@ fn credential_is_valid(identity_conn: &Connection, credential_kind: CredentialKi
 /// past `expires_at` without the caller ever making another `/_matrix/*`
 /// call to trigger [`resolve_bearer_credential`]'s own opportunistic
 /// revoke). P14 schedules this at boot and hourly; this function is only the
-/// decision + the revoke, not the scheduling. Returns how many devices were
-/// reaped.
+/// decision + the revoke, not the scheduling.
+///
+/// Issues exactly ONE identity-database query per credential kind
+/// ([`valid_bearer_token_hashes`], [`valid_web_credential_refs`]) regardless
+/// of how many devices `messenger_conn` holds — every device is then checked
+/// against those two prebuilt `HashSet`s in O(1), never a per-device
+/// round trip to `identity_conn` (manager review, 2026-09-24: the earlier
+/// per-device `credential_is_valid` was O(devices × sessions)). Returns how
+/// many devices were reaped.
 pub fn reap_expired_devices(identity_conn: &Connection, messenger_conn: &mut Connection, live: &live::LiveRegistry, now: &str) -> usize {
     let devices = match matrix_keys_store::devices_for_reaper(messenger_conn) {
         Ok(rows) => rows,
@@ -466,14 +467,26 @@ pub fn reap_expired_devices(identity_conn: &Connection, messenger_conn: &mut Con
         }
     };
 
+    let valid_bearer = match valid_bearer_token_hashes(identity_conn) {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::error!("reap_expired_devices: failed to load valid bearer credentials: {}", e);
+            return 0;
+        }
+    };
+    let valid_web = match valid_web_credential_refs(identity_conn) {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::error!("reap_expired_devices: failed to load valid web credentials: {}", e);
+            return 0;
+        }
+    };
+
     let mut reaped = 0usize;
     for (_user_id, _device_id, credential_kind, credential_ref) in devices {
-        let valid = match credential_is_valid(identity_conn, credential_kind, &credential_ref) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("reap_expired_devices: failed to check a credential: {}", e);
-                continue;
-            }
+        let valid = match credential_kind {
+            CredentialKind::Bearer => valid_bearer.contains(&credential_ref),
+            CredentialKind::Web => valid_web.contains(&credential_ref),
         };
         if valid {
             continue;
@@ -735,16 +748,17 @@ mod tests {
             )
             .expect("insert a token that expired 1h ago, same UTC date");
 
+        let valid = valid_bearer_token_hashes(&identity_conn).expect("load valid set");
         assert!(
-            !credential_is_valid(&identity_conn, CredentialKind::Bearer, "same-day-expired").expect("check"),
-            "a token that expired 1h ago on today's UTC date must be invalid — a raw RFC-3339-vs-SQLite-datetime \
-             string compare puts 'T' (0x54) ahead of ' ' (0x20) on the expiry date and would wrongly call this one \
-             still valid"
+            !valid.contains("same-day-expired"),
+            "a token that expired 1h ago on today's UTC date must not be in the valid set — a raw \
+             RFC-3339-vs-SQLite-datetime string compare puts 'T' (0x54) ahead of ' ' (0x20) on the expiry date and \
+             would wrongly include it"
         );
     }
 
     #[test]
-    fn credential_is_valid_web_hashes_every_unexpired_session_id_to_find_a_match() {
+    fn valid_web_credential_refs_hashes_every_unexpired_session_id() {
         let identity_conn = identity_test_conn();
         let raw_session = "raw-session-still-live";
         let far_future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
@@ -755,8 +769,71 @@ mod tests {
             )
             .expect("insert a live web session");
 
-        let credential_ref = web_credential_ref(raw_session);
-        assert!(credential_is_valid(&identity_conn, CredentialKind::Web, &credential_ref).expect("check"));
-        assert!(!credential_is_valid(&identity_conn, CredentialKind::Web, "some-other-hash").expect("check"));
+        let valid = valid_web_credential_refs(&identity_conn).expect("load valid set");
+        assert!(valid.contains(&web_credential_ref(raw_session)));
+        assert!(!valid.contains("some-other-hash"));
+    }
+
+    // ---- manager review 2026-09-24: the reaper must not issue a per-device identity query ----
+
+    /// `reap_expired_devices` must build its two validity sets ONCE per run,
+    /// not once per device (the earlier `credential_is_valid` design was
+    /// O(devices × sessions) — a per-device Web check re-scanned every
+    /// unexpired session). This is provable by structure, not a runtime
+    /// query counter (no query-tracing feature is enabled on this crate's
+    /// `rusqlite` dependency): [`reap_expired_devices`]'s own body calls
+    /// [`valid_bearer_token_hashes`]/[`valid_web_credential_refs`] exactly
+    /// once each, BEFORE the device loop, and the loop itself only ever
+    /// calls `HashSet::contains` — there is no code path back to
+    /// `identity_conn` inside the loop at all. This test pins the
+    /// CORRECTNESS that design must still deliver at scale: N devices, each
+    /// with its OWN distinct valid credential (`credential_ref` is
+    /// one-device-per-credential by design — `idx_devices_credential` is a
+    /// unique index — so a shared credential across devices would not
+    /// exercise the per-device path this test needs), split between the two
+    /// kinds, plus two devices whose credential is missing entirely.
+    #[test]
+    fn reap_expired_devices_checks_many_devices_against_two_prebuilt_validity_sets() {
+        let identity_conn = identity_test_conn();
+        let mut messenger_conn = keys_test_conn();
+        let far_future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        const N: i64 = 100;
+
+        for user_id in 0..N {
+            if user_id % 2 == 0 {
+                let token_hash = format!("bearer-hash-{user_id}");
+                identity_conn
+                    .execute(
+                        "INSERT INTO auth_tokens (token_hash, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, NULL)",
+                        params![token_hash, user_id, T0],
+                    )
+                    .expect("insert a distinct valid bearer token");
+                device_id_for(&messenger_conn, user_id, CredentialKind::Bearer, &token_hash, T0).expect("mint bearer device");
+            } else {
+                let raw_session = format!("session-{user_id}");
+                identity_conn
+                    .execute(
+                        "INSERT INTO web_sessions (session_id, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![raw_session, user_id, T0, far_future],
+                    )
+                    .expect("insert a distinct live web session");
+                let session_ref = web_credential_ref(&raw_session);
+                device_id_for(&messenger_conn, user_id, CredentialKind::Web, &session_ref, T0).expect("mint web device");
+            }
+        }
+        // Two more devices whose credential does not exist in the identity
+        // database at all.
+        device_id_for(&messenger_conn, N, CredentialKind::Bearer, "gone-bearer", T0).expect("mint");
+        device_id_for(&messenger_conn, N + 1, CredentialKind::Web, "gone-web-ref", T0).expect("mint");
+
+        let live = live::LiveRegistry::new();
+        let reaped = reap_expired_devices(&identity_conn, &mut messenger_conn, &live, T0);
+
+        assert_eq!(reaped, 2, "only the two devices with no matching identity-side credential are reaped");
+        for user_id in 0..N {
+            assert_eq!(matrix_keys_store::list_devices(&messenger_conn, user_id).expect("list").len(), 1, "device for user {user_id} must survive");
+        }
+        assert!(matrix_keys_store::list_devices(&messenger_conn, N).expect("list").is_empty());
+        assert!(matrix_keys_store::list_devices(&messenger_conn, N + 1).expect("list").is_empty());
     }
 }
