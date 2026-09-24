@@ -510,6 +510,19 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
     // paid_until above, CREATE TABLE share_links up top is never edited for
     // this column — only this ALTER adds it, on a live database.
     let _ = conn.execute("ALTER TABLE share_links ADD COLUMN clone_allowed INTEGER NOT NULL DEFAULT 0", []);
+    // Safe migration: chart-share policy, link kinds v1 (docs/mlc/plans/
+    // share-policy-2026-09-25.md §1/§11 step 1). `interaction` is "view" |
+    // "interactive" — 'view' is the safe default for every row created
+    // before this column existed (an old client that never chose "view" vs
+    // "interactive" gets the MORE restrictive behaviour). `protected_json`
+    // is a serialized `Vec<ProtectedElementRef>` (routes/share.rs) the
+    // sharer marked Protected at creation time — '[]' for every pre-existing
+    // row, matching "nothing was ever marked Protected before this feature
+    // existed". Like `clone_allowed` above, `CREATE TABLE share_links` up
+    // top is never edited for these two columns — only these ALTERs add
+    // them, on a live database.
+    let _ = conn.execute("ALTER TABLE share_links ADD COLUMN interaction TEXT NOT NULL DEFAULT 'view'", []);
+    let _ = conn.execute("ALTER TABLE share_links ADD COLUMN protected_json TEXT NOT NULL DEFAULT '[]'", []);
     // One-time cleanup: remove device_users entries where device_id doesn't exist
     // in the devices table (old profile_id entries from pre-v0.2.11 bug).
     // `devices` lives in the operational database now (2026-08-30 store
@@ -3199,6 +3212,16 @@ pub struct ShareLinkRow {
     /// Rights v1 (see `effective_rights`): true when the owner opted this
     /// link into the `clone` right at creation time.
     pub clone_allowed: bool,
+    /// Chart-share policy v1 (docs/mlc/plans/share-policy-2026-09-25.md §1):
+    /// `"view"` | `"interactive"` — the live-view interaction floor a link
+    /// grants, consulted by [`effective_share_tier`]. Raw string, same
+    /// storage idiom as `kind` — the `ShareInteraction` enum lives in
+    /// `routes::share`, the one wire-facing layer that parses it.
+    pub interaction: String,
+    /// Serialized `Vec<routes::share::ProtectedElementRef>` — the elements
+    /// the sharer marked Protected at creation time, `'[]'` for every link
+    /// created before this column existed or that never marked anything.
+    pub protected_json: String,
 }
 
 /// Read one query row into a [`ShareLinkRow`]. Column order must match the
@@ -3215,6 +3238,8 @@ fn share_link_from_row(row: &rusqlite::Row<'_>) -> Result<ShareLinkRow> {
         created_at: row.get(7)?,
         expires_at: row.get(8)?,
         clone_allowed: row.get::<_, i64>(9)? != 0,
+        interaction: row.get(10)?,
+        protected_json: row.get(11)?,
     })
 }
 
@@ -3236,7 +3261,10 @@ fn generate_share_token() -> String {
 /// [`set_share_blob_path`] once the token is known and the file is written.
 /// `clone_allowed` is the owner's rights-v1 choice at creation time (see
 /// `effective_rights`) — always `false` for a screenshot share today, since
-/// only a live share carries a preset to clone.
+/// only a live share carries a preset to clone. `interaction`/`protected_json`
+/// are the chart-share-policy v1 fields (docs/mlc/plans/share-policy-
+/// 2026-09-25.md §1) — `"view"`/`"[]"` for a screenshot share (same reasoning
+/// as `clone_allowed`: nothing offers to set them for that kind).
 ///
 /// Retries on the vanishingly unlikely PRIMARY KEY collision, same as
 /// [`mint_gift_codes`].
@@ -3250,13 +3278,15 @@ pub fn create_share_link(
     created_at: &str,
     expires_at: &str,
     clone_allowed: bool,
+    interaction: &str,
+    protected_json: &str,
 ) -> Result<String> {
     loop {
         let token = generate_share_token();
         let inserted = conn.execute(
-            "INSERT OR IGNORE INTO share_links (token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed)
-             VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9)",
-            params![token, user_id, kind, title, preset_json, blob_bytes, created_at, expires_at, clone_allowed as i64],
+            "INSERT OR IGNORE INTO share_links (token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![token, user_id, kind, title, preset_json, blob_bytes, created_at, expires_at, clone_allowed as i64, interaction, protected_json],
         )?;
         if inserted == 1 {
             return Ok(token);
@@ -3281,7 +3311,7 @@ pub fn set_share_blob_path(conn: &Connection, token: &str, blob_path: &str) -> R
 pub fn get_share_link(conn: &Connection, token: &str) -> Result<Option<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.query_row(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json
          FROM share_links
          WHERE token = ?1 AND revoked = 0 AND expires_at > ?2",
         params![token, now],
@@ -3313,7 +3343,7 @@ pub fn share_usage(conn: &Connection, user_id: i64) -> Result<(u64, u64)> {
 pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json
          FROM share_links
          WHERE user_id = ?1 AND revoked = 0 AND expires_at > ?2
          ORDER BY created_at DESC",
@@ -6407,7 +6437,9 @@ mod tests {
                 created_at  TEXT    NOT NULL,
                 expires_at  TEXT    NOT NULL,
                 revoked     INTEGER NOT NULL DEFAULT 0,
-                clone_allowed INTEGER NOT NULL DEFAULT 0
+                clone_allowed INTEGER NOT NULL DEFAULT 0,
+                interaction TEXT NOT NULL DEFAULT 'view',
+                protected_json TEXT NOT NULL DEFAULT '[]'
             );
 
             CREATE TABLE auth_tokens (
@@ -6527,7 +6559,7 @@ mod tests {
         let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        let token = super::create_share_link(&conn, uid, "live", "t", "{}", 0, &now, &future_ts(), false)
+        let token = super::create_share_link(&conn, uid, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]")
             .expect("create");
         assert_eq!(token.len(), 32);
 
@@ -6546,6 +6578,42 @@ mod tests {
         assert!(super::get_share_link(&conn, &token).expect("query").is_none());
         // Revoking twice is not a success either.
         assert!(!super::revoke_share(&conn, uid, &token).expect("revoke"));
+    }
+
+    /// Chart-share policy v1 (docs/mlc/plans/share-policy-2026-09-25.md §1,
+    /// §11 step 1): `interaction`/`protected_json` round-trip through
+    /// `create_share_link` -> `get_share_link` unchanged, and a row inserted
+    /// with the ALTER TABLE's own bare defaults (simulating a link created
+    /// before this column existed) reads back as `"view"`/`"[]"` — the "old
+    /// links keep today's behaviour" migration guarantee.
+    #[test]
+    fn share_link_interaction_and_protected_json_roundtrip() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "erin", Some("pub-erin"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let protected = r#"[{"kind":"primitive","id":"7"}]"#;
+        let token = super::create_share_link(
+            &conn, uid, "live", "t", "{}", 0, &now, &future_ts(), false, "interactive", protected,
+        )
+        .expect("create");
+        let row = super::get_share_link(&conn, &token).expect("query").expect("row");
+        assert_eq!(row.interaction, "interactive");
+        assert_eq!(row.protected_json, protected);
+
+        // A bare INSERT that never names these two columns (an old row) gets
+        // the ALTER TABLE's own defaults, not a NULL/panic.
+        conn.execute(
+            "INSERT INTO share_links (token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, revoked, clone_allowed)
+             VALUES ('legacytoken000000000000000000legacy', ?1, 'live', 'old', '{}', '', 0, ?2, ?3, 0, 0)",
+            rusqlite::params![uid, now, future_ts()],
+        )
+        .expect("insert legacy row");
+        let legacy = super::get_share_link(&conn, "legacytoken000000000000000000legacy")
+            .expect("query")
+            .expect("row");
+        assert_eq!(legacy.interaction, "view");
+        assert_eq!(legacy.protected_json, "[]");
     }
 
     // ---- extend_paid_until / grant_paid_days (admin `paid-days` grant) ----
@@ -6652,14 +6720,14 @@ mod tests {
 
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (0, 0));
 
-        super::create_share_link(&conn, uid, "live", "l1", "{}", 0, &now, &future_ts(), false)
+        super::create_share_link(&conn, uid, "live", "l1", "{}", 0, &now, &future_ts(), false, "view", "[]")
             .expect("create");
-        let shot = super::create_share_link(&conn, uid, "screenshot", "s1", "", 42, &now, &future_ts(), false)
+        let shot = super::create_share_link(&conn, uid, "screenshot", "s1", "", 42, &now, &future_ts(), false, "view", "[]")
             .expect("create");
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (1, 1));
 
         // Expired and revoked rows stop counting.
-        super::create_share_link(&conn, uid, "live", "l2", "{}", 0, &now, &past_ts(), false)
+        super::create_share_link(&conn, uid, "live", "l2", "{}", 0, &now, &past_ts(), false, "view", "[]")
             .expect("create");
         super::revoke_share(&conn, uid, &shot).expect("revoke");
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (1, 0));
@@ -6672,17 +6740,17 @@ mod tests {
 
         let older = super::create_share_link(
             &conn, uid, "live", "old", "{}", 0,
-            "2026-01-01T00:00:00+00:00", &future_ts(), false,
+            "2026-01-01T00:00:00+00:00", &future_ts(), false, "view", "[]",
         )
         .expect("create");
         let newer = super::create_share_link(
             &conn, uid, "screenshot", "new", "", 1,
-            "2026-02-01T00:00:00+00:00", &future_ts(), false,
+            "2026-02-01T00:00:00+00:00", &future_ts(), false, "view", "[]",
         )
         .expect("create");
         super::create_share_link(
             &conn, uid, "live", "dead", "{}", 0,
-            "2026-03-01T00:00:00+00:00", &past_ts(), false,
+            "2026-03-01T00:00:00+00:00", &past_ts(), false, "view", "[]",
         )
         .expect("create");
 
@@ -6697,14 +6765,14 @@ mod tests {
         let uid = insert_share_user(&conn, "dave", Some("pub-dave"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        let live_expired = super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &past_ts(), false)
+        let live_expired = super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &past_ts(), false, "view", "[]")
             .expect("create");
         let shot_expired =
-            super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &past_ts(), false)
+            super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &past_ts(), false, "view", "[]")
                 .expect("create");
         super::set_share_blob_path(&conn, &shot_expired, &format!("{}/{}.png", uid, shot_expired))
             .expect("stamp blob path");
-        let alive = super::create_share_link(&conn, uid, "live", "ok", "{}", 0, &now, &future_ts(), false)
+        let alive = super::create_share_link(&conn, uid, "live", "ok", "{}", 0, &now, &future_ts(), false, "view", "[]")
             .expect("create");
 
         let removed = super::cleanup_expired_share_links(&conn).expect("cleanup");
@@ -6745,9 +6813,9 @@ mod tests {
         let uid = insert_share_user(&conn, "gina", Some("pub-gina"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &future_ts(), false)
+        super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &future_ts(), false, "view", "[]")
             .expect("create live");
-        let shot = super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &future_ts(), false)
+        let shot = super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &future_ts(), false, "view", "[]")
             .expect("create screenshot");
         let blob_path = format!("{}/{}.png", uid, shot);
         super::set_share_blob_path(&conn, &shot, &blob_path).expect("stamp blob path");

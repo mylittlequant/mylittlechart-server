@@ -240,6 +240,52 @@ pub struct CreateLiveShareRequest {
     /// `false` — unchanged behaviour for every caller that doesn't send it.
     #[serde(default)]
     pub clone_allowed: bool,
+    /// Chart-share policy v1 (docs/mlc/plans/share-policy-2026-09-25.md §1):
+    /// "view" | "interactive". Unknown/missing = "view" — the safe default:
+    /// an old client omitting the field gets the MORE restrictive behaviour.
+    #[serde(default)]
+    pub interaction: ShareInteraction,
+    /// Element refs the sharer marked Protected at share time — present in
+    /// the live view, stripped on clone unless the caller's resolved tier is
+    /// `clone_protected` (§1). Empty by default.
+    #[serde(default)]
+    pub protected: Vec<ProtectedElementRef>,
+}
+
+/// One live-view interaction floor a share link grants (§1). `View` allows
+/// pan/zoom/crosshair only; `Interactive` lets the recipient click and
+/// adjust things locally (never persisted — see `mlc-app/src/share_viewer.rs`,
+/// unaffected by this server-side change).
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareInteraction {
+    #[default]
+    View,
+    Interactive,
+}
+
+impl ShareInteraction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShareInteraction::View => "view",
+            ShareInteraction::Interactive => "interactive",
+        }
+    }
+}
+
+/// One element the sharer marked Protected. `kind` matches the entity-kind
+/// vocabulary `db::ShareTier`/`clone_preset_with_strip` use:
+/// `"indicator" | "primitive" | "alert"`. `id` is the element's own id
+/// STRINGIFIED in the sharer's own id-space (u64 for indicator/primitive/
+/// alert per `mlc-core/src/preset/snapshots.rs`) — valid because
+/// `preset_json` is stored and served WITHOUT any id remap ever touching it
+/// server-side (that only runs client-side, on open/clone) — the id the
+/// sharer marked at creation is the exact id `clone_preset_with_strip` will
+/// see in `preset_json` later.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+pub struct ProtectedElementRef {
+    pub kind: String,
+    pub id: String,
 }
 
 /// POST /api/share/live
@@ -295,6 +341,17 @@ pub async fn create_live_share(
         Err(e) => return e.into_response(),
     };
     let clone_allowed = body.clone_allowed;
+    let interaction = body.interaction.as_str();
+    let protected_json = match serde_json::to_string(&body.protected) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("protected is not serializable")),
+            )
+                .into_response();
+        }
+    };
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(String, String)> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let is_paid = crate::db::user_is_paid(&conn, user_id)?;
@@ -313,6 +370,8 @@ pub async fn create_live_share(
             &created_at,
             &expires_at,
             clone_allowed,
+            interaction,
+            &protected_json,
         )?;
         Ok((token, expires_at))
     })
@@ -440,7 +499,9 @@ pub async fn create_screenshot_share(
             // The row goes in first (blob_path empty) because the blob's path
             // contains the token, which only exists once the insert draws it.
             // A screenshot carries no preset to clone, so clone_allowed is
-            // always false here — no request field offers to set it.
+            // always false here, and interaction/protected stay at their
+            // "view"/"[]" defaults — no request field offers to set any of
+            // them (a screenshot is pure view-only by construction, §0).
             let token = crate::db::create_share_link(
                 &conn,
                 user_id,
@@ -451,6 +512,8 @@ pub async fn create_screenshot_share(
                 &created_at,
                 &expires_at,
                 false,
+                "view",
+                "[]",
             )?;
 
             // user_id and token are server-generated (integer / hex), so
@@ -610,6 +673,15 @@ pub async fn get_share(
                         .into_response();
                 }
             };
+            // Malformed `protected_json` (should never happen — it is
+            // validated as `Vec<ProtectedElementRef>` at creation time, see
+            // `create_live_share`) degrades to "nothing marked Protected"
+            // rather than failing the whole read — the protected list is an
+            // advisory hint for the recipient's object-tree lock glyph, not
+            // a security boundary (the real enforcement is server-side, at
+            // clone time — see `clone_preset_with_strip`).
+            let protected: Vec<ProtectedElementRef> =
+                serde_json::from_str(&row.protected_json).unwrap_or_default();
             Json(serde_json::json!({
                 "kind": "live",
                 "title": row.title,
@@ -618,6 +690,8 @@ pub async fn get_share(
                 "created_at": row.created_at,
                 "expires_at": row.expires_at,
                 "rights": rights,
+                "interaction": row.interaction,
+                "protected": protected,
             }))
             .into_response()
         }
@@ -937,5 +1011,46 @@ pub async fn clone_share(
             Json(ErrorResponse::new("Internal error")),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chart-share policy v1 (docs/mlc/plans/share-policy-2026-09-25.md §1,
+    /// §11 step 1): a pre-existing client sending only the two original
+    /// fields (`{title, preset}` — no `clone_allowed`, no `interaction`, no
+    /// `protected`) must still deserialize, with every new field taking its
+    /// safe `#[serde(default)]` value.
+    #[test]
+    fn create_live_share_request_parses_the_old_two_field_shape() {
+        let body = serde_json::json!({ "title": "old client", "preset": { "windows": [] } });
+        let parsed: CreateLiveShareRequest =
+            serde_json::from_value(body).expect("old-shape request must still parse");
+        assert_eq!(parsed.title, "old client");
+        assert!(!parsed.clone_allowed);
+        assert_eq!(parsed.interaction, ShareInteraction::View);
+        assert!(parsed.protected.is_empty());
+    }
+
+    /// The current, full-shape request round-trips every field, including a
+    /// non-default interaction and a non-empty protected list.
+    #[test]
+    fn create_live_share_request_parses_the_full_rev2_shape() {
+        let body = serde_json::json!({
+            "title": "new client",
+            "preset": {},
+            "clone_allowed": true,
+            "interaction": "interactive",
+            "protected": [{ "kind": "primitive", "id": "42" }],
+        });
+        let parsed: CreateLiveShareRequest =
+            serde_json::from_value(body).expect("full-shape request must parse");
+        assert!(parsed.clone_allowed);
+        assert_eq!(parsed.interaction, ShareInteraction::Interactive);
+        assert_eq!(parsed.protected.len(), 1);
+        assert_eq!(parsed.protected[0].kind, "primitive");
+        assert_eq!(parsed.protected[0].id, "42");
     }
 }
