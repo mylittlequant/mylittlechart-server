@@ -3635,7 +3635,10 @@ pub fn update_share_link_policy(
         conn.execute("UPDATE share_links SET interaction = ?1 WHERE token = ?2", params![v, token])?;
     }
     if let Some(v) = visibility {
-        conn.execute("UPDATE share_links SET visibility = ?1 WHERE token = ?2", params![v, token])?;
+        conn.execute(
+            "UPDATE share_links SET visibility = ?1, revision = revision + 1 WHERE token = ?2",
+            params![v, token],
+        )?;
     }
     if let Some(v) = protected_json {
         conn.execute("UPDATE share_links SET protected_json = ?1 WHERE token = ?2", params![v, token])?;

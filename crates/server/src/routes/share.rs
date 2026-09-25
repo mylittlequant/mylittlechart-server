@@ -2105,6 +2105,78 @@ fn in_rounded_rect(x: i32, y: i32, w: i32, h: i32, r: i32) -> bool {
 /// Branded card with an empty right-hand frame (`assets/og-card-blank.png`).
 /// A chart, a QR, or anything else is placed into that frame. The file has
 /// no chart of its own.
+/// Branded card with the words in the frame. A private link must not fall
+/// back to the site card, which still contains a sample chart.
+pub async fn get_private_share_card() -> Response {
+    Response::builder()
+        .status(200)
+        .header("content-type", "image/png")
+        .header("cache-control", "public, max-age=86400")
+        .body(Body::from(private_share_card_png().to_vec()))
+        .unwrap()
+}
+
+fn private_share_card_png() -> &'static [u8] {
+    static CELL: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut card = blank_card().clone();
+        paint_card_label(&mut card, "PRIVATE", SHOT_Y + SHOT_H / 2 - 70);
+        paint_card_label(&mut card, "CHART", SHOT_Y + SHOT_H / 2 + 20);
+        let mut buf = Vec::new();
+        let _ = image::DynamicImage::ImageRgba8(card).write_to(
+            &mut std::io::Cursor::new(&mut buf),
+            image::ImageFormat::Png,
+        );
+        buf
+    })
+    .as_slice()
+}
+
+fn glyph_rows(c: char) -> [u8; 7] {
+    match c {
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b01010, 0b00100],
+        _ => [0, 0, 0, 0, 0, 0, 0],
+    }
+}
+
+fn paint_card_label(card: &mut image::RgbaImage, text: &str, top: u32) {
+    const SCALE: u32 = 10;
+    const GAP: u32 = 4;
+    let cols = 5u32;
+    let advance = (cols + 1) * SCALE + GAP;
+    let width = text.chars().count() as u32 * advance;
+    let mut x0 = SHOT_X + SHOT_W.saturating_sub(width) / 2;
+    let ink = [0xE8, 0xEC, 0xF4, 255];
+    for ch in text.chars() {
+        let rows = glyph_rows(ch);
+        for (ry, bits) in rows.iter().enumerate() {
+            for cx in 0..cols {
+                if bits & (1u8 << (cols - 1 - cx)) == 0 {
+                    continue;
+                }
+                let px = x0 + cx * SCALE;
+                let py = top + ry as u32 * SCALE;
+                for dy in 0..SCALE {
+                    for dx in 0..SCALE {
+                        if let Some(p) = card.get_pixel_mut_checked(px + dx, py + dy) {
+                            *p = image::Rgba(ink);
+                        }
+                    }
+                }
+            }
+        }
+        x0 += advance;
+    }
+}
+
 fn blank_card() -> &'static image::RgbaImage {
     static CELL: std::sync::OnceLock<image::RgbaImage> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
@@ -2215,7 +2287,9 @@ pub(crate) fn og_tags_for_share(row: &crate::db::ShareLinkRow, owner_label: &str
         return OgTags {
             title: Some(PRIVATE_SHARE_OG_TITLE.to_string()),
             description: None,
-            image_url: None,
+            // Not the site default card: that one still has a sample chart.
+            // This image is the same frame with the words in place of a chart.
+            image_url: Some("https://mylittlechart.org/api/share/private-card.png".to_string()),
         };
     }
     let image_url = if row.preview_path.is_empty() {
@@ -3067,7 +3141,10 @@ mod tests {
         let tags = og_tags_for_share(&private, "admin");
         assert_eq!(tags.title, Some(PRIVATE_SHARE_OG_TITLE.to_string()));
         assert_eq!(tags.description, None);
-        assert_eq!(tags.image_url, None);
+        assert_eq!(
+            tags.image_url.as_deref(),
+            Some("https://mylittlechart.org/api/share/private-card.png")
+        );
     }
 
     #[test]

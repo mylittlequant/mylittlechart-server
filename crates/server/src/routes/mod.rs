@@ -147,6 +147,7 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
                 .layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route("/share/mine", get(share::list_my_shares))
+        .route("/share/private-card.png", get(share::get_private_share_card))
         .route(
             "/share/{token}",
             get(share::get_share).delete(share::delete_share).patch(share::update_share_policy),
