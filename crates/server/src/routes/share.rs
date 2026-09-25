@@ -206,6 +206,15 @@ async fn check_share_entitlement(
             ShareKind::Live => live_count,
             ShareKind::Screenshot => shot_count,
         };
+        let kind_str = kind.as_str();
+        let limit = entitlements::share_limit(kind, is_paid);
+        let mut current = current;
+        while current >= limit {
+            if !crate::db::burn_oldest_unpinned_share(&conn, user_id, kind_str)? {
+                break;
+            }
+            current -= 1;
+        }
         Ok(entitlements::share_create_allowed(kind, current, is_paid))
     })
     .await;
@@ -215,7 +224,7 @@ async fn check_share_entitlement(
         Ok(Ok(false)) => Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse::new(
-                "share limit reached: revoke an existing share or upgrade the account",
+                "share limit reached: every share of this kind is pinned — unpin or revoke one",
             )),
         )
             .into_response()),
@@ -871,6 +880,9 @@ pub async fn get_share(
                 "protected": protected,
                 "clone_protected": clone_protected,
                 "allow_forward": allow_forward,
+                "visibility": row.visibility,
+                "clone_allowed": row.clone_allowed,
+                "pinned": row.pinned,
             }))
             .into_response()
         }
@@ -884,6 +896,8 @@ pub async fn get_share(
             "rights": rights,
             "clone_protected": clone_protected,
             "allow_forward": allow_forward,
+            "visibility": row.visibility,
+            "pinned": row.pinned,
         }))
         .into_response(),
         // A kind this build does not know is treated as not found — an older
@@ -955,6 +969,11 @@ pub async fn list_my_shares(State(state): State<Arc<AppState>>, headers: HeaderM
                     "bytes": row.blob_bytes,
                     "created_at": row.created_at,
                     "expires_at": row.expires_at,
+                    "pinned": row.pinned,
+                    "clone_allowed": row.clone_allowed,
+                    "interaction": row.interaction,
+                    "visibility": row.visibility,
+                    "allow_forward": row.effective_allow_forward(),
                 })
             })
             .collect())
@@ -1326,8 +1345,9 @@ pub async fn delete_share_grant(
 /// instruction (docs/mlc/plans/share-policy-2026-09-25.md §3 called changing
 /// a link's policy post-creation out of scope for v1; the owner has since
 /// asked for exactly this for `visibility`/`interaction`/`protected`, so
-/// those three — and only those three — become mutable through this one
-/// path). Revoke-and-reshare remains the only way to change `clone_allowed`.
+/// those three become mutable through this one path). `clone_allowed` and
+/// `pinned` are mutable here too: the ring burns unpinned links, and the
+/// owner turns clone on or off without revoking the token the tab holds.
 #[derive(serde::Deserialize)]
 pub struct UpdateShareLinkPolicyRequest {
     pub interaction: Option<ShareInteraction>,
@@ -1343,6 +1363,12 @@ pub struct UpdateShareLinkPolicyRequest {
     /// own doc comment for the exact mechanism.
     #[serde(default)]
     pub allow_forward: Option<bool>,
+    /// Absent leaves `clone_allowed` as it was set at creation.
+    #[serde(default)]
+    pub clone_allowed: Option<bool>,
+    /// Absent leaves the ring-pin as it is.
+    #[serde(default)]
+    pub pinned: Option<bool>,
 }
 
 /// PATCH /api/share/{token}
@@ -1389,6 +1415,8 @@ pub async fn update_share_policy(
     let interaction = body.interaction.map(|i| i.as_str());
     let visibility = body.visibility.map(|v| v.as_str());
     let allow_forward = body.allow_forward;
+    let clone_allowed = body.clone_allowed;
+    let pinned = body.pinned;
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
@@ -1400,6 +1428,8 @@ pub async fn update_share_policy(
             visibility,
             protected_json.as_deref(),
             allow_forward,
+            clone_allowed,
+            pinned,
         )
     })
     .await;
@@ -2473,7 +2503,7 @@ mod tests {
 
         // A stranger's update is refused entirely.
         assert!(!crate::db::update_share_link_policy(
-            &conn, &token, stranger, Some("interactive"), None, None, None,
+            &conn, &token, stranger, Some("interactive"), None, None, None, None, None,
         )
         .expect("update"));
         let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
@@ -2482,7 +2512,7 @@ mod tests {
         // The owner can update just `interaction`, leaving `visibility` and
         // `protected_json` untouched.
         assert!(crate::db::update_share_link_policy(
-            &conn, &token, owner, Some("interactive"), None, None, None,
+            &conn, &token, owner, Some("interactive"), None, None, None, None, None,
         )
         .expect("update"));
         let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
@@ -2492,7 +2522,7 @@ mod tests {
 
         // …and `visibility`/`protected` independently of `interaction`.
         assert!(crate::db::update_share_link_policy(
-            &conn, &token, owner, None, Some("private"), Some(r#"[{"kind":"primitive","id":"1"}]"#), None,
+            &conn, &token, owner, None, Some("private"), Some(r#"[{"kind":"primitive","id":"1"}]"#), None, None, None,
         )
         .expect("update"));
         let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
@@ -2573,7 +2603,7 @@ mod tests {
         // same 404-opacity discipline as every other field this route can
         // set.
         assert!(!crate::db::update_share_link_policy(
-            &conn, &token, stranger, None, None, None, Some(false),
+            &conn, &token, stranger, None, None, None, Some(false), None, None,
         )
         .expect("update"));
         let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
@@ -2581,7 +2611,7 @@ mod tests {
 
         // The owner pins it explicitly.
         assert!(crate::db::update_share_link_policy(
-            &conn, &token, owner, None, None, None, Some(false),
+            &conn, &token, owner, None, None, None, Some(false), None, None,
         )
         .expect("update"));
         let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
@@ -2607,7 +2637,7 @@ mod tests {
         .expect("create share");
         // Flip visibility to private WITHOUT touching allow_forward.
         assert!(crate::db::update_share_link_policy(
-            &conn, &token_a, owner, None, Some("private"), None, None,
+            &conn, &token_a, owner, None, Some("private"), None, None, None, None,
         )
         .expect("update"));
         let row_a = crate::db::get_share_link(&conn, &token_a).expect("query").expect("row");
@@ -2629,7 +2659,7 @@ mod tests {
         let row_b = crate::db::get_share_link(&conn, &token_b).expect("query").expect("row");
         assert!(row_b.effective_allow_forward(), "public default, before the PATCH");
         assert!(crate::db::update_share_link_policy(
-            &conn, &token_b, owner, None, Some("private"), None, None,
+            &conn, &token_b, owner, None, Some("private"), None, None, None, None,
         )
         .expect("update"));
         let row_b = crate::db::get_share_link(&conn, &token_b).expect("query").expect("row");
@@ -2800,6 +2830,7 @@ mod tests {
             visibility: "public".to_string(),
             preview_path: String::new(),
             allow_forward: None,
+            pinned: false,
         };
 
         // Public, blank title, no preview — no override at all.
@@ -2851,6 +2882,7 @@ mod tests {
             visibility: row.visibility.clone(),
             preview_path: row.preview_path.clone(),
             allow_forward: row.allow_forward,
+            pinned: row.pinned,
         }
     }
 

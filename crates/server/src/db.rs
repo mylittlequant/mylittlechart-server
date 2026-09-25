@@ -571,6 +571,13 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
     // overwhelming majority of existing rows, matching today's actual
     // behaviour of "recipients can already forward the raw link text".
     let _ = conn.execute("ALTER TABLE share_links ADD COLUMN allow_forward INTEGER", []);
+    // Pin keeps a link out of the ring. Unpinned links are the ones creation
+    // burns, oldest first, once the account is at its cap. Existing rows
+    // start unpinned.
+    let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     // Safe migration: per-account/group share rights (§1's new `ShareTier`
     // core). NULL for every existing `object_grants` row — a grant with no
     // group target simply never matches via `grant_group_members`, the same
@@ -3296,6 +3303,10 @@ pub struct ShareLinkRow {
     /// that turns this raw, possibly-unset value into the answer a caller
     /// actually wants.
     pub allow_forward: Option<bool>,
+    /// Kept out of the ring. Creation burns the oldest unpinned link of the
+    /// same kind once the account is at its cap; a pinned link is never that
+    /// victim.
+    pub pinned: bool,
 }
 
 impl ShareLinkRow {
@@ -3333,6 +3344,7 @@ fn share_link_from_row(row: &rusqlite::Row<'_>) -> Result<ShareLinkRow> {
         visibility: row.get(12)?,
         preview_path: row.get(13)?,
         allow_forward: row.get::<_, Option<i64>>(14)?.map(|v| v != 0),
+        pinned: row.get::<_, i64>(15)? != 0,
     })
 }
 
@@ -3412,7 +3424,7 @@ pub fn set_share_blob_path(conn: &Connection, token: &str, blob_path: &str) -> R
 pub fn get_share_link(conn: &Connection, token: &str) -> Result<Option<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.query_row(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned
          FROM share_links
          WHERE token = ?1 AND revoked = 0 AND expires_at > ?2",
         params![token, now],
@@ -3444,7 +3456,7 @@ pub fn share_usage(conn: &Connection, user_id: i64) -> Result<(u64, u64)> {
 pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned
          FROM share_links
          WHERE user_id = ?1 AND revoked = 0 AND expires_at > ?2
          ORDER BY created_at DESC",
@@ -3499,6 +3511,8 @@ pub fn update_share_link_policy(
     visibility: Option<&str>,
     protected_json: Option<&str>,
     allow_forward: Option<bool>,
+    clone_allowed: Option<bool>,
+    pinned: Option<bool>,
 ) -> Result<bool> {
     let owns: bool = conn
         .query_row(
@@ -3526,7 +3540,39 @@ pub fn update_share_link_policy(
             params![v as i64, token],
         )?;
     }
+    if let Some(v) = clone_allowed {
+        conn.execute(
+            "UPDATE share_links SET clone_allowed = ?1 WHERE token = ?2",
+            params![v as i64, token],
+        )?;
+    }
+    if let Some(v) = pinned {
+        conn.execute(
+            "UPDATE share_links SET pinned = ?1 WHERE token = ?2",
+            params![v as i64, token],
+        )?;
+    }
     Ok(true)
+}
+
+/// Revoke the oldest active unpinned share of `kind` for this account.
+/// Returns false when every active share of that kind is pinned, so the
+/// caller can still refuse creation instead of burning a pinned link.
+pub fn burn_oldest_unpinned_share(conn: &Connection, user_id: i64, kind: &str) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let token: Option<String> = conn
+        .query_row(
+            "SELECT token FROM share_links
+             WHERE user_id = ?1 AND kind = ?2 AND revoked = 0 AND pinned = 0 AND expires_at > ?3
+             ORDER BY created_at ASC LIMIT 1",
+            params![user_id, kind, now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(token) = token else {
+        return Ok(false);
+    };
+    revoke_share(conn, user_id, &token)
 }
 
 /// Revoke one share link, owner-only: the `user_id` in the WHERE clause is
@@ -6953,7 +6999,8 @@ mod tests {
                 protected_json TEXT NOT NULL DEFAULT '[]',
                 visibility TEXT NOT NULL DEFAULT 'public',
                 preview_path TEXT NOT NULL DEFAULT '',
-                allow_forward INTEGER
+                allow_forward INTEGER,
+                pinned INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE auth_tokens (

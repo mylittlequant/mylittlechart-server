@@ -313,8 +313,8 @@ impl ShareKind {
 /// Free limits also apply to anonymous callers, who cannot create shares at
 /// all (creation is authenticated-only) — they exist here so
 /// `GET /api/entitlements` can still state a maximum for them.
-pub const FREE_LIVE_SHARE_LIMIT: u64 = 1;
-pub const PAID_LIVE_SHARE_LIMIT: u64 = 10;
+pub const FREE_LIVE_SHARE_LIMIT: u64 = 25;
+pub const PAID_LIVE_SHARE_LIMIT: u64 = 100;
 pub const FREE_SCREENSHOT_SHARE_LIMIT: u64 = 10;
 pub const PAID_SCREENSHOT_SHARE_LIMIT: u64 = 100;
 
@@ -599,18 +599,18 @@ mod tests {
 
     #[test]
     fn share_create_allowed_free_tier_boundaries() {
-        // Free: 1 live, 10 screenshots — the boundary count itself is refused.
-        assert!(share_create_allowed(ShareKind::Live, 0, false));
-        assert!(!share_create_allowed(ShareKind::Live, 1, false));
+        // Free: 25 live, 10 screenshots — the boundary count itself is refused.
+        assert!(share_create_allowed(ShareKind::Live, 24, false));
+        assert!(!share_create_allowed(ShareKind::Live, 25, false));
         assert!(share_create_allowed(ShareKind::Screenshot, 9, false));
         assert!(!share_create_allowed(ShareKind::Screenshot, 10, false));
     }
 
     #[test]
     fn share_create_allowed_paid_tier_boundaries() {
-        // Paid: 10 live, 100 screenshots.
-        assert!(share_create_allowed(ShareKind::Live, 9, true));
-        assert!(!share_create_allowed(ShareKind::Live, 10, true));
+        // Paid: 100 live, 100 screenshots.
+        assert!(share_create_allowed(ShareKind::Live, 99, true));
+        assert!(!share_create_allowed(ShareKind::Live, 100, true));
         assert!(share_create_allowed(ShareKind::Screenshot, 99, true));
         assert!(!share_create_allowed(ShareKind::Screenshot, 100, true));
     }
