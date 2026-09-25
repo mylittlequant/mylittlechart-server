@@ -2137,7 +2137,27 @@ pub fn upsert_receipt(
     ts: i64,
 ) -> Result<i64, MatrixStoreError> {
     let tx = conn.transaction()?;
+    let stream_id = upsert_receipt_in_tx(&tx, room_id, user_id, receipt_type, event_id, ts)?;
+    tx.commit()?;
+    Ok(stream_id)
+}
 
+/// The `&Transaction`-scoped core of [`upsert_receipt`] — split out the same
+/// way [`insert_timeline_event_in_tx`] is split from [`insert_timeline_event`],
+/// so [`catch_up_dm_conversation`] (P15: bridging a live legacy DM send, or a
+/// boot pass catching one up) can advance a reader's receipt in the SAME
+/// transaction as the messages that reader's receipt targets, rather than a
+/// second one — `upsert_receipt` itself opens its own transaction and so
+/// cannot be nested inside a caller's own `Transaction` on the same
+/// connection.
+fn upsert_receipt_in_tx(
+    tx: &Transaction,
+    room_id: &str,
+    user_id: i64,
+    receipt_type: ReceiptType,
+    event_id: &str,
+    ts: i64,
+) -> Result<i64, MatrixStoreError> {
     let target: Option<(i64, String)> = tx
         .query_row("SELECT stream_id, room_id FROM events WHERE event_id = ?1", params![event_id], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -2160,12 +2180,11 @@ pub fn upsert_receipt(
         let existing_position: i64 =
             tx.query_row("SELECT stream_id FROM events WHERE event_id = ?1", params![existing_event_id], |row| row.get(0))?;
         if target_position <= existing_position {
-            tx.commit()?;
             return Ok(*existing_stream_id);
         }
     }
 
-    let stream_id = next_stream_id(&tx)?;
+    let stream_id = next_stream_id(tx)?;
     tx.execute(
         "INSERT INTO receipts (room_id, user_id, receipt_type, event_id, ts, stream_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -2173,7 +2192,6 @@ pub fn upsert_receipt(
             event_id = excluded.event_id, ts = excluded.ts, stream_id = excluded.stream_id",
         params![room_id, user_id, receipt_type.as_str(), event_id, ts, stream_id],
     )?;
-    tx.commit()?;
     Ok(stream_id)
 }
 
@@ -2619,6 +2637,56 @@ pub fn migrate_dm_conversation(
         },
         DmMigrationCounts { messages_imported: extras.messages.len(), receipts_set },
     ))
+}
+
+/// A catch-up pass for an ALREADY migrated room (P15) — the binary crate's
+/// own `matrix_migration` module calls this both from a live legacy DM
+/// send's bridge (`routes::dm::create_message`, right after its own insert
+/// commits) and from a boot pass over a conversation
+/// [`room_by_legacy_dm_id`] already finds a room for. `messages` (already
+/// filtered by the caller to exclude anything already in
+/// `legacy_dm_message_map`, ordered ascending by `legacy_message_id`) lands
+/// as new `org.mylittlechart.legacy_dm` timeline events plus their
+/// `legacy_dm_message_map` rows, then each of `receipts` advances that
+/// reader's `m.read` receipt to the newest of THESE messages they have
+/// `read_at` for — never moved backwards ([`upsert_receipt_in_tx`]'s own
+/// guarantee, the SAME one a live `/receipt` call gets) — all in ONE
+/// transaction. Reuses the exact per-event helpers [`migrate_dm_conversation`]
+/// itself uses, so a caught-up room's rows are indistinguishable from ones a
+/// fresh migration (or a live Matrix send) would have produced.
+pub fn catch_up_dm_conversation(
+    conn: &mut Connection,
+    room_id: &str,
+    messages: &[LegacyDmMessageImport],
+    receipts: &[LegacyDmReadReceipt],
+) -> Result<DmMigrationCounts, MatrixStoreError> {
+    let tx = conn.transaction()?;
+
+    let mut event_id_by_legacy_id: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    for message in messages {
+        insert_timeline_event_in_tx(
+            &tx,
+            &message.event_id,
+            room_id,
+            message.sender_user_id,
+            "org.mylittlechart.legacy_dm",
+            &message.content,
+            message.origin_server_ts,
+            None,
+        )?;
+        insert_legacy_dm_message_map(&tx, message.legacy_message_id, &message.event_id)?;
+        event_id_by_legacy_id.insert(message.legacy_message_id, message.event_id.clone());
+    }
+
+    let mut receipts_set = 0usize;
+    for receipt in receipts {
+        let Some(target_event_id) = event_id_by_legacy_id.get(&receipt.up_to_legacy_message_id) else { continue };
+        upsert_receipt_in_tx(&tx, room_id, receipt.reader_user_id, ReceiptType::Read, target_event_id, receipt.ts_ms)?;
+        receipts_set += 1;
+    }
+
+    tx.commit()?;
+    Ok(DmMigrationCounts { messages_imported: messages.len(), receipts_set })
 }
 
 // ============================================================================

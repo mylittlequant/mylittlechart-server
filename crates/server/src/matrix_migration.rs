@@ -46,6 +46,23 @@
 //! migrating any ONE conversation (an identity lookup error, a messenger
 //! write error, an unparseable timestamp) is caught here, logged with that
 //! conversation's id, and never touches any other conversation.
+//!
+//! # Catch-up (P15): the old `/dm/conversations*` routes stay live
+//!
+//! `routes::dm`'s legacy send-message route keeps working for native clients
+//! that have not moved to the Matrix subset yet — any message it accepts
+//! after boot lands in `social.db`'s `dm_messages` only, never in the
+//! migrated room, unless something re-runs the import for that one
+//! conversation. [`catch_up_conversation`] is that re-run: it appends every
+//! `dm_messages` row not yet in `legacy_dm_message_map`, using the exact
+//! same per-message content/timestamp derivation [`migrate_one_conversation`]
+//! uses ([`legacy_dm_message_import`]/[`track_read_receipt`], factored out so
+//! the two paths can never drift). [`migrate_legacy_dms`] runs it on every
+//! `AlreadyMigrated` conversation at boot, closing any gap since the last
+//! run. A live bridge that also runs it right after
+//! `routes::dm::create_message`'s own insert commits (so an already-open
+//! `/sync` long-poll sees the message at once, not just at the next boot) is
+//! a later piece.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -81,6 +98,11 @@ pub struct MigrationReport {
     pub conversations_skipped: usize,
     pub messages_imported: usize,
     pub receipts_set: usize,
+    /// Messages appended by [`catch_up_conversation`] across every
+    /// already-migrated conversation this pass touched (P15) — disjoint from
+    /// `messages_imported`, which only ever counts a conversation's FIRST,
+    /// full migration.
+    pub messages_caught_up: usize,
     pub skipped: Vec<SkippedConversation>,
 }
 
@@ -127,7 +149,9 @@ impl From<matrix_store::MatrixStoreError> for ConversationMigrationError {
 }
 
 enum ConversationOutcome {
-    AlreadyMigrated,
+    /// Carries what [`catch_up_conversation`] found on this pass — `0`/`0`
+    /// is the routine case (nothing new since the last run).
+    AlreadyMigrated { messages_caught_up: usize, receipts_caught_up: usize },
     Migrated { messages_imported: usize, receipts_set: usize },
     Skipped(String),
 }
@@ -209,7 +233,10 @@ pub fn migrate_legacy_dms(
 
     for conv in &conversations {
         match migrate_one_conversation(messenger, social, identity, conv, now) {
-            Ok(ConversationOutcome::AlreadyMigrated) => {}
+            Ok(ConversationOutcome::AlreadyMigrated { messages_caught_up, receipts_caught_up }) => {
+                report.messages_caught_up += messages_caught_up;
+                report.receipts_set += receipts_caught_up;
+            }
             Ok(ConversationOutcome::Migrated { messages_imported, receipts_set }) => {
                 report.conversations_migrated += 1;
                 report.messages_imported += messages_imported;
@@ -229,11 +256,12 @@ pub fn migrate_legacy_dms(
     }
 
     tracing::info!(
-        "Legacy DM migration: {} conversation(s) migrated, {} skipped, {} message(s) imported, {} receipt(s) set",
+        "Legacy DM migration: {} conversation(s) migrated, {} skipped, {} message(s) imported, {} receipt(s) set, {} message(s) caught up",
         report.conversations_migrated,
         report.conversations_skipped,
         report.messages_imported,
         report.receipts_set,
+        report.messages_caught_up,
     );
 
     Ok(report)
@@ -250,8 +278,12 @@ fn migrate_one_conversation(
     conv: &LegacyConversation,
     now: &str,
 ) -> Result<ConversationOutcome, ConversationMigrationError> {
-    if matrix_store::room_by_legacy_dm_id(messenger, conv.id)?.is_some() {
-        return Ok(ConversationOutcome::AlreadyMigrated);
+    if let Some(room) = matrix_store::room_by_legacy_dm_id(messenger, conv.id)? {
+        let counts = catch_up_conversation(messenger, social, &room.id, conv)?;
+        return Ok(ConversationOutcome::AlreadyMigrated {
+            messages_caught_up: counts.messages_imported,
+            receipts_caught_up: counts.receipts_set,
+        });
     }
 
     let lo_public_id = match db::get_user_public_id(identity, conv.user_lo) {
@@ -321,37 +353,8 @@ fn migrate_one_conversation(
     let mut last_read_by_reader: HashMap<i64, (i64, i64)> = HashMap::new();
 
     for message in &messages {
-        let origin_server_ts = rfc3339_to_millis(&message.created_at)?;
-        message_imports.push(matrix_store::LegacyDmMessageImport {
-            legacy_message_id: message.id,
-            event_id: matrix_store::new_event_id(),
-            sender_user_id: message.sender_user_id,
-            content: serde_json::json!({
-                "legacy_message_id": message.id,
-                "legacy_conversation_id": conv.id,
-                "nonce_b64": STANDARD.encode(&message.nonce),
-                "ciphertext_b64": STANDARD.encode(&message.ciphertext),
-            })
-            .to_string(),
-            origin_server_ts,
-        });
-
-        if let Some(read_at) = &message.read_at {
-            // A message's `read_at` is only ever stamped for the party who
-            // did NOT send it (`dm_db::mark_read`) — the reader is always
-            // "the other one" of this conversation's fixed pair.
-            let reader_user_id = if message.sender_user_id == conv.user_lo { conv.user_hi } else { conv.user_lo };
-            let ts_ms = rfc3339_to_millis(read_at)?;
-            last_read_by_reader
-                .entry(reader_user_id)
-                .and_modify(|(best_id, best_ts)| {
-                    if message.id > *best_id {
-                        *best_id = message.id;
-                        *best_ts = ts_ms;
-                    }
-                })
-                .or_insert((message.id, ts_ms));
-        }
+        message_imports.push(legacy_dm_message_import(conv.id, message)?);
+        track_read_receipt(conv, message, &mut last_read_by_reader)?;
     }
 
     let receipts: Vec<matrix_store::LegacyDmReadReceipt> = last_read_by_reader
@@ -387,6 +390,122 @@ fn migrate_one_conversation(
     let (_room, counts) = matrix_store::migrate_dm_conversation(messenger, bootstrap, &state_events, bootstrap_origin_ts, extras)?;
 
     Ok(ConversationOutcome::Migrated { messages_imported: counts.messages_imported, receipts_set: counts.receipts_set })
+}
+
+// ============================================================================
+// Shared per-message building blocks — used by [`migrate_one_conversation`]
+// (a full first-time migration) AND [`catch_up_conversation`] (P15: an
+// already-migrated room's gap-closer), factored out here so the two paths
+// can never drift on content shape, `origin_server_ts` derivation, or the
+// read-receipt "never over-count as read" rule.
+// ============================================================================
+
+/// Build one `dm_messages` row's `org.mylittlechart.legacy_dm` timeline
+/// import — the exact content shape and `origin_server_ts` derivation
+/// [`migrate_one_conversation`] always used. `event_id` is minted fresh on
+/// every call; safe because every caller only ever calls this for a
+/// `legacy_message_id` it has already confirmed is NOT yet in
+/// `legacy_dm_message_map`.
+fn legacy_dm_message_import(
+    conversation_id: i64,
+    message: &LegacyMessage,
+) -> Result<matrix_store::LegacyDmMessageImport, ConversationMigrationError> {
+    let origin_server_ts = rfc3339_to_millis(&message.created_at)?;
+    Ok(matrix_store::LegacyDmMessageImport {
+        legacy_message_id: message.id,
+        event_id: matrix_store::new_event_id(),
+        sender_user_id: message.sender_user_id,
+        content: serde_json::json!({
+            "legacy_message_id": message.id,
+            "legacy_conversation_id": conversation_id,
+            "nonce_b64": STANDARD.encode(&message.nonce),
+            "ciphertext_b64": STANDARD.encode(&message.ciphertext),
+        })
+        .to_string(),
+        origin_server_ts,
+    })
+}
+
+/// Fold one `dm_messages` row's `read_at` (if any) into `last_read_by_reader`
+/// (`reader_user_id -> (highest dm_messages.id read, its own read_at in
+/// ms)`). The reader is always "the other one" of `conv`'s fixed pair
+/// (`read_at` is only ever stamped for the party who did NOT send it,
+/// `dm_db::mark_read`), and only the HIGHEST `dm_messages.id` a reader has
+/// read is kept — never over-count as read (plan P12 scope, unchanged by
+/// P15).
+fn track_read_receipt(
+    conv: &LegacyConversation,
+    message: &LegacyMessage,
+    last_read_by_reader: &mut HashMap<i64, (i64, i64)>,
+) -> Result<(), ConversationMigrationError> {
+    let Some(read_at) = &message.read_at else { return Ok(()) };
+    let reader_user_id = if message.sender_user_id == conv.user_lo { conv.user_hi } else { conv.user_lo };
+    let ts_ms = rfc3339_to_millis(read_at)?;
+    last_read_by_reader
+        .entry(reader_user_id)
+        .and_modify(|(best_id, best_ts)| {
+            if message.id > *best_id {
+                *best_id = message.id;
+                *best_ts = ts_ms;
+            }
+        })
+        .or_insert((message.id, ts_ms));
+    Ok(())
+}
+
+// ============================================================================
+// Catch-up (P15) — an already-migrated conversation's gap-closer
+// ============================================================================
+
+/// Catch up ONE already-migrated conversation's Matrix room with any
+/// `dm_messages` rows added since its last migration/catch-up pass — every
+/// `dm_messages.id` not yet in `legacy_dm_message_map`, appended ascending
+/// (`list_dm_messages`'s own `ORDER BY id ASC`) as `org.mylittlechart.legacy_dm`
+/// timeline events in ONE transaction
+/// ([`mylittlechart_server::matrix_store::catch_up_dm_conversation`]). A
+/// reader's `m.read` receipt only ever advances to the newest of THESE newly
+/// appended messages they have `read_at` for — an older message's `read_at`
+/// stamped between passes is out of scope here, since that message was
+/// already reflected (if at all) the moment IT was imported.
+///
+/// `room_id` must already be `conv`'s migrated room — every caller
+/// ([`migrate_one_conversation`], and a later piece's live-send bridge) has
+/// just confirmed this via [`matrix_store::room_by_legacy_dm_id`].
+/// `messages_imported` in the returned counts is `0` for the routine case:
+/// nothing new since `conv`'s room was last touched.
+fn catch_up_conversation(
+    messenger: &mut Connection,
+    social: &Connection,
+    room_id: &str,
+    conv: &LegacyConversation,
+) -> Result<matrix_store::DmMigrationCounts, ConversationMigrationError> {
+    let messages = list_dm_messages(social, conv.id)?;
+    let mut message_imports = Vec::new();
+    let mut last_read_by_reader: HashMap<i64, (i64, i64)> = HashMap::new();
+
+    for message in &messages {
+        if matrix_store::legacy_dm_message_event_id(messenger, message.id)?.is_some() {
+            continue;
+        }
+        message_imports.push(legacy_dm_message_import(conv.id, message)?);
+        track_read_receipt(conv, message, &mut last_read_by_reader)?;
+    }
+
+    if message_imports.is_empty() {
+        return Ok(matrix_store::DmMigrationCounts::default());
+    }
+
+    let receipts: Vec<matrix_store::LegacyDmReadReceipt> = last_read_by_reader
+        .into_iter()
+        .map(|(reader_user_id, (up_to_legacy_message_id, ts_ms))| matrix_store::LegacyDmReadReceipt {
+            reader_user_id,
+            up_to_legacy_message_id,
+            ts_ms,
+        })
+        .collect();
+
+    let counts = matrix_store::catch_up_dm_conversation(messenger, room_id, &message_imports, &receipts)?;
+    Ok(counts)
 }
 
 #[cfg(test)]
@@ -701,5 +820,95 @@ mod tests {
         assert_eq!(event3.origin_server_ts, rfc3339_to_millis("2026-09-01T00:03:00+00:00").expect("parse"));
         assert!(event1.stream_id < event2.stream_id);
         assert!(event2.stream_id < event3.stream_id);
+    }
+
+    // ---- P15: catch-up + live bridge ----
+
+    #[test]
+    fn catch_up_appends_only_new_legacy_messages_once() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        let nonce = [0u8; dm_db::DM_NONCE_LEN];
+        dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"one", "2026-09-01T00:01:00+00:00").expect("insert 1");
+        migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("initial migration");
+
+        dm_db::create_message(&social, conv.id, conv.user_hi, &nonce, b"two", "2026-09-01T00:02:00+00:00").expect("insert 2");
+        dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"three", "2026-09-01T00:03:00+00:00").expect("insert 3");
+
+        let room = matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").expect("room exists");
+        let legacy_conv = LegacyConversation { id: conv.id, user_lo: conv.user_lo, user_hi: conv.user_hi, created_at: conv.created_at.clone() };
+
+        let counts = catch_up_conversation(&mut messenger, &social, &room.id, &legacy_conv).expect("catch up");
+        assert_eq!(counts.messages_imported, 2);
+
+        let counts_again = catch_up_conversation(&mut messenger, &social, &room.id, &legacy_conv).expect("catch up again");
+        assert_eq!(counts_again.messages_imported, 0);
+
+        let map_rows: i64 = messenger.query_row("SELECT COUNT(*) FROM legacy_dm_message_map", [], |r| r.get(0)).expect("count");
+        assert_eq!(map_rows, 3, "one map row per dm_messages row across both passes");
+    }
+
+    #[test]
+    fn catch_up_content_is_identical_to_migration_content() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        let nonce = [7u8; dm_db::DM_NONCE_LEN];
+        let ciphertext = b"same payload shape";
+        let migrated_msg =
+            dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, ciphertext, "2026-09-01T00:01:00+00:00").expect("insert 1");
+        migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("initial migration");
+
+        let caught_up_msg =
+            dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, ciphertext, "2026-09-01T00:02:00+00:00").expect("insert 2");
+        let room = matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").expect("room exists");
+        let legacy_conv = LegacyConversation { id: conv.id, user_lo: conv.user_lo, user_hi: conv.user_hi, created_at: conv.created_at.clone() };
+        let counts = catch_up_conversation(&mut messenger, &social, &room.id, &legacy_conv).expect("catch up");
+        assert_eq!(counts.messages_imported, 1);
+
+        let migrated_event_id = matrix_store::legacy_dm_message_event_id(&messenger, migrated_msg).expect("query").expect("mapped");
+        let caught_up_event_id = matrix_store::legacy_dm_message_event_id(&messenger, caught_up_msg).expect("query").expect("mapped");
+        let migrated_event = matrix_store::get_event(&messenger, &migrated_event_id).expect("query").expect("exists");
+        let caught_up_event = matrix_store::get_event(&messenger, &caught_up_event_id).expect("query").expect("exists");
+
+        let migrated_content: serde_json::Value = serde_json::from_str(&migrated_event.content).expect("json");
+        let caught_up_content: serde_json::Value = serde_json::from_str(&caught_up_event.content).expect("json");
+
+        // Same shape, same conversation, same nonce/ciphertext — the only
+        // field that legitimately differs is `legacy_message_id`, since
+        // these are two different `dm_messages` rows (proves
+        // `legacy_dm_message_import` is the one shared source both the
+        // full-migration and catch-up paths call).
+        assert_eq!(migrated_content["legacy_conversation_id"], caught_up_content["legacy_conversation_id"]);
+        assert_eq!(migrated_content["nonce_b64"], caught_up_content["nonce_b64"]);
+        assert_eq!(migrated_content["ciphertext_b64"], caught_up_content["ciphertext_b64"]);
+        assert_eq!(migrated_content["legacy_message_id"], serde_json::json!(migrated_msg));
+        assert_eq!(caught_up_content["legacy_message_id"], serde_json::json!(caught_up_msg));
+        assert_eq!(migrated_event.event_type, "org.mylittlechart.legacy_dm");
+        assert_eq!(caught_up_event.event_type, "org.mylittlechart.legacy_dm");
+        assert_eq!(caught_up_event.origin_server_ts, rfc3339_to_millis("2026-09-01T00:02:00+00:00").expect("parse"));
+    }
+
+    #[test]
+    fn boot_migration_catches_up_already_migrated_conversations() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        let nonce = [0u8; dm_db::DM_NONCE_LEN];
+        dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"one", "2026-09-01T00:01:00+00:00").expect("insert 1");
+
+        let first = migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("first boot");
+        assert_eq!(first.conversations_migrated, 1);
+        assert_eq!(first.messages_caught_up, 0);
+
+        // A message arrives through the OLD `/dm/conversations/*` route
+        // after boot — lands only in `social.db`, exactly like
+        // `routes::dm::create_message`'s own insert, until the live bridge
+        // or the next boot's catch-up closes the gap.
+        dm_db::create_message(&social, conv.id, conv.user_hi, &nonce, b"two", "2026-09-01T00:02:00+00:00").expect("insert 2");
+
+        let second = migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("second boot");
+        assert_eq!(second.conversations_migrated, 0, "the conversation already has a room");
+        assert_eq!(second.conversations_skipped, 0);
+        assert_eq!(second.messages_caught_up, 1);
+
+        let event_id = matrix_store::legacy_dm_message_event_id(&messenger, 2).expect("query").expect("mapped — boot caught it up");
+        let event = matrix_store::get_event(&messenger, &event_id).expect("query").expect("exists");
+        assert_eq!(event.event_type, "org.mylittlechart.legacy_dm");
     }
 }
