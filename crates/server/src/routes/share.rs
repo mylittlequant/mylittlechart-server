@@ -248,6 +248,10 @@ async fn check_share_entitlement(
 // POST /api/share/live
 // ============================================================================
 
+fn default_clone_allowed() -> bool {
+    true
+}
+
 /// Request body for POST /api/share/live.
 #[derive(serde::Deserialize)]
 pub struct CreateLiveShareRequest {
@@ -258,9 +262,9 @@ pub struct CreateLiveShareRequest {
     /// Empty (old clients) mints a new link every call.
     #[serde(default)]
     pub chart_id: String,
-    /// Rights v1 (plan §2): opt this link into the `clone` right. Default
-    /// `false` — unchanged behaviour for every caller that doesn't send it.
-    #[serde(default)]
+    /// Rights v1: the link grants `clone` unless the caller explicitly
+    /// sends `false`. Absent means on.
+    #[serde(default = "default_clone_allowed")]
     pub clone_allowed: bool,
     /// Chart-share policy v1 (docs/mlc/plans/share-policy-2026-09-25.md §1):
     /// "view" | "interactive". Unknown/missing = "view" — the safe default:
@@ -2327,7 +2331,7 @@ mod tests {
         let parsed: CreateLiveShareRequest =
             serde_json::from_value(body).expect("old-shape request must still parse");
         assert_eq!(parsed.title, "old client");
-        assert!(!parsed.clone_allowed);
+        assert!(parsed.clone_allowed);
         assert_eq!(parsed.interaction, ShareInteraction::View);
         assert!(parsed.protected.is_empty());
         // Rev 3: an old client sending no `allow_forward` at all gets `None`
