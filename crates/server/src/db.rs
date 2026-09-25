@@ -3406,6 +3406,46 @@ pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLink
     Ok(out)
 }
 
+/// Update a subset of a link's own policy fields after creation, owner-only
+/// (docs/mlc/plans/share-policy-2026-09-25.md §3 called changing a link's
+/// policy post-creation a non-goal for v1 — revisited here on explicit
+/// product instruction: `interaction`/`visibility`/`protected_json` may now
+/// be changed through this one path; `clone_allowed` still cannot, see
+/// `routes::share::update_share_policy`'s doc comment). Each `Some`
+/// argument is written; `None` leaves that column untouched. Returns
+/// `false` for an unknown token or a non-owner caller — same "someone
+/// else's token" 404 discipline as every other owner-scoped write here.
+pub fn update_share_link_policy(
+    conn: &Connection,
+    token: &str,
+    owner_user_id: i64,
+    interaction: Option<&str>,
+    visibility: Option<&str>,
+    protected_json: Option<&str>,
+) -> Result<bool> {
+    let owns: bool = conn
+        .query_row(
+            "SELECT 1 FROM share_links WHERE token = ?1 AND user_id = ?2",
+            params![token, owner_user_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !owns {
+        return Ok(false);
+    }
+    if let Some(v) = interaction {
+        conn.execute("UPDATE share_links SET interaction = ?1 WHERE token = ?2", params![v, token])?;
+    }
+    if let Some(v) = visibility {
+        conn.execute("UPDATE share_links SET visibility = ?1 WHERE token = ?2", params![v, token])?;
+    }
+    if let Some(v) = protected_json {
+        conn.execute("UPDATE share_links SET protected_json = ?1 WHERE token = ?2", params![v, token])?;
+    }
+    Ok(true)
+}
+
 /// Revoke one share link, owner-only: the `user_id` in the WHERE clause is
 /// what makes "someone else's token" answer `false` exactly like "no such
 /// token", so the route can 404 both without leaking existence. Already-
@@ -3549,6 +3589,11 @@ pub struct ObjectGrantRow {
     pub owner_user_id: i64,
     /// `None` = public ("anyone with the link").
     pub grantee_user_id: Option<i64>,
+    /// `None` unless this row targets a [`grant_groups`] row instead of one
+    /// account. Widened in alongside chart-share policy v1 Rev 2 (§1/§8.1);
+    /// rooms' own grants (`routes::rooms`) never set this — a room grant
+    /// always targets one account or is public, never a group.
+    pub grantee_group_id: Option<i64>,
     pub right: String,
     pub expires_at: Option<String>,
     pub created_at: String,
@@ -3561,9 +3606,10 @@ fn object_grant_from_row(row: &rusqlite::Row<'_>) -> Result<ObjectGrantRow> {
         object_id: row.get(2)?,
         owner_user_id: row.get(3)?,
         grantee_user_id: row.get(4)?,
-        right: row.get(5)?,
-        expires_at: row.get(6)?,
-        created_at: row.get(7)?,
+        grantee_group_id: row.get(5)?,
+        right: row.get(6)?,
+        expires_at: row.get(7)?,
+        created_at: row.get(8)?,
     })
 }
 
@@ -3627,7 +3673,7 @@ pub fn revoke_object_grant(conn: &Connection, grant_id: i64, owner_user_id: i64)
 /// only counts live ones.
 pub fn list_object_grants(conn: &Connection, object_kind: &str, object_id: &str) -> Result<Vec<ObjectGrantRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, object_kind, object_id, owner_user_id, grantee_user_id, right, expires_at, created_at
+        "SELECT id, object_kind, object_id, owner_user_id, grantee_user_id, grantee_group_id, right, expires_at, created_at
          FROM object_grants WHERE object_kind = ?1 AND object_id = ?2 ORDER BY created_at DESC",
     )?;
     let mut rows = stmt.query(params![object_kind, object_id])?;
@@ -3857,13 +3903,181 @@ pub fn upsert_share_grant(
     Ok(conn.last_insert_rowid())
 }
 
-// Group CRUD (create a group, add/remove members — §8.3) is not part of
-// this wave: no route calls it yet (grant management UI is a later step),
-// so no writer lives here either — matching this module's own "no route, no
-// function" discipline (`object_grants`' own history, §0's evidence note).
-// `grant_groups`/`grant_group_members` exist as tables now so
-// `effective_share_tier`'s group-grant path has something real to query;
-// `[cfg(test)]` fixtures insert rows directly, same as `insert_share_user`.
+// ============================================================================
+// Owner-curated grant groups (docs/mlc/plans/share-policy-2026-09-25.md
+// §1/§8.3): a reusable, named list of accounts a chart-share owner can grant
+// a ShareTier to as one unit (`upsert_share_grant`'s `grantee_group_id`)
+// instead of one grant row per account. v1 is manual membership only — no
+// automatic sync from any entitlement/paid flag (see `entitlements.rs`'s own
+// note on this).
+// ============================================================================
+
+/// One row of `grant_groups`, with its live member count.
+pub struct GrantGroupRow {
+    pub id: i64,
+    pub owner_user_id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub member_count: i64,
+}
+
+/// Create a new group, owned by `owner_user_id`.
+pub fn create_grant_group(conn: &Connection, owner_user_id: i64, name: &str, now: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO grant_groups (owner_user_id, name, created_at) VALUES (?1, ?2, ?3)",
+        params![owner_user_id, name, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Whether `group_id` exists and is owned by `owner_user_id` — the one
+/// ownership check every group route, and `routes::share::create_share_grant`
+/// (validating a `grantee_group_id` grant target), run before touching a
+/// group.
+pub fn grant_group_is_owned_by(conn: &Connection, group_id: i64, owner_user_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM grant_groups WHERE id = ?1 AND owner_user_id = ?2",
+            params![group_id, owner_user_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// A group's own name, or `None` once the id is gone — the label
+/// `routes::share::list_share_grants` shows for a group-targeted grant.
+pub fn grant_group_name(conn: &Connection, group_id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT name FROM grant_groups WHERE id = ?1",
+        params![group_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Rename a group, owner-only — `false` for someone else's group or an
+/// unknown id (same "someone else's row answers like no such row"
+/// discipline as [`revoke_share`]).
+pub fn rename_grant_group(conn: &Connection, group_id: i64, owner_user_id: i64, name: &str) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE grant_groups SET name = ?1 WHERE id = ?2 AND owner_user_id = ?3",
+        params![name, group_id, owner_user_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Delete a group, owner-only. Cascades its own membership rows. Any
+/// `object_grants` row still targeting the deleted id is orphaned (its
+/// `grantee_group_id` set to `NULL`) rather than deleted — plan §8.3's
+/// intent ("it simply never matches anyone again") requires exactly this
+/// UPDATE first: `object_grants.grantee_group_id` carries a real
+/// `REFERENCES grant_groups(id)` under `PRAGMA foreign_keys=ON` (see
+/// `init_db`), so deleting the group row FIRST, with a live grant still
+/// pointing at it, fails with a foreign-key-constraint error in production
+/// exactly the same way it does in this crate's own test fixtures — nulling
+/// the reference first is not an optimization, it is what makes the delete
+/// possible at all. A row with `grantee_user_id` ALSO `NULL` (a group-only
+/// grant) does not thereby become a "public" grant: [`effective_share_tier`]'s
+/// own query only ever matches a row via `grantee_user_id = caller` or
+/// `grantee_group_id IN (...)` — a row with both `NULL` matches neither
+/// condition and is inert, exactly the "never matches anyone again" outcome
+/// this function promises.
+pub fn delete_grant_group(conn: &Connection, group_id: i64, owner_user_id: i64) -> Result<bool> {
+    if !grant_group_is_owned_by(conn, group_id, owner_user_id)? {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE object_grants SET grantee_group_id = NULL WHERE grantee_group_id = ?1",
+        params![group_id],
+    )?;
+    conn.execute("DELETE FROM grant_group_members WHERE group_id = ?1", params![group_id])?;
+    conn.execute("DELETE FROM grant_groups WHERE id = ?1", params![group_id])?;
+    Ok(true)
+}
+
+/// The caller's own groups, newest first, each with its live member count —
+/// `GET /api/groups`.
+pub fn list_grant_groups(conn: &Connection, owner_user_id: i64) -> Result<Vec<GrantGroupRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT g.id, g.owner_user_id, g.name, g.created_at,
+                (SELECT COUNT(*) FROM grant_group_members m WHERE m.group_id = g.id) AS member_count
+         FROM grant_groups g WHERE g.owner_user_id = ?1 ORDER BY g.created_at DESC",
+    )?;
+    let mut rows = stmt.query(params![owner_user_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(GrantGroupRow {
+            id: row.get(0)?,
+            owner_user_id: row.get(1)?,
+            name: row.get(2)?,
+            created_at: row.get(3)?,
+            member_count: row.get(4)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Count of a group's live members — the input to
+/// [`entitlements::group_member_add_allowed`]'s fan-out ceiling.
+pub fn count_grant_group_members(conn: &Connection, group_id: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM grant_group_members WHERE group_id = ?1",
+        params![group_id],
+        |row| row.get(0),
+    )
+}
+
+/// Count of groups `owner_user_id` owns — the input to
+/// [`entitlements::group_create_allowed`]'s ceiling.
+pub fn count_grant_groups(conn: &Connection, owner_user_id: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM grant_groups WHERE owner_user_id = ?1",
+        params![owner_user_id],
+        |row| row.get(0),
+    )
+}
+
+/// Add one member by already-resolved `user_id`, owner-only — `false` for a
+/// group the caller does not own. `INSERT OR IGNORE` makes re-adding an
+/// existing member a harmless no-op rather than a duplicate-row error.
+pub fn add_grant_group_member(
+    conn: &Connection,
+    group_id: i64,
+    owner_user_id: i64,
+    user_id: i64,
+    now: &str,
+) -> Result<bool> {
+    if !grant_group_is_owned_by(conn, group_id, owner_user_id)? {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO grant_group_members (group_id, user_id, added_at) VALUES (?1, ?2, ?3)",
+        params![group_id, user_id, now],
+    )?;
+    Ok(true)
+}
+
+/// Remove one member, owner-only — `false` for a group the caller does not
+/// own; removing a member who was never in the group is a harmless no-op
+/// (same `DELETE ... WHERE` idiom as [`revoke_share`], just not reported
+/// separately from "not your group" — both already answer the same way the
+/// route needs: proceed silently either way once ownership holds).
+pub fn remove_grant_group_member(
+    conn: &Connection,
+    group_id: i64,
+    owner_user_id: i64,
+    user_id: i64,
+) -> Result<bool> {
+    if !grant_group_is_owned_by(conn, group_id, owner_user_id)? {
+        return Ok(false);
+    }
+    conn.execute(
+        "DELETE FROM grant_group_members WHERE group_id = ?1 AND user_id = ?2",
+        params![group_id, user_id],
+    )?;
+    Ok(true)
+}
 
 // ============================================================================
 // Shared presets (rooms) — Phase 1 (docs/mlc/plans/shared-presets-rights-
@@ -8292,7 +8506,11 @@ mod
     /// `shared_preset_entities.updated_by` naming no user) fails the same
     /// way it would in production instead of silently passing in-memory —
     /// exercised on purpose by
-    /// `apply_room_patch_db_error_rolls_back_whole_batch`.
+    /// `apply_room_patch_db_error_rolls_back_whole_batch`. `object_grants`
+    /// carries `grantee_group_id` (a bare column, no FK — this fixture never
+    /// creates `grant_groups`) only so `list_object_grants`'s widened SELECT
+    /// (chart-share policy v1 Rev 2, §8.2) matches this table's shape too;
+    /// rooms' own tests still never populate it.
     fn rooms_test_conn() -> Connection {
         let conn = share_test_conn();
         conn.execute_batch(
@@ -8303,6 +8521,7 @@ mod
                 object_id TEXT NOT NULL,
                 owner_user_id INTEGER NOT NULL REFERENCES users(id),
                 grantee_user_id INTEGER REFERENCES users(id),
+                grantee_group_id INTEGER,
                 right TEXT NOT NULL,
                 expires_at TEXT,
                 created_at TEXT NOT NULL
@@ -9099,27 +9318,6 @@ mod
         super::get_share_link(conn, &token).expect("query").expect("row")
     }
 
-    /// Test-only group setup — no production writer exists for `grant_groups`/
-    /// `grant_group_members` yet (§8.3 group-management routes are a later
-    /// step), so fixtures insert rows directly, the same way `insert_share_user`
-    /// bypasses any production "create a user" function that doesn't exist.
-    fn insert_grant_group(conn: &Connection, owner_user_id: i64, name: &str, now: &str) -> i64 {
-        conn.execute(
-            "INSERT INTO grant_groups (owner_user_id, name, created_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![owner_user_id, name, now],
-        )
-        .expect("insert grant group");
-        conn.last_insert_rowid()
-    }
-
-    fn insert_grant_group_member(conn: &Connection, group_id: i64, user_id: i64, now: &str) {
-        conn.execute(
-            "INSERT INTO grant_group_members (group_id, user_id, added_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![group_id, user_id, now],
-        )
-        .expect("insert grant group member");
-    }
-
     #[test]
     fn effective_share_tier_owner_is_always_clone_protected() {
         let conn = share_rights_test_conn();
@@ -9200,8 +9398,8 @@ mod
         let row = make_share(&conn, owner, "view", false, "private");
         let now = chrono::Utc::now().to_rfc3339();
 
-        let group_id = insert_grant_group(&conn, owner, "subscribers", &now);
-        insert_grant_group_member(&conn, group_id, member, &now);
+        let group_id = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create group");
+        super::add_grant_group_member(&conn, group_id, owner, member, &now).expect("add member");
         super::upsert_share_grant(
             &conn, &row.token, owner, None, Some(group_id), super::ShareTier::CloneProtected, None, &now,
         )
@@ -9248,6 +9446,153 @@ mod
             super::effective_share_tier(&conn, &row, Some(grantee)).expect("tier"),
             Some(super::ShareTier::Clone)
         );
+    }
+
+    /// Revoking a share grant (`revoke_object_grant`, the same generic
+    /// function rooms' own grant CRUD uses) stops it from counting on the
+    /// very next `effective_share_tier` call — owner instruction 1's "even
+    /// if a link leaks, the server re-checks the requester's rights" holds
+    /// for a grant that existed and was pulled, not just for one that never
+    /// existed (already proven by `effective_share_tier_private_link_with_no_grant_is_none`).
+    #[test]
+    fn revoking_a_share_grant_stops_it_on_the_next_effective_share_tier_call() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let grantee = insert_share_user(&conn, "grantee", Some("pub-grantee"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let grant_id = super::upsert_share_grant(
+            &conn, &row.token, owner, Some(grantee), None, super::ShareTier::Clone, None, &now,
+        )
+        .expect("grant");
+        assert_eq!(
+            super::effective_share_tier(&conn, &row, Some(grantee)).expect("tier"),
+            Some(super::ShareTier::Clone)
+        );
+
+        assert!(super::revoke_object_grant(&conn, grant_id, owner).expect("revoke"));
+        assert_eq!(super::effective_share_tier(&conn, &row, Some(grantee)).expect("tier"), None);
+    }
+
+    /// `list_object_grants` projects `grantee_group_id` (widened alongside
+    /// `ObjectGrantRow` for §8.2's grant-listing route) — a group-targeted
+    /// share grant round-trips through it with `grantee_user_id: None`,
+    /// `grantee_group_id: Some(group_id)`.
+    #[test]
+    fn list_object_grants_projects_grantee_group_id() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+        let group_id = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create group");
+
+        super::upsert_share_grant(
+            &conn, &row.token, owner, None, Some(group_id), super::ShareTier::Clone, None, &now,
+        )
+        .expect("grant");
+
+        let grants = super::list_object_grants(&conn, "chart", &row.token).expect("list");
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].grantee_user_id, None);
+        assert_eq!(grants[0].grantee_group_id, Some(group_id));
+    }
+
+    // ---- Chart-share policy v1, Rev 2 — grant groups (§8.3) ----
+
+    #[test]
+    fn grant_group_create_rename_delete_owner_only() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let stranger = insert_share_user(&conn, "stranger", Some("pub-stranger"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let group_id = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create");
+        assert!(super::grant_group_is_owned_by(&conn, group_id, owner).expect("owned"));
+        assert!(!super::grant_group_is_owned_by(&conn, group_id, stranger).expect("owned"));
+
+        // A non-owner cannot rename or delete it.
+        assert!(!super::rename_grant_group(&conn, group_id, stranger, "hijacked").expect("rename"));
+        assert!(!super::delete_grant_group(&conn, group_id, stranger).expect("delete"));
+        assert_eq!(
+            super::grant_group_name(&conn, group_id).expect("name"),
+            Some("subscribers".to_string())
+        );
+
+        // The owner can.
+        assert!(super::rename_grant_group(&conn, group_id, owner, "vip").expect("rename"));
+        assert_eq!(super::grant_group_name(&conn, group_id).expect("name"), Some("vip".to_string()));
+        assert!(super::delete_grant_group(&conn, group_id, owner).expect("delete"));
+        assert_eq!(super::grant_group_name(&conn, group_id).expect("name"), None);
+    }
+
+    #[test]
+    fn grant_group_membership_add_remove_owner_only() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let stranger = insert_share_user(&conn, "stranger", Some("pub-stranger"));
+        let member = insert_share_user(&conn, "member", Some("pub-member"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let group_id = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create");
+
+        // A non-owner cannot add or remove a member.
+        assert!(!super::add_grant_group_member(&conn, group_id, stranger, member, &now).expect("add"));
+        assert_eq!(super::count_grant_group_members(&conn, group_id).expect("count"), 0);
+
+        // The owner can, idempotently.
+        assert!(super::add_grant_group_member(&conn, group_id, owner, member, &now).expect("add"));
+        assert!(super::add_grant_group_member(&conn, group_id, owner, member, &now).expect("add again"));
+        assert_eq!(super::count_grant_group_members(&conn, group_id).expect("count"), 1);
+
+        assert!(!super::remove_grant_group_member(&conn, group_id, stranger, member).expect("remove"));
+        assert_eq!(super::count_grant_group_members(&conn, group_id).expect("count"), 1);
+        assert!(super::remove_grant_group_member(&conn, group_id, owner, member).expect("remove"));
+        assert_eq!(super::count_grant_group_members(&conn, group_id).expect("count"), 0);
+    }
+
+    #[test]
+    fn list_grant_groups_is_scoped_to_the_caller_and_carries_member_counts() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let other_owner = insert_share_user(&conn, "other-owner", Some("pub-other-owner"));
+        let member = insert_share_user(&conn, "member", Some("pub-member"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let g1 = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create g1");
+        super::add_grant_group_member(&conn, g1, owner, member, &now).expect("add");
+        super::create_grant_group(&conn, other_owner, "not-mine", &now).expect("create g2");
+
+        let groups = super::list_grant_groups(&conn, owner).expect("list");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, g1);
+        assert_eq!(groups[0].member_count, 1);
+    }
+
+    /// Deleting a group leaves any `object_grants` row still targeting it in
+    /// place (plan §8.3's "no cascade needed" rule) — `effective_share_tier`
+    /// simply stops matching anyone for it, since `grant_group_members` has
+    /// nothing left to join against.
+    #[test]
+    fn deleting_a_grant_group_leaves_its_share_grant_inert_not_erroring() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let member = insert_share_user(&conn, "member", Some("pub-member"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let group_id = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create");
+        super::add_grant_group_member(&conn, group_id, owner, member, &now).expect("add");
+        super::upsert_share_grant(
+            &conn, &row.token, owner, None, Some(group_id), super::ShareTier::Clone, None, &now,
+        )
+        .expect("grant");
+        assert_eq!(
+            super::effective_share_tier(&conn, &row, Some(member)).expect("tier"),
+            Some(super::ShareTier::Clone)
+        );
+
+        assert!(super::delete_grant_group(&conn, group_id, owner).expect("delete"));
+        assert_eq!(super::effective_share_tier(&conn, &row, Some(member)).expect("tier"), None);
     }
 }
 

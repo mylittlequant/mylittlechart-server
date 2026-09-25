@@ -58,6 +58,15 @@ const MAX_TITLE_CHARS: usize = 200;
 /// PNG magic bytes — the only content check a screenshot gets.
 const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
+/// Cap on `CreateLiveShareRequest::protected`/`UpdateShareLinkPolicyRequest::
+/// protected`'s element count. `preset_json` is bounded by
+/// `entitlements::PRESET_MAX_BYTES`, but `protected_json` is a SEPARATE
+/// column with no size check of its own before this cap existed — an
+/// unbounded `protected` array could grow the row's storage footprint
+/// independent of the preset itself. A real chart has, at most, a few dozen
+/// protectable elements; 500 is generous headroom, not a design ceiling.
+const MAX_PROTECTED_ELEMENTS: usize = 500;
+
 // ============================================================================
 // Auth helper
 // ============================================================================
@@ -339,6 +348,13 @@ pub async fn create_live_share(
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new("preset must be a JSON object")),
+        )
+            .into_response();
+    }
+    if body.protected.len() > MAX_PROTECTED_ELEMENTS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("protected exceeds the maximum element count")),
         )
             .into_response();
     }
@@ -1001,33 +1017,50 @@ pub async fn delete_share(
 }
 
 // ============================================================================
-// POST /api/share/{token}/grants
+// POST/GET /api/share/{token}/grants, DELETE .../grants/{grant_id}
 // ============================================================================
 
-/// Request body for POST /api/share/{token}/grants. A minimal, id-based
-/// shape: exactly one of `grantee_user_id`/`grantee_group_id` must be set.
-/// The sharer-facing nick/group-name lookup plan §8.2 describes
-/// (`GrantRequest`/`GrantTarget::{Nick,Group}`) is deferred to whoever wires
-/// a client for this route — this is the write path `db::upsert_share_grant`
-/// / `db::effective_share_tier` need to exist and be reachable from
-/// production code, not the full grant-management UI surface (§8.2's GET/DELETE
-/// listing routes and §8.3's group-CRUD routes are likewise out of this wave).
+/// Request body for POST /api/share/{token}/grants. Exactly one of
+/// `grantee_nick`/`grantee_group_id` must be set — a share-tier grant always
+/// targets one account (resolved server-side from its nick, mirroring
+/// `routes::rooms::CreateGrantRequest`'s own by-nick shape) or one of the
+/// caller's own groups, never both and never "public" (a link's own public
+/// floor is `interaction`/`clone_allowed`/`visibility`, not a grant row).
 #[derive(serde::Deserialize)]
 pub struct CreateShareGrantRequest {
-    pub grantee_user_id: Option<i64>,
+    #[serde(default)]
+    pub grantee_nick: Option<String>,
+    #[serde(default)]
     pub grantee_group_id: Option<i64>,
     /// "view" | "interactive" | "clone" | "clone_protected" — see `db::ShareTier`.
     pub tier: String,
     pub expires_at: Option<String>,
 }
 
+enum CreateShareGrantOutcome {
+    Created { grant_id: i64 },
+    ShareNotFound,
+    UnknownNick,
+    UnknownGroup,
+    QuotaExceeded,
+}
+
 /// POST /api/share/{token}/grants
 ///
 /// Owner-only (§8.2). Unknown token AND a non-owner caller both answer the
 /// same bare 404 (same "someone else's token" discipline as `delete_share`).
-/// Writes straight into `object_grants` via `db::upsert_share_grant` — the
-/// per-account/group layer `db::effective_share_tier` reads fresh on every
-/// subsequent `GET`/clone (§1).
+/// `grantee_nick` is resolved to a `user_id` server-side
+/// (`db::user_id_for_nick`) — a caller never supplies a raw numeric id
+/// directly, matching `routes::rooms::create_grant`'s own by-nick shape.
+/// `grantee_group_id` must name one of the CALLER's OWN groups
+/// (`db::grant_group_is_owned_by`) — granting through a group you do not own
+/// would let a caller extend someone else's curated membership list rights
+/// on a share it never touches. Quota-checked via
+/// `entitlements::grant_create_allowed` against the token's own live grant
+/// count, the same fan-out ceiling `routes::rooms::create_grant` applies to
+/// a room. Writes straight into `object_grants` via `db::upsert_share_grant`
+/// — the per-account/group layer `db::effective_share_tier` reads fresh on
+/// every subsequent `GET`/clone (§1).
 pub async fn create_share_grant(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1039,11 +1072,11 @@ pub async fn create_share_grant(
         Err(status) => return auth_err(status),
     };
 
-    if body.grantee_user_id.is_some() == body.grantee_group_id.is_some() {
+    if body.grantee_nick.is_some() == body.grantee_group_id.is_some() {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
-                "grant must target exactly one of grantee_user_id or grantee_group_id",
+                "grant must target exactly one of grantee_nick or grantee_group_id",
             )),
         )
             .into_response();
@@ -1056,7 +1089,110 @@ pub async fn create_share_grant(
             .into_response();
     };
 
-    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<i64>> {
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<CreateShareGrantOutcome> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let row = match crate::db::get_share_link(&conn, &token)? {
+            Some(row) => row,
+            None => return Ok(CreateShareGrantOutcome::ShareNotFound),
+        };
+        if row.user_id != user_id {
+            return Ok(CreateShareGrantOutcome::ShareNotFound);
+        }
+
+        let grantee_user_id = match &body.grantee_nick {
+            Some(nick) => match crate::db::user_id_for_nick(&conn, nick)? {
+                Some(uid) => Some(uid),
+                None => return Ok(CreateShareGrantOutcome::UnknownNick),
+            },
+            None => None,
+        };
+        let grantee_group_id = match body.grantee_group_id {
+            Some(gid) => {
+                if !crate::db::grant_group_is_owned_by(&conn, gid, user_id)? {
+                    return Ok(CreateShareGrantOutcome::UnknownGroup);
+                }
+                Some(gid)
+            }
+            None => None,
+        };
+
+        let current = crate::db::count_object_grants(&conn, "chart", &row.token)?;
+        if !entitlements::grant_create_allowed(current) {
+            return Ok(CreateShareGrantOutcome::QuotaExceeded);
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let id = crate::db::upsert_share_grant(
+            &conn,
+            &row.token,
+            user_id,
+            grantee_user_id,
+            grantee_group_id,
+            tier,
+            body.expires_at.as_deref(),
+            &now,
+        )?;
+        Ok(CreateShareGrantOutcome::Created { grant_id: id })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(CreateShareGrantOutcome::Created { grant_id })) => {
+            Json(serde_json::json!({ "grant_id": grant_id })).into_response()
+        }
+        Ok(Ok(CreateShareGrantOutcome::ShareNotFound)) => share_not_found(),
+        Ok(Ok(CreateShareGrantOutcome::UnknownNick)) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("unknown nick")),
+        )
+            .into_response(),
+        Ok(Ok(CreateShareGrantOutcome::UnknownGroup)) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("unknown group")),
+        )
+            .into_response(),
+        Ok(Ok(CreateShareGrantOutcome::QuotaExceeded)) => (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new("grant limit reached for this share")),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error creating share grant: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/share/{token}/grants
+///
+/// Owner-only listing (§8.2) — unfiltered: an expired grant still lists (so
+/// the owner can see and clean it up), same posture as
+/// `db::list_object_grants`'s own doc comment. Each grant's target is
+/// resolved to a display label: a nick-targeted grant shows the grantee's
+/// `effective_label_for_user`; a group-targeted grant shows the group's own
+/// name (or `null` for either once the underlying account/group is gone —
+/// the grant row itself still lists, matching `routes::rooms::list_grants`'s
+/// own "a stale label is not an error" posture).
+pub async fn list_share_grants(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return auth_err(status),
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<Vec<serde_json::Value>>> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let row = match crate::db::get_share_link(&conn, &token)? {
             Some(row) => row,
@@ -1065,26 +1201,172 @@ pub async fn create_share_grant(
         if row.user_id != user_id {
             return Ok(None);
         }
-        let now = chrono::Utc::now().to_rfc3339();
-        let id = crate::db::upsert_share_grant(
-            &conn,
-            &row.token,
-            user_id,
-            body.grantee_user_id,
-            body.grantee_group_id,
-            tier,
-            body.expires_at.as_deref(),
-            &now,
-        )?;
-        Ok(Some(id))
+        let grants = crate::db::list_object_grants(&conn, "chart", &row.token)?;
+        let mut out = Vec::with_capacity(grants.len());
+        for g in grants {
+            let grantee = if let Some(uid) = g.grantee_user_id {
+                let label = crate::db::effective_label_for_user(&conn, uid)?;
+                serde_json::json!({ "kind": "nick", "user_id": uid, "label": label })
+            } else if let Some(gid) = g.grantee_group_id {
+                let name = crate::db::grant_group_name(&conn, gid)?;
+                serde_json::json!({ "kind": "group", "group_id": gid, "name": name })
+            } else {
+                serde_json::Value::Null
+            };
+            out.push(serde_json::json!({
+                "id": g.id,
+                "grantee": grantee,
+                "tier": g.right,
+                "expires_at": g.expires_at,
+                "created_at": g.created_at,
+            }));
+        }
+        Ok(Some(out))
     })
     .await;
 
     match result {
-        Ok(Ok(Some(id))) => Json(serde_json::json!({ "grant_id": id })).into_response(),
+        Ok(Ok(Some(grants))) => Json(serde_json::json!({ "grants": grants })).into_response(),
         Ok(Ok(None)) => share_not_found(),
         Ok(Err(e)) => {
-            tracing::error!("DB error creating share grant: {}", e);
+            tracing::error!("DB error listing share grants: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/share/{token}/grants/{grant_id}
+///
+/// Owner-only revoke (`db::revoke_object_grant`, already owner-scoped by its
+/// own `owner_user_id` column check) — the `token` in the path names the
+/// resource the client is looking at, not an extra filter, same shape as
+/// `routes::rooms::delete_grant`.
+pub async fn delete_share_grant(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((_token, grant_id)): Path<(String, i64)>,
+) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return auth_err(status),
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::revoke_object_grant(&conn, grant_id, user_id)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(true)) => Json(serde_json::json!({ "revoked": true })).into_response(),
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error revoking share grant: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+// ============================================================================
+// PATCH /api/share/{token}  (owner-only policy update)
+// ============================================================================
+
+/// Request body for PATCH /api/share/{token}. Each field is optional and
+/// independent: sending only `visibility` leaves `interaction`/`protected`
+/// untouched, and so on. `clone_allowed` and `title` are deliberately NOT
+/// here — this route revisits ONLY the plan's non-goal on explicit product
+/// instruction (docs/mlc/plans/share-policy-2026-09-25.md §3 called changing
+/// a link's policy post-creation out of scope for v1; the owner has since
+/// asked for exactly this for `visibility`/`interaction`/`protected`, so
+/// those three — and only those three — become mutable through this one
+/// path). Revoke-and-reshare remains the only way to change `clone_allowed`.
+#[derive(serde::Deserialize)]
+pub struct UpdateShareLinkPolicyRequest {
+    pub interaction: Option<ShareInteraction>,
+    pub visibility: Option<ShareVisibility>,
+    pub protected: Option<Vec<ProtectedElementRef>>,
+}
+
+/// PATCH /api/share/{token}
+///
+/// Owner-only. Unknown token AND a non-owner caller both answer the same
+/// bare 404 (`db::update_share_link_policy`'s own ownership check). Every
+/// field a caller supplies takes effect immediately: a link already open in
+/// a recipient's tab re-resolves its tier fresh on the recipient's NEXT
+/// `GET`/clone (`db::effective_share_tier` never caches), so a tightened
+/// `visibility`/`interaction` takes effect without waiting for the link's
+/// own TTL.
+pub async fn update_share_policy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    Json(body): Json<UpdateShareLinkPolicyRequest>,
+) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return auth_err(status),
+    };
+    if let Some(protected) = &body.protected {
+        if protected.len() > MAX_PROTECTED_ELEMENTS {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("protected exceeds the maximum element count")),
+            )
+                .into_response();
+        }
+    }
+    let protected_json = match &body.protected {
+        Some(protected) => match serde_json::to_string(protected) {
+            Ok(s) => Some(s),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new("protected is not serializable")),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+    let interaction = body.interaction.map(|i| i.as_str());
+    let visibility = body.visibility.map(|v| v.as_str());
+
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::update_share_link_policy(
+            &conn,
+            &token,
+            user_id,
+            interaction,
+            visibility,
+            protected_json.as_deref(),
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(true)) => Json(serde_json::json!({ "updated": true })).into_response(),
+        Ok(Ok(false)) => share_not_found(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error updating share policy: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new("Database error")),
@@ -1715,5 +1997,91 @@ mod tests {
         assert!(cloned["indicators"].as_array().expect("array").is_empty());
         assert_eq!(stripped.len(), 1);
         assert_eq!(stripped[0]["reason"], "license");
+    }
+
+    // ---- §8.2 grants: owner-only, revoked stops on the next check ----
+
+    /// Grant CRUD end to end, at the `db::` layer `create_share_grant`/
+    /// `list_share_grants`/`delete_share_grant` call: the owner can grant and
+    /// revoke; a non-owner's attempt to revoke someone else's grant refuses
+    /// (`db::revoke_object_grant`'s own owner-scoped WHERE); a revoked grant
+    /// stops counting on the very next `effective_share_tier` check (already
+    /// proven for the DB layer directly in `db.rs`'s own
+    /// `revoking_a_share_grant_stops_it_on_the_next_effective_share_tier_call`
+    /// — this test additionally proves `count_object_grants`/`list_object_grants`
+    /// agree with that outcome, the two functions `create_share_grant`/
+    /// `list_share_grants` actually call).
+    #[test]
+    fn share_grant_owner_ok_non_owner_refused_revoked_stops_working() {
+        let conn = strip_test_conn();
+        let owner = insert_user(&conn, "owner");
+        let grantee = insert_user(&conn, "grantee");
+        let stranger = insert_user(&conn, "stranger");
+        let now = chrono::Utc::now().to_rfc3339();
+        let token = crate::db::create_share_link(
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "private",
+        )
+        .expect("create share");
+
+        let grant_id = crate::db::upsert_share_grant(
+            &conn, &token, owner, Some(grantee), None, crate::db::ShareTier::Clone, None, &now,
+        )
+        .expect("grant");
+        assert_eq!(crate::db::count_object_grants(&conn, "chart", &token).expect("count"), 1);
+        assert_eq!(crate::db::list_object_grants(&conn, "chart", &token).expect("list").len(), 1);
+
+        // A stranger cannot revoke the owner's grant.
+        assert!(!crate::db::revoke_object_grant(&conn, grant_id, stranger).expect("revoke"));
+        assert_eq!(crate::db::count_object_grants(&conn, "chart", &token).expect("count"), 1);
+
+        // The owner can, and the grantee's tier is gone on the next check.
+        assert!(crate::db::revoke_object_grant(&conn, grant_id, owner).expect("revoke"));
+        let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
+        assert_eq!(crate::db::effective_share_tier(&conn, &row, Some(grantee)).expect("tier"), None);
+        assert_eq!(crate::db::list_object_grants(&conn, "chart", &token).expect("list").len(), 0);
+    }
+
+    /// `update_share_policy`'s DB write (`db::update_share_link_policy`):
+    /// owner OK, non-owner refused, and each field is independently
+    /// optional.
+    #[test]
+    fn update_share_link_policy_owner_only_and_fields_are_independent() {
+        let conn = strip_test_conn();
+        let owner = insert_user(&conn, "owner");
+        let stranger = insert_user(&conn, "stranger");
+        let now = chrono::Utc::now().to_rfc3339();
+        let token = crate::db::create_share_link(
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public",
+        )
+        .expect("create share");
+
+        // A stranger's update is refused entirely.
+        assert!(!crate::db::update_share_link_policy(
+            &conn, &token, stranger, Some("interactive"), None, None,
+        )
+        .expect("update"));
+        let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
+        assert_eq!(row.interaction, "view");
+
+        // The owner can update just `interaction`, leaving `visibility` and
+        // `protected_json` untouched.
+        assert!(crate::db::update_share_link_policy(
+            &conn, &token, owner, Some("interactive"), None, None,
+        )
+        .expect("update"));
+        let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
+        assert_eq!(row.interaction, "interactive");
+        assert_eq!(row.visibility, "public");
+        assert_eq!(row.protected_json, "[]");
+
+        // …and `visibility`/`protected` independently of `interaction`.
+        assert!(crate::db::update_share_link_policy(
+            &conn, &token, owner, None, Some("private"), Some(r#"[{"kind":"primitive","id":"1"}]"#),
+        )
+        .expect("update"));
+        let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
+        assert_eq!(row.interaction, "interactive");
+        assert_eq!(row.visibility, "private");
+        assert_eq!(row.protected_json, r#"[{"kind":"primitive","id":"1"}]"#);
     }
 }

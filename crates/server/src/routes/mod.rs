@@ -40,6 +40,7 @@ pub mod dm;
 pub mod entitlements;
 pub mod forum;
 pub mod forum_v2;
+pub mod groups;
 pub mod heartbeat;
 pub mod link;
 pub mod notify;
@@ -146,13 +147,29 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
                 .layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route("/share/mine", get(share::list_my_shares))
-        .route("/share/{token}", get(share::get_share).delete(share::delete_share))
+        .route(
+            "/share/{token}",
+            get(share::get_share).delete(share::delete_share).patch(share::update_share_policy),
+        )
         .route("/share/{token}/png", get(share::get_share_png))
         // Clone-with-strip (rights v1): auth required, needs the `clone`
         // right on the token (see routes/share.rs's module doc).
         .route("/share/{token}/clone", post(share::clone_share))
         // Per-account/group share grants (rights v2, §8.2) — owner-only.
-        .route("/share/{token}/grants", post(share::create_share_grant))
+        .route(
+            "/share/{token}/grants",
+            get(share::list_share_grants).post(share::create_share_grant),
+        )
+        .route("/share/{token}/grants/{grant_id}", delete(share::delete_share_grant))
+        // Owner-curated grant groups (§8.3) — a reusable, named account list
+        // a share grant can target instead of one grant row per account.
+        .route("/groups", get(groups::list_my_groups).post(groups::create_group))
+        .route(
+            "/groups/{id}",
+            patch(groups::rename_group).delete(groups::delete_group),
+        )
+        .route("/groups/{id}/members", post(groups::add_group_member))
+        .route("/groups/{id}/members/{user_id}", delete(groups::remove_group_member))
         // Shared presets (rooms) — server-hosted, per-nick rights, per-entity
         // LWW patch, no live channel yet (Phase 1 — see routes/rooms.rs's
         // module doc). `{kind}` is reserved for future object kinds; Phase 1
