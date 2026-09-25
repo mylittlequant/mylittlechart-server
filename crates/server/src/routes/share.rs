@@ -1978,14 +1978,153 @@ pub async fn get_share_preview(
     }
 
     match tokio::fs::read(share_root.join(&rel_path)).await {
-        Ok(body) => Response::builder()
-            .status(200)
-            .header("content-type", "image/png")
-            .header("cache-control", "public, max-age=300")
-            .body(Body::from(body))
-            .unwrap(),
+        Ok(body) => {
+            // The file on disk is the chart crop. The bytes we serve are
+            // that crop set into the branded card (hat on the left, this
+            // chart on the right). A compose failure serves the crop itself.
+            let png = match tokio::task::spawn_blocking(move || {
+                compose_share_card_png(&body).unwrap_or(body)
+            })
+            .await
+            {
+                Ok(png) => png,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new("Internal error")),
+                    )
+                        .into_response();
+                }
+            };
+            Response::builder()
+                .status(200)
+                .header("content-type", "image/png")
+                .header("cache-control", "public, max-age=300")
+                .body(Body::from(png))
+                .unwrap()
+        }
         Err(_) => share_not_found(),
     }
+}
+
+/// Shot window inside `assets/og-card.png`, matching
+/// `mylittlechart-landing/tools/og-cards/og_card.html`.
+const SHOT_X: u32 = 600;
+const SHOT_Y: u32 = 58;
+const SHOT_W: u32 = 560;
+const SHOT_H: u32 = 557;
+const SHOT_RADIUS: i32 = 12;
+const FADE_X: u32 = 560;
+const FADE_W: u32 = 90;
+const CARD_BG: [u8; 4] = [0x13, 0x17, 0x22, 255];
+const SHOT_BORDER: [u8; 4] = [0x36, 0x3a, 0x45, 255];
+
+fn card_template() -> &'static image::RgbaImage {
+    static CELL: std::sync::OnceLock<image::RgbaImage> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        image::load_from_memory_with_format(
+            include_bytes!("../../assets/og-card.png"),
+            image::ImageFormat::Png,
+        )
+        .expect("share card template")
+        .to_rgba8()
+    })
+}
+
+fn in_rounded_rect(x: i32, y: i32, w: i32, h: i32, r: i32) -> bool {
+    if x < 0 || y < 0 || x >= w || y >= h {
+        return false;
+    }
+    let r = r.max(0).min(w / 2).min(h / 2);
+    if r == 0 {
+        return true;
+    }
+    let (cx, cy) = if x < r && y < r {
+        (r, r)
+    } else if x >= w - r && y < r {
+        (w - r, r)
+    } else if x < r && y >= h - r {
+        (r, h - r)
+    } else if x >= w - r && y >= h - r {
+        (w - r, h - r)
+    } else {
+        return true;
+    };
+    let dx = x - cx;
+    let dy = y - cy;
+    dx * dx + dy * dy <= r * r
+}
+
+/// Scale `img` so it covers `dw`×`dh`, then keep the top-left of that
+/// cover. Same rule as the card CSS (`object-fit: cover; object-position: left top`).
+fn cover_top_left(img: &image::DynamicImage, dw: u32, dh: u32) -> image::RgbaImage {
+    let sw = img.width().max(1) as f64;
+    let sh = img.height().max(1) as f64;
+    let scale = (dw as f64 / sw).max(dh as f64 / sh);
+    let rw = ((sw * scale).round() as u32).max(dw);
+    let rh = ((sh * scale).round() as u32).max(dh);
+    let resized = img.resize_exact(rw, rh, image::imageops::FilterType::Lanczos3);
+    image::imageops::crop_imm(&resized.to_rgba8(), 0, 0, dw, dh).to_image()
+}
+
+fn blend_toward(px: &mut image::Rgba<u8>, src: [u8; 4], coverage: f32) {
+    let a = coverage.clamp(0.0, 1.0);
+    let inv = 1.0 - a;
+    for i in 0..3 {
+        px.0[i] = (src[i] as f32 * a + px.0[i] as f32 * inv).round() as u8;
+    }
+    px.0[3] = 255;
+}
+
+/// Paint `chart` into the right-hand frame of the branded card. The left
+/// side (hat, wordmark, "the terminal", platforms) is the template and is
+/// not redrawn.
+fn compose_share_card(chart: &image::DynamicImage) -> image::RgbaImage {
+    let shot = cover_top_left(chart, SHOT_W, SHOT_H);
+    let mut card = card_template().clone();
+    let r = SHOT_RADIUS;
+    for y in 0..SHOT_H {
+        for x in 0..SHOT_W {
+            let xi = x as i32;
+            let yi = y as i32;
+            if !in_rounded_rect(xi, yi, SHOT_W as i32, SHOT_H as i32, r) {
+                continue;
+            }
+            let dx = SHOT_X + x;
+            let dy = SHOT_Y + y;
+            if dx >= card.width() || dy >= card.height() {
+                continue;
+            }
+            let px = if in_rounded_rect(xi, yi, SHOT_W as i32, SHOT_H as i32, r - 1) {
+                *shot.get_pixel(x, y)
+            } else {
+                image::Rgba(SHOT_BORDER)
+            };
+            card.put_pixel(dx, dy, px);
+        }
+    }
+    for x in 0..FADE_W {
+        let coverage = 1.0 - (x as f32 / FADE_W as f32);
+        let dx = FADE_X + x;
+        if dx >= card.width() {
+            break;
+        }
+        for y in 0..card.height() {
+            blend_toward(card.get_pixel_mut(dx, y), CARD_BG, coverage);
+        }
+    }
+    card
+}
+
+fn compose_share_card_png(chart_png: &[u8]) -> Result<Vec<u8>, PreviewError> {
+    let chart = image::load_from_memory_with_format(chart_png, image::ImageFormat::Png)
+        .map_err(|_| PreviewError::DecodeFailed)?;
+    let card = compose_share_card(&chart);
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(card)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|_| PreviewError::EncodeFailed)?;
+    Ok(out)
 }
 
 // ============================================================================
@@ -2005,36 +2144,31 @@ pub(crate) const PRIVATE_SHARE_OG_TITLE: &str = "A private chart on MyLittleChar
 /// never "blank it out".
 pub(crate) struct OgTags {
     pub title: Option<String>,
+    /// Replaces `og:description` / `twitter:description`. The link title
+    /// stays the product name; this line is `shared (nick) — chart`.
+    pub description: Option<String>,
     pub image_url: Option<String>,
 }
 
 /// Resolve the OG-tag override for a fetched, live [`crate::db::ShareLinkRow`]
 /// (§9's selection matrix — the "token not found/expired/revoked" branch is
 /// the caller's own `None` case, one level up, before this ever runs):
-/// - private → the fixed [`PRIVATE_SHARE_OG_TITLE`], no image (the app's own
-///   default logo tag is left untouched).
-/// - public, blank title → no title override (the app's own default title
-///   is not sensitive, and blank is not a real title to show).
-/// - public, non-blank title → that title, verbatim.
+/// - private → the fixed [`PRIVATE_SHARE_OG_TITLE`], no image, no chart
+///   name in the description.
+/// - public → the link title stays the app default ("mylittlechart — the
+///   terminal"). The description is `shared (nick) — chart title`.
 /// - image is overridden ONLY when `preview_path` is set AND the link is
 ///   public — a private link never points at its preview even when one was
 ///   uploaded (defense in depth alongside [`get_share_preview`]'s own
 ///   refusal).
-pub(crate) fn og_tags_for_share(row: &crate::db::ShareLinkRow) -> OgTags {
+pub(crate) fn og_tags_for_share(row: &crate::db::ShareLinkRow, owner_label: &str) -> OgTags {
     if row.visibility == "private" {
         return OgTags {
             title: Some(PRIVATE_SHARE_OG_TITLE.to_string()),
+            description: None,
             image_url: None,
         };
     }
-    let title = {
-        let trimmed = row.title.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    };
     let image_url = if row.preview_path.is_empty() {
         None
     } else {
@@ -2043,7 +2177,23 @@ pub(crate) fn og_tags_for_share(row: &crate::db::ShareLinkRow) -> OgTags {
             row.token
         ))
     };
-    OgTags { title, image_url }
+    OgTags {
+        title: None,
+        description: Some(share_card_description(owner_label, &row.title)),
+        image_url,
+    }
+}
+
+/// `shared (nick) — chart title`. Either half may be missing.
+fn share_card_description(owner_label: &str, chart_title: &str) -> String {
+    let who = owner_label.trim();
+    let title = chart_title.trim();
+    match (who.is_empty(), title.is_empty()) {
+        (false, false) => format!("shared ({who}) — {title}"),
+        (false, true) => format!("shared ({who})"),
+        (true, false) => format!("shared — {title}"),
+        (true, true) => "shared".to_string(),
+    }
 }
 
 /// HTML-attribute-escape `s` — the one place caller-supplied text (a share
@@ -2095,17 +2245,20 @@ fn replace_meta_content(html: &str, prefix: &str, value: &str) -> String {
 /// `og:title`/`og:image`/`twitter:title`/`twitter:image` tags) rather than
 /// depending on a `<!--OG_META-->` marker added to that file — no cross-repo
 /// change is needed for this to work against the real, deployed template.
-/// Never touches `og:type`/`og:url`/`og:description`/`twitter:description`/
-/// the document `<title>` — only the two title tags (when `tags.title` is
-/// `Some`) and the two image tags (only when `tags.image_url` is `Some`,
-/// leaving the app's own default logo tag untouched otherwise — the "no
-/// og:image, app default logo only" rule for a private or preview-less
-/// share).
+/// Never touches `og:type`/`og:url` or the document `<title>`. Title tags
+/// change only when `tags.title` is `Some` (a private card). Description
+/// tags change only when `tags.description` is `Some`. Image tags change
+/// only when `tags.image_url` is `Some`, leaving the app's own default
+/// logo tag untouched otherwise.
 pub(crate) fn inject_og_tags(html: &str, tags: &OgTags) -> String {
     let mut out = html.to_string();
     if let Some(title) = &tags.title {
         out = replace_meta_content(&out, r#"property="og:title" content=""#, title);
         out = replace_meta_content(&out, r#"name="twitter:title" content=""#, title);
+    }
+    if let Some(description) = &tags.description {
+        out = replace_meta_content(&out, r#"property="og:description" content=""#, description);
+        out = replace_meta_content(&out, r#"name="twitter:description" content=""#, description);
     }
     if let Some(image_url) = &tags.image_url {
         out = replace_meta_content(&out, r#"property="og:image" content=""#, image_url);
@@ -2809,9 +2962,9 @@ mod tests {
         assert_eq!(share_preview_rel_path(&row), Some("1/abc-preview.png"));
     }
 
-    /// `og_tags_for_share`'s selection matrix (§9): private always gets the
-    /// fixed neutral title and no image; public with a blank title gets no
-    /// title override; public with a real title and a preview gets both.
+    /// Public links keep the product title. The description carries the
+    /// nick and the chart name. The image is set only when a preview exists.
+    /// Private links stay the neutral title with no image and no chart name.
     #[test]
     fn og_tags_for_share_selection_matrix() {
         let base = crate::db::ShareLinkRow {
@@ -2833,32 +2986,44 @@ mod tests {
             pinned: false,
         };
 
-        // Public, blank title, no preview — no override at all.
-        let tags = og_tags_for_share(&base);
+        let tags = og_tags_for_share(&base, "");
         assert_eq!(tags.title, None);
+        assert_eq!(tags.description.as_deref(), Some("shared"));
         assert_eq!(tags.image_url, None);
 
-        // Public, real title, no preview — title override only.
         let with_title = crate::db::ShareLinkRow { title: "My BTC setup".to_string(), ..clone_row(&base) };
-        let tags = og_tags_for_share(&with_title);
-        assert_eq!(tags.title, Some("My BTC setup".to_string()));
+        let tags = og_tags_for_share(&with_title, "admin");
+        assert_eq!(tags.title, None);
+        assert_eq!(tags.description.as_deref(), Some("shared (admin) — My BTC setup"));
         assert_eq!(tags.image_url, None);
 
-        // Public, real title, WITH a preview — both overridden.
         let with_preview = crate::db::ShareLinkRow {
             preview_path: "1/tok-preview.png".to_string(),
             ..clone_row(&with_title)
         };
-        let tags = og_tags_for_share(&with_preview);
-        assert_eq!(tags.title, Some("My BTC setup".to_string()));
+        let tags = og_tags_for_share(&with_preview, "admin");
+        assert_eq!(tags.title, None);
         assert_eq!(tags.image_url, Some("https://mylittlechart.org/api/share/tok/preview.png".to_string()));
 
-        // Private — fixed neutral title, no image, REGARDLESS of the
-        // preview or the real title above.
         let private = crate::db::ShareLinkRow { visibility: "private".to_string(), ..clone_row(&with_preview) };
-        let tags = og_tags_for_share(&private);
+        let tags = og_tags_for_share(&private, "admin");
         assert_eq!(tags.title, Some(PRIVATE_SHARE_OG_TITLE.to_string()));
+        assert_eq!(tags.description, None);
         assert_eq!(tags.image_url, None);
+    }
+
+    #[test]
+    fn compose_share_card_keeps_the_brand_and_fills_the_frame() {
+        let src = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            80,
+            40,
+            image::Rgba([200, 30, 30, 255]),
+        ));
+        let card = compose_share_card(&src);
+        assert_eq!((card.width(), card.height()), (PREVIEW_OUTPUT_WIDTH, PREVIEW_OUTPUT_HEIGHT));
+        assert_eq!(card.get_pixel(120, 300), card_template().get_pixel(120, 300));
+        let shot = card.get_pixel(SHOT_X + 200, SHOT_Y + 200);
+        assert!(shot[0] > 150 && shot[1] < 80, "frame pixel {shot:?} is not the chart");
     }
 
     /// `ShareLinkRow` carries no `Clone` derive in production (nothing else
@@ -2895,6 +3060,7 @@ mod tests {
         "<meta property=\"og:image\" content=\"https://mylittlechart.org/og-card.png\" />",
         "<meta name=\"twitter:card\" content=\"summary_large_image\" />",
         "<meta name=\"twitter:title\" content=\"mylittlechart — the terminal\" />",
+        "<meta name=\"twitter:description\" content=\"Windows · macOS · Linux · Browser\" />",
         "<meta name=\"twitter:image\" content=\"https://mylittlechart.org/og-card.png\" />",
         "</head><body></body></html>",
     );
@@ -2903,6 +3069,7 @@ mod tests {
     fn inject_og_tags_overrides_title_and_image_when_both_present() {
         let tags = OgTags {
             title: Some("My BTC setup".to_string()),
+            description: None,
             image_url: Some("https://mylittlechart.org/api/share/tok/preview.png".to_string()),
         };
         let out = inject_og_tags(SAMPLE_INDEX_HTML, &tags);
@@ -2926,7 +3093,11 @@ mod tests {
     /// og:image, app default logo only" rule.
     #[test]
     fn inject_og_tags_leaves_image_untouched_when_none_provided() {
-        let tags = OgTags { title: Some(PRIVATE_SHARE_OG_TITLE.to_string()), image_url: None };
+        let tags = OgTags {
+            title: Some(PRIVATE_SHARE_OG_TITLE.to_string()),
+            description: None,
+            image_url: None,
+        };
         let out = inject_og_tags(SAMPLE_INDEX_HTML, &tags);
 
         assert!(out.contains(&format!(r#"property="og:title" content="{PRIVATE_SHARE_OG_TITLE}""#)));
@@ -2934,12 +3105,23 @@ mod tests {
         assert!(out.contains(r#"name="twitter:image" content="https://mylittlechart.org/og-card.png""#));
     }
 
-    /// No tags at all → byte-identical output (the "token not found" case —
-    /// the caller never invokes `inject_og_tags` for it, but this proves the
-    /// function itself is a true no-op absent both overrides too).
+    #[test]
+    fn inject_og_tags_sets_the_shared_line_and_keeps_the_product_title() {
+        let tags = OgTags {
+            title: None,
+            description: Some("shared (admin) — My BTC setup".to_string()),
+            image_url: Some("https://mylittlechart.org/api/share/tok/preview.png".to_string()),
+        };
+        let out = inject_og_tags(SAMPLE_INDEX_HTML, &tags);
+        assert!(out.contains(r#"property="og:title" content="mylittlechart — the terminal""#));
+        assert!(out.contains(r#"property="og:description" content="shared (admin) — My BTC setup""#));
+        assert!(out.contains(r#"name="twitter:description" content="shared (admin) — My BTC setup""#));
+    }
+
+    /// No tags at all → byte-identical output.
     #[test]
     fn inject_og_tags_is_a_no_op_with_no_overrides() {
-        let tags = OgTags { title: None, image_url: None };
+        let tags = OgTags { title: None, description: None, image_url: None };
         assert_eq!(inject_og_tags(SAMPLE_INDEX_HTML, &tags), SAMPLE_INDEX_HTML);
     }
 
@@ -2948,7 +3130,7 @@ mod tests {
     #[test]
     fn inject_og_tags_escapes_a_nasty_title() {
         let nasty = "\"><script>alert(1)</script>";
-        let tags = OgTags { title: Some(nasty.to_string()), image_url: None };
+        let tags = OgTags { title: Some(nasty.to_string()), description: None, image_url: None };
         let out = inject_og_tags(SAMPLE_INDEX_HTML, &tags);
 
         assert!(!out.contains("<script>"), "raw script tag must never appear: {out}");

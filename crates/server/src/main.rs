@@ -200,7 +200,8 @@ async fn root_or_share_og(
         let Some(row) = crate::db::get_share_link(&conn, &token)? else {
             return Ok(None);
         };
-        Ok(Some(routes::share::og_tags_for_share(&row)))
+        let label = crate::db::effective_label_for_user(&conn, row.user_id).unwrap_or_default();
+        Ok(Some(routes::share::og_tags_for_share(&row, &label)))
     })
     .await;
 
