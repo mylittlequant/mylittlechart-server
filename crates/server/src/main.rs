@@ -159,15 +159,13 @@ struct ShareQueryParam {
 }
 
 /// `GET /` — per-link preview card / OG injection
-/// (docs/mlc/plans/share-policy-2026-09-25.md §9). nginx detours a
-/// `?share=` request to this backend instead of serving its own static
-/// `index.html` directly (`ops/nginx-mlc-site.conf`'s planned `if
-/// ($arg_share)` conditional — written as a diff, not yet applied; nginx
-/// deploys are owner-gated). Every other request — no `share` param at all,
-/// which is every request that reaches this backend directly rather than
-/// through that one nginx detour — gets the unchanged [`redirect_to_app_root`]
-/// 301, so this route carries zero behaviour change for the case nginx
-/// itself never sends here.
+/// (docs/mlc/plans/share-policy-2026-09-25.md §9). Edge nginx detours a
+/// link-preview crawler's `?share=` request here
+/// (`ops/nginx-mlc-site.conf`, `$mlc_share_preview` → `@mlc_share_preview`).
+/// A browser opening the same URL is not detoured: it keeps the edge's
+/// `index.html`. Every other request — no `share` param at all — gets the
+/// unchanged [`redirect_to_app_root`] 301. The template this reads is
+/// `STATIC_DIR/index.html`, copied from the edge app by `deploy-app.sh`.
 ///
 /// For a `share`-tagged request: reads `static_dir/index.html` (the SAME
 /// file `outside_api_app`'s `ServeDir` would have served — never a
