@@ -266,6 +266,20 @@ pub struct CreateLiveShareRequest {
     /// rule, `db::effective_share_tier`).
     #[serde(default)]
     pub visibility: ShareVisibility,
+    /// [Rev 3] Whether OUR OWN clients should offer a "Forward" action on a
+    /// card built from this link. `None` (the field absent, or an explicit
+    /// JSON `null`) means "not set — follow `visibility`'s own default":
+    /// `true` for a public link, `false` for a private one
+    /// (`db::ShareLinkRow::effective_allow_forward`). `Some(v)` pins the
+    /// value regardless of `visibility`, including through a LATER `PATCH`
+    /// that changes only `visibility` (§1's Rev 3 addition — see
+    /// `UpdateShareLinkPolicyRequest::allow_forward`'s doc comment for the
+    /// "does not silently flip" rule this enables). This is a client-side
+    /// courtesy, not a security boundary: the hard guarantee for "nobody
+    /// else can open this" is still `visibility: private` plus a real grant
+    /// — copied link text can never be un-copied.
+    #[serde(default)]
+    pub allow_forward: Option<bool>,
 }
 
 /// One live-view interaction floor a share link grants (§1). `View` allows
@@ -387,6 +401,7 @@ pub async fn create_live_share(
     let clone_allowed = body.clone_allowed;
     let interaction = body.interaction.as_str();
     let visibility = body.visibility.as_str();
+    let allow_forward = body.allow_forward;
     let protected_json = match serde_json::to_string(&body.protected) {
         Ok(s) => s,
         Err(_) => {
@@ -418,6 +433,7 @@ pub async fn create_live_share(
             interaction,
             &protected_json,
             visibility,
+            allow_forward,
         )?;
         Ok((token, expires_at))
     })
@@ -548,7 +564,10 @@ pub async fn create_screenshot_share(
             // always false here, and interaction/protected/visibility stay
             // at their "view"/"[]"/"public" defaults — no request field
             // offers to set any of them (a screenshot is pure view-only by
-            // construction, §0).
+            // construction, §0). `allow_forward` stays `None` (unset) too,
+            // for the same reason — it then follows `"public"`'s own
+            // effective default (`true`), same as before this column
+            // existed.
             let token = crate::db::create_share_link(
                 &conn,
                 user_id,
@@ -562,6 +581,7 @@ pub async fn create_screenshot_share(
                 "view",
                 "[]",
                 "public",
+                None,
             )?;
 
             // user_id and token are server-generated (integer / hex), so
@@ -775,7 +795,11 @@ struct ShareLockedResponse {
 /// SCOPED exception to this module's "unknown/expired/revoked all answer the
 /// same bare 404" opacity doctrine, which stays unchanged for those three
 /// cases. Live shares answer the frozen preset; screenshot shares answer the
-/// URL of the PNG endpoint.
+/// URL of the PNG endpoint. [Rev 3] Both kinds also echo `"allow_forward"`
+/// (`row.effective_allow_forward()`) — the client-side "offer a Forward
+/// action" courtesy flag, resolved the same way regardless of `caller`'s
+/// tier (unlike `"rights"`/`"clone_protected"`, it is not a per-recipient
+/// grant, just this link's own policy).
 pub async fn get_share(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -808,6 +832,10 @@ pub async fn get_share(
     let is_owner = caller == Some(row.user_id);
     let rights = rights_for_tier(tier, is_owner);
     let clone_protected = tier == crate::db::ShareTier::CloneProtected;
+    // [Rev 3] The resolved forwarding flag — explicit if the owner ever set
+    // one, otherwise `visibility`'s own default (`ShareLinkRow::
+    // effective_allow_forward`'s doc comment has the full rule).
+    let allow_forward = row.effective_allow_forward();
 
     match ShareKind::from_wire_name(&row.kind) {
         Some(ShareKind::Live) => {
@@ -842,6 +870,7 @@ pub async fn get_share(
                 "interaction": row.interaction,
                 "protected": protected,
                 "clone_protected": clone_protected,
+                "allow_forward": allow_forward,
             }))
             .into_response()
         }
@@ -854,6 +883,7 @@ pub async fn get_share(
             "expires_at": row.expires_at,
             "rights": rights,
             "clone_protected": clone_protected,
+            "allow_forward": allow_forward,
         }))
         .into_response(),
         // A kind this build does not know is treated as not found — an older
@@ -1303,6 +1333,16 @@ pub struct UpdateShareLinkPolicyRequest {
     pub interaction: Option<ShareInteraction>,
     pub visibility: Option<ShareVisibility>,
     pub protected: Option<Vec<ProtectedElementRef>>,
+    /// [Rev 3] `None`/absent leaves `allow_forward` exactly as it is —
+    /// including "still unset, still following `visibility`'s default" if
+    /// that was its state before this call. `Some(v)` pins it explicitly.
+    /// This is why sending ONLY `visibility` in the same request that
+    /// changes it never flips an already-explicit `allow_forward`: this
+    /// field is simply absent from that request, so
+    /// `db::update_share_link_policy` never touches the column — see its
+    /// own doc comment for the exact mechanism.
+    #[serde(default)]
+    pub allow_forward: Option<bool>,
 }
 
 /// PATCH /api/share/{token}
@@ -1348,6 +1388,7 @@ pub async fn update_share_policy(
     };
     let interaction = body.interaction.map(|i| i.as_str());
     let visibility = body.visibility.map(|v| v.as_str());
+    let allow_forward = body.allow_forward;
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
@@ -1358,6 +1399,7 @@ pub async fn update_share_policy(
             interaction,
             visibility,
             protected_json.as_deref(),
+            allow_forward,
         )
     })
     .await;
@@ -2060,10 +2102,14 @@ mod tests {
         assert!(!parsed.clone_allowed);
         assert_eq!(parsed.interaction, ShareInteraction::View);
         assert!(parsed.protected.is_empty());
+        // Rev 3: an old client sending no `allow_forward` at all gets `None`
+        // — "never set explicitly", follows `visibility`'s own default.
+        assert_eq!(parsed.allow_forward, None);
     }
 
     /// The current, full-shape request round-trips every field, including a
-    /// non-default interaction and a non-empty protected list.
+    /// non-default interaction, a non-empty protected list, and (Rev 3) an
+    /// explicit `allow_forward`.
     #[test]
     fn create_live_share_request_parses_the_full_rev2_shape() {
         let body = serde_json::json!({
@@ -2072,6 +2118,7 @@ mod tests {
             "clone_allowed": true,
             "interaction": "interactive",
             "protected": [{ "kind": "primitive", "id": "42" }],
+            "allow_forward": false,
         });
         let parsed: CreateLiveShareRequest =
             serde_json::from_value(body).expect("full-shape request must parse");
@@ -2080,6 +2127,7 @@ mod tests {
         assert_eq!(parsed.protected.len(), 1);
         assert_eq!(parsed.protected[0].kind, "primitive");
         assert_eq!(parsed.protected[0].id, "42");
+        assert_eq!(parsed.allow_forward, Some(false));
     }
 
     // ---- §8.4 acceptance test + clone_preset_with_strip unit coverage ----
@@ -2122,7 +2170,8 @@ mod tests {
                 interaction TEXT NOT NULL DEFAULT 'view',
                 protected_json TEXT NOT NULL DEFAULT '[]',
                 visibility TEXT NOT NULL DEFAULT 'public',
-                preview_path TEXT NOT NULL DEFAULT ''
+                preview_path TEXT NOT NULL DEFAULT '',
+                allow_forward INTEGER
             );
 
             CREATE TABLE grant_groups (
@@ -2239,6 +2288,7 @@ mod tests {
             "view",
             &protected_json,
             "private",
+            None,
         )
         .expect("create share");
 
@@ -2385,7 +2435,7 @@ mod tests {
         let stranger = insert_user(&conn, "stranger");
         let now = chrono::Utc::now().to_rfc3339();
         let token = crate::db::create_share_link(
-            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "private",
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "private", None,
         )
         .expect("create share");
 
@@ -2417,13 +2467,13 @@ mod tests {
         let stranger = insert_user(&conn, "stranger");
         let now = chrono::Utc::now().to_rfc3339();
         let token = crate::db::create_share_link(
-            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public",
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None,
         )
         .expect("create share");
 
         // A stranger's update is refused entirely.
         assert!(!crate::db::update_share_link_policy(
-            &conn, &token, stranger, Some("interactive"), None, None,
+            &conn, &token, stranger, Some("interactive"), None, None, None,
         )
         .expect("update"));
         let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
@@ -2432,7 +2482,7 @@ mod tests {
         // The owner can update just `interaction`, leaving `visibility` and
         // `protected_json` untouched.
         assert!(crate::db::update_share_link_policy(
-            &conn, &token, owner, Some("interactive"), None, None,
+            &conn, &token, owner, Some("interactive"), None, None, None,
         )
         .expect("update"));
         let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
@@ -2442,13 +2492,156 @@ mod tests {
 
         // …and `visibility`/`protected` independently of `interaction`.
         assert!(crate::db::update_share_link_policy(
-            &conn, &token, owner, None, Some("private"), Some(r#"[{"kind":"primitive","id":"1"}]"#),
+            &conn, &token, owner, None, Some("private"), Some(r#"[{"kind":"primitive","id":"1"}]"#), None,
         )
         .expect("update"));
         let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
         assert_eq!(row.interaction, "interactive");
         assert_eq!(row.visibility, "private");
         assert_eq!(row.protected_json, r#"[{"kind":"primitive","id":"1"}]"#);
+    }
+
+    // ---- Rev 3: allow_forward — defaults, explicit set, PATCH, ownership ----
+    // (docs/mlc/plans/share-policy-2026-09-25.md "Rev 3")
+
+    /// Defaults per `visibility` when `allow_forward` is never set explicitly
+    /// at create time, PLUS an explicit value at create time pinning
+    /// regardless of `visibility` (owner instruction: "default `true` for
+    /// public links, `false` for private ones, unless the create body sets
+    /// it explicitly").
+    #[test]
+    fn create_share_link_allow_forward_defaults_per_visibility_unless_explicit() {
+        let conn = strip_test_conn();
+        let owner = insert_user(&conn, "owner");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Unset (`None`) on a public link — follows the public default: true.
+        let public_unset = crate::db::create_share_link(
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None,
+        )
+        .expect("create share");
+        let row = crate::db::get_share_link(&conn, &public_unset).expect("query").expect("row");
+        assert_eq!(row.allow_forward, None, "never set explicitly");
+        assert!(row.effective_allow_forward());
+
+        // Unset on a private link — follows the private default: false.
+        let private_unset = crate::db::create_share_link(
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "private", None,
+        )
+        .expect("create share");
+        let row = crate::db::get_share_link(&conn, &private_unset).expect("query").expect("row");
+        assert_eq!(row.allow_forward, None);
+        assert!(!row.effective_allow_forward());
+
+        // Explicit `Some(false)` on a public link overrides the public
+        // default of `true`.
+        let public_explicit_off = crate::db::create_share_link(
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", Some(false),
+        )
+        .expect("create share");
+        let row = crate::db::get_share_link(&conn, &public_explicit_off).expect("query").expect("row");
+        assert_eq!(row.allow_forward, Some(false));
+        assert!(!row.effective_allow_forward());
+
+        // Explicit `Some(true)` on a private link overrides the private
+        // default of `false`.
+        let private_explicit_on = crate::db::create_share_link(
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "private", Some(true),
+        )
+        .expect("create share");
+        let row = crate::db::get_share_link(&conn, &private_explicit_on).expect("query").expect("row");
+        assert_eq!(row.allow_forward, Some(true));
+        assert!(row.effective_allow_forward());
+    }
+
+    /// `PATCH`'s DB write can set `allow_forward` explicitly, owner-only —
+    /// same "someone else's token" refusal (mapped to a bare 404 by
+    /// `update_share_policy`, unchanged for this new field) already proven
+    /// for `interaction`/`visibility`/`protected` above.
+    #[test]
+    fn update_share_link_policy_allow_forward_owner_only_and_explicit() {
+        let conn = strip_test_conn();
+        let owner = insert_user(&conn, "owner");
+        let stranger = insert_user(&conn, "stranger");
+        let now = chrono::Utc::now().to_rfc3339();
+        let token = crate::db::create_share_link(
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None,
+        )
+        .expect("create share");
+
+        // A stranger's attempt is refused entirely — the row is untouched,
+        // same 404-opacity discipline as every other field this route can
+        // set.
+        assert!(!crate::db::update_share_link_policy(
+            &conn, &token, stranger, None, None, None, Some(false),
+        )
+        .expect("update"));
+        let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
+        assert_eq!(row.allow_forward, None);
+
+        // The owner pins it explicitly.
+        assert!(crate::db::update_share_link_policy(
+            &conn, &token, owner, None, None, None, Some(false),
+        )
+        .expect("update"));
+        let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
+        assert_eq!(row.allow_forward, Some(false));
+        assert!(!row.effective_allow_forward());
+    }
+
+    /// The load-bearing Rev 3 rule: changing `visibility` through `PATCH`
+    /// alone (passing `allow_forward: None`, i.e. "not sent this call") never
+    /// flips an ALREADY-explicit `allow_forward`, but DOES move the
+    /// EFFECTIVE default for a link where it was never set.
+    #[test]
+    fn update_share_link_policy_visibility_change_never_flips_an_explicit_allow_forward() {
+        let conn = strip_test_conn();
+        let owner = insert_user(&conn, "owner");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Link A: allow_forward pinned explicitly to `false` on a PUBLIC
+        // link (fighting its own default of `true`).
+        let token_a = crate::db::create_share_link(
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", Some(false),
+        )
+        .expect("create share");
+        // Flip visibility to private WITHOUT touching allow_forward.
+        assert!(crate::db::update_share_link_policy(
+            &conn, &token_a, owner, None, Some("private"), None, None,
+        )
+        .expect("update"));
+        let row_a = crate::db::get_share_link(&conn, &token_a).expect("query").expect("row");
+        assert_eq!(row_a.visibility, "private");
+        assert_eq!(
+            row_a.allow_forward,
+            Some(false),
+            "an explicit value must survive a visibility-only PATCH untouched"
+        );
+        assert!(!row_a.effective_allow_forward());
+
+        // Link B: allow_forward NEVER set explicitly on a PUBLIC link (true
+        // by default). Flip visibility to private, again without touching
+        // allow_forward.
+        let token_b = crate::db::create_share_link(
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None,
+        )
+        .expect("create share");
+        let row_b = crate::db::get_share_link(&conn, &token_b).expect("query").expect("row");
+        assert!(row_b.effective_allow_forward(), "public default, before the PATCH");
+        assert!(crate::db::update_share_link_policy(
+            &conn, &token_b, owner, None, Some("private"), None, None,
+        )
+        .expect("update"));
+        let row_b = crate::db::get_share_link(&conn, &token_b).expect("query").expect("row");
+        assert_eq!(row_b.visibility, "private");
+        assert_eq!(
+            row_b.allow_forward, None,
+            "still never set explicitly — the PATCH must not have written it"
+        );
+        assert!(
+            !row_b.effective_allow_forward(),
+            "an unset link follows its NEW visibility's default, not its old one"
+        );
     }
 
     // ---- §9: preview image validation + OG-tag injection ----
@@ -2562,7 +2755,7 @@ mod tests {
         let owner = insert_user(&conn, "owner");
         let now = chrono::Utc::now().to_rfc3339();
         let token = crate::db::create_share_link(
-            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "private",
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "private", None,
         )
         .expect("create share");
         assert!(crate::db::set_share_preview_path(&conn, &token, owner, "1/abc-preview.png").expect("set path"));
@@ -2577,7 +2770,7 @@ mod tests {
         let owner = insert_user(&conn, "owner");
         let now = chrono::Utc::now().to_rfc3339();
         let token = crate::db::create_share_link(
-            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public",
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None,
         )
         .expect("create share");
         crate::db::set_share_preview_path(&conn, &token, owner, "1/abc-preview.png").expect("set path");
@@ -2606,6 +2799,7 @@ mod tests {
             protected_json: "[]".to_string(),
             visibility: "public".to_string(),
             preview_path: String::new(),
+            allow_forward: None,
         };
 
         // Public, blank title, no preview — no override at all.
@@ -2656,6 +2850,7 @@ mod tests {
             protected_json: row.protected_json.clone(),
             visibility: row.visibility.clone(),
             preview_path: row.preview_path.clone(),
+            allow_forward: row.allow_forward,
         }
     }
 

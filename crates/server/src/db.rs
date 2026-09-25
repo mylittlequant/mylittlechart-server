@@ -554,6 +554,23 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
     // them, on a live database.
     let _ = conn.execute("ALTER TABLE share_links ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'", []);
     let _ = conn.execute("ALTER TABLE share_links ADD COLUMN preview_path TEXT NOT NULL DEFAULT ''", []);
+    // Safe migration: chart-share policy, Rev 3 (docs/mlc/plans/share-policy-
+    // 2026-09-25.md, "Rev 3"). `allow_forward` is a NULLABLE integer, not a
+    // `NOT NULL ... DEFAULT` column like its siblings above — deliberately:
+    // NULL means "never explicitly set", and the *effective* value is derived
+    // at READ time from the link's own `visibility` (see
+    // [`ShareLinkRow::effective_allow_forward`]): `true` for a public link,
+    // `false` for a private one. This is what makes a later `PATCH`
+    // visibility change able to move the effective default without ever
+    // touching this column, while a caller who DID set `allow_forward`
+    // explicitly (0 or 1, at create or via PATCH) keeps that exact value
+    // forever, regardless of any later visibility change — the one row this
+    // plan does not want a `NOT NULL DEFAULT` for. Every pre-existing row
+    // reads back NULL here (unset), so it silently starts following its own
+    // `visibility`'s default — `true` for the public links that are the
+    // overwhelming majority of existing rows, matching today's actual
+    // behaviour of "recipients can already forward the raw link text".
+    let _ = conn.execute("ALTER TABLE share_links ADD COLUMN allow_forward INTEGER", []);
     // Safe migration: per-account/group share rights (§1's new `ShareTier`
     // core). NULL for every existing `object_grants` row — a grant with no
     // group target simply never matches via `grant_group_members`, the same
@@ -3271,6 +3288,30 @@ pub struct ShareLinkRow {
     /// `routes::share::og_tags_for_share` (OG-tag selection for the
     /// crawler-facing `GET /` route in `main.rs`).
     pub preview_path: String,
+    /// [Rev 3] `Some(true)`/`Some(false)` once the owner has explicitly set
+    /// forwarding at create time or via `PATCH /api/share/{token}`; `None`
+    /// for every link that never had it set explicitly (including every row
+    /// created before this column existed) — see the ALTER TABLE's own
+    /// comment above and [`Self::effective_allow_forward`], the ONE place
+    /// that turns this raw, possibly-unset value into the answer a caller
+    /// actually wants.
+    pub allow_forward: Option<bool>,
+}
+
+impl ShareLinkRow {
+    /// The forwarding flag a caller/UI actually acts on: the explicit value
+    /// if the owner ever set one, otherwise the visibility-keyed default —
+    /// `true` for `"public"`, `false` for anything else (in practice just
+    /// `"private"`). Reading this fresh off `self.visibility` on every call,
+    /// rather than baking a default into the column at write time, is
+    /// exactly what lets a `PATCH` that changes ONLY `visibility` move an
+    /// unset link's effective forwarding without ever writing to
+    /// `allow_forward` — and, symmetrically, lets an explicit value survive
+    /// that same `PATCH` untouched (docs/mlc/plans/share-policy-2026-09-25.md
+    /// Rev 3).
+    pub fn effective_allow_forward(&self) -> bool {
+        self.allow_forward.unwrap_or(self.visibility == "public")
+    }
 }
 
 /// Read one query row into a [`ShareLinkRow`]. Column order must match the
@@ -3291,6 +3332,7 @@ fn share_link_from_row(row: &rusqlite::Row<'_>) -> Result<ShareLinkRow> {
         protected_json: row.get(11)?,
         visibility: row.get(12)?,
         preview_path: row.get(13)?,
+        allow_forward: row.get::<_, Option<i64>>(14)?.map(|v| v != 0),
     })
 }
 
@@ -3318,6 +3360,10 @@ fn generate_share_token() -> String {
 /// as `clone_allowed`: nothing offers to set them for that kind).
 /// `visibility` is `"public"`/`"private"` (§1 Rev 2); `preview_path` starts
 /// empty always — it is stamped later, once a preview image exists (§9).
+/// `allow_forward` is Rev 3's forwarding flag: `None` when the caller never
+/// set it explicitly — the row then follows its own `visibility`'s default
+/// (see [`ShareLinkRow::effective_allow_forward`]) — `Some(v)` when it did;
+/// always `None` for a screenshot share, same reasoning as `clone_allowed`.
 ///
 /// Retries on the vanishingly unlikely PRIMARY KEY collision, same as
 /// [`mint_gift_codes`].
@@ -3334,13 +3380,14 @@ pub fn create_share_link(
     interaction: &str,
     protected_json: &str,
     visibility: &str,
+    allow_forward: Option<bool>,
 ) -> Result<String> {
     loop {
         let token = generate_share_token();
         let inserted = conn.execute(
-            "INSERT OR IGNORE INTO share_links (token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility)
-             VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![token, user_id, kind, title, preset_json, blob_bytes, created_at, expires_at, clone_allowed as i64, interaction, protected_json, visibility],
+            "INSERT OR IGNORE INTO share_links (token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, allow_forward)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![token, user_id, kind, title, preset_json, blob_bytes, created_at, expires_at, clone_allowed as i64, interaction, protected_json, visibility, allow_forward.map(|v| v as i64)],
         )?;
         if inserted == 1 {
             return Ok(token);
@@ -3365,7 +3412,7 @@ pub fn set_share_blob_path(conn: &Connection, token: &str, blob_path: &str) -> R
 pub fn get_share_link(conn: &Connection, token: &str) -> Result<Option<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.query_row(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward
          FROM share_links
          WHERE token = ?1 AND revoked = 0 AND expires_at > ?2",
         params![token, now],
@@ -3397,7 +3444,7 @@ pub fn share_usage(conn: &Connection, user_id: i64) -> Result<(u64, u64)> {
 pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward
          FROM share_links
          WHERE user_id = ?1 AND revoked = 0 AND expires_at > ?2
          ORDER BY created_at DESC",
@@ -3436,6 +3483,14 @@ pub fn set_share_preview_path(
 /// argument is written; `None` leaves that column untouched. Returns
 /// `false` for an unknown token or a non-owner caller — same "someone
 /// else's token" 404 discipline as every other owner-scoped write here.
+///
+/// `allow_forward` (Rev 3) follows the exact same "`None` = untouched"
+/// convention as the other three — writing `Some(v)` here is what makes a
+/// value "explicit" for [`ShareLinkRow::effective_allow_forward`]'s purposes
+/// from this call onward, including surviving a LATER call that changes only
+/// `visibility`: that later call passes `allow_forward: None` and this
+/// function then does not touch the column at all, leaving the earlier
+/// explicit value exactly as it was.
 pub fn update_share_link_policy(
     conn: &Connection,
     token: &str,
@@ -3443,6 +3498,7 @@ pub fn update_share_link_policy(
     interaction: Option<&str>,
     visibility: Option<&str>,
     protected_json: Option<&str>,
+    allow_forward: Option<bool>,
 ) -> Result<bool> {
     let owns: bool = conn
         .query_row(
@@ -3463,6 +3519,12 @@ pub fn update_share_link_policy(
     }
     if let Some(v) = protected_json {
         conn.execute("UPDATE share_links SET protected_json = ?1 WHERE token = ?2", params![v, token])?;
+    }
+    if let Some(v) = allow_forward {
+        conn.execute(
+            "UPDATE share_links SET allow_forward = ?1 WHERE token = ?2",
+            params![v as i64, token],
+        )?;
     }
     Ok(true)
 }
@@ -6890,7 +6952,8 @@ mod tests {
                 interaction TEXT NOT NULL DEFAULT 'view',
                 protected_json TEXT NOT NULL DEFAULT '[]',
                 visibility TEXT NOT NULL DEFAULT 'public',
-                preview_path TEXT NOT NULL DEFAULT ''
+                preview_path TEXT NOT NULL DEFAULT '',
+                allow_forward INTEGER
             );
 
             CREATE TABLE auth_tokens (
@@ -7010,7 +7073,7 @@ mod tests {
         let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        let token = super::create_share_link(&conn, uid, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public")
+        let token = super::create_share_link(&conn, uid, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create");
         assert_eq!(token.len(), 32);
 
@@ -7045,7 +7108,7 @@ mod tests {
 
         let protected = r#"[{"kind":"primitive","id":"7"}]"#;
         let token = super::create_share_link(
-            &conn, uid, "live", "t", "{}", 0, &now, &future_ts(), false, "interactive", protected, "public",
+            &conn, uid, "live", "t", "{}", 0, &now, &future_ts(), false, "interactive", protected, "public", None,
         )
         .expect("create");
         let row = super::get_share_link(&conn, &token).expect("query").expect("row");
@@ -7171,14 +7234,14 @@ mod tests {
 
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (0, 0));
 
-        super::create_share_link(&conn, uid, "live", "l1", "{}", 0, &now, &future_ts(), false, "view", "[]", "public")
+        super::create_share_link(&conn, uid, "live", "l1", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create");
-        let shot = super::create_share_link(&conn, uid, "screenshot", "s1", "", 42, &now, &future_ts(), false, "view", "[]", "public")
+        let shot = super::create_share_link(&conn, uid, "screenshot", "s1", "", 42, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create");
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (1, 1));
 
         // Expired and revoked rows stop counting.
-        super::create_share_link(&conn, uid, "live", "l2", "{}", 0, &now, &past_ts(), false, "view", "[]", "public")
+        super::create_share_link(&conn, uid, "live", "l2", "{}", 0, &now, &past_ts(), false, "view", "[]", "public", None)
             .expect("create");
         super::revoke_share(&conn, uid, &shot).expect("revoke");
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (1, 0));
@@ -7191,17 +7254,17 @@ mod tests {
 
         let older = super::create_share_link(
             &conn, uid, "live", "old", "{}", 0,
-            "2026-01-01T00:00:00+00:00", &future_ts(), false, "view", "[]", "public",
+            "2026-01-01T00:00:00+00:00", &future_ts(), false, "view", "[]", "public", None,
         )
         .expect("create");
         let newer = super::create_share_link(
             &conn, uid, "screenshot", "new", "", 1,
-            "2026-02-01T00:00:00+00:00", &future_ts(), false, "view", "[]", "public",
+            "2026-02-01T00:00:00+00:00", &future_ts(), false, "view", "[]", "public", None,
         )
         .expect("create");
         super::create_share_link(
             &conn, uid, "live", "dead", "{}", 0,
-            "2026-03-01T00:00:00+00:00", &past_ts(), false, "view", "[]", "public",
+            "2026-03-01T00:00:00+00:00", &past_ts(), false, "view", "[]", "public", None,
         )
         .expect("create");
 
@@ -7216,14 +7279,14 @@ mod tests {
         let uid = insert_share_user(&conn, "dave", Some("pub-dave"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        let live_expired = super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &past_ts(), false, "view", "[]", "public")
+        let live_expired = super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &past_ts(), false, "view", "[]", "public", None)
             .expect("create");
         let shot_expired =
-            super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &past_ts(), false, "view", "[]", "public")
+            super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &past_ts(), false, "view", "[]", "public", None)
                 .expect("create");
         super::set_share_blob_path(&conn, &shot_expired, &format!("{}/{}.png", uid, shot_expired))
             .expect("stamp blob path");
-        let alive = super::create_share_link(&conn, uid, "live", "ok", "{}", 0, &now, &future_ts(), false, "view", "[]", "public")
+        let alive = super::create_share_link(&conn, uid, "live", "ok", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create");
 
         let removed = super::cleanup_expired_share_links(&conn).expect("cleanup");
@@ -7264,9 +7327,9 @@ mod tests {
         let uid = insert_share_user(&conn, "gina", Some("pub-gina"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &future_ts(), false, "view", "[]", "public")
+        super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create live");
-        let shot = super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &future_ts(), false, "view", "[]", "public")
+        let shot = super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create screenshot");
         let blob_path = format!("{}/{}.png", uid, shot);
         super::set_share_blob_path(&conn, &shot, &blob_path).expect("stamp blob path");
@@ -9333,7 +9396,7 @@ mod
     ) -> super::ShareLinkRow {
         let now = chrono::Utc::now().to_rfc3339();
         let token = super::create_share_link(
-            conn, owner, "live", "t", "{}", 0, &now, &future_ts(), clone_allowed, interaction, "[]", visibility,
+            conn, owner, "live", "t", "{}", 0, &now, &future_ts(), clone_allowed, interaction, "[]", visibility, None,
         )
         .expect("create");
         super::get_share_link(conn, &token).expect("query").expect("row")
