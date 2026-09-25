@@ -1768,11 +1768,11 @@ const PREVIEW_MAX_DIM: u32 = 2048;
 /// non-16:9-ish chart screenshot never has its edges cut off.
 const PREVIEW_OUTPUT_WIDTH: u32 = 1200;
 const PREVIEW_OUTPUT_HEIGHT: u32 = 630;
-/// Letterbox background — the app's own dark chart-canvas colour
-/// (`#131722`, `mylittlechart-landing/web/app/index.html`'s `#boot`
-/// background), not an invented value, so a letterboxed card reads as "the
-/// app's own frame" rather than an arbitrary colour choice.
-const PREVIEW_BACKGROUND_RGBA: [u8; 4] = [0x13, 0x17, 0x22, 0xff];
+/// Long edge of the chart PNG stored on disk. The served card is always
+/// [`PREVIEW_OUTPUT_WIDTH`]×[`PREVIEW_OUTPUT_HEIGHT`]; this cap is only the
+/// source that gets fitted into the empty frame.
+const PREVIEW_STORE_MAX_EDGE: u32 = 1280;
+
 
 /// Why [`build_preview_png`] refused an upload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1799,12 +1799,13 @@ impl PreviewError {
     }
 }
 
-/// Decode `bytes` as a PNG, validate size/dimensions, and re-encode a fixed
-/// 1200×630 letterboxed PNG carrying nothing but raw pixels — the re-encode
-/// is what "strip metadata" buys: any non-pixel chunk smuggled into a
+/// Decode `bytes` as a PNG, validate size/dimensions, and re-encode the
+/// chart at its own aspect (long edge capped). The re-encode is what
+/// "strip metadata" buys: any non-pixel chunk smuggled into a
 /// technically-valid PNG container (a `tEXt` comment, an embedded colour
 /// profile, …) never survives the round trip, because only the DECODED
-/// pixel buffer is ever touched again.
+/// pixel buffer is ever touched again. The branded frame is applied later,
+/// on the way out, over a blank card.
 fn build_preview_png(bytes: &[u8]) -> Result<Vec<u8>, PreviewError> {
     if bytes.len() > PREVIEW_MAX_BYTES {
         return Err(PreviewError::TooLarge);
@@ -1819,22 +1820,27 @@ fn build_preview_png(bytes: &[u8]) -> Result<Vec<u8>, PreviewError> {
         return Err(PreviewError::DimensionsOutOfBounds);
     }
 
-    let scale = (PREVIEW_OUTPUT_WIDTH as f64 / w as f64).min(PREVIEW_OUTPUT_HEIGHT as f64 / h as f64);
-    let new_w = ((w as f64 * scale).round() as u32).clamp(1, PREVIEW_OUTPUT_WIDTH);
-    let new_h = ((h as f64 * scale).round() as u32).clamp(1, PREVIEW_OUTPUT_HEIGHT);
-    let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
-
-    let mut canvas = image::RgbaImage::from_pixel(
-        PREVIEW_OUTPUT_WIDTH,
-        PREVIEW_OUTPUT_HEIGHT,
-        image::Rgba(PREVIEW_BACKGROUND_RGBA),
-    );
-    let x_off = ((PREVIEW_OUTPUT_WIDTH - new_w) / 2) as i64;
-    let y_off = ((PREVIEW_OUTPUT_HEIGHT - new_h) / 2) as i64;
-    image::imageops::overlay(&mut canvas, &resized.to_rgba8(), x_off, y_off);
+    // Keep the chart's own aspect. The card frame is applied when the
+    // preview is served, onto a blank card that has no chart of its own.
+    let long = w.max(h);
+    let (ow, oh) = if long > PREVIEW_STORE_MAX_EDGE {
+        let scale = PREVIEW_STORE_MAX_EDGE as f64 / long as f64;
+        (
+            ((w as f64 * scale).round() as u32).max(1),
+            ((h as f64 * scale).round() as u32).max(1),
+        )
+    } else {
+        (w, h)
+    };
+    let stored = if (ow, oh) == (w, h) {
+        img.to_rgba8()
+    } else {
+        img.resize_exact(ow, oh, image::imageops::FilterType::Lanczos3)
+            .to_rgba8()
+    };
 
     let mut out = Vec::new();
-    image::DynamicImage::ImageRgba8(canvas)
+    image::DynamicImage::ImageRgba8(stored)
         .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .map_err(|_| PreviewError::EncodeFailed)?;
     Ok(out)
@@ -2017,7 +2023,6 @@ const SHOT_RADIUS: i32 = 12;
 const FADE_X: u32 = 560;
 const FADE_W: u32 = 90;
 const CARD_BG: [u8; 4] = [0x13, 0x17, 0x22, 255];
-const SHOT_BORDER: [u8; 4] = [0x36, 0x3a, 0x45, 255];
 
 fn card_template() -> &'static image::RgbaImage {
     static CELL: std::sync::OnceLock<image::RgbaImage> = std::sync::OnceLock::new();
@@ -2055,16 +2060,19 @@ fn in_rounded_rect(x: i32, y: i32, w: i32, h: i32, r: i32) -> bool {
     dx * dx + dy * dy <= r * r
 }
 
-/// Scale `img` so it covers `dw`×`dh`, then keep the top-left of that
-/// cover. Same rule as the card CSS (`object-fit: cover; object-position: left top`).
-fn cover_top_left(img: &image::DynamicImage, dw: u32, dh: u32) -> image::RgbaImage {
-    let sw = img.width().max(1) as f64;
-    let sh = img.height().max(1) as f64;
-    let scale = (dw as f64 / sw).max(dh as f64 / sh);
-    let rw = ((sw * scale).round() as u32).max(dw);
-    let rh = ((sh * scale).round() as u32).max(dh);
-    let resized = img.resize_exact(rw, rh, image::imageops::FilterType::Lanczos3);
-    image::imageops::crop_imm(&resized.to_rgba8(), 0, 0, dw, dh).to_image()
+/// Branded card with an empty right-hand frame (`assets/og-card-blank.png`).
+/// A chart, a QR, or anything else is placed into that frame. The file has
+/// no chart of its own.
+fn blank_card() -> &'static image::RgbaImage {
+    static CELL: std::sync::OnceLock<image::RgbaImage> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        image::load_from_memory_with_format(
+            include_bytes!("../../assets/og-card-blank.png"),
+            image::ImageFormat::Png,
+        )
+        .expect("blank share card")
+        .to_rgba8()
+    })
 }
 
 fn blend_toward(px: &mut image::Rgba<u8>, src: [u8; 4], coverage: f32) {
@@ -2076,31 +2084,30 @@ fn blend_toward(px: &mut image::Rgba<u8>, src: [u8; 4], coverage: f32) {
     px.0[3] = 255;
 }
 
-/// Paint `chart` into the right-hand frame of the branded card. The left
-/// side (hat, wordmark, "the terminal", platforms) is the template and is
-/// not redrawn.
+/// Fit the whole chart inside the empty frame. Nothing is cropped, and the
+/// sample chart from the source artwork is not under it: [`blank_card`]
+/// already cleared that side.
 fn compose_share_card(chart: &image::DynamicImage) -> image::RgbaImage {
-    let shot = cover_top_left(chart, SHOT_W, SHOT_H);
-    let mut card = card_template().clone();
-    let r = SHOT_RADIUS;
-    for y in 0..SHOT_H {
-        for x in 0..SHOT_W {
-            let xi = x as i32;
-            let yi = y as i32;
-            if !in_rounded_rect(xi, yi, SHOT_W as i32, SHOT_H as i32, r) {
+    let mut card = blank_card().clone();
+    let sw = chart.width().max(1) as f64;
+    let sh = chart.height().max(1) as f64;
+    let scale = (SHOT_W as f64 / sw).min(SHOT_H as f64 / sh);
+    let dw = ((sw * scale).round() as u32).clamp(1, SHOT_W);
+    let dh = ((sh * scale).round() as u32).clamp(1, SHOT_H);
+    let resized = chart
+        .resize_exact(dw, dh, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    let ox = SHOT_X + (SHOT_W - dw) / 2;
+    let oy = SHOT_Y + (SHOT_H - dh) / 2;
+    let (fw, fh, r) = (SHOT_W as i32, SHOT_H as i32, SHOT_RADIUS - 1);
+    for y in 0..dh {
+        for x in 0..dw {
+            let lx = (ox + x - SHOT_X) as i32;
+            let ly = (oy + y - SHOT_Y) as i32;
+            if !in_rounded_rect(lx, ly, fw, fh, r) {
                 continue;
             }
-            let dx = SHOT_X + x;
-            let dy = SHOT_Y + y;
-            if dx >= card.width() || dy >= card.height() {
-                continue;
-            }
-            let px = if in_rounded_rect(xi, yi, SHOT_W as i32, SHOT_H as i32, r - 1) {
-                *shot.get_pixel(x, y)
-            } else {
-                image::Rgba(SHOT_BORDER)
-            };
-            card.put_pixel(dx, dy, px);
+            card.put_pixel(ox + x, oy + y, *resized.get_pixel(x, y));
         }
     }
     for x in 0..FADE_W {
@@ -2145,7 +2152,7 @@ pub(crate) const PRIVATE_SHARE_OG_TITLE: &str = "A private chart on MyLittleChar
 pub(crate) struct OgTags {
     pub title: Option<String>,
     /// Replaces `og:description` / `twitter:description`. The link title
-    /// stays the product name; this line is `shared (nick) — chart`.
+    /// stays the product name; this line is `nick - chart`.
     pub description: Option<String>,
     pub image_url: Option<String>,
 }
@@ -2156,7 +2163,7 @@ pub(crate) struct OgTags {
 /// - private → the fixed [`PRIVATE_SHARE_OG_TITLE`], no image, no chart
 ///   name in the description.
 /// - public → the link title stays the app default ("mylittlechart — the
-///   terminal"). The description is `shared (nick) — chart title`.
+///   terminal"). The description is `nick - chart title`.
 /// - image is overridden ONLY when `preview_path` is set AND the link is
 ///   public — a private link never points at its preview even when one was
 ///   uploaded (defense in depth alongside [`get_share_preview`]'s own
@@ -2179,20 +2186,21 @@ pub(crate) fn og_tags_for_share(row: &crate::db::ShareLinkRow, owner_label: &str
     };
     OgTags {
         title: None,
-        description: Some(share_card_description(owner_label, &row.title)),
+        description: share_card_description(owner_label, &row.title),
         image_url,
     }
 }
 
-/// `shared (nick) — chart title`. Either half may be missing.
-fn share_card_description(owner_label: &str, chart_title: &str) -> String {
+/// `nick - chart title`. Either half may be missing. Both missing → no
+/// description override.
+fn share_card_description(owner_label: &str, chart_title: &str) -> Option<String> {
     let who = owner_label.trim();
     let title = chart_title.trim();
     match (who.is_empty(), title.is_empty()) {
-        (false, false) => format!("shared ({who}) — {title}"),
-        (false, true) => format!("shared ({who})"),
-        (true, false) => format!("shared — {title}"),
-        (true, true) => "shared".to_string(),
+        (false, false) => Some(format!("{who} - {title}")),
+        (false, true) => Some(who.to_string()),
+        (true, false) => Some(title.to_string()),
+        (true, true) => None,
     }
 }
 
@@ -2900,13 +2908,13 @@ mod tests {
     }
 
     #[test]
-    fn build_preview_png_reencodes_a_valid_upload_to_the_fixed_canvas() {
+    fn build_preview_png_reencodes_a_valid_upload_keeping_its_aspect() {
         let src = make_test_png(400, 300);
         let out = build_preview_png(&src).expect("valid upload re-encodes");
         let decoded = image::load_from_memory_with_format(&out, image::ImageFormat::Png)
             .expect("re-encoded output must itself be a valid PNG");
-        assert_eq!(decoded.width(), PREVIEW_OUTPUT_WIDTH);
-        assert_eq!(decoded.height(), PREVIEW_OUTPUT_HEIGHT);
+        assert_eq!(decoded.width(), 400);
+        assert_eq!(decoded.height(), 300);
     }
 
     /// A PNG carrying a `tEXt` ancillary chunk is re-encoded WITHOUT it —
@@ -2988,13 +2996,13 @@ mod tests {
 
         let tags = og_tags_for_share(&base, "");
         assert_eq!(tags.title, None);
-        assert_eq!(tags.description.as_deref(), Some("shared"));
+        assert_eq!(tags.description, None);
         assert_eq!(tags.image_url, None);
 
         let with_title = crate::db::ShareLinkRow { title: "My BTC setup".to_string(), ..clone_row(&base) };
         let tags = og_tags_for_share(&with_title, "admin");
         assert_eq!(tags.title, None);
-        assert_eq!(tags.description.as_deref(), Some("shared (admin) — My BTC setup"));
+        assert_eq!(tags.description.as_deref(), Some("admin - My BTC setup"));
         assert_eq!(tags.image_url, None);
 
         let with_preview = crate::db::ShareLinkRow {
@@ -3022,7 +3030,10 @@ mod tests {
         let card = compose_share_card(&src);
         assert_eq!((card.width(), card.height()), (PREVIEW_OUTPUT_WIDTH, PREVIEW_OUTPUT_HEIGHT));
         assert_eq!(card.get_pixel(120, 300), card_template().get_pixel(120, 300));
-        let shot = card.get_pixel(SHOT_X + 200, SHOT_Y + 200);
+        // The sample chart is gone. The gap above a wide image is the card background.
+        let gap = card.get_pixel(SHOT_X + SHOT_W / 2, SHOT_Y + 8);
+        assert_eq!(gap.0, CARD_BG, "sample chart still shows above the frame: {gap:?}");
+        let shot = card.get_pixel(SHOT_X + SHOT_W / 2, SHOT_Y + SHOT_H / 2);
         assert!(shot[0] > 150 && shot[1] < 80, "frame pixel {shot:?} is not the chart");
     }
 
@@ -3109,13 +3120,13 @@ mod tests {
     fn inject_og_tags_sets_the_shared_line_and_keeps_the_product_title() {
         let tags = OgTags {
             title: None,
-            description: Some("shared (admin) — My BTC setup".to_string()),
+            description: Some("admin - My BTC setup".to_string()),
             image_url: Some("https://mylittlechart.org/api/share/tok/preview.png".to_string()),
         };
         let out = inject_og_tags(SAMPLE_INDEX_HTML, &tags);
         assert!(out.contains(r#"property="og:title" content="mylittlechart — the terminal""#));
-        assert!(out.contains(r#"property="og:description" content="shared (admin) — My BTC setup""#));
-        assert!(out.contains(r#"name="twitter:description" content="shared (admin) — My BTC setup""#));
+        assert!(out.contains(r#"property="og:description" content="admin - My BTC setup""#));
+        assert!(out.contains(r#"name="twitter:description" content="admin - My BTC setup""#));
     }
 
     /// No tags at all → byte-identical output.
