@@ -1015,6 +1015,7 @@ pub async fn list_my_shares(State(state): State<Arc<AppState>>, headers: HeaderM
                     "interaction": row.interaction,
                     "visibility": row.visibility,
                     "allow_forward": row.effective_allow_forward(),
+                    "chart_id": row.chart_id,
                 })
             })
             .collect())
