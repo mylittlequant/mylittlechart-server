@@ -151,6 +151,8 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         // Clone-with-strip (rights v1): auth required, needs the `clone`
         // right on the token (see routes/share.rs's module doc).
         .route("/share/{token}/clone", post(share::clone_share))
+        // Per-account/group share grants (rights v2, §8.2) — owner-only.
+        .route("/share/{token}/grants", post(share::create_share_grant))
         // Shared presets (rooms) — server-hosted, per-nick rights, per-entity
         // LWW patch, no live channel yet (Phase 1 — see routes/rooms.rs's
         // module doc). `{kind}` is reserved for future object kinds; Phase 1

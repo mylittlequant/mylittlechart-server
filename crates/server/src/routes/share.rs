@@ -250,6 +250,13 @@ pub struct CreateLiveShareRequest {
     /// `clone_protected` (§1). Empty by default.
     #[serde(default)]
     pub protected: Vec<ProtectedElementRef>,
+    /// [Rev 2] "public" (default, unchanged behaviour) | "private" — a
+    /// private link resolves to ZERO rights for anyone without an explicit
+    /// `object_grants` row (§8.5); `clone_allowed`/`interaction` above become
+    /// inert floors that never apply on a private link (§1's tier-resolution
+    /// rule, `db::effective_share_tier`).
+    #[serde(default)]
+    pub visibility: ShareVisibility,
 }
 
 /// One live-view interaction floor a share link grants (§1). `View` allows
@@ -269,6 +276,27 @@ impl ShareInteraction {
         match self {
             ShareInteraction::View => "view",
             ShareInteraction::Interactive => "interactive",
+        }
+    }
+}
+
+/// [Rev 2] A link's own visibility floor (§1/§8.5). `Public` is Rev 1's
+/// unchanged behaviour — reachable by anyone holding the token, subject to
+/// its own `interaction`/`clone_allowed` floor. `Private` refuses anyone
+/// without an explicit per-account/group grant, even with the token in hand.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareVisibility {
+    #[default]
+    Public,
+    Private,
+}
+
+impl ShareVisibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShareVisibility::Public => "public",
+            ShareVisibility::Private => "private",
         }
     }
 }
@@ -342,6 +370,7 @@ pub async fn create_live_share(
     };
     let clone_allowed = body.clone_allowed;
     let interaction = body.interaction.as_str();
+    let visibility = body.visibility.as_str();
     let protected_json = match serde_json::to_string(&body.protected) {
         Ok(s) => s,
         Err(_) => {
@@ -372,6 +401,7 @@ pub async fn create_live_share(
             clone_allowed,
             interaction,
             &protected_json,
+            visibility,
         )?;
         Ok((token, expires_at))
     })
@@ -499,9 +529,10 @@ pub async fn create_screenshot_share(
             // The row goes in first (blob_path empty) because the blob's path
             // contains the token, which only exists once the insert draws it.
             // A screenshot carries no preset to clone, so clone_allowed is
-            // always false here, and interaction/protected stay at their
-            // "view"/"[]" defaults — no request field offers to set any of
-            // them (a screenshot is pure view-only by construction, §0).
+            // always false here, and interaction/protected/visibility stay
+            // at their "view"/"[]"/"public" defaults — no request field
+            // offers to set any of them (a screenshot is pure view-only by
+            // construction, §0).
             let token = crate::db::create_share_link(
                 &conn,
                 user_id,
@@ -514,6 +545,7 @@ pub async fn create_screenshot_share(
                 false,
                 "view",
                 "[]",
+                "public",
             )?;
 
             // user_id and token are server-generated (integer / hex), so
@@ -627,17 +659,107 @@ async fn fetch_public_share(
     }
 }
 
+/// [Rev 2] `get_share`'s own fetch: row + owner label + the caller's
+/// FRESHLY re-derived `ShareTier` (`db::effective_share_tier`, never a
+/// cached/client-supplied value, §1/§8.1) — `None` means "this token is
+/// real, but `caller` holds no tier on it" (the private-link lock case,
+/// §8.5), distinct from the row not existing at all (still the outer
+/// `Option`, same "unknown/expired/revoked" 404 opacity as `fetch_public_share`).
+/// A separate function from `fetch_public_share` rather than a shared one:
+/// `get_share_png` never used the rights/owner it got back either (`_owner`,
+/// `_rights` are discarded at both its call sites) — this file's own
+/// existing pattern of duplicating a small credential/fetch helper rather
+/// than forcing one shape onto two different callers (see `resolve_user_id`
+/// vs `resolve_caller_optional`'s doc comment).
+async fn fetch_public_share_with_tier(
+    state: Arc<AppState>,
+    token: String,
+    caller: Option<i64>,
+) -> Result<Option<(crate::db::ShareLinkRow, String, Option<crate::db::ShareTier>)>, Response> {
+    let result = tokio::task::spawn_blocking(
+        move || -> rusqlite::Result<Option<(crate::db::ShareLinkRow, String, Option<crate::db::ShareTier>)>> {
+            let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+            let row = crate::db::get_share_link(&conn, &token)?;
+            match row {
+                Some(row) => {
+                    let owner = crate::db::share_owner_label(&conn, row.user_id)?
+                        .unwrap_or_default();
+                    let tier = crate::db::effective_share_tier(&conn, &row, caller)?;
+                    Ok(Some((row, owner, tier)))
+                }
+                None => Ok(None),
+            }
+        },
+    )
+    .await;
+
+    match result {
+        Ok(Ok(row)) => Ok(row),
+        Ok(Err(e)) => {
+            tracing::error!("DB error fetching share: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response())
+        }
+        Err(_) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response()),
+    }
+}
+
+/// `["read"]` + `"clone"` when `tier` is at least `Clone` — Rev 1's own
+/// `"rights"` wire shape (§1), now derived from the resolved `ShareTier`
+/// instead of the old link-only `effective_rights`. `"edit"` stays tied to
+/// actual ownership, not to the tier value: `CloneProtected` is also
+/// reachable by a non-owner recipient holding that grant, who must NOT see
+/// `"edit"` in their own rights list (co-editing is out of scope — the
+/// owner is the only caller `is_owner` is ever true for).
+fn rights_for_tier(tier: crate::db::ShareTier, is_owner: bool) -> Vec<&'static str> {
+    let mut rights = vec!["read"];
+    if tier >= crate::db::ShareTier::Clone {
+        rights.push("clone");
+    }
+    if is_owner {
+        rights.push("edit");
+    }
+    rights
+}
+
+/// `{"locked": true}` — nothing else. The distinguishable 403 body
+/// `GET /api/share/{token}` answers for a real, private share the caller
+/// holds no tier on (§8.5) — a SCOPED, explicit exception to this module's
+/// own "unknown/expired/revoked all answer the same bare 404" opacity
+/// doctrine: a prober who already has the exact token learns "this one
+/// exists and is private," accepted by direct owner instruction (plan §8.5).
+/// `clone_share`'s own 403 keeps its old plain `ErrorResponse` shape
+/// unconditionally — the client tells the two apart by the presence of this
+/// `"locked"` key, checked only on the open path.
+#[derive(serde::Serialize)]
+struct ShareLockedResponse {
+    locked: bool,
+}
+
 /// GET /api/share/{token}
 ///
 /// PUBLIC — the token is the capability, no session and no build attestation.
 /// The bearer/session, if any, is OPTIONAL (`resolve_caller_optional`): an
-/// anonymous caller still gets the full response, unchanged from before
-/// rights v1, plus a `"rights"` array (`db::effective_rights`) reporting what
-/// it may do with the token — `["read"]` for an anonymous or non-owner
-/// caller without `clone_allowed`, `["read","clone"]` when the link opted in,
-/// `["read","clone","edit"]` for the owner. Live shares answer the frozen
-/// preset; screenshot shares answer the URL of the PNG endpoint. Unknown,
-/// expired, and revoked tokens all get the same bare 404.
+/// anonymous caller still gets a response, plus a `"rights"` array
+/// ([`rights_for_tier`]) reporting what it may do with the token —
+/// `["read"]` without `clone`, `["read","clone"]` at tier `Clone` or above,
+/// `["read","clone","edit"]` for the owner — plus a `"clone_protected"` bool
+/// (tier `== CloneProtected`, §1 Rev 2) for the clone-strip decision and the
+/// UI's "Clone (full)" badge. The caller's tier is re-derived FRESH on every
+/// call (`db::effective_share_tier`) — never cached, never trusted from the
+/// client. A real, PRIVATE share the caller holds no tier on answers the
+/// distinguishable [`ShareLockedResponse`] (§8.5) instead of the preset — a
+/// SCOPED exception to this module's "unknown/expired/revoked all answer the
+/// same bare 404" opacity doctrine, which stays unchanged for those three
+/// cases. Live shares answer the frozen preset; screenshot shares answer the
+/// URL of the PNG endpoint.
 pub async fn get_share(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -654,11 +776,22 @@ pub async fn get_share(
         }
     };
 
-    let (row, owner, rights) = match fetch_public_share(state, token, caller).await {
+    let (row, owner, tier) = match fetch_public_share_with_tier(state, token, caller).await {
         Ok(Some(found)) => found,
         Ok(None) => return share_not_found(),
         Err(resp) => return resp,
     };
+
+    let Some(tier) = tier else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ShareLockedResponse { locked: true }),
+        )
+            .into_response();
+    };
+    let is_owner = caller == Some(row.user_id);
+    let rights = rights_for_tier(tier, is_owner);
+    let clone_protected = tier == crate::db::ShareTier::CloneProtected;
 
     match ShareKind::from_wire_name(&row.kind) {
         Some(ShareKind::Live) => {
@@ -692,6 +825,7 @@ pub async fn get_share(
                 "rights": rights,
                 "interaction": row.interaction,
                 "protected": protected,
+                "clone_protected": clone_protected,
             }))
             .into_response()
         }
@@ -703,6 +837,7 @@ pub async fn get_share(
             "bytes": row.blob_bytes,
             "expires_at": row.expires_at,
             "rights": rights,
+            "clone_protected": clone_protected,
         }))
         .into_response(),
         // A kind this build does not know is treated as not found — an older
@@ -866,6 +1001,105 @@ pub async fn delete_share(
 }
 
 // ============================================================================
+// POST /api/share/{token}/grants
+// ============================================================================
+
+/// Request body for POST /api/share/{token}/grants. A minimal, id-based
+/// shape: exactly one of `grantee_user_id`/`grantee_group_id` must be set.
+/// The sharer-facing nick/group-name lookup plan §8.2 describes
+/// (`GrantRequest`/`GrantTarget::{Nick,Group}`) is deferred to whoever wires
+/// a client for this route — this is the write path `db::upsert_share_grant`
+/// / `db::effective_share_tier` need to exist and be reachable from
+/// production code, not the full grant-management UI surface (§8.2's GET/DELETE
+/// listing routes and §8.3's group-CRUD routes are likewise out of this wave).
+#[derive(serde::Deserialize)]
+pub struct CreateShareGrantRequest {
+    pub grantee_user_id: Option<i64>,
+    pub grantee_group_id: Option<i64>,
+    /// "view" | "interactive" | "clone" | "clone_protected" — see `db::ShareTier`.
+    pub tier: String,
+    pub expires_at: Option<String>,
+}
+
+/// POST /api/share/{token}/grants
+///
+/// Owner-only (§8.2). Unknown token AND a non-owner caller both answer the
+/// same bare 404 (same "someone else's token" discipline as `delete_share`).
+/// Writes straight into `object_grants` via `db::upsert_share_grant` — the
+/// per-account/group layer `db::effective_share_tier` reads fresh on every
+/// subsequent `GET`/clone (§1).
+pub async fn create_share_grant(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    Json(body): Json<CreateShareGrantRequest>,
+) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return auth_err(status),
+    };
+
+    if body.grantee_user_id.is_some() == body.grantee_group_id.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "grant must target exactly one of grantee_user_id or grantee_group_id",
+            )),
+        )
+            .into_response();
+    }
+    let Some(tier) = crate::db::ShareTier::from_str(&body.tier) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid tier")),
+        )
+            .into_response();
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<i64>> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let row = match crate::db::get_share_link(&conn, &token)? {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        if row.user_id != user_id {
+            return Ok(None);
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let id = crate::db::upsert_share_grant(
+            &conn,
+            &row.token,
+            user_id,
+            body.grantee_user_id,
+            body.grantee_group_id,
+            tier,
+            body.expires_at.as_deref(),
+            &now,
+        )?;
+        Ok(Some(id))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(id))) => Json(serde_json::json!({ "grant_id": id })).into_response(),
+        Ok(Ok(None)) => share_not_found(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error creating share grant: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+// ============================================================================
 // POST /api/share/{token}/clone
 // ============================================================================
 
@@ -889,21 +1123,36 @@ enum CloneOutcome {
 
 /// Walk `preset.indicators[*].type_id` and drop any entry
 /// `db::indicator_should_strip` flags for `recipient`, recording each as
-/// `{type_id, name}`. Every other part of `preset` (windows, bubbles,
-/// layout, alerts, primitives, …) is carried through unchanged — only the
-/// `indicators` array is filtered.
+/// `{type_id, name, reason: "license"}`. Every other part of `preset`
+/// (windows, bubbles, layout, alerts, primitives, …) is carried through
+/// unchanged — only the `indicators` array is filtered.
+///
+/// A SECOND, independent pass (docs/mlc/plans/share-policy-2026-09-25.md §5)
+/// then strips every element the sharer marked Protected — primitives
+/// (nested under `windows[*].drawings.primitives`/`stashed_primitives`/
+/// `symbol_drawings_snapshots[*]` and `bubbles[*].primitives`), any
+/// surviving indicator, and alerts — UNLESS `skip_protected_strip` is `true`
+/// (the caller's resolved `ShareTier` is `CloneProtected`, §1). The two
+/// passes are independent: holding `CloneProtected` on a share never grants
+/// a license on someone else's published indicator, and a missing indicator
+/// license is never bypassed by a Protected grant.
 ///
 /// Extracted out of [`clone_share`]'s own inline loop
 /// (docs/mlc/plans/shared-presets-rights-and-live-sync-2026-09-23.md §5) so
 /// `routes::rooms`'s own clone route can run the exact same strip rule over
 /// a room's reassembled preset — one strip implementation, not two that
-/// could drift apart.
+/// could drift apart. Rooms has no `protected`/`clone_protected` concept of
+/// its own (Protected is a share-link-only idea, §6) — it always passes
+/// `protected: &[]` and `skip_protected_strip: false`.
 pub(crate) fn clone_preset_with_strip(
     conn: &rusqlite::Connection,
     mut preset: serde_json::Value,
     recipient: i64,
+    protected: &[ProtectedElementRef],
+    skip_protected_strip: bool,
 ) -> rusqlite::Result<(serde_json::Value, Vec<serde_json::Value>)> {
     let mut stripped = Vec::new();
+
     if let Some(indicators) = preset.get_mut("indicators").and_then(|v| v.as_array_mut()) {
         let mut kept = Vec::with_capacity(indicators.len());
         for entry in indicators.drain(..) {
@@ -912,31 +1161,158 @@ pub(crate) fn clone_preset_with_strip(
                 !type_id.is_empty() && crate::db::indicator_should_strip(conn, type_id, recipient)?;
             if should_strip {
                 let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                stripped.push(serde_json::json!({ "type_id": type_id, "name": name }));
+                stripped.push(serde_json::json!({ "type_id": type_id, "name": name, "reason": "license" }));
             } else {
                 kept.push(entry);
             }
         }
         *indicators = kept;
     }
+
+    if !skip_protected_strip && !protected.is_empty() {
+        strip_protected_elements(&mut preset, protected, &mut stripped);
+    }
+
     Ok((preset, stripped))
+}
+
+/// Does `(kind, id)` match any entry in `protected`?
+fn is_protected(protected: &[ProtectedElementRef], kind: &str, id: &str) -> bool {
+    protected.iter().any(|p| p.kind == kind && p.id == id)
+}
+
+/// Read a `PrimitiveSnapshot`-shaped value's own id: `prim.json` is a STRING
+/// (the primitive's own serialized state), parsed as JSON, then `.data.id`
+/// read off of THAT (mirrors `mlc-core::drawing::primitive_snapshot::
+/// PrimitiveSnapshot::id()` / `rooms_codec::primitive_entity_id`, duplicated
+/// here per this module's own "inline, don't depend on rooms_codec" rule,
+/// §5). `None` on anything that does not parse — a Protected mark that
+/// cannot be matched is simply never stripped, the same defensive posture
+/// the license pass's own `unwrap_or("")` already uses; this never fails the
+/// whole clone over one malformed primitive.
+fn primitive_snapshot_id(prim: &serde_json::Value) -> Option<u64> {
+    let inner = prim.get("json")?.as_str()?;
+    let parsed: serde_json::Value = serde_json::from_str(inner).ok()?;
+    parsed.get("data")?.get("id")?.as_u64()
+}
+
+/// Remove every `PrimitiveSnapshot`-shaped entry in `arr` whose own id is
+/// marked Protected, recording each as
+/// `{"kind":"primitive","id":..,"name":<type_id>,"reason":"protected"}`.
+fn strip_protected_primitives(
+    arr: &mut Vec<serde_json::Value>,
+    protected: &[ProtectedElementRef],
+    stripped: &mut Vec<serde_json::Value>,
+) {
+    arr.retain(|prim| {
+        let Some(id) = primitive_snapshot_id(prim) else {
+            return true;
+        };
+        let id_str = id.to_string();
+        if is_protected(protected, "primitive", &id_str) {
+            let type_id = prim.get("type_id").and_then(|v| v.as_str()).unwrap_or("");
+            stripped.push(serde_json::json!({ "kind": "primitive", "id": id_str, "name": type_id, "reason": "protected" }));
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// Strip every Protected-marked primitive, indicator, and alert out of
+/// `preset` in place. Tolerant of a preset missing `windows`/`bubbles`
+/// entirely (an older or minimal preset) — never errors the whole clone on
+/// a malformed shape, same posture as the rest of this module's JSON
+/// walking (`clone_share` already treats `preset` as opaque `serde_json::
+/// Value`, never deserializing into `ChartPreset`).
+fn strip_protected_elements(
+    preset: &mut serde_json::Value,
+    protected: &[ProtectedElementRef],
+    stripped: &mut Vec<serde_json::Value>,
+) {
+    if let Some(windows) = preset.get_mut("windows").and_then(|v| v.as_array_mut()) {
+        for window in windows {
+            if let Some(prims) = window
+                .get_mut("drawings")
+                .and_then(|d| d.get_mut("primitives"))
+                .and_then(|v| v.as_array_mut())
+            {
+                strip_protected_primitives(prims, protected, stripped);
+            }
+            if let Some(prims) = window.get_mut("stashed_primitives").and_then(|v| v.as_array_mut()) {
+                strip_protected_primitives(prims, protected, stripped);
+            }
+            if let Some(symbol_map) = window.get_mut("symbol_drawings_snapshots").and_then(|v| v.as_object_mut()) {
+                for (_symbol, arr) in symbol_map.iter_mut() {
+                    if let Some(prims) = arr.as_array_mut() {
+                        strip_protected_primitives(prims, protected, stripped);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(bubbles) = preset.get_mut("bubbles").and_then(|v| v.as_array_mut()) {
+        for bubble in bubbles {
+            if let Some(prims) = bubble.get_mut("primitives").and_then(|v| v.as_array_mut()) {
+                strip_protected_primitives(prims, protected, stripped);
+            }
+        }
+    }
+
+    if let Some(indicators) = preset.get_mut("indicators").and_then(|v| v.as_array_mut()) {
+        indicators.retain(|entry| {
+            let Some(id) = entry.get("id").and_then(|v| v.as_u64()) else {
+                return true;
+            };
+            let id_str = id.to_string();
+            if is_protected(protected, "indicator", &id_str) {
+                let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                stripped.push(serde_json::json!({ "kind": "indicator", "id": id_str, "name": name, "reason": "protected" }));
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    if let Some(alerts) = preset.get_mut("alerts").and_then(|v| v.as_array_mut()) {
+        alerts.retain(|entry| {
+            let Some(id) = entry.get("id").and_then(|v| v.as_u64()) else {
+                return true;
+            };
+            let id_str = id.to_string();
+            if is_protected(protected, "alert", &id_str) {
+                let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                stripped.push(serde_json::json!({ "kind": "alert", "id": id_str, "name": name, "reason": "protected" }));
+                false
+            } else {
+                true
+            }
+        });
+    }
 }
 
 /// POST /api/share/{token}/clone
 ///
-/// Auth required (see `resolve_user_id`). Requires `clone` in the caller's
-/// effective rights (`db::effective_rights`) — 403 otherwise. Only a `live`
-/// share carries a preset to clone; a `screenshot` token answers 400.
-/// Unknown, expired, and revoked tokens answer the same bare 404 as
-/// `GET /api/share/{token}`.
+/// Auth required (see `resolve_user_id`). Requires the caller's freshly
+/// re-derived [`crate::db::ShareTier`] (`db::effective_share_tier`, called
+/// here, never a client-supplied or previously-cached rights claim — plan
+/// §1/§4/§8.1) to be at least `Clone` — 403 otherwise, same plain shape as
+/// before rights v2. Only a `live` share carries a preset to clone; a
+/// `screenshot` token answers 400. Unknown, expired, and revoked tokens
+/// answer the same bare 404 as `GET /api/share/{token}`.
 ///
 /// Walks `preset.indicators[*].type_id` (`IndicatorSnapshot`, mlc-core) and
 /// drops any entry `db::indicator_should_strip` flags for the caller,
-/// recording each as `{type_id, name}`. Every other part of the preset
-/// (windows, bubbles, layout, alerts, …) is carried through unchanged — only
-/// the `indicators` array is filtered. Answers:
+/// recording each as `{type_id, name, reason: "license"}` — unconditionally.
+/// Then, UNLESS the caller's tier is `CloneProtected`, strips every element
+/// the sharer marked Protected the same way, tagged `reason: "protected"`
+/// (`clone_preset_with_strip`, §5). Every other part of the preset (windows,
+/// bubbles, layout, alerts not Protected, …) is carried through unchanged.
+/// Answers:
 /// ```json
-/// { "preset": { …stripped preset… }, "stripped": [{"type_id": "…", "name": "…"}] }
+/// { "preset": { …stripped preset… }, "stripped": [{"kind or type_id": "…", "name": "…", "reason": "…"}] }
 /// ```
 pub async fn clone_share(
     State(state): State<Arc<AppState>>,
@@ -955,10 +1331,11 @@ pub async fn clone_share(
             None => return Ok(None),
         };
 
-        let rights = crate::db::effective_rights(&conn, &row, Some(user_id));
-        if !rights.contains(&"clone") {
-            return Ok(Some(CloneOutcome::Forbidden));
-        }
+        let tier = crate::db::effective_share_tier(&conn, &row, Some(user_id))?;
+        let tier = match tier {
+            Some(tier) if tier >= crate::db::ShareTier::Clone => tier,
+            _ => return Ok(Some(CloneOutcome::Forbidden)),
+        };
         if row.kind != ShareKind::Live.as_str() {
             return Ok(Some(CloneOutcome::NotClonable));
         }
@@ -971,7 +1348,10 @@ pub async fn clone_share(
             }
         };
 
-        let (preset, stripped) = clone_preset_with_strip(&conn, preset, user_id)?;
+        let protected: Vec<ProtectedElementRef> = serde_json::from_str(&row.protected_json).unwrap_or_default();
+        let skip_protected_strip = tier == crate::db::ShareTier::CloneProtected;
+        let (preset, stripped) =
+            clone_preset_with_strip(&conn, preset, user_id, &protected, skip_protected_strip)?;
         Ok(Some(CloneOutcome::Cloned { preset, stripped }))
     })
     .await;
@@ -1052,5 +1432,288 @@ mod tests {
         assert_eq!(parsed.protected.len(), 1);
         assert_eq!(parsed.protected[0].kind, "primitive");
         assert_eq!(parsed.protected[0].id, "42");
+    }
+
+    // ---- §8.4 acceptance test + clone_preset_with_strip unit coverage ----
+    // (docs/mlc/plans/share-policy-2026-09-25.md §8.4/§11 step 3)
+
+    /// Minimal in-memory schema for the tables `create_share_link`,
+    /// `upsert_share_grant`, `effective_share_tier`, and
+    /// `indicator_should_strip` touch — a local, `routes::share`-owned
+    /// fixture (this crate's test fixtures are private to each module's own
+    /// `mod tests`, `db.rs`'s own `share_test_conn`/`share_rights_test_conn`
+    /// included, so this module builds its own rather than reaching across).
+    fn strip_test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys=ON;
+
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                provider_user_id TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                public_id TEXT,
+                UNIQUE(provider, provider_user_id)
+            );
+
+            CREATE TABLE share_links (
+                token       TEXT    PRIMARY KEY,
+                user_id     INTEGER NOT NULL REFERENCES users(id),
+                kind        TEXT    NOT NULL,
+                title       TEXT    NOT NULL DEFAULT '',
+                preset_json TEXT    NOT NULL DEFAULT '',
+                blob_path   TEXT    NOT NULL DEFAULT '',
+                blob_bytes  INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT    NOT NULL,
+                expires_at  TEXT    NOT NULL,
+                revoked     INTEGER NOT NULL DEFAULT 0,
+                clone_allowed INTEGER NOT NULL DEFAULT 0,
+                interaction TEXT NOT NULL DEFAULT 'view',
+                protected_json TEXT NOT NULL DEFAULT '[]',
+                visibility TEXT NOT NULL DEFAULT 'public',
+                preview_path TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE grant_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL REFERENCES users(id),
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE grant_group_members (
+                group_id INTEGER NOT NULL REFERENCES grant_groups(id),
+                user_id  INTEGER NOT NULL REFERENCES users(id),
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (group_id, user_id)
+            );
+            CREATE TABLE object_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                object_kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                owner_user_id INTEGER NOT NULL REFERENCES users(id),
+                grantee_user_id INTEGER REFERENCES users(id),
+                grantee_group_id INTEGER REFERENCES grant_groups(id),
+                right TEXT NOT NULL,
+                expires_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE published_indicators (
+                type_id TEXT PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL REFERENCES users(id),
+                visibility TEXT NOT NULL DEFAULT 'private',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE indicator_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type_id TEXT NOT NULL REFERENCES published_indicators(type_id),
+                grantee_user_id INTEGER NOT NULL REFERENCES users(id),
+                expires_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            ",
+        )
+        .expect("strip test schema");
+        conn
+    }
+
+    fn insert_user(conn: &rusqlite::Connection, name: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO users (provider, provider_user_id, display_name, created_at) VALUES ('test', ?1, ?1, '2026-01-01T00:00:00+00:00')",
+            rusqlite::params![name],
+        )
+        .expect("insert user");
+        conn.last_insert_rowid()
+    }
+
+    fn future_ts() -> String {
+        (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339()
+    }
+
+    /// One window with one `elliott_impulse` primitive (id 501) in
+    /// `drawings.primitives` — `PrimitiveSnapshot`-shaped
+    /// (`{"type_id","json"}`, the real id nested at `json.data.id`), the
+    /// real Elliott Wave primitive kind (`mlc-core/src/toolbar.rs`), per the
+    /// plan's own instruction to use the real primitive type for this test.
+    fn elliott_preset_fixture() -> serde_json::Value {
+        let inner = serde_json::json!({ "data": { "id": 501 } });
+        serde_json::json!({
+            "windows": [{
+                "window_id": 1,
+                "drawings": {
+                    "window_id": 1,
+                    "primitives": [{
+                        "type_id": "elliott_impulse",
+                        "json": serde_json::to_string(&inner).expect("serialize inner"),
+                    }],
+                },
+            }],
+            "bubbles": [],
+            "indicators": [],
+            "alerts": [],
+        })
+    }
+
+    /// §8.4's own acceptance test, built BEFORE the rest of step 3 lands
+    /// (owner instruction 2): a preset with a Protected `elliott_impulse`
+    /// primitive, shared on a PRIVATE link, with account A granted `Clone`
+    /// and account B granted `CloneProtected`.
+    #[test]
+    fn ewa_protected_clone_strip_and_private_link_lock_end_to_end() {
+        let conn = strip_test_conn();
+        let owner = insert_user(&conn, "owner");
+        let account_a = insert_user(&conn, "account_a");
+        let account_b = insert_user(&conn, "account_b");
+        let account_c = insert_user(&conn, "account_c");
+
+        let preset = elliott_preset_fixture();
+        let preset_json = serde_json::to_string(&preset).expect("serialize preset");
+        let protected_refs = vec![ProtectedElementRef {
+            kind: "primitive".to_string(),
+            id: "501".to_string(),
+        }];
+        let protected_json = serde_json::to_string(&protected_refs).expect("serialize protected");
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let token = crate::db::create_share_link(
+            &conn,
+            owner,
+            "live",
+            "ewa test",
+            &preset_json,
+            0,
+            &now,
+            &future_ts(),
+            false,
+            "view",
+            &protected_json,
+            "private",
+        )
+        .expect("create share");
+
+        crate::db::upsert_share_grant(
+            &conn, &token, owner, Some(account_a), None, crate::db::ShareTier::Clone, None, &now,
+        )
+        .expect("grant A clone");
+        crate::db::upsert_share_grant(
+            &conn, &token, owner, Some(account_b), None, crate::db::ShareTier::CloneProtected, None, &now,
+        )
+        .expect("grant B clone_protected");
+
+        let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
+
+        // 1. An ungranted account C's open path resolves to no tier at all —
+        //    `get_share` answers the distinguishable locked response
+        //    (§8.5), not the preset, for exactly this case.
+        assert_eq!(
+            crate::db::effective_share_tier(&conn, &row, Some(account_c)).expect("tier"),
+            None
+        );
+        assert_eq!(
+            serde_json::to_value(ShareLockedResponse { locked: true }).expect("serialize"),
+            serde_json::json!({ "locked": true }),
+        );
+
+        // 2. Account A (tier Clone): the clone strips the Protected Elliott
+        //    primitive, tagged reason "protected".
+        let tier_a = crate::db::effective_share_tier(&conn, &row, Some(account_a))
+            .expect("tier")
+            .expect("account A holds a tier");
+        assert_eq!(tier_a, crate::db::ShareTier::Clone);
+        let preset_for_a: serde_json::Value = serde_json::from_str(&row.preset_json).expect("parse preset");
+        let (cloned_a, stripped_a) = clone_preset_with_strip(
+            &conn,
+            preset_for_a,
+            account_a,
+            &protected_refs,
+            tier_a == crate::db::ShareTier::CloneProtected,
+        )
+        .expect("clone for A");
+        assert!(cloned_a["windows"][0]["drawings"]["primitives"]
+            .as_array()
+            .expect("array")
+            .is_empty());
+        assert_eq!(stripped_a.len(), 1);
+        assert_eq!(stripped_a[0]["kind"], "primitive");
+        assert_eq!(stripped_a[0]["id"], "501");
+        assert_eq!(stripped_a[0]["reason"], "protected");
+
+        // 3. Account B (tier CloneProtected): the clone carries the
+        //    Protected Elliott primitive through unchanged, nothing stripped.
+        let tier_b = crate::db::effective_share_tier(&conn, &row, Some(account_b))
+            .expect("tier")
+            .expect("account B holds a tier");
+        assert_eq!(tier_b, crate::db::ShareTier::CloneProtected);
+        let preset_for_b: serde_json::Value = serde_json::from_str(&row.preset_json).expect("parse preset");
+        let (cloned_b, stripped_b) = clone_preset_with_strip(
+            &conn,
+            preset_for_b,
+            account_b,
+            &protected_refs,
+            tier_b == crate::db::ShareTier::CloneProtected,
+        )
+        .expect("clone for B");
+        assert_eq!(
+            cloned_b["windows"][0]["drawings"]["primitives"]
+                .as_array()
+                .expect("array")
+                .len(),
+            1
+        );
+        assert!(stripped_b.is_empty());
+
+        // 4. Account A's OPEN view (not clone) still shows the primitive —
+        //    Protected means "not carried into a Clone," never "hidden from
+        //    the live view" (unchanged honesty note, §1). Neither clone
+        //    above ever mutated the stored row — re-reading it fresh proves it.
+        let live_view: serde_json::Value = serde_json::from_str(&row.preset_json).expect("parse preset");
+        assert_eq!(
+            live_view["windows"][0]["drawings"]["primitives"]
+                .as_array()
+                .expect("array")
+                .len(),
+            1
+        );
+
+        // 5. A leaked link opened by a non-granted account is still
+        //    refused: the same token, re-checked for account C, resolves to
+        //    no tier again — enforcement is per-caller, never link-secrecy.
+        assert_eq!(
+            crate::db::effective_share_tier(&conn, &row, Some(account_c)).expect("tier"),
+            None
+        );
+    }
+
+    /// `clone_preset_with_strip`'s license pass runs UNCONDITIONALLY —
+    /// independent of `skip_protected_strip`, proven here with
+    /// `skip_protected_strip: true` and an empty `protected` list (so only
+    /// the license pass can possibly account for the strip).
+    #[test]
+    fn clone_preset_with_strip_license_pass_is_independent_of_skip_protected_strip() {
+        let conn = strip_test_conn();
+        let vendor = insert_user(&conn, "vendor");
+        let recipient = insert_user(&conn, "recipient");
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO published_indicators (type_id, owner_user_id, visibility, created_at) VALUES ('vendor_ind', ?1, 'public', ?2)",
+            rusqlite::params![vendor, now],
+        )
+        .expect("publish indicator");
+
+        let preset = serde_json::json!({
+            "windows": [],
+            "bubbles": [],
+            "indicators": [{ "id": 1, "type_id": "vendor_ind", "name": "Vendor Indicator" }],
+            "alerts": [],
+        });
+
+        let (cloned, stripped) =
+            clone_preset_with_strip(&conn, preset, recipient, &[], true).expect("clone");
+        assert!(cloned["indicators"].as_array().expect("array").is_empty());
+        assert_eq!(stripped.len(), 1);
+        assert_eq!(stripped[0]["reason"], "license");
     }
 }
