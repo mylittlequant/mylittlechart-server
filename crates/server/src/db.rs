@@ -578,6 +578,17 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         "ALTER TABLE share_links ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // One live link per author chart. Empty chart_id is a legacy row that
+    // was minted once and is never reused. `revision` bumps every time the
+    // author republishes that chart onto the same token.
+    let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN chart_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
     // Safe migration: per-account/group share rights (§1's new `ShareTier`
     // core). NULL for every existing `object_grants` row — a grant with no
     // group target simply never matches via `grant_group_members`, the same
@@ -3307,6 +3318,12 @@ pub struct ShareLinkRow {
     /// same kind once the account is at its cap; a pinned link is never that
     /// victim.
     pub pinned: bool,
+    /// Author chart this live link is bound to. Empty on screenshot rows and
+    /// on live rows created before the binding existed.
+    pub chart_id: String,
+    /// Bumps when the author republishes the chart onto this token. The
+    /// clipboard URL carries it as `v` so a messenger refetches the card.
+    pub revision: i64,
 }
 
 impl ShareLinkRow {
@@ -3345,6 +3362,8 @@ fn share_link_from_row(row: &rusqlite::Row<'_>) -> Result<ShareLinkRow> {
         preview_path: row.get(13)?,
         allow_forward: row.get::<_, Option<i64>>(14)?.map(|v| v != 0),
         pinned: row.get::<_, i64>(15)? != 0,
+        chart_id: row.get(16)?,
+        revision: row.get(17)?,
     })
 }
 
@@ -3408,6 +3427,93 @@ pub fn create_share_link(
     }
 }
 
+/// Active live token bound to this author's chart, if one still resolves.
+pub fn find_active_live_share_for_chart(
+    conn: &Connection,
+    user_id: i64,
+    chart_id: &str,
+) -> Result<Option<(String, i64)>> {
+    if chart_id.is_empty() {
+        return Ok(None);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.query_row(
+        "SELECT token, revision FROM share_links
+         WHERE user_id = ?1 AND chart_id = ?2 AND kind = 'live' AND revoked = 0 AND expires_at > ?3
+         ORDER BY created_at DESC LIMIT 1",
+        params![user_id, chart_id, now],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+/// Publish the author's current chart onto one stable live link.
+///
+/// An empty `chart_id` always mints a new token (legacy clients). A non-empty
+/// id reuses the active row for that chart and bumps `revision`. Returns
+/// `(token, revision, expires_at, created)`.
+pub fn publish_live_share(
+    conn: &Connection,
+    user_id: i64,
+    chart_id: &str,
+    title: &str,
+    preset_json: &str,
+    created_at: &str,
+    expires_at: &str,
+    clone_allowed: bool,
+    interaction: &str,
+    protected_json: &str,
+    visibility: &str,
+    allow_forward: Option<bool>,
+) -> Result<(String, i64, String, bool)> {
+    if let Some((token, revision)) = find_active_live_share_for_chart(conn, user_id, chart_id)? {
+        let next = revision.saturating_add(1).max(1);
+        conn.execute(
+            "UPDATE share_links
+             SET title = ?1, preset_json = ?2, expires_at = ?3, revision = ?4,
+                 clone_allowed = ?5, interaction = ?6, protected_json = ?7,
+                 visibility = ?8, allow_forward = ?9
+             WHERE token = ?10 AND user_id = ?11",
+            params![
+                title,
+                preset_json,
+                expires_at,
+                next,
+                clone_allowed as i64,
+                interaction,
+                protected_json,
+                visibility,
+                allow_forward.map(|v| v as i64),
+                token,
+                user_id,
+            ],
+        )?;
+        return Ok((token, next, expires_at.to_string(), false));
+    }
+    let token = create_share_link(
+        conn,
+        user_id,
+        "live",
+        title,
+        preset_json,
+        0,
+        created_at,
+        expires_at,
+        clone_allowed,
+        interaction,
+        protected_json,
+        visibility,
+        allow_forward,
+    )?;
+    if !chart_id.is_empty() {
+        conn.execute(
+            "UPDATE share_links SET chart_id = ?1, revision = 1 WHERE token = ?2 AND user_id = ?3",
+            params![chart_id, token, user_id],
+        )?;
+    }
+    Ok((token, 1, expires_at.to_string(), true))
+}
+
 /// Stamp the real blob path onto a freshly created screenshot share (see
 /// [`create_share_link`] for why the path cannot be known at INSERT time).
 pub fn set_share_blob_path(conn: &Connection, token: &str, blob_path: &str) -> Result<()> {
@@ -3424,7 +3530,7 @@ pub fn set_share_blob_path(conn: &Connection, token: &str, blob_path: &str) -> R
 pub fn get_share_link(conn: &Connection, token: &str) -> Result<Option<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.query_row(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision
          FROM share_links
          WHERE token = ?1 AND revoked = 0 AND expires_at > ?2",
         params![token, now],
@@ -3456,7 +3562,7 @@ pub fn share_usage(conn: &Connection, user_id: i64) -> Result<(u64, u64)> {
 pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision
          FROM share_links
          WHERE user_id = ?1 AND revoked = 0 AND expires_at > ?2
          ORDER BY created_at DESC",
@@ -7000,7 +7106,9 @@ mod tests {
                 visibility TEXT NOT NULL DEFAULT 'public',
                 preview_path TEXT NOT NULL DEFAULT '',
                 allow_forward INTEGER,
-                pinned INTEGER NOT NULL DEFAULT 0
+                pinned INTEGER NOT NULL DEFAULT 0,
+                chart_id TEXT NOT NULL DEFAULT '',
+                revision INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE auth_tokens (

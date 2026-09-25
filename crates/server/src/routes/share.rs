@@ -254,6 +254,10 @@ pub struct CreateLiveShareRequest {
     #[serde(default)]
     pub title: String,
     pub preset: serde_json::Value,
+    /// Author chart id. A repeat publish of the same id reuses the token.
+    /// Empty (old clients) mints a new link every call.
+    #[serde(default)]
+    pub chart_id: String,
     /// Rights v1 (plan §2): opt this link into the `clone` right. Default
     /// `false` — unchanged behaviour for every caller that doesn't send it.
     #[serde(default)]
@@ -399,8 +403,40 @@ pub async fn create_live_share(
         }
     };
 
-    if let Err(resp) = check_share_entitlement(state.clone(), user_id, ShareKind::Live).await {
-        return resp;
+    let chart_id = body.chart_id.trim().to_string();
+    let republish = if chart_id.is_empty() {
+        false
+    } else {
+        let state_lookup = state.clone();
+        let chart_lookup = chart_id.clone();
+        match tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+            let conn = state_lookup.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(crate::db::find_active_live_share_for_chart(&conn, user_id, &chart_lookup)?.is_some())
+        })
+        .await
+        {
+            Ok(Ok(found)) => found,
+            Ok(Err(e)) => {
+                tracing::error!("DB error looking up chart share: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new("Database error")),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new("Internal error")),
+                )
+                    .into_response();
+            }
+        }
+    };
+    if !republish {
+        if let Err(resp) = check_share_entitlement(state.clone(), user_id, ShareKind::Live).await {
+            return resp;
+        }
     }
 
     let title = match clean_optional_user_text(&body.title, MAX_TITLE_CHARS) {
@@ -421,7 +457,7 @@ pub async fn create_live_share(
                 .into_response();
         }
     };
-    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(String, String)> {
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(String, String, i64)> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let is_paid = crate::db::user_is_paid(&conn, user_id)?;
         let now = chrono::Utc::now();
@@ -429,13 +465,12 @@ pub async fn create_live_share(
         let expires_at = (now
             + chrono::Duration::seconds(entitlements::share_ttl_secs(ShareKind::Live, is_paid) as i64))
             .to_rfc3339();
-        let token = crate::db::create_share_link(
+        let (token, revision, expires_at, _created) = crate::db::publish_live_share(
             &conn,
             user_id,
-            ShareKind::Live.as_str(),
+            &chart_id,
             &title,
             &preset_json,
-            0,
             &created_at,
             &expires_at,
             clone_allowed,
@@ -444,15 +479,16 @@ pub async fn create_live_share(
             visibility,
             allow_forward,
         )?;
-        Ok((token, expires_at))
+        Ok((token, expires_at, revision))
     })
     .await;
 
     match result {
-        Ok(Ok((token, expires_at))) => Json(serde_json::json!({
+        Ok(Ok((token, expires_at, revision))) => Json(serde_json::json!({
             "token": token,
-            "url_path": format!("/?share={}", token),
+            "url_path": format!("/?share={}&v={}", token, revision),
             "expires_at": expires_at,
+            "revision": revision,
         }))
         .into_response(),
         Ok(Err(e)) => {
@@ -883,6 +919,7 @@ pub async fn get_share(
                 "visibility": row.visibility,
                 "clone_allowed": row.clone_allowed,
                 "pinned": row.pinned,
+                "revision": row.revision,
             }))
             .into_response()
         }
@@ -2180,8 +2217,8 @@ pub(crate) fn og_tags_for_share(row: &crate::db::ShareLinkRow, owner_label: &str
         None
     } else {
         Some(format!(
-            "https://mylittlechart.org/api/share/{}/preview.png",
-            row.token
+            "https://mylittlechart.org/api/share/{}/preview.png?v={}",
+            row.token, row.revision.max(1)
         ))
     };
     OgTags {
@@ -2362,7 +2399,10 @@ mod tests {
                 protected_json TEXT NOT NULL DEFAULT '[]',
                 visibility TEXT NOT NULL DEFAULT 'public',
                 preview_path TEXT NOT NULL DEFAULT '',
-                allow_forward INTEGER
+                allow_forward INTEGER,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                chart_id TEXT NOT NULL DEFAULT '',
+                revision INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE grant_groups (
@@ -2992,6 +3032,8 @@ mod tests {
             preview_path: String::new(),
             allow_forward: None,
             pinned: false,
+            chart_id: String::new(),
+            revision: 1,
         };
 
         let tags = og_tags_for_share(&base, "");
@@ -3011,7 +3053,10 @@ mod tests {
         };
         let tags = og_tags_for_share(&with_preview, "admin");
         assert_eq!(tags.title, None);
-        assert_eq!(tags.image_url, Some("https://mylittlechart.org/api/share/tok/preview.png".to_string()));
+        assert_eq!(
+            tags.image_url.as_deref(),
+            Some("https://mylittlechart.org/api/share/tok/preview.png?v=1")
+        );
 
         let private = crate::db::ShareLinkRow { visibility: "private".to_string(), ..clone_row(&with_preview) };
         let tags = og_tags_for_share(&private, "admin");
@@ -3059,6 +3104,8 @@ mod tests {
             preview_path: row.preview_path.clone(),
             allow_forward: row.allow_forward,
             pinned: row.pinned,
+            chart_id: row.chart_id.clone(),
+            revision: row.revision,
         }
     }
 
