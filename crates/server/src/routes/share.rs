@@ -1676,6 +1676,372 @@ pub async fn clone_share(
     }
 }
 
+// ============================================================================
+// POST /api/share/{token}/preview, GET /api/share/{token}/preview.png (§9)
+// ============================================================================
+
+/// Upload cap for `POST /api/share/{token}/preview`'s raw PNG body — also
+/// the `DefaultBodyLimit` override `routes/mod.rs` layers onto that route,
+/// so an over-cap request is refused by axum itself before ever reaching
+/// [`build_preview_png`]'s own explicit check below.
+pub(crate) const PREVIEW_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// Per-side decode cap — refused before any resize work, so a "valid PNG,
+/// absurd dimensions" upload cannot spend CPU decompressing a huge canvas
+/// just to be rejected afterward.
+const PREVIEW_MAX_DIM: u32 = 2048;
+/// The re-encoded preview's fixed canvas size — the standard Open Graph
+/// card aspect ratio (1.91:1). The source image is scaled to FIT inside
+/// this canvas (never cropped, never upscaled past its own resolution) and
+/// centered on a solid background — letterboxed, not filled — so a
+/// non-16:9-ish chart screenshot never has its edges cut off.
+const PREVIEW_OUTPUT_WIDTH: u32 = 1200;
+const PREVIEW_OUTPUT_HEIGHT: u32 = 630;
+/// Letterbox background — the app's own dark chart-canvas colour
+/// (`#131722`, `mylittlechart-landing/web/app/index.html`'s `#boot`
+/// background), not an invented value, so a letterboxed card reads as "the
+/// app's own frame" rather than an arbitrary colour choice.
+const PREVIEW_BACKGROUND_RGBA: [u8; 4] = [0x13, 0x17, 0x22, 0xff];
+
+/// Why [`build_preview_png`] refused an upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewError {
+    TooLarge,
+    NotPng,
+    DecodeFailed,
+    DimensionsOutOfBounds,
+    EncodeFailed,
+}
+
+impl PreviewError {
+    fn to_response(self) -> Response {
+        let (status, msg) = match self {
+            PreviewError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "preview exceeds the upload size cap"),
+            PreviewError::NotPng => (StatusCode::BAD_REQUEST, "preview must be a PNG file"),
+            PreviewError::DecodeFailed => (StatusCode::BAD_REQUEST, "preview could not be decoded as PNG"),
+            PreviewError::DimensionsOutOfBounds => {
+                (StatusCode::BAD_REQUEST, "preview dimensions are out of bounds")
+            }
+            PreviewError::EncodeFailed => (StatusCode::INTERNAL_SERVER_ERROR, "preview re-encode failed"),
+        };
+        (status, Json(ErrorResponse::new(msg))).into_response()
+    }
+}
+
+/// Decode `bytes` as a PNG, validate size/dimensions, and re-encode a fixed
+/// 1200×630 letterboxed PNG carrying nothing but raw pixels — the re-encode
+/// is what "strip metadata" buys: any non-pixel chunk smuggled into a
+/// technically-valid PNG container (a `tEXt` comment, an embedded colour
+/// profile, …) never survives the round trip, because only the DECODED
+/// pixel buffer is ever touched again.
+fn build_preview_png(bytes: &[u8]) -> Result<Vec<u8>, PreviewError> {
+    if bytes.len() > PREVIEW_MAX_BYTES {
+        return Err(PreviewError::TooLarge);
+    }
+    if bytes.len() < PNG_MAGIC.len() || bytes[..PNG_MAGIC.len()] != PNG_MAGIC {
+        return Err(PreviewError::NotPng);
+    }
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+        .map_err(|_| PreviewError::DecodeFailed)?;
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 || w > PREVIEW_MAX_DIM || h > PREVIEW_MAX_DIM {
+        return Err(PreviewError::DimensionsOutOfBounds);
+    }
+
+    let scale = (PREVIEW_OUTPUT_WIDTH as f64 / w as f64).min(PREVIEW_OUTPUT_HEIGHT as f64 / h as f64);
+    let new_w = ((w as f64 * scale).round() as u32).clamp(1, PREVIEW_OUTPUT_WIDTH);
+    let new_h = ((h as f64 * scale).round() as u32).clamp(1, PREVIEW_OUTPUT_HEIGHT);
+    let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
+
+    let mut canvas = image::RgbaImage::from_pixel(
+        PREVIEW_OUTPUT_WIDTH,
+        PREVIEW_OUTPUT_HEIGHT,
+        image::Rgba(PREVIEW_BACKGROUND_RGBA),
+    );
+    let x_off = ((PREVIEW_OUTPUT_WIDTH - new_w) / 2) as i64;
+    let y_off = ((PREVIEW_OUTPUT_HEIGHT - new_h) / 2) as i64;
+    image::imageops::overlay(&mut canvas, &resized.to_rgba8(), x_off, y_off);
+
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(canvas)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|_| PreviewError::EncodeFailed)?;
+    Ok(out)
+}
+
+/// POST /api/share/{token}/preview
+///
+/// Owner-only, auth required. Body is the raw PNG bytes (no multipart
+/// envelope — see this route's `DefaultBodyLimit` override in
+/// `routes/mod.rs`, sized to [`PREVIEW_MAX_BYTES`]). Decoded, validated, and
+/// re-encoded by [`build_preview_png`] before anything touches disk; the
+/// result lands at `<data_dir>/share/<user_id>/<token>-preview.png` via the
+/// same atomic tmp+rename write `create_screenshot_share` already uses.
+pub async fn upload_share_preview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return auth_err(status),
+    };
+
+    let png_bytes = match build_preview_png(&body) {
+        Ok(bytes) => bytes,
+        Err(e) => return e.to_response(),
+    };
+
+    let token_for_response = token.clone();
+    let share_root = state.control_plane().share_root.clone();
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let row = match crate::db::get_share_link(&conn, &token)? {
+            Some(row) => row,
+            None => return Ok(false),
+        };
+        if row.user_id != user_id {
+            return Ok(false);
+        }
+
+        let rel_path = format!(
+            "{}/{}-preview.png",
+            crate::syncstore::sanitize(&user_id.to_string())?,
+            crate::syncstore::sanitize(&token)?
+        );
+        let abs_path = share_root.join(&rel_path);
+        let write_result = (|| -> std::io::Result<()> {
+            if let Some(dir) = abs_path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = abs_path.with_extension("png.tmp");
+            std::fs::write(&tmp, &png_bytes)?;
+            std::fs::rename(&tmp, &abs_path)?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            tracing::error!("IO error writing preview blob {}: {}", rel_path, e);
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
+        }
+        crate::db::set_share_preview_path(&conn, &token, user_id, &rel_path)?;
+        Ok(true)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(true)) => Json(serde_json::json!({
+            "preview_url": format!("/api/share/{}/preview.png", token_for_response),
+        }))
+        .into_response(),
+        Ok(Ok(false)) => share_not_found(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error saving share preview: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+/// Whether `row` may ever serve a preview image, and its relative path if
+/// so — factored out of [`get_share_preview`] so the "a private share never
+/// serves its preview" rule is a plain, unit-testable function rather than
+/// logic buried inside a `spawn_blocking` closure.
+fn share_preview_rel_path(row: &crate::db::ShareLinkRow) -> Option<&str> {
+    if row.visibility == "private" || row.preview_path.is_empty() {
+        None
+    } else {
+        Some(row.preview_path.as_str())
+    }
+}
+
+/// GET /api/share/{token}/preview.png
+///
+/// PUBLIC, same 404 opacity discipline as `get_share_png`. A PRIVATE share's
+/// preview endpoint 404s UNCONDITIONALLY regardless of file presence — belt
+/// on top of the OG-injection route's own "never point at the image for a
+/// private share" rule (defense in depth, §9).
+pub async fn get_share_preview(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+) -> Response {
+    let share_root = state.control_plane().share_root.clone();
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<String>> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = crate::db::get_share_link(&conn, &token)? else {
+            return Ok(None);
+        };
+        Ok(share_preview_rel_path(&row).map(|p| p.to_string()))
+    })
+    .await;
+
+    let rel_path = match result {
+        Ok(Ok(Some(p))) => p,
+        Ok(Ok(None)) => return share_not_found(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error fetching share preview: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Internal error")),
+            )
+                .into_response();
+        }
+    };
+    if !crate::pathutil::is_safe_relative_path(&rel_path) {
+        return share_not_found();
+    }
+
+    match tokio::fs::read(share_root.join(&rel_path)).await {
+        Ok(body) => Response::builder()
+            .status(200)
+            .header("content-type", "image/png")
+            .header("cache-control", "public, max-age=300")
+            .body(Body::from(body))
+            .unwrap(),
+        Err(_) => share_not_found(),
+    }
+}
+
+// ============================================================================
+// OG/twitter meta-tag injection for the crawler-facing `GET /` route (§9) —
+// pure functions, called from `main.rs`'s root handler (which owns the file
+// I/O and the DB round trip; everything here is a plain, unit-testable
+// string transform).
+// ============================================================================
+
+/// The neutral title a PRIVATE share's link-preview card shows — never the
+/// chart's own title, never a hint that a preview image exists (§9: "Private
+/// shares get a neutral card, never the chart image").
+pub(crate) const PRIVATE_SHARE_OG_TITLE: &str = "A private chart on MyLittleChart";
+
+/// The per-token override for the served `index.html`'s OG/twitter meta
+/// tags — a `None` field means "leave that tag at its app-wide default",
+/// never "blank it out".
+pub(crate) struct OgTags {
+    pub title: Option<String>,
+    pub image_url: Option<String>,
+}
+
+/// Resolve the OG-tag override for a fetched, live [`crate::db::ShareLinkRow`]
+/// (§9's selection matrix — the "token not found/expired/revoked" branch is
+/// the caller's own `None` case, one level up, before this ever runs):
+/// - private → the fixed [`PRIVATE_SHARE_OG_TITLE`], no image (the app's own
+///   default logo tag is left untouched).
+/// - public, blank title → no title override (the app's own default title
+///   is not sensitive, and blank is not a real title to show).
+/// - public, non-blank title → that title, verbatim.
+/// - image is overridden ONLY when `preview_path` is set AND the link is
+///   public — a private link never points at its preview even when one was
+///   uploaded (defense in depth alongside [`get_share_preview`]'s own
+///   refusal).
+pub(crate) fn og_tags_for_share(row: &crate::db::ShareLinkRow) -> OgTags {
+    if row.visibility == "private" {
+        return OgTags {
+            title: Some(PRIVATE_SHARE_OG_TITLE.to_string()),
+            image_url: None,
+        };
+    }
+    let title = {
+        let trimmed = row.title.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+    let image_url = if row.preview_path.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "https://mylittlechart.org/api/share/{}/preview.png",
+            row.token
+        ))
+    };
+    OgTags { title, image_url }
+}
+
+/// HTML-attribute-escape `s` — the one place caller-supplied text (a share
+/// title) reaches raw HTML output in this whole crate. Escapes the five
+/// characters that matter inside a double-quoted attribute value; `'` is
+/// included even though it cannot break a double-quoted value, cheaply
+/// closing off the single-quoted-attribute variant too.
+fn escape_html_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Replace the `content="…"` value of the FIRST `<meta …>` tag whose exact
+/// attribute prefix is `prefix` (e.g. `r#"property="og:title" content=""#`)
+/// with `value`, HTML-attribute-escaped. Returns `html` UNCHANGED when
+/// `prefix` is not found — a missing tag is never invented, so an
+/// unexpected template shape degrades to "no override" rather than
+/// corrupting the page.
+fn replace_meta_content(html: &str, prefix: &str, value: &str) -> String {
+    let Some(tag_start) = html.find(prefix) else {
+        return html.to_string();
+    };
+    let value_start = tag_start + prefix.len();
+    let Some(rel_end) = html[value_start..].find('"') else {
+        return html.to_string();
+    };
+    let value_end = value_start + rel_end;
+    let mut out = String::with_capacity(html.len() + value.len());
+    out.push_str(&html[..value_start]);
+    out.push_str(&escape_html_attr(value));
+    out.push_str(&html[value_end..]);
+    out
+}
+
+/// Override the served `index.html`'s per-share OG/twitter meta tags in
+/// place — the crawler-facing `GET /` route (`main.rs`, §9). Self-contained:
+/// it locates each tag by its own stable attribute prefix in the
+/// ALREADY-SHIPPED template (`mylittlechart-landing/web/app/index.html`'s
+/// `og:title`/`og:image`/`twitter:title`/`twitter:image` tags) rather than
+/// depending on a `<!--OG_META-->` marker added to that file — no cross-repo
+/// change is needed for this to work against the real, deployed template.
+/// Never touches `og:type`/`og:url`/`og:description`/`twitter:description`/
+/// the document `<title>` — only the two title tags (when `tags.title` is
+/// `Some`) and the two image tags (only when `tags.image_url` is `Some`,
+/// leaving the app's own default logo tag untouched otherwise — the "no
+/// og:image, app default logo only" rule for a private or preview-less
+/// share).
+pub(crate) fn inject_og_tags(html: &str, tags: &OgTags) -> String {
+    let mut out = html.to_string();
+    if let Some(title) = &tags.title {
+        out = replace_meta_content(&out, r#"property="og:title" content=""#, title);
+        out = replace_meta_content(&out, r#"name="twitter:title" content=""#, title);
+    }
+    if let Some(image_url) = &tags.image_url {
+        out = replace_meta_content(&out, r#"property="og:image" content=""#, image_url);
+        out = replace_meta_content(&out, r#"name="twitter:image" content=""#, image_url);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2083,5 +2449,282 @@ mod tests {
         assert_eq!(row.interaction, "interactive");
         assert_eq!(row.visibility, "private");
         assert_eq!(row.protected_json, r#"[{"kind":"primitive","id":"1"}]"#);
+    }
+
+    // ---- §9: preview image validation + OG-tag injection ----
+
+    /// A minimal, valid PNG of `w`×`h` — flat colour, no ancillary chunks —
+    /// built with the SAME `image` crate the production code decodes with,
+    /// so these tests exercise the real encode/decode round trip rather than
+    /// a hand-rolled fixture format.
+    fn make_test_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([200, 30, 30, 255]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("encode test png");
+        out
+    }
+
+    /// Standard IEEE CRC32 (the PNG chunk checksum algorithm) — used only to
+    /// hand-build a `tEXt` chunk for
+    /// `build_preview_png_strips_a_text_chunk` below; no production code
+    /// needs a CRC32 of its own (the `image`/`png` crates compute their own
+    /// internally).
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in bytes {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+
+    /// Splice a `tEXt` chunk (keyword `"Comment"`) into a valid PNG's byte
+    /// stream, immediately after its IHDR chunk — the first chunk after the
+    /// 8-byte signature, located generically by reading IHDR's own length
+    /// field rather than assuming a fixed offset.
+    fn png_with_text_chunk(png: &[u8]) -> Vec<u8> {
+        let ihdr_len = u32::from_be_bytes(png[8..12].try_into().expect("4 bytes"));
+        // 8 (signature) + 4 (this chunk's own length field) + 4 (chunk type
+        // "IHDR") + ihdr_len (data) + 4 (crc).
+        let ihdr_end = 8 + 4 + 4 + ihdr_len as usize + 4;
+        let mut chunk_body = b"tEXt".to_vec();
+        chunk_body.extend_from_slice(b"Comment\0hello world");
+        let data_len = (chunk_body.len() - 4) as u32;
+        let crc = crc32(&chunk_body);
+
+        let mut out = Vec::with_capacity(png.len() + 8 + chunk_body.len());
+        out.extend_from_slice(&png[..ihdr_end]);
+        out.extend_from_slice(&data_len.to_be_bytes());
+        out.extend_from_slice(&chunk_body);
+        out.extend_from_slice(&crc.to_be_bytes());
+        out.extend_from_slice(&png[ihdr_end..]);
+        out
+    }
+
+    #[test]
+    fn build_preview_png_rejects_oversized_upload() {
+        let oversized = vec![0u8; PREVIEW_MAX_BYTES + 1];
+        assert_eq!(build_preview_png(&oversized), Err(PreviewError::TooLarge));
+    }
+
+    #[test]
+    fn build_preview_png_rejects_a_non_png_payload() {
+        let not_png = b"this is not a png file at all, just plain text bytes".to_vec();
+        assert_eq!(build_preview_png(&not_png), Err(PreviewError::NotPng));
+    }
+
+    #[test]
+    fn build_preview_png_rejects_dimensions_over_the_decode_cap() {
+        let huge = make_test_png(PREVIEW_MAX_DIM + 1, 10);
+        assert_eq!(build_preview_png(&huge), Err(PreviewError::DimensionsOutOfBounds));
+    }
+
+    #[test]
+    fn build_preview_png_reencodes_a_valid_upload_to_the_fixed_canvas() {
+        let src = make_test_png(400, 300);
+        let out = build_preview_png(&src).expect("valid upload re-encodes");
+        let decoded = image::load_from_memory_with_format(&out, image::ImageFormat::Png)
+            .expect("re-encoded output must itself be a valid PNG");
+        assert_eq!(decoded.width(), PREVIEW_OUTPUT_WIDTH);
+        assert_eq!(decoded.height(), PREVIEW_OUTPUT_HEIGHT);
+    }
+
+    /// A PNG carrying a `tEXt` ancillary chunk is re-encoded WITHOUT it —
+    /// the whole point of never re-serializing anything but the decoded
+    /// pixel buffer.
+    #[test]
+    fn build_preview_png_strips_a_text_chunk() {
+        let src = make_test_png(100, 60);
+        let with_text = png_with_text_chunk(&src);
+        assert!(
+            with_text.windows(4).any(|w| w == b"tEXt"),
+            "fixture must actually carry a tEXt chunk"
+        );
+
+        let out = build_preview_png(&with_text).expect("valid upload re-encodes");
+        assert!(
+            !out.windows(4).any(|w| w == b"tEXt"),
+            "re-encoded output must carry no tEXt chunk"
+        );
+    }
+
+    /// `get_share_preview`'s "never serve a private share's preview" rule,
+    /// factored into [`share_preview_rel_path`] for direct testing —
+    /// unconditional on file presence: a private row with a real
+    /// `preview_path` still resolves to `None`.
+    #[test]
+    fn share_preview_rel_path_never_visible_for_a_private_share() {
+        let conn = strip_test_conn();
+        let owner = insert_user(&conn, "owner");
+        let now = chrono::Utc::now().to_rfc3339();
+        let token = crate::db::create_share_link(
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "private",
+        )
+        .expect("create share");
+        assert!(crate::db::set_share_preview_path(&conn, &token, owner, "1/abc-preview.png").expect("set path"));
+        let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
+
+        assert_eq!(share_preview_rel_path(&row), None);
+    }
+
+    #[test]
+    fn share_preview_rel_path_visible_for_a_public_share_with_a_preview() {
+        let conn = strip_test_conn();
+        let owner = insert_user(&conn, "owner");
+        let now = chrono::Utc::now().to_rfc3339();
+        let token = crate::db::create_share_link(
+            &conn, owner, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public",
+        )
+        .expect("create share");
+        crate::db::set_share_preview_path(&conn, &token, owner, "1/abc-preview.png").expect("set path");
+        let row = crate::db::get_share_link(&conn, &token).expect("query").expect("row");
+
+        assert_eq!(share_preview_rel_path(&row), Some("1/abc-preview.png"));
+    }
+
+    /// `og_tags_for_share`'s selection matrix (§9): private always gets the
+    /// fixed neutral title and no image; public with a blank title gets no
+    /// title override; public with a real title and a preview gets both.
+    #[test]
+    fn og_tags_for_share_selection_matrix() {
+        let base = crate::db::ShareLinkRow {
+            token: "tok".to_string(),
+            user_id: 1,
+            kind: "live".to_string(),
+            title: String::new(),
+            preset_json: "{}".to_string(),
+            blob_path: String::new(),
+            blob_bytes: 0,
+            created_at: String::new(),
+            expires_at: String::new(),
+            clone_allowed: false,
+            interaction: "view".to_string(),
+            protected_json: "[]".to_string(),
+            visibility: "public".to_string(),
+            preview_path: String::new(),
+        };
+
+        // Public, blank title, no preview — no override at all.
+        let tags = og_tags_for_share(&base);
+        assert_eq!(tags.title, None);
+        assert_eq!(tags.image_url, None);
+
+        // Public, real title, no preview — title override only.
+        let with_title = crate::db::ShareLinkRow { title: "My BTC setup".to_string(), ..clone_row(&base) };
+        let tags = og_tags_for_share(&with_title);
+        assert_eq!(tags.title, Some("My BTC setup".to_string()));
+        assert_eq!(tags.image_url, None);
+
+        // Public, real title, WITH a preview — both overridden.
+        let with_preview = crate::db::ShareLinkRow {
+            preview_path: "1/tok-preview.png".to_string(),
+            ..clone_row(&with_title)
+        };
+        let tags = og_tags_for_share(&with_preview);
+        assert_eq!(tags.title, Some("My BTC setup".to_string()));
+        assert_eq!(tags.image_url, Some("https://mylittlechart.org/api/share/tok/preview.png".to_string()));
+
+        // Private — fixed neutral title, no image, REGARDLESS of the
+        // preview or the real title above.
+        let private = crate::db::ShareLinkRow { visibility: "private".to_string(), ..clone_row(&with_preview) };
+        let tags = og_tags_for_share(&private);
+        assert_eq!(tags.title, Some(PRIVATE_SHARE_OG_TITLE.to_string()));
+        assert_eq!(tags.image_url, None);
+    }
+
+    /// `ShareLinkRow` carries no `Clone` derive in production (nothing else
+    /// needs it) — this test-only helper builds a copy field by field so the
+    /// selection-matrix test above can vary one field at a time without
+    /// hand-repeating every other field on each fixture.
+    fn clone_row(row: &crate::db::ShareLinkRow) -> crate::db::ShareLinkRow {
+        crate::db::ShareLinkRow {
+            token: row.token.clone(),
+            user_id: row.user_id,
+            kind: row.kind.clone(),
+            title: row.title.clone(),
+            preset_json: row.preset_json.clone(),
+            blob_path: row.blob_path.clone(),
+            blob_bytes: row.blob_bytes,
+            created_at: row.created_at.clone(),
+            expires_at: row.expires_at.clone(),
+            clone_allowed: row.clone_allowed,
+            interaction: row.interaction.clone(),
+            protected_json: row.protected_json.clone(),
+            visibility: row.visibility.clone(),
+            preview_path: row.preview_path.clone(),
+        }
+    }
+
+    const SAMPLE_INDEX_HTML: &str = concat!(
+        "<!DOCTYPE html><html><head>",
+        "<title>mylittlechart</title>",
+        "<meta property=\"og:type\" content=\"website\" />",
+        "<meta property=\"og:title\" content=\"mylittlechart — the terminal\" />",
+        "<meta property=\"og:description\" content=\"Windows · macOS · Linux · Browser\" />",
+        "<meta property=\"og:image\" content=\"https://mylittlechart.org/og-card.png\" />",
+        "<meta name=\"twitter:card\" content=\"summary_large_image\" />",
+        "<meta name=\"twitter:title\" content=\"mylittlechart — the terminal\" />",
+        "<meta name=\"twitter:image\" content=\"https://mylittlechart.org/og-card.png\" />",
+        "</head><body></body></html>",
+    );
+
+    #[test]
+    fn inject_og_tags_overrides_title_and_image_when_both_present() {
+        let tags = OgTags {
+            title: Some("My BTC setup".to_string()),
+            image_url: Some("https://mylittlechart.org/api/share/tok/preview.png".to_string()),
+        };
+        let out = inject_og_tags(SAMPLE_INDEX_HTML, &tags);
+
+        assert!(out.contains(r#"property="og:title" content="My BTC setup""#));
+        assert!(out.contains(r#"name="twitter:title" content="My BTC setup""#));
+        assert!(out.contains(
+            r#"property="og:image" content="https://mylittlechart.org/api/share/tok/preview.png""#
+        ));
+        assert!(out.contains(
+            r#"name="twitter:image" content="https://mylittlechart.org/api/share/tok/preview.png""#
+        ));
+        // Untouched tags survive verbatim.
+        assert!(out.contains(r#"og:description" content="Windows · macOS · Linux · Browser""#));
+        assert!(out.contains("<title>mylittlechart</title>"));
+        assert!(!out.contains("mylittlechart — the terminal"));
+    }
+
+    /// The private-card case: title overridden, image tags left at the
+    /// app's own default (no `image_url` in `tags`) — proves the "no
+    /// og:image, app default logo only" rule.
+    #[test]
+    fn inject_og_tags_leaves_image_untouched_when_none_provided() {
+        let tags = OgTags { title: Some(PRIVATE_SHARE_OG_TITLE.to_string()), image_url: None };
+        let out = inject_og_tags(SAMPLE_INDEX_HTML, &tags);
+
+        assert!(out.contains(&format!(r#"property="og:title" content="{PRIVATE_SHARE_OG_TITLE}""#)));
+        assert!(out.contains(r#"property="og:image" content="https://mylittlechart.org/og-card.png""#));
+        assert!(out.contains(r#"name="twitter:image" content="https://mylittlechart.org/og-card.png""#));
+    }
+
+    /// No tags at all → byte-identical output (the "token not found" case —
+    /// the caller never invokes `inject_og_tags` for it, but this proves the
+    /// function itself is a true no-op absent both overrides too).
+    #[test]
+    fn inject_og_tags_is_a_no_op_with_no_overrides() {
+        let tags = OgTags { title: None, image_url: None };
+        assert_eq!(inject_og_tags(SAMPLE_INDEX_HTML, &tags), SAMPLE_INDEX_HTML);
+    }
+
+    /// A hostile title never breaks out of the `content="…"` attribute —
+    /// the escaped output contains no raw `<script>` tag.
+    #[test]
+    fn inject_og_tags_escapes_a_nasty_title() {
+        let nasty = "\"><script>alert(1)</script>";
+        let tags = OgTags { title: Some(nasty.to_string()), image_url: None };
+        let out = inject_og_tags(SAMPLE_INDEX_HTML, &tags);
+
+        assert!(!out.contains("<script>"), "raw script tag must never appear: {out}");
+        assert!(out.contains("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
     }
 }

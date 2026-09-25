@@ -38,6 +38,7 @@ base64 = { workspace = true }
 # admin-gate tests) rides along on the same `util` feature.
 tower = { workspace = true }
 unicode-normalization = { workspace = true }
+image = { workspace = true }
 
 # Static musl builds cannot link a system OpenSSL, so the deploy target — and
 # only the deploy target — builds it from source. Features are additive, so

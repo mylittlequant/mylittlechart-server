@@ -3264,14 +3264,17 @@ pub struct ShareLinkRow {
     /// before this column existed, matching that link's actual historical
     /// behaviour (reachable by anyone holding the token).
     pub visibility: String,
+    /// Path of the re-encoded preview PNG relative to `<data_dir>/share/`
+    /// (§9), or empty when no preview has been uploaded yet — same idiom as
+    /// `blob_path`. Set by [`set_share_preview_path`], read by
+    /// `routes::share::get_share_preview` (serving) and
+    /// `routes::share::og_tags_for_share` (OG-tag selection for the
+    /// crawler-facing `GET /` route in `main.rs`).
+    pub preview_path: String,
 }
 
 /// Read one query row into a [`ShareLinkRow`]. Column order must match the
-/// SELECT lists below. `preview_path` (§9, unused by anything in this wave)
-/// is deliberately NOT projected here — the column exists on disk (its
-/// ALTER TABLE lands in the same migration batch as `visibility` above, to
-/// avoid a third boot-time migration later) but gets a `ShareLinkRow` field
-/// and a reader only once something in the tree actually reads it.
+/// SELECT lists below.
 fn share_link_from_row(row: &rusqlite::Row<'_>) -> Result<ShareLinkRow> {
     Ok(ShareLinkRow {
         token: row.get(0)?,
@@ -3287,6 +3290,7 @@ fn share_link_from_row(row: &rusqlite::Row<'_>) -> Result<ShareLinkRow> {
         interaction: row.get(10)?,
         protected_json: row.get(11)?,
         visibility: row.get(12)?,
+        preview_path: row.get(13)?,
     })
 }
 
@@ -3361,7 +3365,7 @@ pub fn set_share_blob_path(conn: &Connection, token: &str, blob_path: &str) -> R
 pub fn get_share_link(conn: &Connection, token: &str) -> Result<Option<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.query_row(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path
          FROM share_links
          WHERE token = ?1 AND revoked = 0 AND expires_at > ?2",
         params![token, now],
@@ -3393,7 +3397,7 @@ pub fn share_usage(conn: &Connection, user_id: i64) -> Result<(u64, u64)> {
 pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path
          FROM share_links
          WHERE user_id = ?1 AND revoked = 0 AND expires_at > ?2
          ORDER BY created_at DESC",
@@ -3404,6 +3408,23 @@ pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLink
         out.push(share_link_from_row(row)?);
     }
     Ok(out)
+}
+
+/// Stamp the re-encoded preview PNG's path onto a share link, owner-only —
+/// the `user_id` in the WHERE clause makes "someone else's token" answer
+/// `false` exactly like "no such token" (same discipline as [`revoke_share`]).
+/// `routes::share::upload_share_preview`'s write path.
+pub fn set_share_preview_path(
+    conn: &Connection,
+    token: &str,
+    owner_user_id: i64,
+    preview_path: &str,
+) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE share_links SET preview_path = ?1 WHERE token = ?2 AND user_id = ?3",
+        params![preview_path, token, owner_user_id],
+    )?;
+    Ok(n > 0)
 }
 
 /// Update a subset of a link's own policy fields after creation, owner-only

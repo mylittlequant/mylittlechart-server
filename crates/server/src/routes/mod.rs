@@ -161,6 +161,13 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
             get(share::list_share_grants).post(share::create_share_grant),
         )
         .route("/share/{token}/grants/{grant_id}", delete(share::delete_share_grant))
+        // Per-link preview image + OG injection (§9) — owner-only upload,
+        // public serve (same 404 opacity discipline as /share/{token}/png).
+        .route(
+            "/share/{token}/preview",
+            post(share::upload_share_preview).layer(DefaultBodyLimit::max(share::PREVIEW_MAX_BYTES)),
+        )
+        .route("/share/{token}/preview.png", get(share::get_share_preview))
         // Owner-curated grant groups (§8.3) — a reusable, named account list
         // a share grant can target instead of one grant row per account.
         .route("/groups", get(groups::list_my_groups).post(groups::create_group))
