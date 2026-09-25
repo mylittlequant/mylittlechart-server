@@ -61,7 +61,13 @@ use crate::dm_db;
 use crate::routes::matrix::rooms::{dm_pair_key, invite_power_level, power_levels_content, room_kind_settings, state_event};
 
 /// State event type for a migrated room's copy of each member's DM identity
-/// key (plan §2 manager decision 5).
+/// key (plan §2 manager decision 5). Content:
+/// `{"public_key_b64", "legacy_conversation_id"}` — `legacy_conversation_id`
+/// is the legacy `dm_conversations.id`, present so a client can derive
+/// `mlc_vault::dm::conversation_key` from room state alone, without ever
+/// having to be told the legacy conversation id out of band. Every
+/// `org.mylittlechart.legacy_dm` message event in the same room carries the
+/// same `legacy_conversation_id` in its own content.
 const LEGACY_DM_KEY_EVENT_TYPE: &str = "org.mylittlechart.legacy_dm_key";
 
 // ============================================================================
@@ -301,7 +307,10 @@ fn migrate_one_conversation(
                 LEGACY_DM_KEY_EVENT_TYPE,
                 mxid,
                 user_id,
-                serde_json::json!({ "public_key_b64": STANDARD.encode(&identity_key.public_key) }),
+                serde_json::json!({
+                    "public_key_b64": STANDARD.encode(&identity_key.public_key),
+                    "legacy_conversation_id": conv.id,
+                }),
             ));
         }
     }
@@ -319,6 +328,7 @@ fn migrate_one_conversation(
             sender_user_id: message.sender_user_id,
             content: serde_json::json!({
                 "legacy_message_id": message.id,
+                "legacy_conversation_id": conv.id,
                 "nonce_b64": STANDARD.encode(&message.nonce),
                 "ciphertext_b64": STANDARD.encode(&message.ciphertext),
             })
@@ -533,6 +543,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_dm_events_carry_the_legacy_conversation_id() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        let nonce = [0u8; dm_db::DM_NONCE_LEN];
+        let msg = dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"hello", "2026-09-01T00:01:00+00:00").expect("insert");
+
+        migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("migrate");
+
+        let event_id = matrix_store::legacy_dm_message_event_id(&messenger, msg).expect("query").expect("mapped");
+        let event = matrix_store::get_event(&messenger, &event_id).expect("query").expect("exists");
+        let content: serde_json::Value = serde_json::from_str(&event.content).expect("json");
+        assert_eq!(content["legacy_conversation_id"], serde_json::json!(conv.id));
+    }
+
+    #[test]
     fn legacy_key_state_events_carry_each_members_public_key() {
         let (identity, social, mut messenger, conv) = base_fixture();
         let lo_key = vec![1u8; dm_db::DM_PUBLIC_KEY_LEN];
@@ -552,6 +576,7 @@ mod tests {
         let lo_content: serde_json::Value = serde_json::from_str(&lo_event.content).expect("json");
         let lo_decoded = STANDARD.decode(lo_content["public_key_b64"].as_str().expect("string")).expect("valid base64");
         assert_eq!(lo_decoded, lo_key);
+        assert_eq!(lo_content["legacy_conversation_id"], serde_json::json!(conv.id));
 
         let hi_event = matrix_store::current_state_event(&messenger, &room.id, LEGACY_DM_KEY_EVENT_TYPE, &hi_mxid)
             .expect("query")
@@ -559,6 +584,7 @@ mod tests {
         let hi_content: serde_json::Value = serde_json::from_str(&hi_event.content).expect("json");
         let hi_decoded = STANDARD.decode(hi_content["public_key_b64"].as_str().expect("string")).expect("valid base64");
         assert_eq!(hi_decoded, hi_key);
+        assert_eq!(hi_content["legacy_conversation_id"], serde_json::json!(conv.id));
     }
 
     #[test]

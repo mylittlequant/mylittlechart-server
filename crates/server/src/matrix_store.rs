@@ -2422,7 +2422,20 @@ pub fn legacy_dm_message_event_id(conn: &Connection, legacy_message_id: i64) -> 
 /// idempotency proof compares event ids across two runs) without a second
 /// round trip back into this module. `content` is already the full
 /// `org.mylittlechart.legacy_dm` JSON body
-/// (`{"legacy_message_id","nonce_b64","ciphertext_b64"}`).
+/// (`{"legacy_message_id","legacy_conversation_id","nonce_b64","ciphertext_b64"}`).
+///
+/// # `legacy_conversation_id`
+///
+/// Both this message's own content AND the room's
+/// `org.mylittlechart.legacy_dm_key` state event content (plan §2 manager
+/// decision 5) carry the legacy `dm_conversations.id` (as
+/// `legacy_conversation_id`) — a client derives
+/// `mlc_vault::dm::conversation_key` from that id plus the sender's and its
+/// own keys, and has no other way to learn which legacy conversation a
+/// migrated room came from. A `messenger.db` migrated by a build before this
+/// field existed is missing it on every already-migrated row; that is a
+/// dev-only concern (nothing has shipped) — recreate the database rather
+/// than backfill it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LegacyDmMessageImport {
     pub legacy_message_id: i64,
