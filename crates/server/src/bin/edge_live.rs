@@ -38,6 +38,8 @@ struct Room {
     last_g: String,
     last_v: String,
     last_p: String,
+    last_preview: String,
+    last_cursor: String,
     next_id: u64,
     subs: Vec<Sub>,
 }
@@ -178,6 +180,8 @@ async fn host_room(app: Arc<App>, token: String, mut sock: WebSocket, publish: b
             last_g: String::new(),
             last_v: String::new(),
             last_p: String::new(),
+            last_preview: String::new(),
+            last_cursor: String::new(),
             next_id: 1,
             subs: Vec::new(),
         });
@@ -189,6 +193,12 @@ async fn host_room(app: Arc<App>, token: String, mut sock: WebSocket, publish: b
         }
         if !room.last_p.is_empty() {
             let _ = tx.send(room.last_p.clone());
+        }
+        if !room.last_preview.is_empty() {
+            let _ = tx.send(room.last_preview.clone());
+        }
+        if !room.last_cursor.is_empty() {
+            let _ = tx.send(room.last_cursor.clone());
         }
         let my_id = room.next_id;
         room.next_id = room.next_id.wrapping_add(1);
@@ -212,6 +222,10 @@ async fn host_room(app: Arc<App>, token: String, mut sock: WebSocket, publish: b
                     room.last_v = text.clone();
                 } else if text.contains("\"t\":\"p\"") {
                     room.last_p = text.clone();
+                } else if text.contains("\"t\":\"preview\"") {
+                    room.last_preview = text.clone();
+                } else if text.contains("\"t\":\"c\"") {
+                    room.last_cursor = text.clone();
                 }
                 room.subs.retain(|sub| sub.id == my_id || sub.tx.send(text.clone()).is_ok());
             }
