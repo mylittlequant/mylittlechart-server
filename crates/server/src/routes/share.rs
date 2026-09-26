@@ -1492,7 +1492,7 @@ pub async fn get_share_ops(
                 })
             })
             .collect();
-        Ok(Ok(serde_json::json!({ "head": head, "reset": reset, "can_send": can_send, "ops": ops })))
+        Ok(Ok(serde_json::json!({ "head": head, "reset": reset, "can_send": can_send, "live": row.live, "ops": ops })))
     })
     .await;
 
@@ -1663,6 +1663,9 @@ pub struct UpdateShareLinkPolicyRequest {
     /// Absent leaves the ring-pin as it is.
     #[serde(default)]
     pub pinned: Option<bool>,
+    /// Absent leaves channel mode as it is. `false` is a cadence link.
+    #[serde(default)]
+    pub live: Option<bool>,
 }
 
 /// PATCH /api/share/{token}
@@ -1711,9 +1714,13 @@ pub async fn update_share_policy(
     let allow_forward = body.allow_forward;
     let clone_allowed = body.clone_allowed;
     let pinned = body.pinned;
+    let live = body.live;
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(live) = live {
+            return crate::db::set_share_live(&conn, &token, user_id, live);
+        }
         crate::db::update_share_link_policy(
             &conn,
             &token,
@@ -2734,7 +2741,8 @@ mod tests {
                 pinned INTEGER NOT NULL DEFAULT 0,
                 chart_id TEXT NOT NULL DEFAULT '',
                 revision INTEGER NOT NULL DEFAULT 1,
-                op_seq INTEGER NOT NULL DEFAULT 0
+                op_seq INTEGER NOT NULL DEFAULT 0,
+                live INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE share_ops (
                 token TEXT NOT NULL,
@@ -3377,6 +3385,7 @@ mod tests {
             chart_id: String::new(),
             revision: 1,
             op_seq: 0,
+            live: false,
         };
 
         let tags = og_tags_for_share(&base, "");
@@ -3453,6 +3462,7 @@ mod tests {
             chart_id: row.chart_id.clone(),
             revision: row.revision,
             op_seq: row.op_seq,
+            live: row.live,
         }
     }
 

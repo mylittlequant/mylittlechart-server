@@ -133,6 +133,13 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/account/redeem", post(account::redeem))
         // Account nick change (cookie-session or bearer auth, same as redeem).
         .route("/account/nick", post(account::set_nick))
+        .route("/account/friends", get(account::friends))
+        .route("/account/privacy", patch(account::set_privacy))
+        .route("/account/friend-invites", post(account::create_friend_invite))
+        .route(
+            "/account/friend-invites/{token}/accept",
+            post(account::accept_friend_invite),
+        )
         // Chart share links. Creation/listing/revoke are authenticated; the
         // two GETs by token are public — the token is the capability (see
         // routes/share.rs). `/share/mine` is a static segment, which matchit

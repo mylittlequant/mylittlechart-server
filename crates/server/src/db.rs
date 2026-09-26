@@ -596,6 +596,29 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         "ALTER TABLE share_links ADD COLUMN op_seq INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // Live is a channel. Off (default) means the link updates on a cadence.
+    let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN live INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE users ADD COLUMN discoverable INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS friendships (
+            user_id INTEGER NOT NULL,
+            friend_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, friend_id)
+        );
+        CREATE TABLE IF NOT EXISTS friend_invites (
+            token TEXT PRIMARY KEY,
+            inviter_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );",
+    );
     let _ = conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS share_ops (
             token TEXT NOT NULL,
@@ -1856,6 +1879,13 @@ pub fn search_share_nicks(
          WHERE id != ?1
            AND nick IS NOT NULL AND nick != ''
            AND LOWER(nick) LIKE ?2 ESCAPE '\\'
+           AND (
+             IFNULL(discoverable, 1) = 1
+             OR EXISTS (
+               SELECT 1 FROM friendships
+               WHERE user_id = ?1 AND friend_id = users.id
+             )
+           )
          ORDER BY
            CASE
              WHEN LOWER(nick) = ?3 THEN 0
@@ -3394,6 +3424,9 @@ pub struct ShareLinkRow {
     /// Head of `share_ops` for this token. 0 means no ops since the last
     /// preset publish.
     pub op_seq: i64,
+    /// Channel mode. False: viewers catch up on a cadence. True: the same
+    /// log is the live channel.
+    pub live: bool,
 }
 
 impl ShareLinkRow {
@@ -3435,6 +3468,7 @@ fn share_link_from_row(row: &rusqlite::Row<'_>) -> Result<ShareLinkRow> {
         chart_id: row.get(16)?,
         revision: row.get(17)?,
         op_seq: row.get(18)?,
+        live: row.get::<_, i64>(19)? != 0,
     })
 }
 
@@ -3602,7 +3636,7 @@ pub fn set_share_blob_path(conn: &Connection, token: &str, blob_path: &str) -> R
 pub fn get_share_link(conn: &Connection, token: &str) -> Result<Option<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.query_row(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision, op_seq
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision, op_seq, live
          FROM share_links
          WHERE token = ?1 AND revoked = 0 AND expires_at > ?2",
         params![token, now],
@@ -3634,7 +3668,7 @@ pub fn share_usage(conn: &Connection, user_id: i64) -> Result<(u64, u64)> {
 pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision, op_seq
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision, op_seq, live
          FROM share_links
          WHERE user_id = ?1 AND revoked = 0 AND expires_at > ?2
          ORDER BY created_at DESC",
@@ -3734,6 +3768,112 @@ pub fn update_share_link_policy(
         )?;
     }
     Ok(true)
+}
+
+/// Hidden accounts stay out of nick search unless `caller` already friended them.
+pub fn visible_in_search(conn: &Connection, caller: i64, target: i64) -> Result<bool> {
+    if caller == target {
+        return Ok(false);
+    }
+    let discoverable: i64 = conn
+        .query_row(
+            "SELECT IFNULL(discoverable, 1) FROM users WHERE id = ?1",
+            params![target],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(1);
+    if discoverable != 0 {
+        return Ok(true);
+    }
+    let friend: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM friendships WHERE user_id = ?1 AND friend_id = ?2",
+            params![caller, target],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(friend.is_some())
+}
+
+pub fn account_discoverable(conn: &Connection, user_id: i64) -> Result<bool> {
+    let v: Option<i64> = conn
+        .query_row(
+            "SELECT IFNULL(discoverable, 1) FROM users WHERE id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(v.unwrap_or(1) != 0)
+}
+
+pub fn set_account_discoverable(conn: &Connection, user_id: i64, on: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE users SET discoverable = ?1 WHERE id = ?2",
+        params![on as i64, user_id],
+    )?;
+    Ok(())
+}
+
+pub fn list_friend_nicks(conn: &Connection, user_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT u.nick FROM friendships f
+         JOIN users u ON u.id = f.friend_id
+         WHERE f.user_id = ?1 AND u.nick IS NOT NULL AND u.nick != ''
+         ORDER BY LOWER(u.nick)",
+    )?;
+    let mut rows = stmt.query(params![user_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
+}
+
+pub fn create_friend_invite(conn: &Connection, inviter: i64, now: &str, expires: &str) -> Result<String> {
+    let token = generate_share_token();
+    conn.execute(
+        "INSERT INTO friend_invites (token, inviter_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+        params![token, inviter, now, expires],
+    )?;
+    Ok(token)
+}
+
+/// Both directions, so each side finds the other. Returns false if the
+/// invite is missing, expired, or is the inviter accepting their own link.
+pub fn accept_friend_invite(conn: &Connection, token: &str, accepter: i64, now: &str) -> Result<bool> {
+    let inviter: Option<i64> = conn
+        .query_row(
+            "SELECT inviter_id FROM friend_invites WHERE token = ?1 AND expires_at > ?2",
+            params![token, now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(inviter) = inviter else {
+        return Ok(false);
+    };
+    if inviter == accepter {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
+        params![inviter, accepter, now],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
+        params![accepter, inviter, now],
+    )?;
+    conn.execute("DELETE FROM friend_invites WHERE token = ?1", params![token])?;
+    Ok(true)
+}
+
+/// Owner sets whether this token is a live channel or a cadence link.
+pub fn set_share_live(conn: &Connection, token: &str, owner_user_id: i64, live: bool) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE share_links SET live = ?1 WHERE token = ?2 AND user_id = ?3 AND kind = 'live'",
+        params![live as i64, token, owner_user_id],
+    )?;
+    Ok(n > 0)
 }
 
 /// Revoke the oldest active unpinned share of `kind` for this account.
@@ -7350,7 +7490,8 @@ mod tests {
                 pinned INTEGER NOT NULL DEFAULT 0,
                 chart_id TEXT NOT NULL DEFAULT '',
                 revision INTEGER NOT NULL DEFAULT 1,
-                op_seq INTEGER NOT NULL DEFAULT 0
+                op_seq INTEGER NOT NULL DEFAULT 0,
+                live INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE share_ops (
                 token TEXT NOT NULL,
@@ -10136,7 +10277,14 @@ mod share_nick_search_tests {
             "CREATE TABLE users (
                 id INTEGER PRIMARY KEY,
                 nick TEXT,
-                display_name TEXT NOT NULL DEFAULT ''
+                display_name TEXT NOT NULL DEFAULT '',
+                discoverable INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE friendships (
+                user_id INTEGER NOT NULL,
+                friend_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, friend_id)
             );",
         )
         .unwrap();
@@ -10266,6 +10414,7 @@ mod share_op_tests {
             chart_id: String::new(),
             revision: 1,
             op_seq: 2,
+            live: false,
         };
         assert!(!share_caller_can_edit(&conn, &link, 2).unwrap());
         upsert_share_grant(&conn, "t", 1, Some(2), None, ShareTier::Clone, None, "now").unwrap();
