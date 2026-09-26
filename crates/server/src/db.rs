@@ -602,6 +602,10 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         [],
     );
     let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN live_edge TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
         "ALTER TABLE users ADD COLUMN discoverable INTEGER NOT NULL DEFAULT 1",
         [],
     );
@@ -617,6 +621,24 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
             inviter_id INTEGER NOT NULL,
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS friend_requests (
+            from_id INTEGER NOT NULL,
+            to_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (from_id, to_id)
+        );
+        CREATE TABLE IF NOT EXISTS blocks (
+            user_id INTEGER NOT NULL,
+            blocked_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, blocked_id)
+        );
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, target_id)
         );",
     );
     let _ = conn.execute_batch(
@@ -1885,6 +1907,12 @@ pub fn search_share_nicks(
                SELECT 1 FROM friendships
                WHERE user_id = ?1 AND friend_id = users.id
              )
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM blocks WHERE user_id = ?1 AND blocked_id = users.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM blocks WHERE user_id = users.id AND blocked_id = ?1
            )
          ORDER BY
            CASE
@@ -3772,7 +3800,7 @@ pub fn update_share_link_policy(
 
 /// Hidden accounts stay out of nick search unless `caller` already friended them.
 pub fn visible_in_search(conn: &Connection, caller: i64, target: i64) -> Result<bool> {
-    if caller == target {
+    if caller == target || blocked_either(conn, caller, target)? {
         return Ok(false);
     }
     let discoverable: i64 = conn
@@ -3867,41 +3895,224 @@ pub fn accept_friend_invite(conn: &Connection, token: &str, accepter: i64, now: 
     Ok(true)
 }
 
-/// Mutual friendship by exact nick. `Err` text is the refusal the route maps
-/// to a status. Already-friends is success.
-pub fn add_friend_by_nick(conn: &Connection, caller: i64, nick: &str, now: &str) -> Result<std::result::Result<(), &'static str>> {
-    let nick = nick.trim();
-    if nick.is_empty() {
-        return Ok(Err("no such nick"));
-    }
-    let target: Option<(i64, String)> = conn
+fn blocked_either(conn: &Connection, a: i64, b: i64) -> Result<bool> {
+    let hit: Option<i64> = conn
         .query_row(
-            "SELECT id, nick FROM users WHERE nick IS NOT NULL AND LOWER(nick) = LOWER(?1)",
-            params![nick],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT 1 FROM blocks WHERE (user_id = ?1 AND blocked_id = ?2) OR (user_id = ?2 AND blocked_id = ?1)",
+            params![a, b],
+            |row| row.get(0),
         )
         .optional()?;
-    let Some((target, canonical)) = target else {
+    Ok(hit.is_some())
+}
+
+fn user_by_nick(conn: &Connection, nick: &str) -> Result<Option<(i64, String)>> {
+    let nick = nick.trim();
+    if nick.is_empty() {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT id, nick FROM users WHERE nick IS NOT NULL AND nick != '' AND LOWER(nick) = LOWER(?1)",
+        params![nick],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+fn nicks_for(conn: &Connection, sql: &str, user_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params![user_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
+}
+
+pub struct SocialLists {
+    pub discoverable: bool,
+    pub friends: Vec<String>,
+    pub incoming: Vec<String>,
+    pub outgoing: Vec<String>,
+    pub subscriptions: Vec<String>,
+    pub blocked: Vec<String>,
+}
+
+pub fn social_lists(conn: &Connection, user_id: i64) -> Result<SocialLists> {
+    Ok(SocialLists {
+        discoverable: account_discoverable(conn, user_id)?,
+        friends: list_friend_nicks(conn, user_id)?,
+        incoming: nicks_for(
+            conn,
+            "SELECT u.nick FROM friend_requests r JOIN users u ON u.id = r.from_id
+             WHERE r.to_id = ?1 AND u.nick IS NOT NULL AND u.nick != '' ORDER BY LOWER(u.nick)",
+            user_id,
+        )?,
+        outgoing: nicks_for(
+            conn,
+            "SELECT u.nick FROM friend_requests r JOIN users u ON u.id = r.to_id
+             WHERE r.from_id = ?1 AND u.nick IS NOT NULL AND u.nick != '' ORDER BY LOWER(u.nick)",
+            user_id,
+        )?,
+        subscriptions: nicks_for(
+            conn,
+            "SELECT u.nick FROM subscriptions s JOIN users u ON u.id = s.target_id
+             WHERE s.user_id = ?1 AND u.nick IS NOT NULL AND u.nick != '' ORDER BY LOWER(u.nick)",
+            user_id,
+        )?,
+        blocked: nicks_for(
+            conn,
+            "SELECT u.nick FROM blocks b JOIN users u ON u.id = b.blocked_id
+             WHERE b.user_id = ?1 AND u.nick IS NOT NULL AND u.nick != '' ORDER BY LOWER(u.nick)",
+            user_id,
+        )?,
+    })
+}
+
+fn link_friends(conn: &Connection, a: i64, b: i64, now: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
+        params![a, b, now],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
+        params![b, a, now],
+    )?;
+    conn.execute("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2", params![a, b])?;
+    conn.execute("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2", params![b, a])?;
+    Ok(())
+}
+
+fn unlink(conn: &Connection, a: i64, b: i64) -> Result<()> {
+    conn.execute("DELETE FROM friendships WHERE user_id = ?1 AND friend_id = ?2", params![a, b])?;
+    conn.execute("DELETE FROM friendships WHERE user_id = ?1 AND friend_id = ?2", params![b, a])?;
+    conn.execute("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2", params![a, b])?;
+    conn.execute("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2", params![b, a])?;
+    conn.execute("DELETE FROM subscriptions WHERE user_id = ?1 AND target_id = ?2", params![a, b])?;
+    conn.execute("DELETE FROM subscriptions WHERE user_id = ?1 AND target_id = ?2", params![b, a])?;
+    Ok(())
+}
+
+/// `request` does not create a friendship. `approve` does, both ways.
+/// `subscribe` is one row, from the caller to the nick, with no friendship.
+/// `block` removes friendship, requests, and subscriptions in both directions.
+pub fn social_act(conn: &Connection, caller: i64, nick: &str, action: &str, now: &str) -> Result<std::result::Result<(), &'static str>> {
+    let Some((target, _)) = user_by_nick(conn, nick)? else {
         return Ok(Err("no such nick"));
     };
-    if canonical.is_empty() {
-        return Ok(Err("no such nick"));
-    }
     if target == caller {
         return Ok(Err("that is you"));
     }
-    if !visible_in_search(conn, caller, target)? {
-        return Ok(Err("not findable"));
+    let blocked = blocked_either(conn, caller, target)?;
+    match action {
+        "request" => {
+            if blocked {
+                return Ok(Err("blocked"));
+            }
+            let already: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM friendships WHERE user_id = ?1 AND friend_id = ?2",
+                    params![caller, target],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if already.is_some() {
+                return Ok(Ok(()));
+            }
+            let incoming: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM friend_requests WHERE from_id = ?1 AND to_id = ?2",
+                    params![target, caller],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if incoming.is_some() {
+                link_friends(conn, caller, target, now)?;
+                return Ok(Ok(()));
+            }
+            conn.execute(
+                "INSERT OR IGNORE INTO friend_requests (from_id, to_id, created_at) VALUES (?1, ?2, ?3)",
+                params![caller, target, now],
+            )?;
+            Ok(Ok(()))
+        }
+        "approve" => {
+            if blocked {
+                return Ok(Err("blocked"));
+            }
+            let incoming: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM friend_requests WHERE from_id = ?1 AND to_id = ?2",
+                    params![target, caller],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if incoming.is_none() {
+                return Ok(Err("no request"));
+            }
+            link_friends(conn, caller, target, now)?;
+            Ok(Ok(()))
+        }
+        "remove" => {
+            conn.execute("DELETE FROM friendships WHERE user_id = ?1 AND friend_id = ?2", params![caller, target])?;
+            conn.execute("DELETE FROM friendships WHERE user_id = ?1 AND friend_id = ?2", params![target, caller])?;
+            Ok(Ok(()))
+        }
+        "block" => {
+            unlink(conn, caller, target)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO blocks (user_id, blocked_id, created_at) VALUES (?1, ?2, ?3)",
+                params![caller, target, now],
+            )?;
+            Ok(Ok(()))
+        }
+        "unblock" => {
+            conn.execute(
+                "DELETE FROM blocks WHERE user_id = ?1 AND blocked_id = ?2",
+                params![caller, target],
+            )?;
+            Ok(Ok(()))
+        }
+        "subscribe" => {
+            if blocked {
+                return Ok(Err("blocked"));
+            }
+            conn.execute(
+                "INSERT OR IGNORE INTO subscriptions (user_id, target_id, created_at) VALUES (?1, ?2, ?3)",
+                params![caller, target, now],
+            )?;
+            Ok(Ok(()))
+        }
+        "unsubscribe" => {
+            conn.execute(
+                "DELETE FROM subscriptions WHERE user_id = ?1 AND target_id = ?2",
+                params![caller, target],
+            )?;
+            Ok(Ok(()))
+        }
+        _ => Ok(Err("no such nick")),
     }
-    conn.execute(
-        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
-        params![caller, target, now],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
-        params![target, caller, now],
-    )?;
-    Ok(Ok(()))
+}
+
+/// Edge that owns this token's live socket. Empty until the first publisher claims it.
+pub fn share_live_edge(conn: &Connection, token: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT IFNULL(live_edge, '') FROM share_links WHERE token = ?1",
+        params![token],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Sets `live_edge` only while it is still empty. Returns the edge that owns the token.
+pub fn claim_share_live_edge(conn: &Connection, token: &str, edge: &str) -> Result<Option<String>> {
+    if edge == "utah" || edge == "ams" {
+        conn.execute(
+            "UPDATE share_links SET live_edge = ?1 WHERE token = ?2 AND IFNULL(live_edge, '') = ''",
+            params![edge, token],
+        )?;
+    }
+    share_live_edge(conn, token)
 }
 
 /// Owner sets whether this token is a live channel or a cadence link.

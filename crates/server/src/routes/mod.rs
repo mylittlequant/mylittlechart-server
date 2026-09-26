@@ -175,6 +175,7 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
             "/share/{token}/ops",
             get(share::get_share_ops).post(share::post_share_ops),
         )
+        .route("/share/{token}/stream-open", get(share::stream_open))
         // Per-link preview image + OG injection (§9) — owner-only upload,
         // public serve (same 404 opacity discipline as /share/{token}/png).
         .route(

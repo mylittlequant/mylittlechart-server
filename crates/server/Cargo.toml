@@ -7,6 +7,10 @@ edition = "2021"
 name = "mylittlechart-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "mlc-edge-live"
+path = "src/bin/edge_live.rs"
+
 [dependencies]
 axum = { workspace = true }
 tokio = { workspace = true }

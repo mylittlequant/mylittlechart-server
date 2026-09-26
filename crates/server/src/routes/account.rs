@@ -299,17 +299,19 @@ pub async fn friends(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         Ok(id) => id,
         Err(status) => return status.into_response(),
     };
-    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(bool, Vec<String>)> {
+    let result = tokio::task::spawn_blocking(move || {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        let on = crate::db::account_discoverable(&conn, user_id)?;
-        let nicks = crate::db::list_friend_nicks(&conn, user_id)?;
-        Ok((on, nicks))
+        crate::db::social_lists(&conn, user_id)
     })
     .await;
     match result {
-        Ok(Ok((discoverable, friends))) => Json(serde_json::json!({
-            "discoverable": discoverable,
-            "friends": friends,
+        Ok(Ok(lists)) => Json(serde_json::json!({
+            "discoverable": lists.discoverable,
+            "friends": lists.friends,
+            "incoming": lists.incoming,
+            "outgoing": lists.outgoing,
+            "subscriptions": lists.subscriptions,
+            "blocked": lists.blocked,
         }))
         .into_response(),
         _ => (
@@ -349,6 +351,8 @@ pub async fn set_privacy(
 #[derive(serde::Deserialize)]
 pub struct AddFriendBody {
     pub nick: String,
+    #[serde(default)]
+    pub action: String,
 }
 
 /// POST /api/account/friends — add a nick that search can already see.
@@ -362,22 +366,28 @@ pub async fn add_friend(
         Err(status) => return status.into_response(),
     };
     let nick = body.nick;
+    let action = if body.action.is_empty() { "request".to_string() } else { body.action };
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<std::result::Result<(), &'static str>> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
-        crate::db::add_friend_by_nick(&conn, user_id, &nick, &now)
+        crate::db::social_act(&conn, user_id, &nick, &action, &now)
     })
     .await;
     match result {
-        Ok(Ok(Ok(()))) => Json(serde_json::json!({ "added": true })).into_response(),
+        Ok(Ok(Ok(()))) => Json(serde_json::json!({ "ok": true })).into_response(),
         Ok(Ok(Err("that is you"))) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new("that is you")),
         )
             .into_response(),
-        Ok(Ok(Err("not findable"))) => (
+        Ok(Ok(Err("blocked"))) => (
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new("not findable")),
+            Json(ErrorResponse::new("blocked")),
+        )
+            .into_response(),
+        Ok(Ok(Err("no request"))) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("no request")),
         )
             .into_response(),
         Ok(Ok(Err(_))) => (

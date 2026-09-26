@@ -1442,6 +1442,64 @@ pub async fn post_share_ops(
     }
 }
 
+/// `GET /api/share/{token}/stream-open` — one lookup before a live socket.
+/// The edge relay forwards the browser cookie and sets `X-Mlc-Edge`.
+/// A publisher claims the edge while `live_edge` is empty. Frames after
+/// this do not come back here.
+pub async fn stream_open(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Response {
+    let caller = match resolve_caller_optional(state.clone(), &headers).await {
+        Ok(uid) => uid,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Internal error")),
+            )
+                .into_response();
+        }
+    };
+    let edge = headers
+        .get("x-mlc-edge")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Result<serde_json::Value, StatusCode>> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = crate::db::get_share_link(&conn, &token)? else {
+            return Ok(Err(StatusCode::NOT_FOUND));
+        };
+        if row.kind != "live" {
+            return Ok(Err(StatusCode::NOT_FOUND));
+        }
+        if crate::db::effective_share_tier(&conn, &row, caller)?.is_none() {
+            return Ok(Err(StatusCode::NOT_FOUND));
+        }
+        let publish = match caller {
+            Some(uid) => crate::db::share_caller_can_edit(&conn, &row, uid)?,
+            None => false,
+        };
+        let owner = if publish {
+            crate::db::claim_share_live_edge(&conn, &row.token, &edge)?.unwrap_or_default()
+        } else {
+            crate::db::share_live_edge(&conn, &row.token)?.unwrap_or_default()
+        };
+        Ok(Ok(serde_json::json!({ "publish": publish, "owner": owner })))
+    })
+    .await;
+    match result {
+        Ok(Ok(Ok(body))) => Json(body).into_response(),
+        Ok(Ok(Err(status))) => status.into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Database error")),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /api/share/{token}/ops?after=` — ops the caller may follow.
 /// Same open gate as `GET /api/share/{token}`. `reset` is true when `after`
 /// is past the head (the preset was republished and the log restarted);
