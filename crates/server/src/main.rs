@@ -180,13 +180,65 @@ struct ShareQueryParam {
 /// `og_tags_for_share`'s own `visibility == "private"` branch, not a lock
 /// screen (§8.5's lock screen is the OPEN-in-app case; a crawler is never
 /// signed in, so §8.5 is not reachable from here).
+fn share_preview_agent(ua: &str) -> bool {
+    if ua.is_empty() {
+        return true;
+    }
+    let ua = ua.to_ascii_lowercase();
+    [
+        "telegrambot",
+        "facebookexternalhit",
+        "facebot",
+        "twitterbot",
+        "slackbot",
+        "discordbot",
+        "whatsapp",
+        "vkshare",
+        "linkedinbot",
+        "googlebot",
+        "bingbot",
+        "yandex",
+        "baiduspider",
+        "embedly",
+        "pinterest",
+        "redditbot",
+        "applebot",
+    ]
+    .iter()
+    .any(|name| ua.contains(name))
+        || ua.contains("bot")
+        || ua.contains("crawler")
+        || ua.contains("spider")
+}
+
+/// Browser pasted `/?share=`. The token moves into a one-shot cookie and
+/// the address bar becomes `/`. The app turns that cookie into a tab.
+fn redirect_share_into_tab(token: &str) -> axum::response::Response {
+    let cookie = format!("mlc_share={token}; Max-Age=120; Path=/; Secure; SameSite=Lax");
+    axum::response::Response::builder()
+        .status(302)
+        .header("location", "/")
+        .header("set-cookie", cookie)
+        .header("cache-control", "no-store")
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
 async fn root_or_share_og(
     axum::extract::State(state): axum::extract::State<Arc<RootAppState>>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<ShareQueryParam>,
 ) -> axum::response::Response {
     let Some(token) = q.share.filter(|t| !t.is_empty()) else {
         return redirect_to_app_root().await;
     };
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !share_preview_agent(ua) && token.len() == 32 && token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return redirect_share_into_tab(&token);
+    }
 
     let index_path = std::path::Path::new(&state.static_dir).join("index.html");
     let html = match tokio::fs::read_to_string(&index_path).await {
