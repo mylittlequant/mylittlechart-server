@@ -1807,6 +1807,61 @@ pub fn user_id_for_nick(conn: &Connection, nick: &str) -> Result<Option<i64>> {
     .optional()
 }
 
+/// One account a share-settings nick box can grant. `label` is the
+/// display name when it differs from the nick, otherwise empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareNickHit {
+    pub nick: String,
+    pub label: String,
+}
+
+/// Accounts with a nick, excluding `caller_id`. A grant addresses a nick
+/// (`user_id_for_nick`), so an account that never set one cannot be a hit.
+/// Match is case-insensitive substring on the nick or the display name.
+/// Exact nick, then nick prefix, then anything else. A published DM key is
+/// not required — this is who may open a chart, not who can receive a message.
+pub fn search_share_nicks(
+    conn: &Connection,
+    caller_id: i64,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<ShareNickHit>> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() || limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let like = format!("%{escaped}%");
+    let prefix = format!("{escaped}%");
+    let mut stmt = conn.prepare(
+        "SELECT nick, display_name FROM users
+         WHERE id != ?1
+           AND nick IS NOT NULL AND nick != ''
+           AND (LOWER(nick) LIKE ?2 ESCAPE '\\' OR LOWER(display_name) LIKE ?2 ESCAPE '\\')
+         ORDER BY
+           CASE
+             WHEN LOWER(nick) = ?3 THEN 0
+             WHEN LOWER(nick) LIKE ?4 ESCAPE '\\' THEN 1
+             ELSE 2
+           END,
+           LOWER(nick)
+         LIMIT ?5",
+    )?;
+    let mut rows = stmt.query(params![caller_id, like, q, prefix, limit])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let nick: String = row.get(0)?;
+        let display_name: String = row.get(1)?;
+        let label = if display_name.is_empty() || display_name.eq_ignore_ascii_case(&nick) {
+            String::new()
+        } else {
+            display_name
+        };
+        out.push(ShareNickHit { nick, label });
+    }
+    Ok(out)
+}
+
 /// The label to show for a user: chosen nick, then `display_name`, then
 /// `public_id` — same fallback order as [`share_owner_label`]. Empty string
 /// only when the user row itself is gone (an orphaned reference).
@@ -9874,4 +9929,52 @@ pub(crate) fn init_test_conn() -> Connection {
     )
     .expect("test schema");
     conn
+}
+
+#[cfg(test)]
+mod share_nick_search_tests {
+    use super::search_share_nicks;
+    use rusqlite::Connection;
+
+    fn conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                nick TEXT,
+                display_name TEXT NOT NULL DEFAULT ''
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert(conn: &Connection, id: i64, nick: Option<&str>, display: &str) {
+        conn.execute(
+            "INSERT INTO users (id, nick, display_name) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, nick, display],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn search_share_nicks_finds_a_nick_without_a_dm_key_and_skips_the_caller() {
+        let conn = conn();
+        insert(&conn, 1, Some("zeng3ld"), "ZENG3LD");
+        insert(&conn, 32, Some("moderator"), "к кк");
+        insert(&conn, 37, Some("admin"), "KONSTANTIN NO");
+        insert(&conn, 2, None, "anti");
+
+        let as_admin = search_share_nicks(&conn, 37, "mod", 8).unwrap();
+        assert_eq!(as_admin.len(), 1);
+        assert_eq!(as_admin[0].nick, "moderator");
+        assert_eq!(as_admin[0].label, "к кк");
+
+        let self_search = search_share_nicks(&conn, 37, "admin", 8).unwrap();
+        assert!(self_search.is_empty());
+
+        // No nick: a grant cannot address this account, even if the display name matches.
+        let unnamed = search_share_nicks(&conn, 37, "anti", 8).unwrap();
+        assert!(unnamed.is_empty());
+    }
 }

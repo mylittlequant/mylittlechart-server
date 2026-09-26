@@ -36,7 +36,7 @@
 
 use axum::{
     body::Body,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -1249,6 +1249,61 @@ pub async fn create_share_grant(
             .into_response(),
         Ok(Err(e)) => {
             tracing::error!("DB error creating share grant: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ShareNickLookupQuery {
+    q: Option<String>,
+}
+
+/// `GET /api/share/lookup?q=` — nick search for share settings.
+///
+/// Any signed-in caller. Hits are accounts that have a nick, excluding the
+/// caller. A published messenger key is not required: this list is who can
+/// be granted on a chart, and `POST /api/share/{token}/grants` resolves the
+/// same nick. Fewer than two characters returns an empty list.
+pub async fn lookup_share_nicks(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ShareNickLookupQuery>,
+) -> Response {
+    let caller_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return auth_err(status),
+    };
+    let q: String = query.q.unwrap_or_default().trim().chars().take(64).collect();
+    if q.chars().count() < 2 {
+        return Json(serde_json::json!({ "users": [] })).into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::search_share_nicks(&conn, caller_id, &q, 8)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(users)) => {
+            let users: Vec<_> = users
+                .into_iter()
+                .map(|u| serde_json::json!({ "nick": u.nick, "label": u.label }))
+                .collect();
+            Json(serde_json::json!({ "users": users })).into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::error!("DB error in share nick lookup: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new("Database error")),

@@ -148,6 +148,8 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         )
         .route("/share/mine", get(share::list_my_shares))
         .route("/share/private-card.png", get(share::get_private_share_card))
+        // Static, before `/share/{token}` — a nick search, not a token.
+        .route("/share/lookup", get(share::lookup_share_nicks))
         .route(
             "/share/{token}",
             get(share::get_share).delete(share::delete_share).patch(share::update_share_policy),
