@@ -1347,6 +1347,8 @@ const SHARE_OP_KINDS: &[&str] = &[
     "primitive_delete",
     "indicator_upsert",
     "indicator_delete",
+    "gesture",
+    "viewport",
 ];
 const SHARE_OPS_MAX: usize = 24;
 const SHARE_OP_BODY_MAX: usize = 48_000;

@@ -346,6 +346,53 @@ pub async fn set_privacy(
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct AddFriendBody {
+    pub nick: String,
+}
+
+/// POST /api/account/friends — add a nick that search can already see.
+pub async fn add_friend(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AddFriendBody>,
+) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    let nick = body.nick;
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<std::result::Result<(), &'static str>> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::db::add_friend_by_nick(&conn, user_id, &nick, &now)
+    })
+    .await;
+    match result {
+        Ok(Ok(Ok(()))) => Json(serde_json::json!({ "added": true })).into_response(),
+        Ok(Ok(Err("that is you"))) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("that is you")),
+        )
+            .into_response(),
+        Ok(Ok(Err("not findable"))) => (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new("not findable")),
+        )
+            .into_response(),
+        Ok(Ok(Err(_))) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new("no such nick")),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Database error")),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /api/account/friend-invites — a link the other person opens to become friends.
 pub async fn create_friend_invite(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let user_id = match resolve_user_id(state.clone(), &headers).await {

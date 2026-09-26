@@ -3867,6 +3867,43 @@ pub fn accept_friend_invite(conn: &Connection, token: &str, accepter: i64, now: 
     Ok(true)
 }
 
+/// Mutual friendship by exact nick. `Err` text is the refusal the route maps
+/// to a status. Already-friends is success.
+pub fn add_friend_by_nick(conn: &Connection, caller: i64, nick: &str, now: &str) -> Result<std::result::Result<(), &'static str>> {
+    let nick = nick.trim();
+    if nick.is_empty() {
+        return Ok(Err("no such nick"));
+    }
+    let target: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, nick FROM users WHERE nick IS NOT NULL AND LOWER(nick) = LOWER(?1)",
+            params![nick],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((target, canonical)) = target else {
+        return Ok(Err("no such nick"));
+    };
+    if canonical.is_empty() {
+        return Ok(Err("no such nick"));
+    }
+    if target == caller {
+        return Ok(Err("that is you"));
+    }
+    if !visible_in_search(conn, caller, target)? {
+        return Ok(Err("not findable"));
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
+        params![caller, target, now],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
+        params![target, caller, now],
+    )?;
+    Ok(Ok(()))
+}
+
 /// Owner sets whether this token is a live channel or a cadence link.
 pub fn set_share_live(conn: &Connection, token: &str, owner_user_id: i64, live: bool) -> Result<bool> {
     let n = conn.execute(
@@ -4470,6 +4507,12 @@ pub fn append_share_ops(
     let mut seq = head;
     for (kind, object_id, body) in ops {
         seq = seq.saturating_add(1);
+        if kind == "gesture" || kind == "viewport" {
+            conn.execute(
+                "DELETE FROM share_ops WHERE token = ?1 AND kind = ?2",
+                params![token, kind],
+            )?;
+        }
         conn.execute(
             "INSERT INTO share_ops (token, seq, user_id, kind, object_id, body, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
