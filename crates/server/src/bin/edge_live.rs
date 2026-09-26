@@ -113,22 +113,21 @@ fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> String {
     headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
 }
 
-async fn open_or_bridge(app: Arc<App>, token: String, sock: WebSocket, cookie: String, auth: String, ua: String) {
-    let mut publish = false;
-    let mut owner = String::new();
-    for _ in 0..40 {
-        let Some((ok, pub_now, owner_now)) = stream_open(&app, &token, &cookie, &auth, &ua).await else {
-            return;
-        };
-        if !ok {
-            return;
-        }
-        publish = pub_now;
-        owner = owner_now;
-        if publish || !owner.is_empty() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+async fn open_or_bridge(app: Arc<App>, token: String, mut sock: WebSocket, cookie: String, auth: String, ua: String) {
+    let hello = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv()).await;
+    let Ok(Some(Ok(Message::Text(text)))) = hello else {
+        return;
+    };
+    let value: serde_json::Value = serde_json::from_str(text.as_str()).unwrap_or_default();
+    if value.get("t").and_then(|v| v.as_str()) != Some("hello") {
+        return;
+    }
+    let ticket = value.get("k").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let Some((ok, publish, owner)) = stream_open(&app, &token, &cookie, &auth, &ua, &ticket).await else {
+        return;
+    };
+    if !ok {
+        return;
     }
     eprintln!("share-live {token} publish={publish} owner={owner} edge={}", app.cfg.edge);
     if !publish && owner.is_empty() {
@@ -141,10 +140,12 @@ async fn open_or_bridge(app: Arc<App>, token: String, sock: WebSocket, cookie: S
     pipe_to_peer(&app, &token, sock, publish).await;
 }
 
-async fn stream_open(app: &App, token: &str, cookie: &str, auth: &str, ua: &str) -> Option<(bool, bool, String)> {
+async fn stream_open(app: &App, token: &str, cookie: &str, auth: &str, ua: &str, ticket: &str) -> Option<(bool, bool, String)> {
     let url = format!("{}/api/share/{token}/stream-open", app.cfg.backend.trim_end_matches('/'));
     let mut req = app.http.get(&url).header("X-Mlc-Edge", &app.cfg.edge);
-    if !cookie.is_empty() {
+    if !ticket.is_empty() {
+        req = req.header("x-mlc-ticket", ticket);
+    } else if !cookie.is_empty() {
         req = req.header("cookie", cookie);
     }
     if !auth.is_empty() {

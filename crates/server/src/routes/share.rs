@@ -1446,11 +1446,30 @@ pub async fn post_share_ops(
 /// The edge relay forwards the browser cookie and sets `X-Mlc-Edge`.
 /// A publisher claims the edge while `live_edge` is empty. Frames after
 /// this do not come back here.
+fn edge_public_origin(edge: &str) -> &'static str {
+    match edge {
+        "utah" => "https://utah.mylittlechart.org",
+        "ams" => "https://ams.mylittlechart.org",
+        _ => "",
+    }
+}
+
 pub async fn stream_open(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Response {
+    if let Some(ticket) = headers.get("x-mlc-ticket").and_then(|v| v.to_str().ok()) {
+        if let Some((publish, owner)) = state.lookup_live_ticket(ticket, &token) {
+            return Json(serde_json::json!({
+                "publish": publish,
+                "owner": owner,
+                "origin": edge_public_origin(&owner),
+            }))
+            .into_response();
+        }
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let caller = match resolve_caller_optional(state.clone(), &headers).await {
         Ok(uid) => uid,
         Err(_) => {
@@ -1486,7 +1505,13 @@ pub async fn stream_open(
         } else {
             crate::db::share_live_edge(&conn, &row.token)?.unwrap_or_default()
         };
-        Ok(Ok(serde_json::json!({ "publish": publish, "owner": owner })))
+        let ticket = state.mint_live_ticket(&row.token, publish, &owner);
+        Ok(Ok(serde_json::json!({
+            "publish": publish,
+            "owner": owner,
+            "origin": edge_public_origin(&owner),
+            "ticket": ticket,
+        })))
     })
     .await;
     match result {
