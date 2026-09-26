@@ -29,11 +29,17 @@ struct Cfg {
     wg_bind: String,
 }
 
+struct Sub {
+    id: u64,
+    tx: mpsc::UnboundedSender<String>,
+}
+
 struct Room {
     last_g: String,
     last_v: String,
     last_p: String,
-    subs: Vec<mpsc::UnboundedSender<String>>,
+    next_id: u64,
+    subs: Vec<Sub>,
 }
 
 struct App {
@@ -97,56 +103,36 @@ async fn socket(
         let publish = q.publish == 1;
         return ws.on_upgrade(move |sock| host_room(app, token, sock, publish)).into_response();
     }
-    let cookie = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let auth = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    ws.on_upgrade(move |sock| open_or_bridge(app, token, sock, cookie, auth)).into_response()
+    let cookie = header_str(&headers, axum::http::header::COOKIE);
+    let auth = header_str(&headers, axum::http::header::AUTHORIZATION);
+    let ua = header_str(&headers, axum::http::header::USER_AGENT);
+    ws.on_upgrade(move |sock| open_or_bridge(app, token, sock, cookie, auth, ua)).into_response()
 }
 
-async fn open_or_bridge(app: Arc<App>, token: String, sock: WebSocket, cookie: String, auth: String) {
-    let url = format!("{}/api/share/{token}/stream-open", app.cfg.backend.trim_end_matches('/'));
-    let mut req = app.http.get(&url).header("X-Mlc-Edge", &app.cfg.edge);
-    if !cookie.is_empty() {
-        req = req.header("cookie", &cookie);
-    }
-    if !auth.is_empty() {
-        req = req.header("authorization", &auth);
-    }
-    let Ok(resp) = req.send().await else {
-        return;
-    };
-    if !resp.status().is_success() {
-        return;
-    }
-    let Ok(body) = resp.json::<serde_json::Value>().await else {
-        return;
-    };
-    let publish = body.get("publish").and_then(|v| v.as_bool()).unwrap_or(false);
-    let mut owner = body.get("owner").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if !publish && owner.is_empty() {
-        for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            let again = format!("{}/api/share/{token}/stream-open", app.cfg.backend.trim_end_matches('/'));
-            let mut req = app.http.get(&again).header("X-Mlc-Edge", &app.cfg.edge);
-            if !cookie.is_empty() {
-                req = req.header("cookie", &cookie);
-            }
-            if let Ok(resp) = req.send().await {
-                if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    owner = body.get("owner").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if !owner.is_empty() {
-                        break;
-                    }
-                }
-            }
+fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> String {
+    headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+}
+
+async fn open_or_bridge(app: Arc<App>, token: String, sock: WebSocket, cookie: String, auth: String, ua: String) {
+    let mut publish = false;
+    let mut owner = String::new();
+    for _ in 0..40 {
+        let Some((ok, pub_now, owner_now)) = stream_open(&app, &token, &cookie, &auth, &ua).await else {
+            return;
+        };
+        if !ok {
+            return;
         }
+        publish = pub_now;
+        owner = owner_now;
+        if publish || !owner.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    eprintln!("share-live {token} publish={publish} owner={owner} edge={}", app.cfg.edge);
+    if !publish && owner.is_empty() {
+        return;
     }
     if owner.is_empty() || owner == app.cfg.edge {
         host_room(app, token, sock, publish).await;
@@ -155,14 +141,39 @@ async fn open_or_bridge(app: Arc<App>, token: String, sock: WebSocket, cookie: S
     pipe_to_peer(&app, &token, sock, publish).await;
 }
 
+async fn stream_open(app: &App, token: &str, cookie: &str, auth: &str, ua: &str) -> Option<(bool, bool, String)> {
+    let url = format!("{}/api/share/{token}/stream-open", app.cfg.backend.trim_end_matches('/'));
+    let mut req = app.http.get(&url).header("X-Mlc-Edge", &app.cfg.edge);
+    if !cookie.is_empty() {
+        req = req.header("cookie", cookie);
+    }
+    if !auth.is_empty() {
+        req = req.header("authorization", auth);
+    }
+    if !ua.is_empty() {
+        req = req.header("user-agent", ua);
+    }
+    let resp = req.send().await.ok()?;
+    let ok = resp.status().is_success();
+    if !ok {
+        eprintln!("share-live stream-open {} {}", token, resp.status());
+        return Some((false, false, String::new()));
+    }
+    let body = resp.json::<serde_json::Value>().await.ok()?;
+    let publish = body.get("publish").and_then(|v| v.as_bool()).unwrap_or(false);
+    let owner = body.get("owner").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    Some((true, publish, owner))
+}
+
 async fn host_room(app: Arc<App>, token: String, mut sock: WebSocket, publish: bool) {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    {
+    let my_id = {
         let mut rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
         let room = rooms.entry(token.clone()).or_insert_with(|| Room {
             last_g: String::new(),
             last_v: String::new(),
             last_p: String::new(),
+            next_id: 1,
             subs: Vec::new(),
         });
         if !room.last_g.is_empty() {
@@ -174,8 +185,11 @@ async fn host_room(app: Arc<App>, token: String, mut sock: WebSocket, publish: b
         if !room.last_p.is_empty() {
             let _ = tx.send(room.last_p.clone());
         }
-        room.subs.push(tx);
-    }
+        let my_id = room.next_id;
+        room.next_id = room.next_id.wrapping_add(1);
+        room.subs.push(Sub { id: my_id, tx });
+        my_id
+    };
     loop {
         tokio::select! {
             incoming = sock.recv() => {
@@ -194,7 +208,7 @@ async fn host_room(app: Arc<App>, token: String, mut sock: WebSocket, publish: b
                 } else if text.contains("\"t\":\"p\"") {
                     room.last_p = text.clone();
                 }
-                room.subs.retain(|sub| sub.send(text.clone()).is_ok());
+                room.subs.retain(|sub| sub.id == my_id || sub.tx.send(text.clone()).is_ok());
             }
             out = rx.recv() => {
                 let Some(text) = out else { break };
