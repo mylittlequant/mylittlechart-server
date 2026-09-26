@@ -1807,19 +1807,18 @@ pub fn user_id_for_nick(conn: &Connection, nick: &str) -> Result<Option<i64>> {
     .optional()
 }
 
-/// One account a share-settings nick box can grant. `label` is the
-/// display name when it differs from the nick, otherwise empty.
+/// One account a share-settings nick box can grant. `label` stays empty:
+/// the box shows the nick and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareNickHit {
     pub nick: String,
     pub label: String,
 }
 
-/// Accounts with a nick, excluding `caller_id`. A grant addresses a nick
-/// (`user_id_for_nick`), so an account that never set one cannot be a hit.
-/// Match is case-insensitive substring on the nick or the display name.
-/// Exact nick, then nick prefix, then anything else. A published DM key is
-/// not required — this is who may open a chart, not who can receive a message.
+/// Accounts with a nick, excluding `caller_id`. Match is case-insensitive
+/// substring on the nick only. An account with no nick is not a hit, and a
+/// display name is neither searched nor returned. Exact nick, then nick
+/// prefix, then substring. A published DM key is not required.
 pub fn search_share_nicks(
     conn: &Connection,
     caller_id: i64,
@@ -1834,10 +1833,10 @@ pub fn search_share_nicks(
     let like = format!("%{escaped}%");
     let prefix = format!("{escaped}%");
     let mut stmt = conn.prepare(
-        "SELECT nick, display_name FROM users
+        "SELECT nick FROM users
          WHERE id != ?1
            AND nick IS NOT NULL AND nick != ''
-           AND (LOWER(nick) LIKE ?2 ESCAPE '\\' OR LOWER(display_name) LIKE ?2 ESCAPE '\\')
+           AND LOWER(nick) LIKE ?2 ESCAPE '\\'
          ORDER BY
            CASE
              WHEN LOWER(nick) = ?3 THEN 0
@@ -1851,13 +1850,7 @@ pub fn search_share_nicks(
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         let nick: String = row.get(0)?;
-        let display_name: String = row.get(1)?;
-        let label = if display_name.is_empty() || display_name.eq_ignore_ascii_case(&nick) {
-            String::new()
-        } else {
-            display_name
-        };
-        out.push(ShareNickHit { nick, label });
+        out.push(ShareNickHit { nick, label: String::new() });
     }
     Ok(out)
 }
@@ -9968,12 +9961,16 @@ mod share_nick_search_tests {
         let as_admin = search_share_nicks(&conn, 37, "mod", 8).unwrap();
         assert_eq!(as_admin.len(), 1);
         assert_eq!(as_admin[0].nick, "moderator");
-        assert_eq!(as_admin[0].label, "к кк");
+        assert_eq!(as_admin[0].label, "");
 
         let self_search = search_share_nicks(&conn, 37, "admin", 8).unwrap();
         assert!(self_search.is_empty());
 
-        // No nick: a grant cannot address this account, even if the display name matches.
+        // Display name is not a search key and is not returned.
+        let by_display = search_share_nicks(&conn, 37, "к", 8).unwrap();
+        assert!(by_display.is_empty());
+
+        // No nick: not searchable, even when the display name matches the query.
         let unnamed = search_share_nicks(&conn, 37, "anti", 8).unwrap();
         assert!(unnamed.is_empty());
     }
