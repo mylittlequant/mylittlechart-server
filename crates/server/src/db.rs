@@ -589,6 +589,25 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         "ALTER TABLE share_links ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
         [],
     );
+    // Monotonic op log head for live follow and co-edit. Republishing the
+    // preset resets this to 0 and deletes the log: the preset is the new
+    // baseline, later ops are the delta.
+    let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN op_seq INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS share_ops (
+            token TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            object_id TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (token, seq)
+        );",
+    );
     // Safe migration: per-account/group share rights (§1's new `ShareTier`
     // core). NULL for every existing `object_grants` row — a grant with no
     // group target simply never matches via `grant_group_members`, the same
@@ -3372,6 +3391,9 @@ pub struct ShareLinkRow {
     /// Bumps when the author republishes the chart onto this token. The
     /// clipboard URL carries it as `v` so a messenger refetches the card.
     pub revision: i64,
+    /// Head of `share_ops` for this token. 0 means no ops since the last
+    /// preset publish.
+    pub op_seq: i64,
 }
 
 impl ShareLinkRow {
@@ -3412,6 +3434,7 @@ fn share_link_from_row(row: &rusqlite::Row<'_>) -> Result<ShareLinkRow> {
         pinned: row.get::<_, i64>(15)? != 0,
         chart_id: row.get(16)?,
         revision: row.get(17)?,
+        op_seq: row.get(18)?,
     })
 }
 
@@ -3536,6 +3559,7 @@ pub fn publish_live_share(
                 user_id,
             ],
         )?;
+        reset_share_ops(conn, &token)?;
         return Ok((token, next, expires_at.to_string(), false));
     }
     let token = create_share_link(
@@ -3578,7 +3602,7 @@ pub fn set_share_blob_path(conn: &Connection, token: &str, blob_path: &str) -> R
 pub fn get_share_link(conn: &Connection, token: &str) -> Result<Option<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.query_row(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision, op_seq
          FROM share_links
          WHERE token = ?1 AND revoked = 0 AND expires_at > ?2",
         params![token, now],
@@ -3610,7 +3634,7 @@ pub fn share_usage(conn: &Connection, user_id: i64) -> Result<(u64, u64)> {
 pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision, op_seq
          FROM share_links
          WHERE user_id = ?1 AND revoked = 0 AND expires_at > ?2
          ORDER BY created_at DESC",
@@ -4125,6 +4149,13 @@ pub fn effective_share_tier(
         let mut rows = stmt.query(params![row.token, now, caller_id])?;
         while let Some(r) = rows.next()? {
             let right: String = r.get(0)?;
+            // `edit` is not a ShareTier. It lets the grantee open a private
+            // link (at least View) and is checked again by
+            // `share_caller_can_edit`. It does not grant clone.
+            if right == "edit" {
+                best = Some(best.map_or(ShareTier::View, |b: ShareTier| b.max(ShareTier::View)));
+                continue;
+            }
             if let Some(tier) = ShareTier::from_str(&right) {
                 best = Some(best.map_or(tier, |b: ShareTier| b.max(tier)));
             }
@@ -4166,6 +4197,7 @@ pub fn upsert_share_grant(
         .query_row(
             "SELECT id FROM object_grants
              WHERE object_kind = 'chart' AND object_id = ?1
+               AND right != 'edit'
                AND ((grantee_user_id IS NULL AND ?2 IS NULL) OR grantee_user_id = ?2)
                AND ((grantee_group_id IS NULL AND ?3 IS NULL) OR grantee_group_id = ?3)",
             params![token, grantee_user_id, grantee_group_id],
@@ -4187,6 +4219,164 @@ pub fn upsert_share_grant(
         params![token, owner_user_id, grantee_user_id, grantee_group_id, tier.as_str(), expires_at, now],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// One applied chart op. `seq` is the token's monotonic head at insert time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareOpRow {
+    pub seq: i64,
+    pub user_id: i64,
+    pub kind: String,
+    pub object_id: String,
+    pub body: String,
+}
+
+/// Drop the op log and zero the head. The preset just published is the
+/// baseline; a subscriber whose cursor is past the new head treats that as
+/// a reset and reads from 0.
+pub fn reset_share_ops(conn: &Connection, token: &str) -> Result<()> {
+    conn.execute("DELETE FROM share_ops WHERE token = ?1", params![token])?;
+    conn.execute(
+        "UPDATE share_links SET op_seq = 0 WHERE token = ?1",
+        params![token],
+    )?;
+    Ok(())
+}
+
+/// Owner, or a live `object_grants` row with `right = 'edit'`. Clone and
+/// view grants do not count. Screenshot links are not editable.
+pub fn share_caller_can_edit(conn: &Connection, row: &ShareLinkRow, caller: i64) -> Result<bool> {
+    if row.kind != "live" {
+        return Ok(false);
+    }
+    if caller == row.user_id {
+        return Ok(true);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let hit: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM object_grants
+             WHERE object_kind = 'chart' AND object_id = ?1
+               AND right = 'edit'
+               AND (expires_at IS NULL OR expires_at > ?2)
+               AND (
+                 grantee_user_id = ?3
+                 OR grantee_group_id IN (SELECT group_id FROM grant_group_members WHERE user_id = ?3)
+               )
+             LIMIT 1",
+            params![row.token, now, caller],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(hit.is_some())
+}
+
+/// Insert an edit grant without replacing a view/clone row for the same nick.
+pub fn upsert_share_edit_grant(
+    conn: &Connection,
+    token: &str,
+    owner_user_id: i64,
+    grantee_user_id: Option<i64>,
+    grantee_group_id: Option<i64>,
+    expires_at: Option<&str>,
+    now: &str,
+) -> Result<i64> {
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM object_grants
+             WHERE object_kind = 'chart' AND object_id = ?1
+               AND right = 'edit'
+               AND ((grantee_user_id IS NULL AND ?2 IS NULL) OR grantee_user_id = ?2)
+               AND ((grantee_group_id IS NULL AND ?3 IS NULL) OR grantee_group_id = ?3)",
+            params![token, grantee_user_id, grantee_group_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        conn.execute(
+            "UPDATE object_grants SET expires_at = ?1, created_at = ?2 WHERE id = ?3",
+            params![expires_at, now, id],
+        )?;
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT INTO object_grants (object_kind, object_id, owner_user_id, grantee_user_id, grantee_group_id, right, expires_at, created_at)
+         VALUES ('chart', ?1, ?2, ?3, ?4, 'edit', ?5, ?6)",
+        params![token, owner_user_id, grantee_user_id, grantee_group_id, expires_at, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Append ops in one transaction. Returns the assigned seqs, in order.
+/// Empty input returns the current head as an empty vec and does not bump.
+pub fn append_share_ops(
+    conn: &Connection,
+    token: &str,
+    user_id: i64,
+    ops: &[(String, String, String)],
+    now: &str,
+) -> Result<Vec<i64>> {
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The caller holds the identity connection lock for this whole call,
+    // so two appends cannot interleave.
+    let head: i64 = conn.query_row(
+        "SELECT op_seq FROM share_links WHERE token = ?1",
+        params![token],
+        |row| row.get(0),
+    )?;
+    let mut seqs = Vec::with_capacity(ops.len());
+    let mut seq = head;
+    for (kind, object_id, body) in ops {
+        seq = seq.saturating_add(1);
+        conn.execute(
+            "INSERT INTO share_ops (token, seq, user_id, kind, object_id, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![token, seq, user_id, kind, object_id, body, now],
+        )?;
+        seqs.push(seq);
+    }
+    conn.execute(
+        "UPDATE share_links SET op_seq = ?1 WHERE token = ?2",
+        params![seq, token],
+    )?;
+    Ok(seqs)
+}
+
+/// Ops with `seq > after`, ascending, at most `limit`.
+pub fn list_share_ops_after(
+    conn: &Connection,
+    token: &str,
+    after: i64,
+    limit: i64,
+) -> Result<(i64, Vec<ShareOpRow>)> {
+    let head: i64 = conn
+        .query_row(
+            "SELECT op_seq FROM share_links WHERE token = ?1",
+            params![token],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let mut stmt = conn.prepare(
+        "SELECT seq, user_id, kind, object_id, body FROM share_ops
+         WHERE token = ?1 AND seq > ?2
+         ORDER BY seq ASC
+         LIMIT ?3",
+    )?;
+    let mut rows = stmt.query(params![token, after, limit])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(ShareOpRow {
+            seq: row.get(0)?,
+            user_id: row.get(1)?,
+            kind: row.get(2)?,
+            object_id: row.get(3)?,
+            body: row.get(4)?,
+        });
+    }
+    Ok((head, out))
 }
 
 // ============================================================================
@@ -7159,7 +7349,18 @@ mod tests {
                 allow_forward INTEGER,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 chart_id TEXT NOT NULL DEFAULT '',
-                revision INTEGER NOT NULL DEFAULT 1
+                revision INTEGER NOT NULL DEFAULT 1,
+                op_seq INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE share_ops (
+                token TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (token, seq)
             );
 
             CREATE TABLE auth_tokens (
@@ -9973,5 +10174,104 @@ mod share_nick_search_tests {
         // No nick: not searchable, even when the display name matches the query.
         let unnamed = search_share_nicks(&conn, 37, "anti", 8).unwrap();
         assert!(unnamed.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod share_op_tests {
+    use super::{append_share_ops, list_share_ops_after, share_caller_can_edit, upsert_share_edit_grant, upsert_share_grant, ShareTier};
+    use rusqlite::Connection;
+
+    fn conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE share_links (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                op_seq INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE share_ops (
+                token TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (token, seq)
+            );
+            CREATE TABLE object_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                object_kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                owner_user_id INTEGER NOT NULL,
+                grantee_user_id INTEGER,
+                grantee_group_id INTEGER,
+                right TEXT NOT NULL,
+                expires_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE grant_group_members (
+                group_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO share_links (token, user_id, kind) VALUES ('t', 1, 'live')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn ops_append_in_order_and_edit_grant_does_not_replace_clone() {
+        let conn = conn();
+        let seqs = append_share_ops(
+            &conn,
+            "t",
+            1,
+            &[
+                ("primitive_upsert".into(), "p:1".into(), "{}".into()),
+                ("primitive_delete".into(), "p:1".into(), String::new()),
+            ],
+            "now",
+        )
+        .unwrap();
+        assert_eq!(seqs, vec![1, 2]);
+        let (head, page) = list_share_ops_after(&conn, "t", 1, 10).unwrap();
+        assert_eq!(head, 2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].kind, "primitive_delete");
+
+        let link = super::ShareLinkRow {
+            token: "t".into(),
+            user_id: 1,
+            kind: "live".into(),
+            title: String::new(),
+            preset_json: String::new(),
+            blob_path: String::new(),
+            blob_bytes: 0,
+            created_at: String::new(),
+            expires_at: "2999".into(),
+            clone_allowed: true,
+            interaction: "view".into(),
+            protected_json: "[]".into(),
+            visibility: "private".into(),
+            preview_path: String::new(),
+            allow_forward: None,
+            pinned: false,
+            chart_id: String::new(),
+            revision: 1,
+            op_seq: 2,
+        };
+        assert!(!share_caller_can_edit(&conn, &link, 2).unwrap());
+        upsert_share_grant(&conn, "t", 1, Some(2), None, ShareTier::Clone, None, "now").unwrap();
+        upsert_share_edit_grant(&conn, "t", 1, Some(2), None, None, "now").unwrap();
+        assert!(share_caller_can_edit(&conn, &link, 2).unwrap());
+        let tier = super::effective_share_tier(&conn, &link, Some(2)).unwrap();
+        assert_eq!(tier, Some(ShareTier::Clone));
     }
 }

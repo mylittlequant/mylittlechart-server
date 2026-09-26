@@ -164,6 +164,10 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
             get(share::list_share_grants).post(share::create_share_grant),
         )
         .route("/share/{token}/grants/{grant_id}", delete(share::delete_share_grant))
+        .route(
+            "/share/{token}/ops",
+            get(share::get_share_ops).post(share::post_share_ops),
+        )
         // Per-link preview image + OG injection (§9) — owner-only upload,
         // public serve (same 404 opacity discipline as /share/{token}/png).
         .route(

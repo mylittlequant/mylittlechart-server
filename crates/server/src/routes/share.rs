@@ -760,9 +760,9 @@ async fn fetch_public_share_with_tier(
     state: Arc<AppState>,
     token: String,
     caller: Option<i64>,
-) -> Result<Option<(crate::db::ShareLinkRow, String, Option<crate::db::ShareTier>)>, Response> {
+) -> Result<Option<(crate::db::ShareLinkRow, String, Option<crate::db::ShareTier>, bool)>, Response> {
     let result = tokio::task::spawn_blocking(
-        move || -> rusqlite::Result<Option<(crate::db::ShareLinkRow, String, Option<crate::db::ShareTier>)>> {
+        move || -> rusqlite::Result<Option<(crate::db::ShareLinkRow, String, Option<crate::db::ShareTier>, bool)>> {
             let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
             let row = crate::db::get_share_link(&conn, &token)?;
             match row {
@@ -770,7 +770,11 @@ async fn fetch_public_share_with_tier(
                     let owner = crate::db::share_owner_label(&conn, row.user_id)?
                         .unwrap_or_default();
                     let tier = crate::db::effective_share_tier(&conn, &row, caller)?;
-                    Ok(Some((row, owner, tier)))
+                    let can_edit = match caller {
+                        Some(uid) => crate::db::share_caller_can_edit(&conn, &row, uid)?,
+                        None => false,
+                    };
+                    Ok(Some((row, owner, tier, can_edit)))
                 }
                 None => Ok(None),
             }
@@ -803,12 +807,12 @@ async fn fetch_public_share_with_tier(
 /// reachable by a non-owner recipient holding that grant, who must NOT see
 /// `"edit"` in their own rights list (co-editing is out of scope — the
 /// owner is the only caller `is_owner` is ever true for).
-fn rights_for_tier(tier: crate::db::ShareTier, is_owner: bool) -> Vec<&'static str> {
+fn rights_for_tier(tier: crate::db::ShareTier, can_edit: bool) -> Vec<&'static str> {
     let mut rights = vec!["read"];
     if tier >= crate::db::ShareTier::Clone {
         rights.push("clone");
     }
-    if is_owner {
+    if can_edit {
         rights.push("edit");
     }
     rights
@@ -865,7 +869,7 @@ pub async fn get_share(
         }
     };
 
-    let (row, owner, tier) = match fetch_public_share_with_tier(state, token, caller).await {
+    let (row, owner, tier, can_edit) = match fetch_public_share_with_tier(state, token, caller).await {
         Ok(Some(found)) => found,
         Ok(None) => return share_not_found(),
         Err(resp) => return resp,
@@ -878,8 +882,7 @@ pub async fn get_share(
         )
             .into_response();
     };
-    let is_owner = caller == Some(row.user_id);
-    let rights = rights_for_tier(tier, is_owner);
+    let rights = rights_for_tier(tier, can_edit);
     let clone_protected = tier == crate::db::ShareTier::CloneProtected;
     // [Rev 3] The resolved forwarding flag — explicit if the owner ever set
     // one, otherwise `visibility`'s own default (`ShareLinkRow::
@@ -924,6 +927,7 @@ pub async fn get_share(
                 "clone_allowed": row.clone_allowed,
                 "pinned": row.pinned,
                 "revision": row.revision,
+                "op_seq": row.op_seq,
             }))
             .into_response()
         }
@@ -1172,12 +1176,20 @@ pub async fn create_share_grant(
         )
             .into_response();
     }
-    let Some(tier) = crate::db::ShareTier::from_str(&body.tier) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new("invalid tier")),
-        )
-            .into_response();
+    let edit_grant = body.tier == "edit";
+    let tier = if edit_grant {
+        None
+    } else {
+        match crate::db::ShareTier::from_str(&body.tier) {
+            Some(tier) => Some(tier),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new("invalid tier")),
+                )
+                    .into_response();
+            }
+        }
     };
 
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<CreateShareGrantOutcome> {
@@ -1213,16 +1225,28 @@ pub async fn create_share_grant(
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        let id = crate::db::upsert_share_grant(
-            &conn,
-            &row.token,
-            user_id,
-            grantee_user_id,
-            grantee_group_id,
-            tier,
-            body.expires_at.as_deref(),
-            &now,
-        )?;
+        let id = if edit_grant {
+            crate::db::upsert_share_edit_grant(
+                &conn,
+                &row.token,
+                user_id,
+                grantee_user_id,
+                grantee_group_id,
+                body.expires_at.as_deref(),
+                &now,
+            )?
+        } else {
+            crate::db::upsert_share_grant(
+                &conn,
+                &row.token,
+                user_id,
+                grantee_user_id,
+                grantee_group_id,
+                tier.expect("tier checked before spawn"),
+                body.expires_at.as_deref(),
+                &now,
+            )?
+        };
         Ok(CreateShareGrantOutcome::Created { grant_id: id })
     })
     .await;
@@ -1304,6 +1328,179 @@ pub async fn lookup_share_nicks(
         }
         Ok(Err(e)) => {
             tracing::error!("DB error in share nick lookup: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+const SHARE_OP_KINDS: &[&str] = &[
+    "primitive_upsert",
+    "primitive_delete",
+    "indicator_upsert",
+    "indicator_delete",
+];
+const SHARE_OPS_MAX: usize = 24;
+const SHARE_OP_BODY_MAX: usize = 48_000;
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ShareOpsQuery {
+    after: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ShareOpIn {
+    kind: String,
+    object_id: String,
+    #[serde(default)]
+    body: String,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ShareOpsBody {
+    ops: Vec<ShareOpIn>,
+}
+
+/// `POST /api/share/{token}/ops` — append chart ops. Owner, or an edit
+/// grant. A view or clone grant is not enough. Screenshot tokens 404.
+pub async fn post_share_ops(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    Json(body): Json<ShareOpsBody>,
+) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return auth_err(status),
+    };
+    if body.ops.is_empty() || body.ops.len() > SHARE_OPS_MAX {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("ops must contain 1 to 24 entries")),
+        )
+            .into_response();
+    }
+    let mut cleaned = Vec::with_capacity(body.ops.len());
+    for op in body.ops {
+        if !SHARE_OP_KINDS.contains(&op.kind.as_str()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("invalid op kind")),
+            )
+                .into_response();
+        }
+        if op.object_id.is_empty() || op.object_id.len() > 80 || op.body.len() > SHARE_OP_BODY_MAX {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("invalid op")),
+            )
+                .into_response();
+        }
+        cleaned.push((op.kind, op.object_id, op.body));
+    }
+
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Result<Vec<i64>, StatusCode>> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = crate::db::get_share_link(&conn, &token)? else {
+            return Ok(Err(StatusCode::NOT_FOUND));
+        };
+        if row.kind != "live" || !crate::db::share_caller_can_edit(&conn, &row, user_id)? {
+            return Ok(Err(StatusCode::FORBIDDEN));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let seqs = crate::db::append_share_ops(&conn, &row.token, user_id, &cleaned, &now)?;
+        Ok(Ok(seqs))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Ok(seqs))) => Json(serde_json::json!({ "seqs": seqs })).into_response(),
+        Ok(Ok(Err(status))) => status.into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error appending share ops: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/share/{token}/ops?after=` — ops the caller may follow.
+/// Same open gate as `GET /api/share/{token}`. `reset` is true when `after`
+/// is past the head (the preset was republished and the log restarted);
+/// the ops in that response are everything since the new baseline.
+pub async fn get_share_ops(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    Query(query): Query<ShareOpsQuery>,
+) -> Response {
+    let caller = match resolve_caller_optional(state.clone(), &headers).await {
+        Ok(uid) => uid,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Internal error")),
+            )
+                .into_response();
+        }
+    };
+    let after = query.after.unwrap_or(0).max(0);
+
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Result<serde_json::Value, StatusCode>> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = crate::db::get_share_link(&conn, &token)? else {
+            return Ok(Err(StatusCode::NOT_FOUND));
+        };
+        if row.kind != "live" {
+            return Ok(Err(StatusCode::NOT_FOUND));
+        }
+        let tier = crate::db::effective_share_tier(&conn, &row, caller)?;
+        if tier.is_none() {
+            return Ok(Err(StatusCode::NOT_FOUND));
+        }
+        let can_send = match caller {
+            Some(uid) => crate::db::share_caller_can_edit(&conn, &row, uid)?,
+            None => false,
+        };
+        let reset = after > row.op_seq;
+        let read_after = if reset { 0 } else { after };
+        let (head, ops) = crate::db::list_share_ops_after(&conn, &row.token, read_after, 100)?;
+        let ops: Vec<_> = ops
+            .into_iter()
+            .map(|op| {
+                serde_json::json!({
+                    "seq": op.seq,
+                    "kind": op.kind,
+                    "object_id": op.object_id,
+                    "body": op.body,
+                })
+            })
+            .collect();
+        Ok(Ok(serde_json::json!({ "head": head, "reset": reset, "can_send": can_send, "ops": ops })))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Ok(body))) => Json(body).into_response(),
+        Ok(Ok(Err(status))) => status.into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error reading share ops: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new("Database error")),
@@ -2536,7 +2733,18 @@ mod tests {
                 allow_forward INTEGER,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 chart_id TEXT NOT NULL DEFAULT '',
-                revision INTEGER NOT NULL DEFAULT 1
+                revision INTEGER NOT NULL DEFAULT 1,
+                op_seq INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE share_ops (
+                token TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (token, seq)
             );
 
             CREATE TABLE grant_groups (
@@ -3168,6 +3376,7 @@ mod tests {
             pinned: false,
             chart_id: String::new(),
             revision: 1,
+            op_seq: 0,
         };
 
         let tags = og_tags_for_share(&base, "");
@@ -3243,6 +3452,7 @@ mod tests {
             pinned: row.pinned,
             chart_id: row.chart_id.clone(),
             revision: row.revision,
+            op_seq: row.op_seq,
         }
     }
 
