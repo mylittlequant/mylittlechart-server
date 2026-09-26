@@ -103,7 +103,7 @@ async fn socket(
             return StatusCode::FORBIDDEN.into_response();
         }
         let publish = q.publish == 1;
-        return ws.on_upgrade(move |sock| host_room(app, token, sock, publish)).into_response();
+        return ws.on_upgrade(move |sock| host_room(app, token, sock, publish, None)).into_response();
     }
     let cookie = header_str(&headers, axum::http::header::COOKIE);
     let auth = header_str(&headers, axum::http::header::AUTHORIZATION);
@@ -115,14 +115,42 @@ fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> String {
     headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
 }
 
-async fn open_or_bridge(app: Arc<App>, token: String, sock: WebSocket, cookie: String, auth: String, ua: String) {
-    // 0.5.641 sends the hand frame as the first message. Do not consume it.
-    // Same-origin socket carries the session cookie, so stream-open can
-    // name the author without a hello ticket.
+fn hello_ticket(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if value.get("t").and_then(|v| v.as_str()) != Some("hello") {
+        return None;
+    }
+    let ticket = value.get("k").and_then(|v| v.as_str()).unwrap_or("");
+    if ticket.is_empty() {
+        None
+    } else {
+        Some(ticket.to_string())
+    }
+}
+
+async fn open_or_bridge(app: Arc<App>, token: String, mut sock: WebSocket, cookie: String, auth: String, ua: String) {
+    // The page mints a ticket with its own session (cookie or bearer) and
+    // sends it as the first frame. The cookie on this upgrade is not the
+    // session: stream-open was answering publish=false and the room then
+    // dropped every hand frame. A hand that arrives first (older client)
+    // is kept and published after the join.
+    let mut ticket = String::new();
+    let mut initial: Option<String> = None;
+    match tokio::time::timeout(std::time::Duration::from_millis(1500), sock.recv()).await {
+        Ok(Some(Ok(Message::Text(text)))) => {
+            let text = text.to_string();
+            if let Some(k) = hello_ticket(&text) {
+                ticket = k;
+            } else {
+                initial = Some(text);
+            }
+        }
+        _ => {}
+    }
     let mut publish = false;
     let mut owner = String::new();
     for _ in 0..40 {
-        let Some((ok, pub_now, owner_now)) = stream_open(&app, &token, &cookie, &auth, &ua, "").await else {
+        let Some((ok, pub_now, owner_now)) = stream_open(&app, &token, &cookie, &auth, &ua, &ticket).await else {
             return;
         };
         if !ok {
@@ -135,15 +163,20 @@ async fn open_or_bridge(app: Arc<App>, token: String, sock: WebSocket, cookie: S
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    eprintln!("share-live {token} publish={publish} owner={owner} edge={}", app.cfg.edge);
+    eprintln!(
+        "share-live publish={publish} owner={owner} edge={} ticket={} cookie={}",
+        app.cfg.edge,
+        !ticket.is_empty(),
+        !cookie.is_empty()
+    );
     if !publish && owner.is_empty() {
         return;
     }
     if owner.is_empty() || owner == app.cfg.edge {
-        host_room(app, token, sock, publish).await;
+        host_room(app, token, sock, publish, initial).await;
         return;
     }
-    pipe_to_peer(&app, &token, sock, publish).await;
+    pipe_to_peer(&app, &token, sock, publish, initial).await;
 }
 
 async fn stream_open(app: &App, token: &str, cookie: &str, auth: &str, ua: &str, ticket: &str) -> Option<(bool, bool, String)> {
@@ -172,7 +205,21 @@ async fn stream_open(app: &App, token: &str, cookie: &str, auth: &str, ua: &str,
     Some((true, publish, owner))
 }
 
-async fn host_room(app: Arc<App>, token: String, mut sock: WebSocket, publish: bool) {
+fn remember(room: &mut Room, text: &str) {
+    if text.contains("\"t\":\"g\"") {
+        room.last_g = text.to_string();
+    } else if text.contains("\"t\":\"v\"") {
+        room.last_v = text.to_string();
+    } else if text.contains("\"t\":\"p\"") {
+        room.last_p = text.to_string();
+    } else if text.contains("\"t\":\"preview\"") {
+        room.last_preview = text.to_string();
+    } else if text.contains("\"t\":\"c\"") {
+        room.last_cursor = text.to_string();
+    }
+}
+
+async fn host_room(app: Arc<App>, token: String, mut sock: WebSocket, publish: bool, initial: Option<String>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let my_id = {
         let mut rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
@@ -205,6 +252,15 @@ async fn host_room(app: Arc<App>, token: String, mut sock: WebSocket, publish: b
         room.subs.push(Sub { id: my_id, tx });
         my_id
     };
+    if publish {
+        if let Some(text) = initial {
+            let mut rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(room) = rooms.get_mut(&token) {
+                remember(room, &text);
+                room.subs.retain(|sub| sub.id == my_id || sub.tx.send(text.clone()).is_ok());
+            }
+        }
+    }
     loop {
         tokio::select! {
             incoming = sock.recv() => {
@@ -216,17 +272,7 @@ async fn host_room(app: Arc<App>, token: String, mut sock: WebSocket, publish: b
                 let text = text.to_string();
                 let mut rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(room) = rooms.get_mut(&token) else { break };
-                if text.contains("\"t\":\"g\"") {
-                    room.last_g = text.clone();
-                } else if text.contains("\"t\":\"v\"") {
-                    room.last_v = text.clone();
-                } else if text.contains("\"t\":\"p\"") {
-                    room.last_p = text.clone();
-                } else if text.contains("\"t\":\"preview\"") {
-                    room.last_preview = text.clone();
-                } else if text.contains("\"t\":\"c\"") {
-                    room.last_cursor = text.clone();
-                }
+                remember(room, &text);
                 room.subs.retain(|sub| sub.id == my_id || sub.tx.send(text.clone()).is_ok());
             }
             out = rx.recv() => {
@@ -239,7 +285,7 @@ async fn host_room(app: Arc<App>, token: String, mut sock: WebSocket, publish: b
     }
 }
 
-async fn pipe_to_peer(app: &App, token: &str, mut browser: WebSocket, publish: bool) {
+async fn pipe_to_peer(app: &App, token: &str, mut browser: WebSocket, publish: bool, initial: Option<String>) {
     let path = format!(
         "/api/share-live/{token}?bridge=1&publish={}",
         if publish { 1 } else { 0 }
@@ -247,6 +293,13 @@ async fn pipe_to_peer(app: &App, token: &str, mut browser: WebSocket, publish: b
     let Some(mut peer) = ws_client(&app.cfg.peer_ws, &path).await else {
         return;
     };
+    if publish {
+        if let Some(text) = initial {
+            if peer.write_text(&text).await.is_err() {
+                return;
+            }
+        }
+    }
     loop {
         tokio::select! {
             incoming = browser.recv() => {
