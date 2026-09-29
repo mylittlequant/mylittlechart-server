@@ -2419,6 +2419,28 @@ pub fn legacy_dm_message_event_id(conn: &Connection, legacy_message_id: i64) -> 
     .optional()
 }
 
+/// The highest `legacy_message_id` already imported into `room_id`'s
+/// `org.mylittlechart.legacy_dm` timeline (P15: `matrix_migration`'s own
+/// catch-up cursor). `legacy_dm_message_map` carries no `room_id` of its
+/// own — `dm_messages.id` is a single autoincrement column shared by every
+/// legacy conversation, not scoped per conversation — so this joins through
+/// `events` to find only the rows imported into THIS room. Message ids are
+/// ascending within one conversation and every migration/catch-up pass
+/// imports every not-yet-mapped row up to "now", so `id > this` is exactly
+/// that conversation's not-yet-imported set — the caller's own cheap
+/// alternative to re-checking `legacy_dm_message_event_id` once per message.
+/// `None` for a room with no legacy message imported yet (a conversation
+/// that had zero messages at migration time).
+pub fn highest_mapped_legacy_message_id(conn: &Connection, room_id: &str) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT MAX(m.legacy_message_id) FROM legacy_dm_message_map m
+         JOIN events e ON e.event_id = m.event_id
+         WHERE e.room_id = ?1",
+        params![room_id],
+        |row| row.get(0),
+    )
+}
+
 // ============================================================================
 // Legacy DM migration batch (P12) — the binary crate's own `matrix_migration`
 // module is the only caller. Everything one `dm_conversations` row needs
@@ -2647,13 +2669,25 @@ pub fn migrate_dm_conversation(
 /// filtered by the caller to exclude anything already in
 /// `legacy_dm_message_map`, ordered ascending by `legacy_message_id`) lands
 /// as new `org.mylittlechart.legacy_dm` timeline events plus their
-/// `legacy_dm_message_map` rows, then each of `receipts` advances that
-/// reader's `m.read` receipt to the newest of THESE messages they have
-/// `read_at` for — never moved backwards ([`upsert_receipt_in_tx`]'s own
-/// guarantee, the SAME one a live `/receipt` call gets) — all in ONE
-/// transaction. Reuses the exact per-event helpers [`migrate_dm_conversation`]
-/// itself uses, so a caught-up room's rows are indistinguishable from ones a
-/// fresh migration (or a live Matrix send) would have produced.
+/// `legacy_dm_message_map` rows; then each of `receipts` advances that
+/// reader's `m.read` receipt — never moved backwards
+/// ([`upsert_receipt_in_tx`]'s own guarantee, the SAME one a live `/receipt`
+/// call gets) — all in ONE transaction. Reuses the exact per-event helpers
+/// [`migrate_dm_conversation`] itself uses, so a caught-up room's rows are
+/// indistinguishable from ones a fresh migration (or a live Matrix send)
+/// would have produced.
+///
+/// Each `receipt.up_to_legacy_message_id` is resolved via
+/// [`legacy_dm_message_event_id`] against the FULL map (this transaction's
+/// own just-inserted rows are visible to it too, same connection) — not just
+/// this call's own `messages` — because the caller's own read-position query
+/// considers EVERY read message in the conversation, including ones a
+/// PRIOR pass already imported (a message read only after it was already
+/// bridged must still move the receipt here; manager review, P15). A target
+/// this catch-up's own `messages` did not just insert AND that is not yet in
+/// the map at all (should not happen — a receipt only ever targets a message
+/// that exists) is skipped rather than erroring, same defensive posture
+/// [`migrate_dm_conversation`]'s own receipt loop takes.
 pub fn catch_up_dm_conversation(
     conn: &mut Connection,
     room_id: &str,
@@ -2662,7 +2696,6 @@ pub fn catch_up_dm_conversation(
 ) -> Result<DmMigrationCounts, MatrixStoreError> {
     let tx = conn.transaction()?;
 
-    let mut event_id_by_legacy_id: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     for message in messages {
         insert_timeline_event_in_tx(
             &tx,
@@ -2675,13 +2708,12 @@ pub fn catch_up_dm_conversation(
             None,
         )?;
         insert_legacy_dm_message_map(&tx, message.legacy_message_id, &message.event_id)?;
-        event_id_by_legacy_id.insert(message.legacy_message_id, message.event_id.clone());
     }
 
     let mut receipts_set = 0usize;
     for receipt in receipts {
-        let Some(target_event_id) = event_id_by_legacy_id.get(&receipt.up_to_legacy_message_id) else { continue };
-        upsert_receipt_in_tx(&tx, room_id, receipt.reader_user_id, ReceiptType::Read, target_event_id, receipt.ts_ms)?;
+        let Some(target_event_id) = legacy_dm_message_event_id(&tx, receipt.up_to_legacy_message_id)? else { continue };
+        upsert_receipt_in_tx(&tx, room_id, receipt.reader_user_id, ReceiptType::Read, &target_event_id, receipt.ts_ms)?;
         receipts_set += 1;
     }
 

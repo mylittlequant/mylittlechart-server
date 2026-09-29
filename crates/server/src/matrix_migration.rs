@@ -49,27 +49,42 @@
 //!
 //! # Catch-up (P15): the old `/dm/conversations*` routes stay live
 //!
-//! `routes::dm`'s legacy send-message route keeps working for native clients
-//! that have not moved to the Matrix subset yet — any message it accepts
-//! after boot lands in `social.db`'s `dm_messages` only, never in the
-//! migrated room, unless something re-runs the import for that one
-//! conversation. [`catch_up_conversation`] is that re-run: it appends every
-//! `dm_messages` row not yet in `legacy_dm_message_map`, using the exact
-//! same per-message content/timestamp derivation [`migrate_one_conversation`]
-//! uses ([`legacy_dm_message_import`]/[`track_read_receipt`], factored out so
-//! the two paths can never drift). [`migrate_legacy_dms`] runs it on every
-//! `AlreadyMigrated` conversation at boot, closing any gap since the last
-//! run. A live bridge that also runs it right after
-//! `routes::dm::create_message`'s own insert commits (so an already-open
-//! `/sync` long-poll sees the message at once, not just at the next boot) is
-//! a later piece.
+//! `routes::dm`'s legacy send-message and read-marker routes keep working
+//! for native clients that have not moved to the Matrix subset yet — any
+//! message or read marker they accept after boot lands in `social.db` only,
+//! never in the migrated room, unless something re-runs the import for that
+//! one conversation. [`catch_up_conversation`] is that re-run:
+//!
+//! - It appends every `dm_messages` row not yet in `legacy_dm_message_map`
+//!   — found via a cursor
+//!   ([`mylittlechart_server::matrix_store::highest_mapped_legacy_message_id`]),
+//!   never a re-scan of every message in the conversation — using the exact
+//!   same content/timestamp derivation [`migrate_one_conversation`] uses
+//!   ([`legacy_dm_message_import`], factored out so the two paths can never
+//!   drift).
+//! - It re-derives BOTH readers' `m.read` receipts straight off `social.db`'s
+//!   own `read_at` column ([`conversation_read_receipts`], one indexed query
+//!   per reader), not just messages new to this pass — a message read only
+//!   AFTER it was already bridged in an earlier pass must still move the
+//!   room's receipt (manager review, P15).
+//!
+//! [`migrate_legacy_dms`] runs it on every `AlreadyMigrated` conversation at
+//! boot, closing any gap since the last run. Two live entry points run it
+//! right after their own `social.db` write commits, so an already-open
+//! `/sync` long-poll on an updated client sees the change at once:
+//! [`bridge_legacy_dm_send`] (a full first-time migration if the
+//! conversation has no room yet, else a catch-up) after
+//! `routes::dm::create_message`'s insert, and [`catch_up_legacy_dm_read`]
+//! (catch-up ONLY — a read marker alone never creates a room) after
+//! `routes::dm::mark_read`'s update. A failure in either is caught, logged,
+//! and never fails the legacy call — the next boot's catch-up closes the
+//! gap.
 
-use std::collections::HashMap;
 use std::fmt;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use mylittlechart_server::matrix_store::{self, RoomKind};
 
@@ -119,11 +134,20 @@ pub struct SkippedConversation {
 // caught, logged, and turned into a `SkippedConversation`)
 // ============================================================================
 
+/// `pub(crate)`, not module-private — [`bridge_legacy_dm_send`]'s `Result`
+/// crosses into `routes::dm` (P15), so this type must be at least as visible
+/// as that function's own `pub(crate)`.
 #[derive(Debug)]
-enum ConversationMigrationError {
+pub(crate) enum ConversationMigrationError {
     Db(rusqlite::Error),
     Store(matrix_store::MatrixStoreError),
     BadTimestamp(String),
+    /// [`bridge_legacy_dm_send`] only: the conversation could not be
+    /// migrated/caught up for a non-database reason (mirrors
+    /// [`ConversationOutcome::Skipped`]'s own reason) — never produced by
+    /// [`migrate_legacy_dms`]'s own boot loop, which turns that outcome into
+    /// a [`SkippedConversation`] report row instead of an `Err`.
+    Skipped(String),
 }
 
 impl fmt::Display for ConversationMigrationError {
@@ -132,6 +156,7 @@ impl fmt::Display for ConversationMigrationError {
             ConversationMigrationError::Db(e) => write!(f, "database error: {e}"),
             ConversationMigrationError::Store(e) => write!(f, "matrix store error: {e:?}"),
             ConversationMigrationError::BadTimestamp(raw) => write!(f, "unparseable timestamp: {raw:?}"),
+            ConversationMigrationError::Skipped(reason) => write!(f, "skipped: {reason}"),
         }
     }
 }
@@ -167,6 +192,12 @@ struct LegacyConversation {
     created_at: String,
 }
 
+impl From<&dm_db::DmConversation> for LegacyConversation {
+    fn from(conv: &dm_db::DmConversation) -> Self {
+        LegacyConversation { id: conv.id, user_lo: conv.user_lo, user_hi: conv.user_hi, created_at: conv.created_at.clone() }
+    }
+}
+
 fn list_dm_conversations(social: &Connection) -> rusqlite::Result<Vec<LegacyConversation>> {
     let mut stmt = social.prepare("SELECT id, user_lo, user_hi, created_at FROM dm_conversations ORDER BY id ASC")?;
     let rows = stmt.query_map([], |row| {
@@ -175,28 +206,38 @@ fn list_dm_conversations(social: &Connection) -> rusqlite::Result<Vec<LegacyConv
     rows.collect()
 }
 
+/// A `dm_messages` row's content half — never `read_at` (P15: every read
+/// position is now resolved straight off `social.db` by
+/// [`highest_read_message`]/[`conversation_read_receipts`], not by carrying
+/// this column through a struct nothing else reads).
 struct LegacyMessage {
     id: i64,
     sender_user_id: i64,
     nonce: Vec<u8>,
     ciphertext: Vec<u8>,
     created_at: String,
-    read_at: Option<String>,
 }
 
-fn list_dm_messages(social: &Connection, conversation_id: i64) -> rusqlite::Result<Vec<LegacyMessage>> {
+/// Every `dm_messages` row of `conversation_id` with `id > after_id`, in
+/// ascending order — pass `0` for "from the start" (every real
+/// `dm_messages.id` is a positive `AUTOINCREMENT` value, so `id > 0` matches
+/// everything). [`migrate_one_conversation`] (a first-time migration) always
+/// passes `0`; [`catch_up_conversation`] passes its own cursor
+/// ([`mylittlechart_server::matrix_store::highest_mapped_legacy_message_id`]),
+/// so a catch-up never re-lists a message it (or a prior pass) already
+/// imported.
+fn list_dm_messages(social: &Connection, conversation_id: i64, after_id: i64) -> rusqlite::Result<Vec<LegacyMessage>> {
     let mut stmt = social.prepare(
-        "SELECT id, sender_user_id, nonce, ciphertext, created_at, read_at
-         FROM dm_messages WHERE conversation_id = ?1 ORDER BY id ASC",
+        "SELECT id, sender_user_id, nonce, ciphertext, created_at
+         FROM dm_messages WHERE conversation_id = ?1 AND id > ?2 ORDER BY id ASC",
     )?;
-    let rows = stmt.query_map(params![conversation_id], |row| {
+    let rows = stmt.query_map(params![conversation_id, after_id], |row| {
         Ok(LegacyMessage {
             id: row.get(0)?,
             sender_user_id: row.get(1)?,
             nonce: row.get(2)?,
             ciphertext: row.get(3)?,
             created_at: row.get(4)?,
-            read_at: row.get(5)?,
         })
     })?;
     rows.collect()
@@ -206,6 +247,46 @@ fn rfc3339_to_millis(raw: &str) -> Result<i64, ConversationMigrationError> {
     chrono::DateTime::parse_from_rfc3339(raw)
         .map(|dt| dt.timestamp_millis())
         .map_err(|_| ConversationMigrationError::BadTimestamp(raw.to_string()))
+}
+
+/// The highest-id `dm_messages` row `sender_user_id` sent in `conversation_id`
+/// that has `read_at` set — i.e. the furthest the OTHER party (the reader)
+/// has read, straight off `social.db` (manager review, P15: this must
+/// consider EVERY read message ever, not just ones touched by the current
+/// pass, so a message marked read long after it was already bridged still
+/// moves the receipt). One indexed query, never a scan of the conversation's
+/// messages. `None` if `sender_user_id` has sent nothing the other party has
+/// read yet.
+fn highest_read_message(social: &Connection, conversation_id: i64, sender_user_id: i64) -> rusqlite::Result<Option<(i64, String)>> {
+    social
+        .query_row(
+            "SELECT id, read_at FROM dm_messages
+             WHERE conversation_id = ?1 AND sender_user_id = ?2 AND read_at IS NOT NULL
+             ORDER BY id DESC LIMIT 1",
+            params![conversation_id, sender_user_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+}
+
+/// Both readers' current furthest-read position in `conv`
+/// ([`highest_read_message`], once per reader) — the shared source
+/// [`migrate_one_conversation`] and [`catch_up_conversation`] both build
+/// their `extras.receipts`/`receipts` from, so neither can drift from
+/// "read straight off `social.db`, never from a HashMap built while
+/// iterating some SUBSET of messages".
+fn conversation_read_receipts(
+    social: &Connection,
+    conv: &LegacyConversation,
+) -> Result<Vec<matrix_store::LegacyDmReadReceipt>, ConversationMigrationError> {
+    let mut receipts = Vec::new();
+    for (reader_user_id, sender_user_id) in [(conv.user_hi, conv.user_lo), (conv.user_lo, conv.user_hi)] {
+        if let Some((up_to_legacy_message_id, read_at)) = highest_read_message(social, conv.id, sender_user_id)? {
+            let ts_ms = rfc3339_to_millis(&read_at)?;
+            receipts.push(matrix_store::LegacyDmReadReceipt { reader_user_id, up_to_legacy_message_id, ts_ms });
+        }
+    }
+    Ok(receipts)
 }
 
 // ============================================================================
@@ -347,24 +428,10 @@ fn migrate_one_conversation(
         }
     }
 
-    let messages = list_dm_messages(social, conv.id)?;
-    let mut message_imports = Vec::with_capacity(messages.len());
-    // reader_user_id -> (highest dm_messages.id this reader has read, its own read_at in ms).
-    let mut last_read_by_reader: HashMap<i64, (i64, i64)> = HashMap::new();
-
-    for message in &messages {
-        message_imports.push(legacy_dm_message_import(conv.id, message)?);
-        track_read_receipt(conv, message, &mut last_read_by_reader)?;
-    }
-
-    let receipts: Vec<matrix_store::LegacyDmReadReceipt> = last_read_by_reader
-        .into_iter()
-        .map(|(reader_user_id, (up_to_legacy_message_id, ts_ms))| matrix_store::LegacyDmReadReceipt {
-            reader_user_id,
-            up_to_legacy_message_id,
-            ts_ms,
-        })
-        .collect();
+    let messages = list_dm_messages(social, conv.id, 0)?;
+    let message_imports: Vec<matrix_store::LegacyDmMessageImport> =
+        messages.iter().map(|message| legacy_dm_message_import(conv.id, message)).collect::<Result<_, _>>()?;
+    let receipts = conversation_read_receipts(social, conv)?;
 
     let direct_hints =
         vec![
@@ -396,8 +463,7 @@ fn migrate_one_conversation(
 // Shared per-message building blocks — used by [`migrate_one_conversation`]
 // (a full first-time migration) AND [`catch_up_conversation`] (P15: an
 // already-migrated room's gap-closer), factored out here so the two paths
-// can never drift on content shape, `origin_server_ts` derivation, or the
-// read-receipt "never over-count as read" rule.
+// can never drift on content shape or `origin_server_ts` derivation.
 // ============================================================================
 
 /// Build one `dm_messages` row's `org.mylittlechart.legacy_dm` timeline
@@ -426,86 +492,129 @@ fn legacy_dm_message_import(
     })
 }
 
-/// Fold one `dm_messages` row's `read_at` (if any) into `last_read_by_reader`
-/// (`reader_user_id -> (highest dm_messages.id read, its own read_at in
-/// ms)`). The reader is always "the other one" of `conv`'s fixed pair
-/// (`read_at` is only ever stamped for the party who did NOT send it,
-/// `dm_db::mark_read`), and only the HIGHEST `dm_messages.id` a reader has
-/// read is kept — never over-count as read (plan P12 scope, unchanged by
-/// P15).
-fn track_read_receipt(
-    conv: &LegacyConversation,
-    message: &LegacyMessage,
-    last_read_by_reader: &mut HashMap<i64, (i64, i64)>,
-) -> Result<(), ConversationMigrationError> {
-    let Some(read_at) = &message.read_at else { return Ok(()) };
-    let reader_user_id = if message.sender_user_id == conv.user_lo { conv.user_hi } else { conv.user_lo };
-    let ts_ms = rfc3339_to_millis(read_at)?;
-    last_read_by_reader
-        .entry(reader_user_id)
-        .and_modify(|(best_id, best_ts)| {
-            if message.id > *best_id {
-                *best_id = message.id;
-                *best_ts = ts_ms;
-            }
-        })
-        .or_insert((message.id, ts_ms));
-    Ok(())
-}
-
 // ============================================================================
 // Catch-up (P15) — an already-migrated conversation's gap-closer
 // ============================================================================
 
-/// Catch up ONE already-migrated conversation's Matrix room with any
-/// `dm_messages` rows added since its last migration/catch-up pass — every
-/// `dm_messages.id` not yet in `legacy_dm_message_map`, appended ascending
-/// (`list_dm_messages`'s own `ORDER BY id ASC`) as `org.mylittlechart.legacy_dm`
-/// timeline events in ONE transaction
-/// ([`mylittlechart_server::matrix_store::catch_up_dm_conversation`]). A
-/// reader's `m.read` receipt only ever advances to the newest of THESE newly
-/// appended messages they have `read_at` for — an older message's `read_at`
-/// stamped between passes is out of scope here, since that message was
-/// already reflected (if at all) the moment IT was imported.
+/// Catch up ONE already-migrated conversation's Matrix room:
+///
+/// - Every `dm_messages` row with `id` past
+///   [`mylittlechart_server::matrix_store::highest_mapped_legacy_message_id`]
+///   ([`list_dm_messages`]'s own cursor parameter — never a re-scan of every
+///   message in the conversation) is appended as an
+///   `org.mylittlechart.legacy_dm` timeline event.
+/// - BOTH readers' `m.read` receipts are re-derived straight off
+///   `social.db`'s own `read_at` column ([`conversation_read_receipts`]),
+///   not just messages new to THIS pass — a message read only after it was
+///   already bridged in an earlier pass must still move the receipt
+///   (manager review, P15).
+///
+/// Both land in ONE transaction
+/// ([`mylittlechart_server::matrix_store::catch_up_dm_conversation`]),
+/// which resolves each receipt's target through the FULL
+/// `legacy_dm_message_map` (not just this call's own newly-inserted rows),
+/// so an old message's receipt still resolves correctly.
 ///
 /// `room_id` must already be `conv`'s migrated room — every caller
-/// ([`migrate_one_conversation`], and a later piece's live-send bridge) has
-/// just confirmed this via [`matrix_store::room_by_legacy_dm_id`].
-/// `messages_imported` in the returned counts is `0` for the routine case:
-/// nothing new since `conv`'s room was last touched.
+/// ([`migrate_one_conversation`], [`bridge_legacy_dm_send`],
+/// [`catch_up_legacy_dm_read`]) has just confirmed this via
+/// [`matrix_store::room_by_legacy_dm_id`]. Both counts are `0` for the
+/// routine case: nothing new and no read-position change since `conv`'s room
+/// was last touched.
 fn catch_up_conversation(
     messenger: &mut Connection,
     social: &Connection,
     room_id: &str,
     conv: &LegacyConversation,
 ) -> Result<matrix_store::DmMigrationCounts, ConversationMigrationError> {
-    let messages = list_dm_messages(social, conv.id)?;
-    let mut message_imports = Vec::new();
-    let mut last_read_by_reader: HashMap<i64, (i64, i64)> = HashMap::new();
+    let after_id = matrix_store::highest_mapped_legacy_message_id(messenger, room_id)?.unwrap_or(0);
+    let new_messages = list_dm_messages(social, conv.id, after_id)?;
+    let message_imports: Vec<matrix_store::LegacyDmMessageImport> =
+        new_messages.iter().map(|message| legacy_dm_message_import(conv.id, message)).collect::<Result<_, _>>()?;
 
-    for message in &messages {
-        if matrix_store::legacy_dm_message_event_id(messenger, message.id)?.is_some() {
-            continue;
-        }
-        message_imports.push(legacy_dm_message_import(conv.id, message)?);
-        track_read_receipt(conv, message, &mut last_read_by_reader)?;
-    }
+    let receipts = conversation_read_receipts(social, conv)?;
 
-    if message_imports.is_empty() {
+    if message_imports.is_empty() && receipts.is_empty() {
         return Ok(matrix_store::DmMigrationCounts::default());
     }
 
-    let receipts: Vec<matrix_store::LegacyDmReadReceipt> = last_read_by_reader
-        .into_iter()
-        .map(|(reader_user_id, (up_to_legacy_message_id, ts_ms))| matrix_store::LegacyDmReadReceipt {
-            reader_user_id,
-            up_to_legacy_message_id,
-            ts_ms,
-        })
-        .collect();
-
     let counts = matrix_store::catch_up_dm_conversation(messenger, room_id, &message_imports, &receipts)?;
     Ok(counts)
+}
+
+// ============================================================================
+// Live bridge (P15) — `routes::dm::create_message`'s send path and
+// `routes::dm::mark_read`'s read-marker path
+// ============================================================================
+
+/// Bridge one legacy DM send (`routes::dm::create_message`'s own insert,
+/// already committed to `social.db` by the time this runs) into its Matrix
+/// room: migrates the conversation from scratch if this is its first message
+/// ever ([`migrate_one_conversation`] then naturally picks up the
+/// just-inserted row too, since it reads every `dm_messages` row for the
+/// conversation), or [`catch_up_conversation`]s it if a room already exists.
+/// Returns the affected room id, for the caller's own live-registry wake
+/// (`routes::dm` reuses
+/// [`crate::routes::matrix::rooms::member_and_invited_ids`], exactly the way
+/// `routes::matrix::messaging` wakes a room after a native Matrix send).
+///
+/// Per this module's own doc ("a bridge failure must NOT fail the legacy
+/// send"): this function's `Err` is `routes::dm`'s to log once (with the
+/// conversation id) and swallow, never to turn into an HTTP failure — the
+/// legacy send already committed before this ever runs, and the next boot's
+/// [`migrate_legacy_dms`] pass closes any gap this call leaves behind.
+pub(crate) fn bridge_legacy_dm_send(
+    messenger: &mut Connection,
+    social: &Connection,
+    identity: &Connection,
+    conversation: &dm_db::DmConversation,
+    now: &str,
+) -> Result<String, ConversationMigrationError> {
+    let conv = LegacyConversation::from(conversation);
+
+    if let Some(room) = matrix_store::room_by_legacy_dm_id(messenger, conv.id)? {
+        catch_up_conversation(messenger, social, &room.id, &conv)?;
+        return Ok(room.id);
+    }
+
+    match migrate_one_conversation(messenger, social, identity, &conv, now)? {
+        ConversationOutcome::Skipped(reason) => Err(ConversationMigrationError::Skipped(reason)),
+        // A race with another writer is not possible under this module's
+        // single-writer discipline (see the module doc) — handled
+        // defensively rather than assumed, same posture
+        // `routes::matrix::messaging::apply_send` takes for its own
+        // "cannot happen" dedup race.
+        ConversationOutcome::Migrated { .. } | ConversationOutcome::AlreadyMigrated { .. } => {
+            matrix_store::room_by_legacy_dm_id(messenger, conv.id)?
+                .map(|room| room.id)
+                .ok_or_else(|| ConversationMigrationError::Skipped("migrated but room lookup failed".to_string()))
+        }
+    }
+}
+
+/// Bridge one legacy `POST /dm/conversations/{id}/read` update
+/// (`routes::dm::mark_read`'s own update, already committed to `social.db`
+/// by the time this runs). Unlike [`bridge_legacy_dm_send`], this NEVER
+/// migrates a conversation that has no room yet — a read marker alone must
+/// never be what creates a room (the FIRST MESSAGE does that, per
+/// [`bridge_legacy_dm_send`]). Returns `Ok(None)` when `conversation` has no
+/// migrated room yet — routine, not an error: nothing to catch up, nothing
+/// for the caller to wake. Returns `Ok(Some(room_id))` after a successful
+/// catch-up — [`catch_up_conversation`] re-derives every reader's receipt
+/// straight from `social.db`'s own `read_at` column, so this closes the gap
+/// even when there is no new MESSAGE to import, only a changed read
+/// position (manager review, P15).
+pub(crate) fn catch_up_legacy_dm_read(
+    messenger: &mut Connection,
+    social: &Connection,
+    conversation: &dm_db::DmConversation,
+) -> Result<Option<String>, ConversationMigrationError> {
+    let Some(room) = matrix_store::room_by_legacy_dm_id(messenger, conversation.id)? else {
+        return Ok(None);
+    };
+    let conv = LegacyConversation::from(conversation);
+    catch_up_conversation(messenger, social, &room.id, &conv)?;
+    Ok(Some(room.id))
 }
 
 #[cfg(test)]
@@ -835,7 +944,7 @@ mod tests {
         dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"three", "2026-09-01T00:03:00+00:00").expect("insert 3");
 
         let room = matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").expect("room exists");
-        let legacy_conv = LegacyConversation { id: conv.id, user_lo: conv.user_lo, user_hi: conv.user_hi, created_at: conv.created_at.clone() };
+        let legacy_conv = LegacyConversation::from(&conv);
 
         let counts = catch_up_conversation(&mut messenger, &social, &room.id, &legacy_conv).expect("catch up");
         assert_eq!(counts.messages_imported, 2);
@@ -845,6 +954,60 @@ mod tests {
 
         let map_rows: i64 = messenger.query_row("SELECT COUNT(*) FROM legacy_dm_message_map", [], |r| r.get(0)).expect("count");
         assert_eq!(map_rows, 3, "one map row per dm_messages row across both passes");
+    }
+
+    #[test]
+    fn catch_up_lists_only_messages_newer_than_the_last_bridged_one() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        let nonce = [0u8; dm_db::DM_NONCE_LEN];
+        let msg1 = dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"one", "2026-09-01T00:01:00+00:00").expect("insert 1");
+        migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("initial migration");
+
+        let room = matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").expect("room exists");
+        assert_eq!(matrix_store::highest_mapped_legacy_message_id(&messenger, &room.id).expect("query"), Some(msg1));
+
+        let msg2 = dm_db::create_message(&social, conv.id, conv.user_hi, &nonce, b"two", "2026-09-01T00:02:00+00:00").expect("insert 2");
+        let legacy_conv = LegacyConversation::from(&conv);
+        let counts = catch_up_conversation(&mut messenger, &social, &room.id, &legacy_conv).expect("catch up");
+        assert_eq!(counts.messages_imported, 1, "only msg2 is past the cursor");
+        assert_eq!(matrix_store::highest_mapped_legacy_message_id(&messenger, &room.id).expect("query"), Some(msg2));
+
+        // A second catch-up with nothing new must not re-list msg1 or msg2.
+        let counts_again = catch_up_conversation(&mut messenger, &social, &room.id, &legacy_conv).expect("catch up again");
+        assert_eq!(counts_again.messages_imported, 0);
+    }
+
+    #[test]
+    fn read_after_migration_advances_the_matrix_receipt() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        let nonce = [0u8; dm_db::DM_NONCE_LEN];
+        let msg = dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"hello", "2026-09-01T00:01:00+00:00").expect("insert");
+        migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("initial migration");
+
+        let room = matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").expect("room exists");
+        // Nobody had read anything at migration time — no receipt yet.
+        assert!(matrix_store::get_receipt(&messenger, &room.id, conv.user_hi, ReceiptType::Read).expect("query").is_none());
+
+        // The OLD client marks it read AFTER the message was already bridged
+        // — this must still move the Matrix receipt (manager review, P15).
+        dm_db::mark_read(&social, conv.id, conv.user_hi, msg, "2026-09-01T00:05:00+00:00").expect("mark read");
+
+        let legacy_conv = LegacyConversation::from(&conv);
+        let counts = catch_up_conversation(&mut messenger, &social, &room.id, &legacy_conv).expect("catch up");
+        assert_eq!(counts.messages_imported, 0, "the message itself was already bridged");
+        assert_eq!(counts.receipts_set, 1);
+
+        let event_id = matrix_store::legacy_dm_message_event_id(&messenger, msg).expect("query").expect("mapped");
+        let receipt = matrix_store::get_receipt(&messenger, &room.id, conv.user_hi, ReceiptType::Read).expect("query").expect("receipt now set");
+        assert_eq!(receipt.event_id, event_id);
+
+        // A second, no-op catch-up must never move the receipt backwards —
+        // `upsert_receipt_in_tx`'s own guarantee, reused here rather than
+        // re-derived.
+        let counts_again = catch_up_conversation(&mut messenger, &social, &room.id, &legacy_conv).expect("catch up again");
+        assert_eq!(counts_again.receipts_set, 1, "still resolves and re-confirms the SAME position, not a backward move");
+        let receipt_again = matrix_store::get_receipt(&messenger, &room.id, conv.user_hi, ReceiptType::Read).expect("query").expect("receipt still set");
+        assert_eq!(receipt_again.event_id, event_id);
     }
 
     #[test]
@@ -859,7 +1022,7 @@ mod tests {
         let caught_up_msg =
             dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, ciphertext, "2026-09-01T00:02:00+00:00").expect("insert 2");
         let room = matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").expect("room exists");
-        let legacy_conv = LegacyConversation { id: conv.id, user_lo: conv.user_lo, user_hi: conv.user_hi, created_at: conv.created_at.clone() };
+        let legacy_conv = LegacyConversation::from(&conv);
         let counts = catch_up_conversation(&mut messenger, &social, &room.id, &legacy_conv).expect("catch up");
         assert_eq!(counts.messages_imported, 1);
 
@@ -910,5 +1073,48 @@ mod tests {
         let event_id = matrix_store::legacy_dm_message_event_id(&messenger, 2).expect("query").expect("mapped — boot caught it up");
         let event = matrix_store::get_event(&messenger, &event_id).expect("query").expect("exists");
         assert_eq!(event.event_type, "org.mylittlechart.legacy_dm");
+    }
+
+    #[test]
+    fn bridge_legacy_dm_send_migrates_the_first_message_then_catches_up_the_next() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        let nonce = [0u8; dm_db::DM_NONCE_LEN];
+        dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"first", "2026-09-01T00:01:00+00:00").expect("insert 1");
+
+        // No room yet — the first send bridges via a full migration.
+        let room_id_first = bridge_legacy_dm_send(&mut messenger, &social, &identity, &conv, NOW).expect("bridge first send");
+        let room = matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").expect("room exists");
+        assert_eq!(room_id_first, room.id);
+        let event_id_1 = matrix_store::legacy_dm_message_event_id(&messenger, 1).expect("query").expect("mapped");
+
+        dm_db::create_message(&social, conv.id, conv.user_hi, &nonce, b"second", "2026-09-01T00:02:00+00:00").expect("insert 2");
+
+        // A room already exists — the second send bridges via catch-up, not
+        // a second migration.
+        let room_id_second = bridge_legacy_dm_send(&mut messenger, &social, &identity, &conv, NOW).expect("bridge second send");
+        assert_eq!(room_id_second, room.id);
+        let event_id_2 = matrix_store::legacy_dm_message_event_id(&messenger, 2).expect("query").expect("mapped");
+        assert_ne!(event_id_1, event_id_2);
+
+        let room_count: i64 = messenger.query_row("SELECT COUNT(*) FROM rooms", [], |r| r.get(0)).expect("count");
+        assert_eq!(room_count, 1, "the second send must not create a second room");
+    }
+
+    #[test]
+    fn bridge_legacy_dm_send_reports_a_skipped_conversation_as_an_error() {
+        let identity = identity_conn();
+        add_user(&identity, 1, "0000000000000000000000000000lo1");
+        // user 2 (user_hi) has no row at all — a deleted account, same
+        // fixture `conversation_with_a_deleted_user_is_skipped_and_reported`
+        // uses.
+        let social = social_conn();
+        let conv = dm_db::get_or_create_conversation(&social, 1, 2, "2026-09-01T00:00:00+00:00").expect("create conversation");
+        let nonce = [0u8; dm_db::DM_NONCE_LEN];
+        dm_db::create_message(&social, conv.id, 1, &nonce, b"hello", "2026-09-01T00:01:00+00:00").expect("insert message");
+        let mut messenger = messenger_conn();
+
+        let err = bridge_legacy_dm_send(&mut messenger, &social, &identity, &conv, NOW).expect_err("no such user 2 — must refuse, not panic");
+        assert!(matches!(err, ConversationMigrationError::Skipped(_)), "got {err:?}");
+        assert!(matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").is_none());
     }
 }

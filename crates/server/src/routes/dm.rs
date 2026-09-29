@@ -68,6 +68,7 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_token};
@@ -715,6 +716,21 @@ pub struct SendMessageRequest {
 /// here, not just at conversation creation — see the module doc);
 /// rate-limited to [`dm_db::DM_MESSAGE_DAILY_LIMIT`] per rolling day per
 /// sender.
+///
+/// # Bridge into the migrated Matrix room (P15)
+///
+/// Right after this route's own insert commits, it bridges the message into
+/// `conversation`'s Matrix DM room — migrating the conversation from scratch
+/// if this is its first message ever, or catching up an already-migrated
+/// room otherwise (`crate::matrix_migration::bridge_legacy_dm_send`) — and,
+/// on success, wakes that room's members ([`super::matrix::rooms`]'s own
+/// `member_and_invited_ids`, plus `ControlPlane::live`) exactly the way
+/// `routes::matrix::messaging::send_event` wakes a room after a native
+/// Matrix send, so an updated client's open `/sync` long-poll returns at
+/// once. A bridge failure never fails this route — the legacy send already
+/// committed above — it is logged once with the conversation id and the
+/// next boot's `matrix_migration::migrate_legacy_dms` catch-up closes the
+/// gap.
 pub async fn create_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -743,8 +759,10 @@ pub async fn create_message(
         ));
     }
 
+    let state_for_blocking = state.clone();
     let result = tokio::task::spawn_blocking(
-        move || -> std::result::Result<(i64, String), SendMessageRefusal> {
+        move || -> std::result::Result<(i64, String, Option<HashSet<i64>>), SendMessageRefusal> {
+            let state = state_for_blocking;
             let social_conn = state.control_plane().social_conn();
             let Some(conversation) = dm_db::get_conversation(&social_conn, conversation_id)? else {
                 return Err(SendMessageRefusal::NotFound);
@@ -773,15 +791,96 @@ pub async fn create_message(
             let now_str = now.to_rfc3339();
             let id = dm_db::create_message(&social_conn, conversation_id, user_id, &nonce, &ciphertext, &now_str)
                 .map_err(SendMessageRefusal::Message)?;
-            Ok((id, now_str))
+
+            let wake_ids = bridge_legacy_dm_send_and_resolve_wake_set(&state, &social_conn, conversation_id, &conversation, &now_str);
+            Ok((id, now_str, wake_ids))
         },
     )
     .await;
 
     match result {
-        Ok(Ok((id, created_at))) => Json(serde_json::json!({ "id": id, "created_at": created_at })).into_response(),
+        Ok(Ok((id, created_at, wake_ids))) => {
+            if let Some(wake_ids) = wake_ids {
+                state.control_plane().live.wake_many(wake_ids.into_iter().map(|id| format!("user:{id}")));
+            }
+            Json(serde_json::json!({ "id": id, "created_at": created_at })).into_response()
+        }
         Ok(Err(e)) => send_message_refusal_response(e),
         Err(_) => internal_error(),
+    }
+}
+
+/// The bridge step [`create_message`] runs right after its own insert
+/// commits (module doc above) — pulled out to its own function so
+/// `create_message` stays readable. Locks `messenger` (and, briefly,
+/// `identity`) itself; `social` is the caller's already-open connection
+/// (read-only from here on, same as every other `matrix_migration` read).
+/// Returns the room's wake set on success, `None` on ANY failure (bridging,
+/// or the follow-up wake-set lookup) — already logged here, never the
+/// caller's to handle.
+fn bridge_legacy_dm_send_and_resolve_wake_set(
+    state: &AppState,
+    social: &rusqlite::Connection,
+    conversation_id: i64,
+    conversation: &dm_db::DmConversation,
+    now: &str,
+) -> Option<HashSet<i64>> {
+    let mut messenger_conn = state.control_plane().messenger_conn();
+    let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+    let bridge_result = crate::matrix_migration::bridge_legacy_dm_send(&mut messenger_conn, social, &identity_conn, conversation, now);
+    drop(identity_conn);
+
+    let room_id = match bridge_result {
+        Ok(room_id) => room_id,
+        Err(e) => {
+            tracing::error!("legacy DM bridge: conversation {} failed: {}", conversation_id, e);
+            return None;
+        }
+    };
+    resolve_wake_set(&messenger_conn, conversation_id, &room_id)
+}
+
+/// The bridge step [`mark_read`] runs right after its own update commits —
+/// same posture as [`bridge_legacy_dm_send_and_resolve_wake_set`], but never
+/// migrates a conversation that has no room yet (a read marker alone must
+/// never be what creates a room — see
+/// [`crate::matrix_migration::catch_up_legacy_dm_read`]'s own doc). Returns
+/// `None` both on failure AND on the routine "no room yet" case — either way
+/// there is nothing for the caller to wake.
+fn bridge_legacy_dm_read_and_resolve_wake_set(
+    state: &AppState,
+    social: &rusqlite::Connection,
+    conversation_id: i64,
+    conversation: &dm_db::DmConversation,
+) -> Option<HashSet<i64>> {
+    let mut messenger_conn = state.control_plane().messenger_conn();
+    let room_id = match crate::matrix_migration::catch_up_legacy_dm_read(&mut messenger_conn, social, conversation) {
+        Ok(Some(room_id)) => room_id,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::error!("legacy DM read bridge: conversation {} failed: {}", conversation_id, e);
+            return None;
+        }
+    };
+    resolve_wake_set(&messenger_conn, conversation_id, &room_id)
+}
+
+/// The wake-set lookup shared by both bridge helpers above — reused, not
+/// re-derived, so a send-bridged and a read-bridged room wake the exact same
+/// way ([`crate::routes::matrix::rooms::member_and_invited_ids`], plus
+/// `ControlPlane::live` back in the caller, exactly how
+/// `routes::matrix::messaging::send_event` wakes a room after a native
+/// Matrix send).
+fn resolve_wake_set(messenger_conn: &rusqlite::Connection, conversation_id: i64, room_id: &str) -> Option<HashSet<i64>> {
+    match crate::routes::matrix::rooms::member_and_invited_ids(messenger_conn, room_id) {
+        Ok(ids) => Some(ids),
+        Err(e) => {
+            tracing::error!(
+                "legacy DM bridge: conversation {} wake-set lookup failed for room {}: {}",
+                conversation_id, room_id, e
+            );
+            None
+        }
     }
 }
 
@@ -891,10 +990,31 @@ pub struct MarkReadRequest {
     pub up_to_id: i64,
 }
 
+enum MarkReadOutcome {
+    /// The conversation does not exist, or `user_id` is not one of its two
+    /// parties — same "indistinguishable from missing" posture as every
+    /// other route here.
+    NotFound,
+    /// The legacy update itself always succeeds when the conversation
+    /// exists; `Some` carries the room's wake set when the read bridge
+    /// found (and caught up) an already-migrated room, `None` when there
+    /// was nothing to bridge or the bridge itself failed (already logged).
+    Marked(Option<HashSet<i64>>),
+}
+
 /// `POST /dm/conversations/{id}/read` — `{"up_to_id": N}`. Marks every
 /// message sent by the OTHER party with `id <= up_to_id` as read. 204 on
 /// success, 404 if the conversation does not exist or the caller is not a
 /// party.
+///
+/// # Bridge into the migrated Matrix room (P15)
+///
+/// Right after this route's own update commits, it catches up
+/// `conversation`'s Matrix DM room if one already exists
+/// (`crate::matrix_migration::catch_up_legacy_dm_read` — never migrates a
+/// conversation that has no room yet, unlike [`create_message`]'s own
+/// bridge) and wakes it the same way `create_message` does. A bridge failure
+/// never fails this route — the legacy read update already committed above.
 pub async fn mark_read(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -906,23 +1026,32 @@ pub async fn mark_read(
         Err(resp) => return resp,
     };
 
-    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+    let state_for_blocking = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<MarkReadOutcome> {
+        let state = state_for_blocking;
         let conn = state.control_plane().social_conn();
         let Some(conversation) = dm_db::get_conversation(&conn, conversation_id)? else {
-            return Ok(false);
+            return Ok(MarkReadOutcome::NotFound);
         };
         if conversation.peer_of(user_id).is_none() {
-            return Ok(false);
+            return Ok(MarkReadOutcome::NotFound);
         }
         let now = chrono::Utc::now().to_rfc3339();
         dm_db::mark_read(&conn, conversation_id, user_id, req.up_to_id, &now)?;
-        Ok(true)
+
+        let wake_ids = bridge_legacy_dm_read_and_resolve_wake_set(&state, &conn, conversation_id, &conversation);
+        Ok(MarkReadOutcome::Marked(wake_ids))
     })
     .await;
 
     match result {
-        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(MarkReadOutcome::Marked(wake_ids))) => {
+            if let Some(wake_ids) = wake_ids {
+                state.control_plane().live.wake_many(wake_ids.into_iter().map(|id| format!("user:{id}")));
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Ok(MarkReadOutcome::NotFound)) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => {
             tracing::error!("DB error marking dm messages read: {}", e);
             internal_error()
