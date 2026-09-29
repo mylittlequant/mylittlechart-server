@@ -993,9 +993,14 @@ pub fn cleanup_orphan_users(conn: &rusqlite::Connection) -> rusqlite::Result<Orp
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
 
     let candidates: Vec<(i64, String)> = {
+        // Anonymous accounts (`provider = 'anon'`) are excluded: a freshly
+        // bought or not-yet-entered one has exactly this shape (one self
+        // mirror, no session yet) and must not be swept; the billing GC
+        // (`billing::anon::gc_pending`) owns their lifecycle.
         let mut stmt = conn.prepare(
             "SELECT u.id, u.created_at FROM users u
-             WHERE (SELECT COUNT(*) FROM user_providers up WHERE up.user_id = u.id) = 1
+             WHERE u.provider != 'anon'
+               AND (SELECT COUNT(*) FROM user_providers up WHERE up.user_id = u.id) = 1
                AND EXISTS (
                    SELECT 1 FROM user_providers up
                    WHERE up.user_id = u.id
@@ -1672,6 +1677,15 @@ pub fn link_provider_to_user(
         }
     }
 
+    // An anonymous account (billing::anon) has no OAuth identity, by
+    // definition: it never takes one, whichever flow asks.
+    if crate::billing::anon::is_anonymous(conn, user_id)? {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(format!("user_id={user_id} is an anonymous account and takes no linked provider identity")),
+        ));
+    }
+
     // Not linked yet — insert new row.
     conn.execute(
         "INSERT INTO user_providers (user_id, provider, provider_user_id, display_name, linked_at, email, email_verified) \
@@ -1749,8 +1763,13 @@ pub fn resolve_or_create_user(
 
     if !device_id.is_empty() {
         if let Some(existing) = get_user_for_device(conn, device_id)? {
-            link_provider_to_user(conn, existing, provider, provider_user_id, display_name, email, now)?;
-            return Ok(existing);
+            // A device an anonymous account is signed in on does not pull an
+            // OAuth identity into it (see `billing::anon`): the identity gets
+            // its own account instead.
+            if !crate::billing::anon::is_anonymous(conn, existing)? {
+                link_provider_to_user(conn, existing, provider, provider_user_id, display_name, email, now)?;
+                return Ok(existing);
+            }
         }
     }
 

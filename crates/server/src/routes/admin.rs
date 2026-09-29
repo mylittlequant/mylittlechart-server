@@ -811,6 +811,13 @@ pub async fn merge_users(
             Json(ErrorResponse::new(format!("{side} user {user_id} does not exist"))),
         )
             .into_response(),
+        Ok(Err(crate::account_merge::MergeError::AnonymousAccount { side, user_id })) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(format!(
+                "{side} user {user_id} is an anonymous account and is never merged"
+            ))),
+        )
+            .into_response(),
         Ok(Err(crate::account_merge::MergeError::Conflicts(conflicts))) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": "hard conflicts", "conflicts": conflicts })),
@@ -1043,6 +1050,196 @@ pub async fn admin_set_user_nick(
         }
         Ok(Err(crate::db::AdminNickError::Db(e))) => {
             tracing::error!("DB error setting user nick via admin: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Database error"))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response(),
+    }
+}
+
+/// Request body of `POST /api/admin/users/{user_id}/grants`.
+#[derive(serde::Deserialize)]
+pub struct AddLifetimeGrantRequest {
+    /// `lifetime_paid` or `lifetime_anon`.
+    pub grant: String,
+    /// The operator's own account id, recorded in the grant's `source_ref`
+    /// (the ADMIN_SECRET carries no identity of its own).
+    pub admin_user_id: i64,
+    /// Why — recorded in the grant's `source_ref`.
+    pub note: String,
+}
+
+fn grant_row_json(row: &crate::billing::grants::GrantRow) -> serde_json::Value {
+    serde_json::json!({
+        "grant_id": row.id,
+        "grant": row.grant.as_str(),
+        "source": row.source,
+        "source_ref": row.source_ref,
+        "created_at": row.created_at,
+        "revoked_at": row.revoked_at,
+    })
+}
+
+/// POST /api/admin/users/{user_id}/grants
+///
+/// Add an operator lifetime grant (`source = admin`, `source_ref =
+/// "{admin_user_id}:{note}"`) to the ledger in `billing/grants.rs`; the
+/// account's `lifetime_paid` / `lifetime_anon` follow the ledger. Body
+/// `{"grant": "lifetime_paid"|"lifetime_anon", "admin_user_id": N, "note": "…"}`
+/// (`note`: 1–200 characters, no control characters). `201 {"grant_id",
+/// "user_id", "grant", "source": "admin", "source_ref", "created": true}`; the
+/// same grant added twice answers `200` with `"created": false` and the
+/// existing id. `404` for an unknown user, `400` for a bad body. Requires
+/// `Authorization: Bearer {ADMIN_SECRET}`.
+pub async fn add_lifetime_grant(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(user_id): Path<i64>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
+        return e;
+    }
+    let req: AddLifetimeGrantRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Invalid JSON body"))).into_response(),
+    };
+    let Some(grant) = crate::billing::grants::parse_lifetime(&req.grant) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("grant must be lifetime_paid or lifetime_anon")),
+        )
+            .into_response();
+    };
+    let Some(note) = crate::billing::grants::clean_note(&req.note) else {
+        return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("note must be 1-200 printable characters")))
+            .into_response();
+    };
+    if req.admin_user_id <= 0 {
+        return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("admin_user_id must be a user id"))).into_response();
+    }
+
+    let admin_user_id = req.admin_user_id;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::billing::grants::add_admin(&conn, user_id, grant, admin_user_id, &note, chrono::Utc::now())
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(added))) => {
+            tracing::info!(
+                "Admin lifetime grant {} for user {} (row {}, created={})",
+                grant.as_str(),
+                user_id,
+                added.id,
+                added.created
+            );
+            let status = if added.created { StatusCode::CREATED } else { StatusCode::OK };
+            (
+                status,
+                Json(serde_json::json!({
+                    "grant_id": added.id,
+                    "user_id": user_id,
+                    "grant": grant.as_str(),
+                    "source": crate::billing::grants::SOURCE_ADMIN,
+                    "source_ref": added.source_ref,
+                    "created": added.created,
+                })),
+            )
+                .into_response()
+        }
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(ErrorResponse::new("no such user"))).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error adding a lifetime grant: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Database error"))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response(),
+    }
+}
+
+/// GET /api/admin/users/{user_id}/grants
+///
+/// The account's lifetime-grant ledger, oldest first, revoked rows included:
+/// `{"user_id", "lifetime_paid", "lifetime_anon", "grants": [{"grant_id",
+/// "grant", "source", "source_ref", "created_at", "revoked_at"}]}`. `404` for
+/// an unknown user. Requires `Authorization: Bearer {ADMIN_SECRET}`.
+pub async fn list_lifetime_grants(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path(user_id): Path<i64>,
+) -> Response {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
+        return e;
+    }
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<serde_json::Value>> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        if !crate::billing::grants::user_exists(&conn, user_id)? {
+            return Ok(None);
+        }
+        let view = crate::billing::entitle::entitlement_view(&conn, user_id, chrono::Utc::now())?;
+        let rows = crate::billing::grants::list(&conn, user_id)?;
+        Ok(Some(serde_json::json!({
+            "user_id": user_id,
+            "lifetime_paid": view.lifetime_paid,
+            "lifetime_anon": view.lifetime_anon,
+            "grants": rows.iter().map(grant_row_json).collect::<Vec<_>>(),
+        })))
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(json))) => Json(json).into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(ErrorResponse::new("no such user"))).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error listing lifetime grants: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Database error"))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response(),
+    }
+}
+
+/// DELETE /api/admin/users/{user_id}/grants/{grant_id}
+///
+/// Revoke an operator grant (`revoked_at` is set, the row stays as history).
+/// `200 {"revoked": true}`; `200 {"revoked": false}` if it was already
+/// revoked; `404` if the account has no such row; `409` for a row created by
+/// an invoice — those are revoked only by that invoice's refund or reversal
+/// event. Requires `Authorization: Bearer {ADMIN_SECRET}`.
+pub async fn revoke_lifetime_grant(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Path((user_id, grant_id)): Path<(i64, i64)>,
+) -> Response {
+    if let Err(e) = verify_admin_secret(&state, &headers, &uri, peer_addr(peer)) {
+        return e;
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::billing::grants::revoke_admin(&conn, user_id, grant_id, chrono::Utc::now())
+    })
+    .await;
+    match result {
+        Ok(Ok(crate::billing::grants::AdminRevoke::Revoked)) => {
+            tracing::info!("Admin revoked lifetime grant row {} of user {}", grant_id, user_id);
+            Json(serde_json::json!({ "revoked": true })).into_response()
+        }
+        Ok(Ok(crate::billing::grants::AdminRevoke::AlreadyRevoked)) => {
+            Json(serde_json::json!({ "revoked": false })).into_response()
+        }
+        Ok(Ok(crate::billing::grants::AdminRevoke::NotFound)) => {
+            (StatusCode::NOT_FOUND, Json(ErrorResponse::new("no such grant"))).into_response()
+        }
+        Ok(Ok(crate::billing::grants::AdminRevoke::NotAdminGrant)) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new("an invoice grant follows its invoice and is not revoked here")),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!("DB error revoking a lifetime grant: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Database error"))).into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new("Internal error"))).into_response(),

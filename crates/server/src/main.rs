@@ -66,6 +66,12 @@
 //!   MLC_BILLING_QUANT_QUOTAS — `plan_id=quota` pairs, comma-separated: the
 //!                            quant quota of each monthly tier (no quota
 //!                            number lives in code)
+//!   MLC_BILLING_ANON_PER_IP_PER_HOUR / MLC_BILLING_ANON_GLOBAL_PER_HOUR /
+//!   MLC_BILLING_KEY_FAILS_PER_IP_PER_HOUR — hourly abuse budgets of the
+//!                            unauthenticated anonymous-account routes:
+//!                            checkouts per client IP (default 5), checkouts
+//!                            across all IPs (200), failed account-key
+//!                            attempts per client IP (20)
 //!   MLC_ALERT_DAEMON       — "1" to run the `mlc-alert-daemon` account-wide
 //!                            price-alert evaluation loop as a background
 //!                            task on this process's own tokio runtime
@@ -897,6 +903,18 @@ async fn main() {
                     // (if any) are unlinked below once the lock is dropped.
                     let share_blobs =
                         crate::db::cleanup_expired_share_links(&conn).unwrap_or_default();
+                    // Anonymous accounts bought but never paid for: deleted
+                    // once their invoice has been expired for a day (one
+                    // with money attached is kept for a human).
+                    match crate::billing::anon::gc_pending(&conn, chrono::Utc::now()) {
+                        Ok(report) if report.deleted > 0 || report.kept_with_payment > 0 => tracing::info!(
+                            "Anonymous account GC: {} unpaid deleted, {} kept because a payment is attached",
+                            report.deleted,
+                            report.kept_with_payment
+                        ),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("Anonymous account GC failed: {e}"),
+                    }
                     drop(ops_conn);
                     drop(conn);
 

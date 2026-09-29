@@ -15,9 +15,12 @@
 //!   `Idempotency-Key`);
 //! * [`signature`] — the `X-Dig2pay-Signature` verifier;
 //! * [`store`] — schema (additive, idempotent migration) and plain row access;
+//! * [`grants`] — the lifetime-grant ledger the lifetime flags derive from;
 //! * [`entitle`] — what an account is entitled to, derived from billing state;
 //! * [`webhook`] — applying a delivered event;
-//! * [`flow`] — the signed-in operations behind `routes::billing`.
+//! * [`flow`] — the signed-in operations behind `routes::billing`;
+//! * [`anon`] — anonymous ("numbered") accounts, their keys and their GC;
+//! * [`throttle`] — the per-IP hourly budgets on the unauthenticated anonymous routes.
 //!
 //! # Entitlement rules (owner-binding)
 //!
@@ -38,45 +41,48 @@
 //!   running they carry paid status too, per day. The quota per tier comes
 //!   from configuration only.
 //! * "Paid" (see `entitle`) is no longer driven by a time-bound `paid_until`
-//!   for account purchases: lifetime flags plus an active subscription. The
-//!   legacy `users.paid_until` column keeps working unchanged.
+//!   for account purchases: lifetime grants plus an active subscription.
 //!
-//! # Migration note — users who hold `paid_until` today
+//! # Lifetime grants
 //!
-//! Accounts that already have a `users.paid_until` (gift/trial codes,
-//! operator grants, everything paid before billing shipped) STAY PAID:
-//! `db::user_is_paid` still honours a future `paid_until`, so nobody loses
-//! access when this ships. Under the new rule those current users become
-//! LIFETIME. That conversion is a one-off statement the operator runs at
-//! cutover, deliberately not executed at boot (`paid_until` also carries
-//! short gift/trial grants, and which of them count as "current users" is
-//! the operator's call):
+//! `lifetime_paid` / `lifetime_anon` are derived from the ledger
+//! (`billing_grants`, see [`grants`]): an account holds one while at least
+//! one non-revoked row says so. Rows come from a settled invoice
+//! (`source = invoice`, `source_ref` = the invoice id) or from an operator
+//! (`source = admin`, `source_ref` = the operator's account id and a note;
+//! `POST /api/admin/users/{id}/grants`). A refund or a reverted payment
+//! revokes only the rows whose `source_ref` is that invoice, and a re-settled
+//! invoice restores only its own; an operator grant or a second purchase is
+//! never touched. The columns on `users` are a cache rebuilt from the ledger
+//! on every change and on every boot.
 //!
-//! ```sql
-//! UPDATE users SET lifetime_paid = 1
-//!  WHERE paid_until IS NOT NULL AND datetime(paid_until) > datetime('now');
-//! ```
+//! # Legacy `paid_until`
 //!
-//! `paid_until` is left in place afterwards (never cleared), so a rollback
-//! loses nothing. Caveat: a lifetime flag set this way is not backed by any
-//! `billing_invoices` row, so if that same account later buys a lifetime plan
-//! and is refunded, the refund clears the flag.
+//! `users.paid_until` stays as the time-bound grant an operator or a gift/trial
+//! code sets (`db::grant_paid_days`, `db::redeem_gift_code`): `db::user_is_paid`
+//! still honours a future value and it simply runs out on its own. Nothing
+//! sells time-bound paid access any more, and there is no cutover step that
+//! converts it — an account that should keep paid status for life gets an
+//! operator grant.
 //!
-//! # Not covered here
+//! # Anonymous accounts
 //!
-//! The anonymous (no-OAuth) sign-up and sign-in flow itself is not part of
-//! this adapter: checkout is a signed-in route, so an anonymous purchase
-//! grants `lifetime_anon` + `lifetime_paid` to the account that buys it. A
-//! public checkout that creates the new anonymous account (and hands its
-//! credential to the payer) is a separate piece.
+//! `mlc-anon-account*` is sold only through the public
+//! `POST /api/billing/anon-checkout`, which creates the new account it
+//! belongs to (see [`anon`]); the signed-in checkout refuses those plans. A
+//! paid account is never sold twice (`409 already_owned`, nothing created on
+//! the processor).
 
+pub mod anon;
 pub mod client;
 pub mod config;
 pub mod entitle;
 pub mod flow;
+pub mod grants;
 pub mod plans;
 pub mod signature;
 pub mod store;
+pub mod throttle;
 pub mod webhook;
 
 #[cfg(test)]

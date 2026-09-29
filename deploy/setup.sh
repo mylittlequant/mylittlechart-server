@@ -51,6 +51,12 @@ DIG2PAY_WEBHOOK_SECRET_FILES=
 MLC_BILLING_ONION_HOSTS=
 # Quant quota per monthly tier: plan_id=quota, comma-separated.
 MLC_BILLING_QUANT_QUOTAS=
+# Abuse budgets of the anonymous-account routes (per hour): checkouts per
+# client IP / across all IPs, and failed account-key attempts per client IP.
+# Defaults 5 / 200 / 20.
+#MLC_BILLING_ANON_PER_IP_PER_HOUR=
+#MLC_BILLING_ANON_GLOBAL_PER_HOUR=
+#MLC_BILLING_KEY_FAILS_PER_IP_PER_HOUR=
 # The one-time account plan ids default to mlc-paid-account-v1,
 # mlc-anon-account-v1, mlc-paid-account-tor-v1 and mlc-anon-account-tor-v1;
 # override with MLC_BILLING_PLAN_PAID / _ANON / _PAID_TOR / _ANON_TOR.

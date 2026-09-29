@@ -19,6 +19,11 @@
 //! * `billing_events` — every webhook delivery, keyed by dig2pay's event id
 //!   (the dedup key), with the raw body and what was done about it.
 //! * `billing_credit` — the per-account credit balance (overpayments).
+//! * `billing_grants` — the lifetime-grant ledger (see `grants.rs`): the
+//!   lifetime flags are derived from it.
+//! * `billing_anon_accounts` — anonymous ("numbered") accounts: the SHA-256
+//!   of their account key and whether payment has activated them (see
+//!   `anon.rs`).
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result, Row};
@@ -102,12 +107,40 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             user_id        INTEGER PRIMARY KEY,
             balance_micros INTEGER NOT NULL DEFAULT 0,
             updated_at     TEXT    NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS billing_grants (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            grant_kind  TEXT    NOT NULL,
+            source      TEXT    NOT NULL,
+            source_ref  TEXT    NOT NULL,
+            created_at  TEXT    NOT NULL,
+            revoked_at  TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_billing_grants_in_force
+            ON billing_grants(user_id, grant_kind, source, source_ref) WHERE revoked_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_billing_grants_user ON billing_grants(user_id);
+        CREATE INDEX IF NOT EXISTS idx_billing_grants_source ON billing_grants(source, source_ref);
+
+        CREATE TABLE IF NOT EXISTS billing_anon_accounts (
+            user_id      INTEGER PRIMARY KEY,
+            key_hash     TEXT    NOT NULL UNIQUE,
+            status       TEXT    NOT NULL,
+            created_at   TEXT    NOT NULL,
+            activated_at TEXT,
+            rotated_at   TEXT
         );",
     )?;
     add_column_if_missing(conn, "users", "lifetime_paid", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "users", "lifetime_anon", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "users", "quant_tier", "TEXT")?;
     add_column_if_missing(conn, "users", "quant_active_until", "TEXT")?;
+    // The lifetime flags are a cache of the grant ledger: seed the ledger
+    // from anything a pre-ledger version granted, then make the cache match
+    // it. Both steps are idempotent and cheap, so they run on every boot.
+    super::grants::backfill_from_invoices(conn)?;
+    super::grants::rebuild_all_caches(conn)?;
     Ok(())
 }
 
@@ -504,6 +537,15 @@ pub fn invoices_for_subscription(conn: &Connection, subscription_id: &str) -> Re
     rows.collect()
 }
 
+/// Every invoice of `user_id`, newest first.
+pub fn invoices_for_user(conn: &Connection, user_id: i64) -> Result<Vec<InvoiceRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {INVOICE_COLUMNS} FROM billing_invoices WHERE user_id = ?1 ORDER BY created_at DESC, rowid DESC"
+    ))?;
+    let rows = stmt.query_map(params![user_id], invoice_from_row)?;
+    rows.collect()
+}
+
 /// Invoices of `user_id` that are still waiting for payment.
 pub fn unpaid_invoices_for_user(conn: &Connection, user_id: i64) -> Result<Vec<InvoiceRow>> {
     let mut stmt = conn.prepare(&format!(
@@ -515,20 +557,15 @@ pub fn unpaid_invoices_for_user(conn: &Connection, user_id: i64) -> Result<Vec<I
     rows.collect()
 }
 
-/// Every invoice of `user_id` that granted `grant` and whose grant is in
-/// force, other than `except_invoice_id`.
-pub fn granted_invoices_of_kind(
-    conn: &Connection,
-    user_id: i64,
-    grant: Grant,
-    except_invoice_id: &str,
-) -> Result<Vec<InvoiceRow>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {INVOICE_COLUMNS} FROM billing_invoices
-         WHERE user_id = ?1 AND grant_kind = ?2 AND grant_state = 'granted' AND invoice_id != ?3"
-    ))?;
-    let rows = stmt.query_map(params![user_id, grant.as_str(), except_invoice_id], invoice_from_row)?;
-    rows.collect()
+/// Correct an invoice's kind to what the processor reports
+/// (`GET /invoices/{id}`'s `kind`). Only ever applied to an invoice that has
+/// granted nothing yet, so no entitlement is left resting on the old kind.
+pub fn set_invoice_kind(conn: &Connection, invoice_id: &str, kind: InvoiceKind, now: DateTime<Utc>) -> Result<()> {
+    conn.execute(
+        "UPDATE billing_invoices SET kind = ?2, updated_at = ?3 WHERE invoice_id = ?1 AND grant_state = 'none'",
+        params![invoice_id, kind.as_str(), now.to_rfc3339()],
+    )?;
+    Ok(())
 }
 
 /// Insert `invoice`; an id already present is left untouched.
@@ -707,6 +744,7 @@ pub fn complete_checkout(
 /// once `from` has nothing left, it changes nothing.
 pub fn merge_user(conn: &Connection, from: i64, into: i64) -> Result<()> {
     super::entitle::merge_entitlements(conn, from, into)?;
+    super::grants::merge(conn, from, into)?;
     if customer_for_user(conn, into)?.is_none() {
         conn.execute(
             "UPDATE billing_subscribers SET user_id = ?1 WHERE user_id = ?2",
@@ -820,7 +858,7 @@ mod tests {
 
         // An anonymous purchase grants anonymous AND paid, so a paid account
         // (either origin) is then already held...
-        crate::billing::entitle::grant_lifetime(&conn, uid, Grant::LifetimeAnon).expect("flag");
+        crate::billing::grants::grant_for_invoice(&conn, uid, Grant::LifetimeAnon, "inv_anon", now).expect("grant");
         for plan in [&paid, &paid_tor] {
             let refused = prepare_checkout(&conn, &catalog, uid, plan, now, key_source("k")).expect("prepare");
             assert!(matches!(refused, Prepared::Refused(Refusal::AlreadyOwned)), "{}: {refused:?}", plan.id);

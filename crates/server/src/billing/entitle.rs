@@ -5,14 +5,17 @@
 //!
 //! 1. `users.paid_until` in the future — the legacy leg (gift/trial codes,
 //!    operator grants, and every account paid before billing shipped);
-//! 2. `users.lifetime_paid = 1` — bought a paid account, for life;
-//! 3. `users.lifetime_anon = 1` — bought an anonymous account, for life;
+//! 2. `users.lifetime_paid = 1` — a paid account, for life;
+//! 3. `users.lifetime_anon = 1` — an anonymous account, for life;
 //! 4. `users.quant_active_until` in the future — a quant subscription that is
 //!    inside a paid period. Quant tiers ALSO carry paid status, per day.
 //!
-//! The lifetime flags and the quant columns are a cache of what the granted
-//! invoices say (`billing_invoices`); this module is the only writer besides
-//! the account merge.
+//! The two lifetime flags are a cache of the grant ledger (`grants.rs`: an
+//! account holds one exactly while a non-revoked `billing_grants` row says
+//! so, so a refund can only take back what its own invoice granted). The
+//! quant columns are a cache of the granted invoices' paid periods
+//! (`recompute_quant`). Nothing outside `grants.rs` and this module writes
+//! either.
 
 use std::collections::HashSet;
 
@@ -121,58 +124,6 @@ pub fn entitled_among(conn: &Connection, user_ids: &[i64], now: DateTime<Utc>) -
         }
     }
     Ok(entitled)
-}
-
-/// The flags a lifetime plan sets, as `(lifetime_paid, lifetime_anon)`.
-/// An anonymous account is ALSO a paid one: `mlc-anon-account*` grants both.
-fn lifetime_flags(grant: Grant) -> Result<(bool, bool)> {
-    match grant {
-        Grant::LifetimePaid => Ok((true, false)),
-        Grant::LifetimeAnon => Ok((true, true)),
-        Grant::Quant => Err(rusqlite::Error::InvalidParameterName(
-            "quant is not a lifetime grant".to_string(),
-        )),
-    }
-}
-
-/// Grant the permanent flags of a lifetime plan (see [`lifetime_flags`]);
-/// flags already set stay set. `false` when the account no longer exists.
-/// Touches no date column: a lifetime grant has no end.
-pub fn grant_lifetime(conn: &Connection, user_id: i64, grant: Grant) -> Result<bool> {
-    let (paid, anon) = lifetime_flags(grant)?;
-    let changed = conn.execute(
-        "UPDATE users SET lifetime_paid = MAX(lifetime_paid, ?1), lifetime_anon = MAX(lifetime_anon, ?2)
-         WHERE id = ?3",
-        params![i64::from(paid), i64::from(anon), user_id],
-    )?;
-    Ok(changed > 0)
-}
-
-/// After the grant of `revoked_invoice_id` is withdrawn: clear the flags
-/// that no other granted invoice still backs. `lifetime_paid` is backed by
-/// any paid OR anonymous purchase, `lifetime_anon` only by an anonymous one.
-pub fn release_lifetime_if_unbacked(
-    conn: &Connection,
-    user_id: i64,
-    grant: Grant,
-    revoked_invoice_id: &str,
-) -> Result<()> {
-    let (paid, anon) = lifetime_flags(grant)?;
-    let backed_by = |kinds: &[Grant]| -> Result<bool> {
-        for kind in kinds {
-            if !store::granted_invoices_of_kind(conn, user_id, *kind, revoked_invoice_id)?.is_empty() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    };
-    if paid && !backed_by(&[Grant::LifetimePaid, Grant::LifetimeAnon])? {
-        conn.execute("UPDATE users SET lifetime_paid = 0 WHERE id = ?1", params![user_id])?;
-    }
-    if anon && !backed_by(&[Grant::LifetimeAnon])? {
-        conn.execute("UPDATE users SET lifetime_anon = 0 WHERE id = ?1", params![user_id])?;
-    }
-    Ok(())
 }
 
 /// Recompute a monthly subscription's paid-through moment from the invoices
@@ -295,8 +246,8 @@ pub fn credit_balance(conn: &Connection, user_id: i64) -> Result<i64> {
 // Account merge
 // ============================================================================
 
-/// Fold `from`'s entitlements and credit into `into`: lifetime flags are
-/// OR-ed, the later quant period wins, credit adds up.
+/// Fold `from`'s quant period and credit into `into`: the later quant period
+/// wins, credit adds up. (The lifetime grants move with `grants::merge`.)
 pub fn merge_entitlements(conn: &Connection, from: i64, into: i64) -> Result<()> {
     if let (Some(a), Some(b)) = (read_columns(conn, from)?, read_columns(conn, into)?) {
         let end = |c: &BillingColumns| {
@@ -312,15 +263,8 @@ pub fn merge_entitlements(conn: &Connection, from: i64, into: i64) -> Result<()>
             (b.quant_tier.clone(), b.quant_active_until.clone())
         };
         conn.execute(
-            "UPDATE users SET lifetime_paid = ?1, lifetime_anon = ?2, quant_tier = ?3, quant_active_until = ?4
-             WHERE id = ?5",
-            params![
-                i64::from(a.lifetime_paid || b.lifetime_paid),
-                i64::from(a.lifetime_anon || b.lifetime_anon),
-                tier,
-                until,
-                into,
-            ],
+            "UPDATE users SET quant_tier = ?1, quant_active_until = ?2 WHERE id = ?3",
+            params![tier, until, into],
         )?;
     }
     let from_credit = credit_balance(conn, from)?;
@@ -370,8 +314,8 @@ mod tests {
         let quant = seed_user(&conn, "quant");
         let none = seed_user(&conn, "none");
         crate::db::set_user_paid_until(&conn, legacy, Some(&(now + Duration::days(3)).to_rfc3339())).expect("legacy");
-        grant_lifetime(&conn, paid, Grant::LifetimePaid).expect("paid");
-        grant_lifetime(&conn, anon, Grant::LifetimeAnon).expect("anon");
+        crate::billing::grants::grant_for_invoice(&conn, paid, Grant::LifetimePaid, "inv_p", now).expect("paid");
+        crate::billing::grants::grant_for_invoice(&conn, anon, Grant::LifetimeAnon, "inv_a", now).expect("anon");
         conn.execute(
             "UPDATE users SET quant_tier = 'mlc-monthly-20-v1', quant_active_until = ?1 WHERE id = ?2",
             params![(now + Duration::days(1)).to_rfc3339(), quant],
@@ -541,28 +485,13 @@ mod tests {
     }
 
     #[test]
-    fn a_lifetime_flag_survives_while_another_granted_invoice_backs_it() {
-        let conn = conn();
-        let now = Utc::now();
-        let uid = seed_user(&conn, "two-buys");
-        grant_lifetime(&conn, uid, Grant::LifetimePaid).expect("set");
-        let mut other = quant_invoice(uid, "sub_x", "inv_other", now, GrantState::Granted);
-        other.grant_kind = Some(Grant::LifetimePaid);
-        store::insert_invoice(&conn, &other, now).expect("insert");
-        release_lifetime_if_unbacked(&conn, uid, Grant::LifetimePaid, "inv_refunded").expect("release");
-        assert!(entitlement_view(&conn, uid, now).expect("view").lifetime_paid, "still backed");
-        release_lifetime_if_unbacked(&conn, uid, Grant::LifetimePaid, "inv_other").expect("release");
-        assert!(!entitlement_view(&conn, uid, now).expect("view").lifetime_paid, "no backing left");
-    }
-
-    #[test]
-    fn merging_accounts_ors_the_flags_keeps_the_later_quant_and_adds_credit() {
+    fn merging_accounts_keeps_the_later_quant_adds_credit_and_moves_the_grants() {
         let conn = conn();
         let now = Utc::now();
         let from = seed_user(&conn, "from");
         let into = seed_user(&conn, "into");
-        grant_lifetime(&conn, from, Grant::LifetimeAnon).expect("anon");
-        grant_lifetime(&conn, into, Grant::LifetimePaid).expect("paid");
+        crate::billing::grants::grant_for_invoice(&conn, from, Grant::LifetimeAnon, "inv_a", now).expect("anon");
+        crate::billing::grants::grant_for_invoice(&conn, into, Grant::LifetimePaid, "inv_p", now).expect("paid");
         conn.execute(
             "UPDATE users SET quant_tier = 'mlc-monthly-50-v1', quant_active_until = ?1 WHERE id = ?2",
             params![(now + Duration::days(20)).to_rfc3339(), from],
@@ -577,6 +506,7 @@ mod tests {
         add_credit(&conn, into, 250_000, now).expect("credit into");
 
         merge_entitlements(&conn, from, into).expect("merge");
+        crate::billing::grants::merge(&conn, from, into).expect("merge grants");
         let view = entitlement_view(&conn, into, now).expect("view");
         assert!(view.lifetime_paid && view.lifetime_anon);
         assert_eq!(view.quant_tier.as_deref(), Some("mlc-monthly-50-v1"));

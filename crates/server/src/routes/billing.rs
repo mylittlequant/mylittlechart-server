@@ -43,12 +43,12 @@ use crate::state::AppState;
 /// `routes::control_api_router`).
 pub const WEBHOOK_MAX_BODY_BYTES: usize = 256 * 1024;
 
-fn error(status: StatusCode, code: &str) -> Response {
+pub(crate) fn error(status: StatusCode, code: &str) -> Response {
     (status, Json(ErrorResponse::new(code))).into_response()
 }
 
 /// The signed-in caller's user id, or the response to send instead.
-async fn signed_in(state: &Arc<AppState>, headers: &HeaderMap) -> Result<i64, Response> {
+pub(crate) async fn signed_in(state: &Arc<AppState>, headers: &HeaderMap) -> Result<i64, Response> {
     match resolve_user_id(state.clone(), headers).await {
         Ok(id) => Ok(id),
         Err(StatusCode::UNAUTHORIZED) => Err(error(StatusCode::UNAUTHORIZED, "Authentication required")),
@@ -58,10 +58,12 @@ async fn signed_in(state: &Arc<AppState>, headers: &HeaderMap) -> Result<i64, Re
 
 /// Map a failed operation to its response. The wire `error` is a stable
 /// snake_case code; dig2pay's own message rides in `detail` for a refusal.
-fn flow_error(e: FlowError) -> Response {
+pub(crate) fn flow_error(e: FlowError) -> Response {
     match e {
         FlowError::NotConfigured => error(StatusCode::SERVICE_UNAVAILABLE, "billing_not_configured"),
         FlowError::PlanNotAvailable => error(StatusCode::BAD_REQUEST, "plan_not_available"),
+        // An anonymous account is bought by someone with no account yet.
+        FlowError::AnonymousOnly => error(StatusCode::BAD_REQUEST, "anonymous_only"),
         // The catalog lists it, the processor does not have it yet: a clean,
         // retryable refusal (nothing was created).
         FlowError::PlanUnavailable => {
@@ -126,6 +128,10 @@ fn plan_json(plan: &Plan) -> Value {
 /// variants (`onion_only: true`) appear only when the request came through
 /// the onion vhost; there the clearnet account plans are not offered. `quota`
 /// is the operator-configured quant quota of a tier (`null` when unset).
+/// An `anon_account` plan is not bought here: it is sold, to someone with no
+/// account yet, by the public `POST /api/billing/anon-checkout`
+/// (`routes/anon_account.rs`); this signed-in checkout answers
+/// `400 anonymous_only` for it.
 pub async fn plans(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(response) = signed_in(&state, &headers).await {
         return response;
@@ -259,7 +265,7 @@ pub async fn checkout(
     }
 }
 
-fn invoice_json(view: InvoiceView) -> Value {
+pub(crate) fn invoice_json(view: InvoiceView) -> Value {
     let i = &view.invoice;
     let period = match (&i.period_from, &i.period_to) {
         (Some(from), Some(to)) => json!({ "from": from, "to": to }),
@@ -418,7 +424,7 @@ pub async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, bod
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::billing::client::Dig2payClient;
     use crate::billing::config::{BillingRuntime, BillingSettings};
@@ -435,37 +441,37 @@ mod tests {
     use std::sync::Mutex;
     use tower::ServiceExt;
 
-    const MERCHANT_KEY: &str = "test-merchant-key";
-    const WEBHOOK_SECRET: &str = "whsec_test_secret";
-    const ONION_HOST: &str = "mlcexample.onion";
+    pub(crate) const MERCHANT_KEY: &str = "test-merchant-key";
+    pub(crate) const WEBHOOK_SECRET: &str = "whsec_test_secret";
+    pub(crate) const ONION_HOST: &str = "mlcexample.onion";
 
     // ------------------------------------------------- in-process merchant
 
     /// One request the mock merchant saw.
     #[derive(Debug, Clone)]
-    struct Call {
-        path: String,
-        authorised: bool,
-        idempotency_key: Option<String>,
-        body: Value,
+    pub(crate) struct Call {
+        pub(crate) path: String,
+        pub(crate) authorised: bool,
+        pub(crate) idempotency_key: Option<String>,
+        pub(crate) body: Value,
     }
 
     #[derive(Default)]
-    struct MockMerchant {
-        calls: Vec<Call>,
+    pub(crate) struct MockMerchant {
+        pub(crate) calls: Vec<Call>,
         /// `Idempotency-Key` → the answer already given to it.
-        answers: HashMap<String, Value>,
-        created: u32,
-        fail_next_subscription: bool,
+        pub(crate) answers: HashMap<String, Value>,
+        pub(crate) created: u32,
+        pub(crate) fail_next_subscription: bool,
         /// Plans the processor does not have (yet): `POST /subscriptions` answers 404.
-        unknown_plans: HashSet<String>,
-        invoice_status: String,
-        change_answer: Option<Value>,
+        pub(crate) unknown_plans: HashSet<String>,
+        pub(crate) invoice_status: String,
+        pub(crate) change_answer: Option<Value>,
     }
 
-    type Shared = Arc<Mutex<MockMerchant>>;
+    pub(crate) type Shared = Arc<Mutex<MockMerchant>>;
 
-    fn pay_options(amount: &str) -> Value {
+    pub(crate) fn pay_options(amount: &str) -> Value {
         json!([
             { "chain": "evm:1", "asset": "USDC", "address": "0x00000000000000000000000000000000000000aa",
               "amount": amount, "expires_at": (Utc::now() + Duration::hours(1)).to_rfc3339(),
@@ -558,7 +564,7 @@ mod tests {
         }
     }
 
-    async fn spawn_merchant() -> (String, Shared) {
+    pub(crate) async fn spawn_merchant() -> (String, Shared) {
         let shared: Shared = Arc::new(Mutex::new(MockMerchant {
             invoice_status: "new".to_string(),
             ..MockMerchant::default()
@@ -591,7 +597,7 @@ mod tests {
         dir
     }
 
-    fn control_plane() -> crate::state::ControlPlane {
+    pub(crate) fn control_plane() -> crate::state::ControlPlane {
         let key = "0".repeat(64);
         let dir = temp_dir("cp");
         crate::state::ControlPlane {
@@ -610,11 +616,16 @@ mod tests {
         }
     }
 
-    fn app_state(billing: Option<BillingRuntime>) -> Arc<AppState> {
+    pub(crate) fn app_state(billing: Option<BillingRuntime>) -> Arc<AppState> {
+        app_state_with_admin(billing, "")
+    }
+
+    /// Like [`app_state`], with `ADMIN_SECRET` set so the admin routes answer.
+    pub(crate) fn app_state_with_admin(billing: Option<BillingRuntime>, admin_secret: &str) -> Arc<AppState> {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
         let state = AppState::new(
             Some(control_plane()),
-            String::new(),
+            admin_secret.to_string(),
             String::new(),
             String::new(),
             String::new(),
@@ -637,11 +648,21 @@ mod tests {
         })
     }
 
-    fn runtime(base_url: Option<&str>) -> BillingRuntime {
-        let settings = BillingSettings::from_lookup(|name| match name {
-            "MLC_BILLING_ONION_HOSTS" => Some(ONION_HOST.to_string()),
-            "MLC_BILLING_QUANT_QUOTAS" => Some("mlc-monthly-50-v1=300,mlc-monthly-20-v1=100".to_string()),
-            _ => None,
+    pub(crate) fn runtime(base_url: Option<&str>) -> BillingRuntime {
+        runtime_with(base_url, &[])
+    }
+
+    /// Like [`runtime`], with extra environment settings (e.g. a smaller abuse budget).
+    pub(crate) fn runtime_with(base_url: Option<&str>, extra: &[(&str, &str)]) -> BillingRuntime {
+        let settings = BillingSettings::from_lookup(|name| {
+            if let Some((_, value)) = extra.iter().find(|(k, _)| *k == name) {
+                return Some((*value).to_string());
+            }
+            match name {
+                "MLC_BILLING_ONION_HOSTS" => Some(ONION_HOST.to_string()),
+                "MLC_BILLING_QUANT_QUOTAS" => Some("mlc-monthly-50-v1=300,mlc-monthly-20-v1=100".to_string()),
+                _ => None,
+            }
         });
         let client = base_url.map(|url| {
             Dig2payClient::new(url, MERCHANT_KEY, std::time::Duration::from_secs(5)).expect("client")
@@ -649,7 +670,7 @@ mod tests {
         BillingRuntime::new(&settings, client, vec![WEBHOOK_SECRET.as_bytes().to_vec()])
     }
 
-    fn sign_in(state: &Arc<AppState>, name: &str) -> (i64, String) {
+    pub(crate) fn sign_in(state: &Arc<AppState>, name: &str) -> (i64, String) {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let uid = crate::db::upsert_user(&conn, "github", name, name, None, &Utc::now().to_rfc3339())
             .expect("seed user");
@@ -659,31 +680,51 @@ mod tests {
         (uid, token)
     }
 
-    async fn send(
+    /// The client address every request carries unless a test says otherwise.
+    pub(crate) const DEFAULT_CLIENT_IP: [u8; 4] = [198, 51, 100, 7];
+
+    pub(crate) async fn send(
         router: &Router,
         method: Method,
         uri: &str,
         headers: &[(&str, &str)],
         body: Option<String>,
     ) -> (StatusCode, Value) {
+        let (status, _, json) = send_from(router, DEFAULT_CLIENT_IP, method, uri, headers, body).await;
+        (status, json)
+    }
+
+    /// Like [`send`], from client address `ip`, also returning the response headers.
+    pub(crate) async fn send_from(
+        router: &Router,
+        ip: [u8; 4],
+        method: Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Option<String>,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
         let mut request = Request::builder().method(method).uri(uri);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        let request = request
+        let mut request = request
             .body(body.map_or_else(Body::empty, Body::from))
             .expect("build request");
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((ip, 40_000))));
         let response = router.clone().oneshot(request).await.expect("router is infallible");
         let status = response.status();
+        let response_headers = response.headers().clone();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (status, response_headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
-    fn auth(token: &str) -> String {
+    pub(crate) fn auth(token: &str) -> String {
         format!("Bearer {token}")
     }
 
-    async fn get_json(router: &Router, token: &str, uri: &str, host: Option<&str>) -> (StatusCode, Value) {
+    pub(crate) async fn get_json(router: &Router, token: &str, uri: &str, host: Option<&str>) -> (StatusCode, Value) {
         let authorization = auth(token);
         let mut headers = vec![("authorization", authorization.as_str())];
         if let Some(host) = host {
@@ -692,7 +733,7 @@ mod tests {
         send(router, Method::GET, uri, &headers, None).await
     }
 
-    async fn post_json(router: &Router, token: &str, uri: &str, body: Value, host: Option<&str>) -> (StatusCode, Value) {
+    pub(crate) async fn post_json(router: &Router, token: &str, uri: &str, body: Value, host: Option<&str>) -> (StatusCode, Value) {
         let authorization = auth(token);
         let mut headers = vec![("authorization", authorization.as_str()), ("content-type", "application/json")];
         if let Some(host) = host {
@@ -702,7 +743,7 @@ mod tests {
     }
 
     /// Deliver a webhook signed with `secret` at time `t`.
-    async fn deliver(router: &Router, secret: &str, t: i64, body: &Value) -> (StatusCode, Value) {
+    pub(crate) async fn deliver(router: &Router, secret: &str, t: i64, body: &Value) -> (StatusCode, Value) {
         let raw = body.to_string();
         let header = sign_for_test(&[secret.as_bytes()], t, raw.as_bytes());
         send(
@@ -715,13 +756,13 @@ mod tests {
         .await
     }
 
-    async fn deliver_ok(router: &Router, body: &Value) -> Value {
+    pub(crate) async fn deliver_ok(router: &Router, body: &Value) -> Value {
         let (status, answer) = deliver(router, WEBHOOK_SECRET, Utc::now().timestamp(), body).await;
         assert_eq!(status, StatusCode::OK, "{answer}");
         answer
     }
 
-    fn webhook_body(event_id: &str, kind: &str, uid: i64, subscription_id: &str, invoice_id: &str, extra: Value) -> Value {
+    pub(crate) fn webhook_body(event_id: &str, kind: &str, uid: i64, subscription_id: &str, invoice_id: &str, extra: Value) -> Value {
         let mut body = json!({
             "event_id": event_id,
             "kind": kind,
@@ -738,7 +779,7 @@ mod tests {
         body
     }
 
-    fn period_days(days: i64) -> Value {
+    pub(crate) fn period_days(days: i64) -> Value {
         let now = Utc::now();
         json!({ "period": { "from": now.to_rfc3339(), "to": (now + Duration::days(days)).to_rfc3339() } })
     }
@@ -977,16 +1018,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_account_plan_grants_its_flag_end_to_end_and_tor_ids_need_the_onion_host() {
+    async fn each_paid_account_plan_grants_its_flag_end_to_end_and_tor_ids_need_the_onion_host() {
         let (base, _merchant) = spawn_merchant().await;
         let state = app_state(Some(runtime(Some(&base))));
         let router = control_api_router(state.clone());
 
         for (plan, host, paid, anon) in [
             ("mlc-paid-account-v1", "mylittlechart.org", true, false),
-            ("mlc-anon-account-v1", "mylittlechart.org", true, true),
             (DEFAULT_PAID_TOR_ID, ONION_HOST, true, false),
-            (DEFAULT_ANON_TOR_ID, ONION_HOST, true, true),
         ] {
             let (uid, token) = sign_in(&state, &format!("acct-{plan}"));
             let (status, checkout) = post_json(&router, &token, "/billing/checkout", json!({"plan_id": plan}), Some(host)).await;
@@ -1014,6 +1053,14 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{plan} via {host}");
             assert_eq!(answer["error"], "plan_not_available");
         }
+
+        // An anonymous account is bought by someone who has none yet: the
+        // signed-in checkout refuses those plans on their own vhost, too.
+        for (plan, host) in [("mlc-anon-account-v1", "mylittlechart.org"), (DEFAULT_ANON_TOR_ID, ONION_HOST)] {
+            let (status, answer) = post_json(&router, &token, "/billing/checkout", json!({"plan_id": plan}), Some(host)).await;
+            assert_eq!((status, answer["error"].as_str()), (StatusCode::BAD_REQUEST, Some("anonymous_only")), "{plan}");
+        }
+        assert_eq!(merchant_calls(&_merchant, "/subscriptions"), 2, "only the two paid purchases reached the processor");
     }
 
     #[tokio::test]
@@ -1050,7 +1097,7 @@ mod tests {
         let (_, other) = sign_in(&state, "other");
         let router = control_api_router(state);
 
-        let (_, checkout) = post_json(&router, &owner, "/billing/checkout", json!({"plan_id": "mlc-anon-account-v1"}), None).await;
+        let (_, checkout) = post_json(&router, &owner, "/billing/checkout", json!({"plan_id": "mlc-paid-account-v1"}), None).await;
         let invoice_id = checkout["invoice_id"].as_str().expect("invoice id");
 
         let (status, _) = get_json(&router, &owner, &format!("/billing/invoice/{invoice_id}"), None).await;
@@ -1249,7 +1296,7 @@ mod tests {
         let state = app_state(Some(runtime(Some(&base))));
         let (uid, token) = sign_in(&state, "integrity");
         let router = control_api_router(state);
-        post_json(&router, &token, "/billing/checkout", json!({"plan_id": "mlc-anon-account-v1"}), None).await;
+        post_json(&router, &token, "/billing/checkout", json!({"plan_id": "mlc-paid-account-v1"}), None).await;
 
         let partial = webhook_body("p-1", "payment_partial", uid, "sub_1", "grp_1", json!({
             "amount": { "asset": "USDT", "chain": "tron", "value": "4.000000", "received": "4.000000", "expected": "10.000000", "shortfall": "6.000000" }
@@ -1290,7 +1337,7 @@ mod tests {
         let (_, invoice) = get_json(&router, &token, "/billing/invoice/grp_1", None).await;
         assert_eq!(invoice["grant_state"], "granted");
         let (_, me) = get_json(&router, &token, "/billing/me", None).await;
-        assert_eq!((me["paid"].as_bool(), me["lifetime_anon"].as_bool()), (Some(true), Some(true)));
+        assert_eq!((me["paid"].as_bool(), me["lifetime_paid"].as_bool()), (Some(true), Some(true)));
     }
 
     #[tokio::test]
@@ -1328,7 +1375,7 @@ mod tests {
 
     /// Sign in as `name` and check out `plan`; returns the account, its token
     /// and the checkout answer.
-    async fn buy(router: &Router, state: &Arc<AppState>, name: &str, plan: &str, host: Option<&str>) -> (i64, String, Value) {
+    pub(crate) async fn buy(router: &Router, state: &Arc<AppState>, name: &str, plan: &str, host: Option<&str>) -> (i64, String, Value) {
         let (uid, token) = sign_in(state, name);
         let (status, checkout) = post_json(router, &token, "/billing/checkout", json!({ "plan_id": plan }), host).await;
         assert_eq!(status, StatusCode::OK, "{plan}: {checkout}");
@@ -1336,7 +1383,7 @@ mod tests {
     }
 
     /// The webhook body dig2pay sends when a one-time plan settles.
-    fn one_time_settlement(event_id: &str, uid: i64, plan: &str, sub: &str, invoice: &str) -> Value {
+    pub(crate) fn one_time_settlement(event_id: &str, uid: i64, plan: &str, sub: &str, invoice: &str) -> Value {
         webhook_body(
             event_id,
             "payment_confirmed",
@@ -1351,7 +1398,7 @@ mod tests {
         )
     }
 
-    fn user_dates(state: &Arc<AppState>, uid: i64) -> (Option<String>, Option<String>) {
+    pub(crate) fn user_dates(state: &Arc<AppState>, uid: i64) -> (Option<String>, Option<String>) {
         state
             .control_plane()
             .db
@@ -1361,7 +1408,7 @@ mod tests {
             .expect("user dates")
     }
 
-    fn merchant_calls(merchant: &Shared, path: &str) -> usize {
+    pub(crate) fn merchant_calls(merchant: &Shared, path: &str) -> usize {
         merchant.lock().expect("mock").calls.iter().filter(|c| c.path == path).count()
     }
 
@@ -1396,7 +1443,7 @@ mod tests {
         let router = control_api_router(state.clone());
 
         // Same routes as monthly: POST /subscribers, then POST /subscriptions with an Idempotency-Key.
-        let (uid, token, checkout) = buy(&router, &state, "one-timer", "mlc-anon-account-v1", None).await;
+        let (uid, token, checkout) = buy(&router, &state, "one-timer", "mlc-paid-account-v1", None).await;
         assert_eq!(checkout["invoice_id"], "grp_1");
         assert!(checkout["pay"].as_array().is_some_and(|p| !p.is_empty()), "pay[] is passed through as issued");
         {
@@ -1412,17 +1459,17 @@ mod tests {
         assert_eq!(merchant_calls(&merchant, "/invoices/grp_1"), 1);
 
         // Exactly ONE payment_confirmed settles it.
-        let settled = one_time_settlement("ot-1", uid, "mlc-anon-account-v1", "sub_1", "grp_1");
+        let settled = one_time_settlement("ot-1", uid, "mlc-paid-account-v1", "sub_1", "grp_1");
         assert_eq!(deliver_ok(&router, &settled).await["outcome"], "granted");
         let (_, me) = get_json(&router, &token, "/billing/me", None).await;
-        assert_eq!((me["lifetime_anon"].as_bool(), me["lifetime_paid"].as_bool(), me["paid"].as_bool()), (Some(true), Some(true), Some(true)));
+        assert_eq!((me["lifetime_anon"].as_bool(), me["lifetime_paid"].as_bool(), me["paid"].as_bool()), (Some(false), Some(true), Some(true)));
         assert_eq!(me["subscription"]["state"], "paid", "the subscription is terminal paid");
         assert_eq!(me["subscription"]["active_until"], Value::Null);
         assert_eq!(me["quant"]["tier"], Value::Null);
 
         // A one-time plan never gets renewal_confirmed; if one arrives anyway nothing changes.
         let stray = webhook_body("ot-2", "renewal_confirmed", uid, "sub_1", "grp_2", json!({
-            "plan_id": "mlc-anon-account-v1",
+            "plan_id": "mlc-paid-account-v1",
             "billing_interval": "one_time",
             "period": { "from": Utc::now().to_rfc3339(), "to": null },
         }));
@@ -1431,7 +1478,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND, "no invoice row is invented for it");
         let (_, after) = get_json(&router, &token, "/billing/me", None).await;
         assert_eq!(after["subscription"]["state"], "paid");
-        assert_eq!((after["lifetime_anon"].as_bool(), after["paid"].as_bool()), (Some(true), Some(true)));
+        assert_eq!((after["lifetime_paid"].as_bool(), after["paid"].as_bool()), (Some(true), Some(true)));
 
         // Replaying the settlement is a no-op.
         assert_eq!(deliver_ok(&router, &settled).await["outcome"], "duplicate");
@@ -1476,9 +1523,7 @@ mod tests {
 
         for (name, plan, host, anon) in [
             ("perm-paid", "mlc-paid-account-v1", "mylittlechart.org", false),
-            ("perm-anon", "mlc-anon-account-v1", "mylittlechart.org", true),
             ("perm-paid-tor", DEFAULT_PAID_TOR_ID, ONION_HOST, false),
-            ("perm-anon-tor", DEFAULT_ANON_TOR_ID, ONION_HOST, true),
         ] {
             let (uid, token, checkout) = buy(&router, &state, name, plan, Some(host)).await;
             let invoice_id = checkout["invoice_id"].as_str().expect("invoice").to_string();
@@ -1562,28 +1607,108 @@ mod tests {
         let (status, _) = post_json(&router, &token, "/billing/checkout", json!({ "plan_id": "mlc-monthly-20-v1" }), None).await;
         assert_eq!(status, StatusCode::OK);
     }
+    // ------------------------------------------- the grant ledger, admin side
+
+    async fn admin_call(admin: &Router, secret: &str, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+        let authorization = format!("Bearer {secret}");
+        send(
+            admin,
+            method,
+            uri,
+            &[("authorization", authorization.as_str()), ("content-type", "application/json")],
+            body.map(|b| b.to_string()),
+        )
+        .await
+    }
 
     #[tokio::test]
-    async fn contract_an_anonymous_purchase_implies_paid_and_never_collides() {
-        let (base, merchant) = spawn_merchant().await;
-        let state = app_state(Some(runtime(Some(&base))));
+    async fn an_operator_grant_survives_the_refund_of_an_invoice_and_is_managed_through_the_admin_routes() {
+        let (base, _merchant) = spawn_merchant().await;
+        let state = app_state_with_admin(Some(runtime(Some(&base))), "s3cret");
         let router = control_api_router(state.clone());
+        let admin = crate::routes::admin_api_router(state.clone());
+        let (uid, token, _) = buy(&router, &state, "ledger-user", "mlc-paid-account-v1", None).await;
+        deliver_ok(&router, &one_time_settlement("l-1", uid, "mlc-paid-account-v1", "sub_1", "grp_1")).await;
 
-        let (uid, token, _) = buy(&router, &state, "anon-holder", "mlc-anon-account-v1", None).await;
-        deliver_ok(&router, &one_time_settlement("a-1", uid, "mlc-anon-account-v1", "sub_1", "grp_1")).await;
-        let calls_before = merchant.lock().expect("mock").calls.len();
+        // Add: 201, then the same again is a 200 that creates nothing.
+        let grants_uri = format!("/admin/users/{uid}/grants");
+        let body = json!({ "grant": "lifetime_paid", "admin_user_id": 7, "note": "early supporter" });
+        let (status, added) = admin_call(&admin, "s3cret", Method::POST, &grants_uri, Some(body.clone())).await;
+        assert_eq!(status, StatusCode::CREATED, "{added}");
+        assert_eq!(added["source"], "admin");
+        assert_eq!(added["source_ref"], "7:early supporter");
+        assert_eq!(added["created"], true);
+        let grant_id = added["grant_id"].as_i64().expect("grant id");
+        let (status, again) = admin_call(&admin, "s3cret", Method::POST, &grants_uri, Some(body)).await;
+        assert_eq!((status, again["created"].as_bool(), again["grant_id"].as_i64()), (StatusCode::OK, Some(false), Some(grant_id)));
 
-        // The account is paid for life through the anonymous purchase, so a paid account is already held...
-        let (status, answer) = post_json(&router, &token, "/billing/checkout", json!({ "plan_id": "mlc-paid-account-v1" }), None).await;
-        assert_eq!((status, answer["error"].as_str()), (StatusCode::CONFLICT, Some("already_owned")));
-        assert_eq!(merchant.lock().expect("mock").calls.len(), calls_before);
+        // The invoice is refunded: the account keeps the status the operator gave it.
+        let refund = webhook_body("l-2", "refund_recorded", uid, "sub_1", "grp_1", json!({}));
+        assert_eq!(deliver_ok(&router, &refund).await["outcome"], "revoked");
+        let (_, me) = get_json(&router, &token, "/billing/me", None).await;
+        assert_eq!((me["lifetime_paid"].as_bool(), me["paid"].as_bool()), (Some(true), Some(true)));
 
-        // ...while an anonymous purchase creates a new account and is never refused as a repeat.
-        for plan in ["mlc-anon-account-v1", DEFAULT_ANON_TOR_ID] {
-            let host = if plan == DEFAULT_ANON_TOR_ID { ONION_HOST } else { "mylittlechart.org" };
-            let (status, answer) = post_json(&router, &token, "/billing/checkout", json!({ "plan_id": plan }), Some(host)).await;
-            assert_eq!(status, StatusCode::OK, "{plan}: {answer}");
+        // The list shows both rows, the invoice's revoked.
+        let (status, listed) = admin_call(&admin, "s3cret", Method::GET, &grants_uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!((listed["lifetime_paid"].as_bool(), listed["lifetime_anon"].as_bool()), (Some(true), Some(false)));
+        let rows = listed["grants"].as_array().expect("grants");
+        assert_eq!(rows.len(), 2);
+        let invoice_row = rows.iter().find(|r| r["source"] == "invoice").expect("invoice row");
+        assert_eq!(invoice_row["source_ref"], "grp_1");
+        assert!(invoice_row["revoked_at"].is_string());
+        let admin_row = rows.iter().find(|r| r["source"] == "admin").expect("admin row");
+        assert!(admin_row["revoked_at"].is_null());
+
+        // An invoice's row is not the operator's to revoke; the operator's is.
+        let invoice_grant_id = invoice_row["grant_id"].as_i64().expect("id");
+        let (status, _) = admin_call(&admin, "s3cret", Method::DELETE, &format!("{grants_uri}/{invoice_grant_id}"), None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, revoked) = admin_call(&admin, "s3cret", Method::DELETE, &format!("{grants_uri}/{grant_id}"), None).await;
+        assert_eq!((status, revoked["revoked"].as_bool()), (StatusCode::OK, Some(true)));
+        let (_, revoked_again) = admin_call(&admin, "s3cret", Method::DELETE, &format!("{grants_uri}/{grant_id}"), None).await;
+        assert_eq!(revoked_again["revoked"], false);
+        let (_, me) = get_json(&router, &token, "/billing/me", None).await;
+        assert_eq!((me["lifetime_paid"].as_bool(), me["paid"].as_bool()), (Some(false), Some(false)));
+    }
+
+    #[tokio::test]
+    async fn the_admin_grant_routes_are_gated_and_validate_their_input() {
+        let (base, _merchant) = spawn_merchant().await;
+        let state = app_state_with_admin(Some(runtime(Some(&base))), "s3cret");
+        let (uid, _) = sign_in(&state, "target");
+        let admin = crate::routes::admin_api_router(state.clone());
+        let uri = format!("/admin/users/{uid}/grants");
+        let ok = json!({ "grant": "lifetime_anon", "admin_user_id": 1, "note": "n" });
+
+        // A wrong or missing secret is indistinguishable from no such route.
+        for secret in ["wrong", ""] {
+            let (status, body) = admin_call(&admin, secret, Method::POST, &uri, Some(ok.clone())).await;
+            assert_eq!((status, body), (StatusCode::NOT_FOUND, Value::Null), "secret {secret:?}");
         }
-        assert_eq!(merchant.lock().expect("mock").created, 3, "each anonymous purchase is its own subscription");
+        let (status, _) = send(&admin, Method::GET, &uri, &[], None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        for (label, body, want) in [
+            ("unknown grant", json!({ "grant": "quant", "admin_user_id": 1, "note": "n" }), StatusCode::BAD_REQUEST),
+            ("no note", json!({ "grant": "lifetime_paid", "admin_user_id": 1, "note": "  " }), StatusCode::BAD_REQUEST),
+            ("long note", json!({ "grant": "lifetime_paid", "admin_user_id": 1, "note": "x".repeat(201) }), StatusCode::BAD_REQUEST),
+            ("no admin id", json!({ "grant": "lifetime_paid", "admin_user_id": 0, "note": "n" }), StatusCode::BAD_REQUEST),
+            ("missing field", json!({ "grant": "lifetime_paid" }), StatusCode::BAD_REQUEST),
+        ] {
+            let (status, _) = admin_call(&admin, "s3cret", Method::POST, &uri, Some(body)).await;
+            assert_eq!(status, want, "{label}");
+        }
+        let (status, _) = admin_call(&admin, "s3cret", Method::POST, "/admin/users/424242/grants", Some(ok.clone())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "unknown user");
+        let (status, _) = admin_call(&admin, "s3cret", Method::GET, "/admin/users/424242/grants", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = admin_call(&admin, "s3cret", Method::DELETE, &format!("{uri}/999"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "unknown row");
+        assert_eq!(
+            state.control_plane().db.lock().expect("db").query_row("SELECT COUNT(*) FROM billing_grants", [], |r| r.get::<_, i64>(0)).expect("count"),
+            0,
+            "every refusal left the ledger empty"
+        );
     }
 }

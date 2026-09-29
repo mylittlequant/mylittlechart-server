@@ -34,6 +34,7 @@ use crate::state::AppState;
 pub mod account;
 pub mod admin;
 pub mod agent_keys;
+pub mod anon_account;
 pub mod billing;
 pub mod dashboard;
 pub mod device_auth;
@@ -142,6 +143,14 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/billing/checkout", post(billing::checkout))
         .route("/billing/invoice/{id}", get(billing::invoice))
         .route("/billing/change", post(billing::change))
+        // Anonymous ("numbered") accounts (routes/anon_account.rs): the
+        // checkout and the key sign-in are PUBLIC — they create and enter an
+        // account that has no session yet — and carry their own per-IP hourly
+        // budgets; the invoice read is authenticated by the account key.
+        .route("/billing/anon-checkout", post(anon_account::anon_checkout))
+        .route("/billing/anon-invoice/{id}", get(anon_account::anon_invoice))
+        .route("/auth/account-key", post(anon_account::sign_in))
+        .route("/account/key/rotate", post(anon_account::rotate))
         .route(
             "/billing/webhook",
             post(billing::webhook).layer(DefaultBodyLimit::max(billing::WEBHOOK_MAX_BODY_BYTES)),
@@ -321,6 +330,17 @@ pub fn admin_api_router(state: Arc<AppState>) -> Router {
         // `/admin/users/{user_id}`, same coexistence as the nick route
         // right above it.
         .route("/admin/users/{user_id}/paid-days", post(admin::grant_paid_days))
+        // The lifetime-grant ledger's operator rows (billing/grants.rs): list,
+        // add, revoke. Same `/admin/users/{user_id}/...` shape as the routes
+        // above; only `source = admin` rows are revocable here.
+        .route(
+            "/admin/users/{user_id}/grants",
+            get(admin::list_lifetime_grants).post(admin::add_lifetime_grant),
+        )
+        .route(
+            "/admin/users/{user_id}/grants/{grant_id}",
+            delete(admin::revoke_lifetime_grant),
+        )
         // Owner outreach (2026-09-09) — static two-segment path under the
         // one-segment `/admin/notify` right above it, same static-vs-static
         // coexistence as `/admin/users` + `/admin/users/merge` above (see

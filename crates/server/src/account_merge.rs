@@ -97,6 +97,10 @@ pub enum MergeError {
     SameUser,
     /// `from` or `into` names no existing account.
     UserNotFound { side: &'static str, user_id: i64 },
+    /// `from` or `into` is an anonymous (numbered) account: it has no OAuth
+    /// identity and takes none, so it is never merged with, or into, another
+    /// account.
+    AnonymousAccount { side: &'static str, user_id: i64 },
     /// Hard conflicts exist and no `keep_vault` was given to resolve them —
     /// `execute` only; `plan` reports conflicts in its summary instead.
     Conflicts(Vec<Conflict>),
@@ -453,6 +457,11 @@ fn validate_pair(identity_conn: &Connection, from: i64, into: i64) -> Result<(),
     }
     if !user_exists(identity_conn, into)? {
         return Err(MergeError::UserNotFound { side: "into", user_id: into });
+    }
+    for (side, user_id) in [("from", from), ("into", into)] {
+        if crate::billing::anon::is_anonymous(identity_conn, user_id)? {
+            return Err(MergeError::AnonymousAccount { side, user_id });
+        }
     }
     Ok(())
 }
@@ -1516,6 +1525,33 @@ mod tests {
         assert_eq!(survivor.modified_at, 100);
     }
 
+    /// An anonymous account is refused on either side of a merge, and nothing
+    /// is written.
+    #[test]
+    fn merging_an_anonymous_account_with_an_oauth_account_is_refused_both_ways() {
+        let db = Mutex::new(identity_conn());
+        let social_m = Mutex::new(social_conn());
+        let dir = TestDir::new();
+        let store = SyncStore::new(dir.0.join("sync"));
+        let (anon, oauth) = {
+            let conn = db.lock().expect("lock");
+            let key = crate::billing::anon::AccountKey::generate();
+            let anon = crate::billing::anon::create_pending(&conn, &key, chrono::Utc::now()).expect("anon");
+            (anon, seed_user(&conn, "github", "oauth-1", "oauth-user"))
+        };
+        for (from, into, side) in [(anon, oauth, "from"), (oauth, anon, "into")] {
+            let err = execute(&db, &social_m, &store, &dir.0, from, into, None).expect_err("must refuse");
+            assert!(matches!(err, MergeError::AnonymousAccount { side: s, .. } if s == side), "{err:?}");
+            let plan_err = plan(&db, &social_m, &store, from, into).expect_err("a dry run refuses too");
+            assert!(matches!(plan_err, MergeError::AnonymousAccount { .. }), "{plan_err:?}");
+        }
+        let conn = db.lock().expect("lock");
+        let survivors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users WHERE id IN (?1, ?2)", params![anon, oauth], |r| r.get(0))
+            .expect("count");
+        assert_eq!(survivors, 2, "nothing was merged or deleted");
+    }
+
     /// A merge carries the loser's purchases to the survivor: entitlements
     /// combine, credit adds up, and the subscription/invoice rows follow — so
     /// a later refund webhook still finds (and can revoke) what was bought.
@@ -1531,8 +1567,14 @@ mod tests {
             let conn = db.lock().expect("lock");
             let from = seed_user(&conn, "github", "f9", "from-user");
             let into = seed_user(&conn, "google", "i9", "into-user");
-            crate::billing::entitle::grant_lifetime(&conn, from, crate::billing::plans::Grant::LifetimeAnon)
-                .expect("from anon");
+            crate::billing::grants::grant_for_invoice(
+                &conn,
+                from,
+                crate::billing::plans::Grant::LifetimeAnon,
+                "grp_9",
+                now,
+            )
+            .expect("from anon");
             crate::billing::entitle::add_credit(&conn, from, 2_000_000, now).expect("from credit");
             crate::billing::entitle::add_credit(&conn, into, 500_000, now).expect("into credit");
             crate::billing::store::record_customer(&conn, from, "cus_from", &from.to_string(), now)
@@ -1559,6 +1601,12 @@ mod tests {
         let conn = db.lock().expect("lock");
         let view = crate::billing::entitle::entitlement_view(&conn, into, chrono::Utc::now()).expect("view");
         assert!(view.lifetime_anon && view.paid);
+        let carried: Vec<String> = crate::billing::grants::list(&conn, into)
+            .expect("grants")
+            .into_iter()
+            .map(|g| g.source_ref)
+            .collect();
+        assert_eq!(carried, vec!["grp_9".to_string(), "grp_9".to_string()], "anonymous + paid, still answering to their invoice");
         assert_eq!(crate::billing::entitle::credit_balance(&conn, into).expect("credit"), 2_500_000);
         assert_eq!(crate::billing::store::customer_for_user(&conn, into).expect("customer").as_deref(), Some("cus_from"));
         let invoice = crate::billing::store::invoice_for_user(&conn, into, "grp_9").expect("query").expect("moved");

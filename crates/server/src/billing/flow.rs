@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use rand::Rng;
 use rusqlite::Connection;
 
+use super::anon::{self, AccountKey};
 use super::client::{GatewayError, PayOption, Proration};
 use super::entitle::{self, EntitlementView};
 use super::plans::Grant;
@@ -30,6 +31,10 @@ pub enum FlowError {
     PlanNotAvailable,
     /// MLC sells the plan but the processor does not have it (yet).
     PlanUnavailable,
+    /// An anonymous-account plan asked for through the signed-in checkout:
+    /// those are sold only by `POST /api/billing/anon-checkout`, which
+    /// creates the new account they belong to.
+    AnonymousOnly,
     /// Refused before dig2pay was called.
     Refused(Refusal),
     /// A plan change was asked for without a running monthly subscription.
@@ -115,13 +120,26 @@ pub struct CheckoutView {
     pub pay: Vec<PayOption>,
 }
 
-/// Start (or resume) the purchase of `plan_id` by `user_id`. `onion` says
-/// whether the request came through the onion vhost.
+/// Start (or resume) the purchase of `plan_id` by the signed-in `user_id`.
+/// `onion` says whether the request came through the onion vhost. Anonymous
+/// account plans are refused here (see [`FlowError::AnonymousOnly`]).
 pub async fn checkout(
     state: &Arc<AppState>,
     user_id: i64,
     plan_id: &str,
     onion: bool,
+) -> Result<CheckoutView, FlowError> {
+    checkout_for(state, user_id, plan_id, onion, false).await
+}
+
+/// The purchase itself. `anonymous_purchase` is true only for the account
+/// [`anon_checkout`] has just created for the payer.
+async fn checkout_for(
+    state: &Arc<AppState>,
+    user_id: i64,
+    plan_id: &str,
+    onion: bool,
+    anonymous_purchase: bool,
 ) -> Result<CheckoutView, FlowError> {
     let billing = state.billing().ok_or(FlowError::NotConfigured)?;
     let client = billing.client().ok_or(FlowError::NotConfigured)?;
@@ -131,6 +149,9 @@ pub async fn checkout(
         .filter(|p| p.offered_to(onion))
         .cloned()
         .ok_or(FlowError::PlanNotAvailable)?;
+    if plan.grant == Grant::LifetimeAnon && !anonymous_purchase {
+        return Err(FlowError::AnonymousOnly);
+    }
 
     let prepared = {
         let billing = billing.clone();
@@ -200,6 +221,45 @@ pub async fn checkout(
     Ok(CheckoutView { invoice_id: created.invoice_id, plan_id: plan.id, pay: created.pay })
 }
 
+/// `POST /api/billing/anon-checkout` result.
+pub struct AnonCheckoutView {
+    /// The account key, shown once. Never stored in this form.
+    pub account_key: String,
+    /// dig2pay's invoice id.
+    pub invoice_id: String,
+    /// Every way to pay it.
+    pub pay: Vec<PayOption>,
+}
+
+/// Buy an anonymous account: create a PENDING anonymous user holding a fresh
+/// key, open the dig2pay subscription under that user's id, and hand back the
+/// key with the invoice. If the invoice cannot be opened the pending account
+/// is removed again: the payer holds no key and no address.
+pub async fn anon_checkout(state: &Arc<AppState>, plan_id: &str, onion: bool) -> Result<AnonCheckoutView, FlowError> {
+    let billing = state.billing().ok_or(FlowError::NotConfigured)?;
+    billing.client().ok_or(FlowError::NotConfigured)?;
+    let sold_anonymously = billing
+        .catalog()
+        .get(plan_id)
+        .is_some_and(|p| p.grant == Grant::LifetimeAnon && p.offered_to(onion));
+    if !sold_anonymously {
+        return Err(FlowError::PlanNotAvailable);
+    }
+
+    let key = AccountKey::generate();
+    let for_db = key.clone();
+    let user_id = with_db(state, move |conn| anon::create_pending(conn, &for_db, Utc::now())).await?;
+    match checkout_for(state, user_id, plan_id, onion, true).await {
+        Ok(view) => Ok(AnonCheckoutView { account_key: key.reveal(), invoice_id: view.invoice_id, pay: view.pay }),
+        Err(e) => {
+            if let Err(cleanup) = with_db(state, move |conn| anon::discard_unfinished(conn, user_id)).await {
+                tracing::warn!("billing: could not discard the unfinished anonymous account {user_id}: {cleanup:?}");
+            }
+            Err(e)
+        }
+    }
+}
+
 // ============================================================================
 // Invoice
 // ============================================================================
@@ -229,6 +289,9 @@ pub async fn invoice(state: &Arc<AppState>, user_id: i64, invoice_id: &str) -> R
     if let Some(client) = billing.client() {
         match client.get_invoice(&invoice.invoice_id).await {
             Ok(live) => {
+                if let Some(processor_kind) = live.kind.as_deref() {
+                    invoice = adopt_processor_kind(state, invoice, processor_kind).await?;
+                }
                 let settled_again = matches!(live.status.as_str(), "settled" | "complete");
                 if invoice.grant_state == GrantState::Reverted && settled_again {
                     let (b, id) = (billing.clone(), invoice.invoice_id.clone());
@@ -251,6 +314,54 @@ pub async fn invoice(state: &Arc<AppState>, user_id: i64, invoice_id: &str) -> R
         }
     }
     Ok(InvoiceView { pay: pay_of(&invoice), invoice, live_status })
+}
+
+/// The invoice kind the processor reports (`"subscription"` or
+/// `"proration"`) mapped onto ours, when it differs from what MLC inferred
+/// (MLC learns of a renewal or proration invoice from its webhook and can
+/// only guess which it is). Corrected only while the invoice has granted
+/// nothing; an already-granted invoice that disagrees is logged instead.
+async fn adopt_processor_kind(
+    state: &Arc<AppState>,
+    mut invoice: InvoiceRow,
+    processor_kind: &str,
+) -> Result<InvoiceRow, FlowError> {
+    let processor_kind = processor_kind.to_string();
+    let (invoice_id, subscription_id) = (invoice.invoice_id.clone(), invoice.subscription_id.clone());
+    let (stored_kind, grant_state) = (invoice.kind, invoice.grant_state);
+    let corrected = with_db(state, move |conn| {
+        let wanted = match processor_kind.as_str() {
+            "proration" => Some(InvoiceKind::Proration),
+            // A subscription invoice is the first one or a renewal.
+            "subscription" if stored_kind == InvoiceKind::Proration => {
+                let has_initial = store::invoices_for_subscription(conn, &subscription_id)?
+                    .iter()
+                    .any(|i| i.kind == InvoiceKind::Initial && i.invoice_id != invoice_id);
+                Some(if has_initial { InvoiceKind::Renewal } else { InvoiceKind::Initial })
+            }
+            _ => None,
+        };
+        match wanted {
+            Some(kind) if kind != stored_kind && grant_state == GrantState::None => {
+                store::set_invoice_kind(conn, &invoice_id, kind, Utc::now())?;
+                Ok(Some(kind))
+            }
+            Some(kind) if kind != stored_kind => {
+                tracing::warn!(
+                    "billing: invoice {invoice_id} is {} at the processor but was recorded as {} and has already granted",
+                    kind.as_str(),
+                    stored_kind.as_str()
+                );
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    })
+    .await?;
+    if let Some(kind) = corrected {
+        invoice.kind = kind;
+    }
+    Ok(invoice)
 }
 
 // ============================================================================

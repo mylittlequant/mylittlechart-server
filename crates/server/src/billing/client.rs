@@ -91,6 +91,9 @@ pub struct CreatedSubscription {
 pub struct LiveInvoice {
     /// `new | processing | settled | complete | expired | invalid`.
     pub status: String,
+    /// `subscription` or `proration`; absent from older processors.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 /// `POST /subscriptions/{id}/change` answer.

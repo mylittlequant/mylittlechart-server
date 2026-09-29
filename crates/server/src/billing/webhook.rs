@@ -44,8 +44,8 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde_json::{Map, Value};
 
-use super::entitle;
 use super::plans::{Catalog, Grant, Interval};
+use super::{anon, entitle, grants};
 use super::store::{
     self, GrantState, InvoiceKind, InvoiceRow, SubState, SubscriptionRow, INVOICE_NEW, INVOICE_REFUNDED,
     INVOICE_REVERTED, INVOICE_SETTLED,
@@ -501,8 +501,14 @@ fn grant(
             store::save_invoice(conn, &invoice, now)?;
             sub.state = SubState::Paid;
             store::save_subscription(conn, &sub, now)?;
-            if !entitle::grant_lifetime(conn, user_id, plan.grant)? {
+            // The grants are ledger rows created by THIS invoice (an anonymous
+            // plan creates anonymous + paid); a refund can only take these back.
+            if !grants::grant_for_invoice(conn, user_id, plan.grant, &invoice.invoice_id, now)? {
                 return Ok(Outcome::UserMissing);
+            }
+            // Payment is what turns a pending anonymous account into a usable one.
+            if plan.grant == Grant::LifetimeAnon {
+                anon::activate(conn, user_id, now)?;
             }
             Ok(Outcome::Granted)
         }
@@ -580,8 +586,10 @@ fn withdraw_entitlement(
     now: DateTime<Utc>,
 ) -> rusqlite::Result<()> {
     match invoice.grant_kind {
-        Some(grant @ (Grant::LifetimePaid | Grant::LifetimeAnon)) => {
-            entitle::release_lifetime_if_unbacked(conn, invoice.user_id, grant, &invoice.invoice_id)
+        Some(Grant::LifetimePaid | Grant::LifetimeAnon) => {
+            // Exactly the ledger rows this invoice created; nothing else.
+            grants::revoke_for_invoice(conn, invoice.user_id, &invoice.invoice_id, now)?;
+            Ok(())
         }
         Some(Grant::Quant) => {
             entitle::recompute_subscription(conn, sub, now)?;
@@ -616,7 +624,8 @@ pub fn restore_reverted(
     store::save_invoice(&tx, &invoice, now)?;
     match invoice.grant_kind {
         Some(grant @ (Grant::LifetimePaid | Grant::LifetimeAnon)) => {
-            entitle::grant_lifetime(&tx, user_id, grant)?;
+            // Only this invoice's own rows come back.
+            grants::grant_for_invoice(&tx, user_id, grant, &invoice.invoice_id, now)?;
         }
         Some(Grant::Quant) => {
             if let Some(mut sub) = store::subscription_by_id(&tx, &invoice.subscription_id)? {
@@ -1553,5 +1562,95 @@ mod tests {
         );
         assert_eq!(run(&conn, &bogus), Outcome::UnknownChange);
         assert_eq!(view(&conn, uid).quant_tier.as_deref(), Some("mlc-monthly-50-v1"));
+    }
+    // ------------------------------------------------------- grant ledger
+
+    fn ledger(conn: &Connection, uid: i64) -> Vec<(String, String, bool)> {
+        crate::billing::grants::list(conn, uid)
+            .expect("ledger")
+            .into_iter()
+            .map(|g| (g.grant.as_str().to_string(), g.source_ref, g.revoked_at.is_none()))
+            .collect()
+    }
+
+    #[test]
+    fn a_refund_leaves_an_admin_grant_and_another_invoices_grant_alone_and_a_resettle_restores_only_its_own() {
+        let conn = conn();
+        let uid = seed_user(&conn, "ledger");
+        seed_purchase(&conn, uid, "mlc-paid-account-v1", "sub_a", "inv_a");
+        seed_purchase(&conn, uid, DEFAULT_PAID_TOR_ID, "sub_b", "inv_b");
+        run(&conn, &event("payment_confirmed", uid, "sub_a", "inv_a", settled_one_time(json!({}))));
+        run(&conn, &event("payment_confirmed", uid, "sub_b", "inv_b", settled_one_time(json!({}))));
+        crate::billing::grants::add_admin(&conn, uid, Grant::LifetimePaid, 9, "support", Utc::now())
+            .expect("admin grant")
+            .expect("user");
+        assert_eq!(ledger(&conn, uid).len(), 3);
+
+        // Invoice A is refunded: only A's row is revoked.
+        assert_eq!(run(&conn, &event("refund_recorded", uid, "sub_a", "inv_a", json!({}))), Outcome::Revoked);
+        assert!(view(&conn, uid).lifetime_paid, "B and the admin grant still hold it");
+        assert_eq!(
+            ledger(&conn, uid),
+            vec![
+                ("lifetime_paid".to_string(), "inv_a".to_string(), false),
+                ("lifetime_paid".to_string(), "inv_b".to_string(), true),
+                ("lifetime_paid".to_string(), "9:support".to_string(), true),
+            ]
+        );
+
+        // B is reorged out: provisional, and the admin grant still holds it.
+        assert_eq!(run(&conn, &event("payment_reverted", uid, "sub_b", "inv_b", json!({}))), Outcome::Reverted);
+        assert!(view(&conn, uid).lifetime_paid);
+        let admin_row = crate::billing::grants::list(&conn, uid).expect("ledger").into_iter().find(|g| g.source == "admin").expect("admin row");
+        crate::billing::grants::revoke_admin(&conn, uid, admin_row.id, Utc::now()).expect("revoke admin");
+        assert!(!view(&conn, uid).lifetime_paid, "A refunded, B reverted, admin revoked: nothing left");
+
+        // B settles again: exactly B's row comes back. A (refunded) and the admin row do not.
+        assert!(restore_reverted(&conn, &catalog(), uid, "inv_b", Utc::now()).expect("restore"));
+        assert!(view(&conn, uid).lifetime_paid);
+        assert_eq!(
+            ledger(&conn, uid),
+            vec![
+                ("lifetime_paid".to_string(), "inv_a".to_string(), false),
+                ("lifetime_paid".to_string(), "inv_b".to_string(), true),
+                ("lifetime_paid".to_string(), "9:support".to_string(), false),
+            ]
+        );
+        assert!(!restore_reverted(&conn, &catalog(), uid, "inv_a", Utc::now()).expect("a refund is final"));
+    }
+
+    #[test]
+    fn an_anonymous_purchase_writes_two_ledger_rows_and_activates_a_pending_account() {
+        let conn = conn();
+        let now = Utc::now();
+        let key = crate::billing::anon::AccountKey::generate();
+        let uid = crate::billing::anon::create_pending(&conn, &key, now).expect("pending");
+        seed_purchase(&conn, uid, "mlc-anon-account-v1", "sub_1", "inv_1");
+        assert_eq!(
+            crate::billing::anon::status_of(&conn, uid).expect("status"),
+            Some(crate::billing::anon::AccountStatus::Pending)
+        );
+        assert_eq!(run(&conn, &event("payment_confirmed", uid, "sub_1", "inv_1", settled_one_time(json!({})))), Outcome::Granted);
+        assert_eq!(
+            crate::billing::anon::status_of(&conn, uid).expect("status"),
+            Some(crate::billing::anon::AccountStatus::Active)
+        );
+        let mut rows = ledger(&conn, uid);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("lifetime_anon".to_string(), "inv_1".to_string(), true),
+                ("lifetime_paid".to_string(), "inv_1".to_string(), true),
+            ]
+        );
+        // A refund revokes both and leaves the (now active) account in place.
+        assert_eq!(run(&conn, &event("refund_recorded", uid, "sub_1", "inv_1", json!({}))), Outcome::Revoked);
+        let v = view(&conn, uid);
+        assert!(!v.lifetime_anon && !v.lifetime_paid);
+        assert_eq!(
+            crate::billing::anon::status_of(&conn, uid).expect("status"),
+            Some(crate::billing::anon::AccountStatus::Active)
+        );
     }
 }

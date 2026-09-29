@@ -10,7 +10,7 @@
 //! | Class       | Paths                                                          | Rate     | Burst |
 //! |-------------|-----------------------------------------------------------------|----------|-------|
 //! | `auth_poll` | `/auth/poll`, `/auth/agent-key/poll`, `/auth/link/poll`, `/auth/tg-login/poll` | 60/min | 30 |
-//! | `oauth`     | `/oauth/*`, `/auth/*/init`, `/auth/*/start`                     | 20/min   | 20    |
+//! | `oauth`     | `/oauth/*`, `/auth/*/init`, `/auth/*/start`, `/auth/account-key`, `/billing/anon-checkout` | 20/min   | 20    |
 //! | `api_write` | every other POST/PUT/PATCH/DELETE                                | 120/min | 120   |
 //! | `api_read`  | every other GET (and anything not matched above)                 | 600/min | 600   |
 //!
@@ -80,6 +80,12 @@ fn classify(path: &str, method: &Method) -> BucketKind {
     {
         return BucketKind::Oauth;
     }
+    // The two unauthenticated anonymous-account routes (a key guess and an
+    // account creation) get the strict class too, on top of their own
+    // per-hour budgets in `billing::throttle`.
+    if path == "/auth/account-key" || path == "/billing/anon-checkout" {
+        return BucketKind::Oauth;
+    }
     match *method {
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE => BucketKind::ApiWrite,
         _ => BucketKind::ApiRead,
@@ -112,7 +118,7 @@ fn first_forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
 /// The address this request is billed against: `X-Forwarded-For`'s first
 /// value when (and ONLY when) `peer` is a trusted proxy address, else the
 /// TCP peer itself.
-fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+pub(crate) fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     if is_trusted_proxy_peer(peer) {
         if let Some(forwarded) = first_forwarded_for(headers) {
             return forwarded;
@@ -254,6 +260,13 @@ pub async fn rate_limit_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_anonymous_account_routes_are_in_the_strict_class() {
+        assert_eq!(classify("/auth/account-key", &Method::POST), BucketKind::Oauth);
+        assert_eq!(classify("/billing/anon-checkout", &Method::POST), BucketKind::Oauth);
+        assert_eq!(classify("/billing/checkout", &Method::POST), BucketKind::ApiWrite);
+    }
 
     #[test]
     fn token_bucket_allows_up_to_capacity_then_refuses() {

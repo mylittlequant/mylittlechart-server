@@ -9,6 +9,9 @@
 //! | `MLC_BILLING_ONION_HOSTS` | comma-separated `Host` names of the onion vhost |
 //! | `MLC_BILLING_PLAN_PAID` / `_ANON` / `_PAID_TOR` / `_ANON_TOR` | ids of the four one-time account plans (defaults: `mlc-paid-account-v1`, `mlc-anon-account-v1`, `mlc-paid-account-tor-v1`, `mlc-anon-account-tor-v1`) |
 //! | `MLC_BILLING_QUANT_QUOTAS` | `plan_id=quota` pairs, comma-separated, one per quant tier |
+//! | `MLC_BILLING_ANON_PER_IP_PER_HOUR` | anonymous checkouts one client IP may start per hour (default 5) |
+//! | `MLC_BILLING_ANON_GLOBAL_PER_HOUR` | anonymous checkouts started per hour across all IPs (default 200) |
+//! | `MLC_BILLING_KEY_FAILS_PER_IP_PER_HOUR` | failed account-key attempts one client IP may make per hour before it is refused (default 20) |
 //!
 //! Key and secret material is only ever read from files, never from a plain
 //! environment value, and is never logged. A missing or unreadable file
@@ -23,6 +26,7 @@ use axum::http::{header, HeaderMap};
 
 use super::client::Dig2payClient;
 use super::plans::{AccountPlanIds, Catalog, QUANT_TIERS};
+use super::throttle::SlidingLimiter;
 
 const ENV_BASE_URL: &str = "DIG2PAY_BASE_URL";
 const ENV_API_KEY_FILE: &str = "DIG2PAY_API_KEY_FILE";
@@ -34,6 +38,17 @@ const ENV_PLAN_ANON: &str = "MLC_BILLING_PLAN_ANON";
 const ENV_PLAN_PAID_TOR: &str = "MLC_BILLING_PLAN_PAID_TOR";
 const ENV_PLAN_ANON_TOR: &str = "MLC_BILLING_PLAN_ANON_TOR";
 const ENV_QUANT_QUOTAS: &str = "MLC_BILLING_QUANT_QUOTAS";
+const ENV_ANON_PER_IP: &str = "MLC_BILLING_ANON_PER_IP_PER_HOUR";
+const ENV_ANON_GLOBAL: &str = "MLC_BILLING_ANON_GLOBAL_PER_HOUR";
+const ENV_KEY_FAILS: &str = "MLC_BILLING_KEY_FAILS_PER_IP_PER_HOUR";
+
+/// Defaults of the three abuse budgets (all per hour).
+const DEFAULT_ANON_PER_IP: usize = 5;
+const DEFAULT_ANON_GLOBAL: usize = 200;
+const DEFAULT_KEY_FAILS: usize = 20;
+
+/// The window every abuse budget above is measured over.
+const ABUSE_WINDOW: Duration = Duration::from_secs(3600);
 
 /// Overall timeout of one merchant API call when `DIG2PAY_TIMEOUT_SECS` is
 /// unset or unparsable.
@@ -56,6 +71,12 @@ pub struct BillingSettings {
     pub account_plans: AccountPlanIds,
     /// Quant quota per monthly plan id.
     pub quant_quotas: BTreeMap<String, u64>,
+    /// Anonymous checkouts per client IP per hour.
+    pub anon_per_ip_per_hour: usize,
+    /// Anonymous checkouts per hour across all IPs.
+    pub anon_global_per_hour: usize,
+    /// Failed account-key attempts per client IP per hour.
+    pub key_fails_per_ip_per_hour: usize,
 }
 
 /// Split a comma-separated list, trimming and dropping empty items.
@@ -157,6 +178,12 @@ impl BillingSettings {
         for item in rejected {
             tracing::warn!("{ENV_QUANT_QUOTAS}: ignoring malformed entry {item:?} (expected plan_id=number)");
         }
+        let budget = |var: &str, default: usize| {
+            get(var)
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(default)
+        };
         Self {
             base_url,
             api_key_file,
@@ -165,6 +192,9 @@ impl BillingSettings {
             onion_hosts,
             account_plans,
             quant_quotas,
+            anon_per_ip_per_hour: budget(ENV_ANON_PER_IP, DEFAULT_ANON_PER_IP),
+            anon_global_per_hour: budget(ENV_ANON_GLOBAL, DEFAULT_ANON_GLOBAL),
+            key_fails_per_ip_per_hour: budget(ENV_KEY_FAILS, DEFAULT_KEY_FAILS),
         }
     }
 }
@@ -185,6 +215,8 @@ pub struct BillingRuntime {
     client: Option<Dig2payClient>,
     webhook_secrets: Vec<Vec<u8>>,
     onion_hosts: Vec<String>,
+    anon_create: SlidingLimiter,
+    key_failures: SlidingLimiter,
 }
 
 impl BillingRuntime {
@@ -199,7 +231,23 @@ impl BillingRuntime {
             client,
             webhook_secrets,
             onion_hosts: settings.onion_hosts.clone(),
+            anon_create: SlidingLimiter::new(
+                ABUSE_WINDOW,
+                settings.anon_per_ip_per_hour,
+                settings.anon_global_per_hour,
+            ),
+            key_failures: SlidingLimiter::new(ABUSE_WINDOW, settings.key_fails_per_ip_per_hour, 0),
         }
+    }
+
+    /// The budget on anonymous checkouts (per IP and overall).
+    pub fn anon_create_limiter(&self) -> &SlidingLimiter {
+        &self.anon_create
+    }
+
+    /// The per-IP throttle on failed account-key attempts.
+    pub fn key_failure_limiter(&self) -> &SlidingLimiter {
+        &self.key_failures
     }
 
     /// Read the environment and the key/secret files. Never fails: whatever
@@ -297,6 +345,10 @@ mod tests {
         assert!(s.quant_quotas.is_empty());
         assert_eq!(s.account_plans, AccountPlanIds::default());
         assert_eq!(s.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert_eq!(
+            (s.anon_per_ip_per_hour, s.anon_global_per_hour, s.key_fails_per_ip_per_hour),
+            (DEFAULT_ANON_PER_IP, DEFAULT_ANON_GLOBAL, DEFAULT_KEY_FAILS)
+        );
     }
 
     #[test]
@@ -324,6 +376,18 @@ mod tests {
         assert_eq!(s.account_plans.anon_tor, "tor-anon");
         assert_eq!(s.quant_quotas.get("mlc-monthly-20-v1"), Some(&10));
         assert_eq!(s.quant_quotas.get("mlc-monthly-50-v1"), Some(&30));
+    }
+
+    #[test]
+    fn the_abuse_budgets_are_configurable_and_zero_or_garbage_falls_back_to_the_default() {
+        let s = settings(&[(ENV_ANON_PER_IP, "2"), (ENV_ANON_GLOBAL, " 30 "), (ENV_KEY_FAILS, "7")]);
+        assert_eq!((s.anon_per_ip_per_hour, s.anon_global_per_hour, s.key_fails_per_ip_per_hour), (2, 30, 7));
+        let s = settings(&[(ENV_ANON_PER_IP, "0"), (ENV_ANON_GLOBAL, "many"), (ENV_KEY_FAILS, "-3")]);
+        assert_eq!(
+            (s.anon_per_ip_per_hour, s.anon_global_per_hour, s.key_fails_per_ip_per_hour),
+            (DEFAULT_ANON_PER_IP, DEFAULT_ANON_GLOBAL, DEFAULT_KEY_FAILS),
+            "there is no way to configure the brake away"
+        );
     }
 
     #[test]

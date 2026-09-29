@@ -63,6 +63,9 @@ To stop permanently (no restart): `touch data/stop-server` before sending restar
 | `MLC_BILLING_ONION_HOSTS` | `""` | For Tor plans | Comma-separated `Host` names of the onion vhost; the Tor plan variants are offered only to requests carrying one |
 | `MLC_BILLING_PLAN_PAID` / `_ANON` / `_PAID_TOR` / `_ANON_TOR` | `mlc-paid-account-v1` / `mlc-anon-account-v1` / `mlc-paid-account-tor-v1` / `mlc-anon-account-tor-v1` | No | Ids of the four one-time account plans on the processor |
 | `MLC_BILLING_QUANT_QUOTAS` | `""` | No | `plan_id=quota` pairs, comma-separated: the quant quota of each monthly tier |
+| `MLC_BILLING_ANON_PER_IP_PER_HOUR` | `5` | No | Anonymous-account checkouts one client IP may start per hour |
+| `MLC_BILLING_ANON_GLOBAL_PER_HOUR` | `200` | No | Anonymous-account checkouts started per hour across all IPs |
+| `MLC_BILLING_KEY_FAILS_PER_IP_PER_HOUR` | `20` | No | Failed account-key attempts one client IP may make per hour before it is refused |
 
 ## API Endpoints
 
@@ -75,6 +78,11 @@ To stop permanently (no restart): `touch data/stop-server` before sending restar
 | POST | `/api/billing/checkout` | Cookie session or Bearer | `{plan_id}` → `{invoice_id, plan_id, pay:[{chain, asset, address, amount, expires_at, qr_svg}]}` via the dig2pay merchant API |
 | GET | `/api/billing/invoice/{id}` | Cookie session or Bearer | One of the caller's own invoices (another account's is a 404) with the processor's live status |
 | POST | `/api/billing/change` | Cookie session or Bearer | `{plan_id}` → move a running quant subscription (upgrade charged now, downgrade at renewal) |
+| POST | `/api/billing/anon-checkout` | None (per-IP hourly budget + a global one) | `{plan_id}` (a `mlc-anon-account*` plan) → `201 {account_key, invoice_id, pay:[…]}`: creates a pending anonymous account (no OAuth, no email) and its invoice; the key is shown once |
+| GET | `/api/billing/anon-invoice/{id}` | `Authorization: AccountKey <key>` | The account's own invoice (any status) |
+| POST | `/api/auth/account-key` | None (per-IP failure throttle) | `{account_key}` → a session (`{status, user_id, public_id, session_id}` + cookie) for an ACTIVE anonymous account; every unusable key is the same 401 |
+| POST | `/api/account/key/rotate` | Cookie session or Bearer | An anonymous account gets a new key; the old one stops working |
+| POST | `/api/admin/users/{id}/grants` | Bearer ADMIN_SECRET (loopback listener) | Add an operator lifetime grant to the ledger `{grant, admin_user_id, note}`; `GET` lists the ledger, `DELETE /api/admin/users/{id}/grants/{grant_id}` revokes an operator row |
 | POST | `/api/billing/webhook` | `X-Dig2pay-Signature` | dig2pay's signed callback (`t=…,v1=…`, HMAC-SHA256 over `"{t}.{raw body}"`, 5-minute window, rotation-aware, deduplicated on the event id); unknown kinds are stored and answered 200 |
 | POST | `/api/heartbeat` | None | Device keep-alive |
 | POST | `/api/telemetry` | Optional Bearer token | Submit usage metrics |
