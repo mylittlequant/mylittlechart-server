@@ -1,5 +1,6 @@
-//! In-process sliding-window limiter keyed by client IP, for the two
-//! unauthenticated anonymous-account routes:
+//! In-process sliding-window limiter, keyed by client IP for the two
+//! unauthenticated anonymous-account routes (and by account id for the staff
+//! routes' per-actor write budget, see `staff.rs`):
 //!
 //! * `POST /api/billing/anon-checkout` — [`SlidingLimiter::try_acquire`]:
 //!   at most N creations per IP per window, and at most M across all IPs;
@@ -15,7 +16,7 @@
 //! not an accounting record.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::IpAddr;
+use std::hash::Hash;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -23,17 +24,18 @@ use std::time::{Duration, Instant};
 /// insert, so a flood of distinct addresses cannot grow the map without bound.
 const SWEEP_THRESHOLD: usize = 4096;
 
-struct Inner {
-    per_ip: HashMap<IpAddr, VecDeque<Instant>>,
+struct Inner<K> {
+    per_ip: HashMap<K, VecDeque<Instant>>,
     global: VecDeque<Instant>,
 }
 
-/// A sliding-window limiter. A limit of `0` means "none" for that scope.
-pub struct SlidingLimiter {
+/// A sliding-window limiter over keys `K`. A limit of `0` means "none" for
+/// that scope.
+pub struct SlidingLimiter<K> {
     window: Duration,
     per_ip_limit: usize,
     global_limit: usize,
-    inner: Mutex<Inner>,
+    inner: Mutex<Inner<K>>,
 }
 
 fn prune(queue: &mut VecDeque<Instant>, now: Instant, window: Duration) {
@@ -42,8 +44,8 @@ fn prune(queue: &mut VecDeque<Instant>, now: Instant, window: Duration) {
     }
 }
 
-impl SlidingLimiter {
-    /// A limiter allowing `per_ip_limit` hits per IP and `global_limit` hits
+impl<K: Hash + Eq + Copy> SlidingLimiter<K> {
+    /// A limiter allowing `per_ip_limit` hits per key and `global_limit` hits
     /// overall within `window`.
     pub fn new(window: Duration, per_ip_limit: usize, global_limit: usize) -> Self {
         Self {
@@ -54,11 +56,11 @@ impl SlidingLimiter {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner<K>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn sweep(&self, inner: &mut Inner, now: Instant) {
+    fn sweep(&self, inner: &mut Inner<K>, now: Instant) {
         if inner.per_ip.len() >= SWEEP_THRESHOLD {
             let window = self.window;
             inner.per_ip.retain(|_, queue| {
@@ -70,7 +72,7 @@ impl SlidingLimiter {
 
     /// Record a hit for `ip` if neither its own budget nor the global one is
     /// spent; `false` (and nothing recorded) otherwise.
-    pub fn try_acquire(&self, ip: IpAddr, now: Instant) -> bool {
+    pub fn try_acquire(&self, ip: K, now: Instant) -> bool {
         let mut inner = self.lock();
         self.sweep(&mut inner, now);
         let window = self.window;
@@ -89,7 +91,7 @@ impl SlidingLimiter {
     }
 
     /// Whether `ip` has used up its own budget (nothing is recorded).
-    pub fn is_blocked(&self, ip: IpAddr, now: Instant) -> bool {
+    pub fn is_blocked(&self, ip: K, now: Instant) -> bool {
         let mut inner = self.lock();
         let window = self.window;
         match inner.per_ip.get_mut(&ip) {
@@ -102,7 +104,7 @@ impl SlidingLimiter {
     }
 
     /// Record a hit for `ip` unconditionally (a failed attempt).
-    pub fn record(&self, ip: IpAddr, now: Instant) {
+    pub fn record(&self, ip: K, now: Instant) {
         let mut inner = self.lock();
         self.sweep(&mut inner, now);
         let window = self.window;
@@ -120,6 +122,7 @@ impl SlidingLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
 
     const HOUR: Duration = Duration::from_secs(3600);
 
@@ -129,7 +132,7 @@ mod tests {
 
     #[test]
     fn five_per_ip_per_window_then_the_window_slides() {
-        let limiter = SlidingLimiter::new(HOUR, 5, 0);
+        let limiter: SlidingLimiter<IpAddr> = SlidingLimiter::new(HOUR, 5, 0);
         let t0 = Instant::now();
         for i in 0..5 {
             assert!(limiter.try_acquire(ip(1), t0 + Duration::from_secs(i)), "hit {i}");
@@ -145,7 +148,7 @@ mod tests {
 
     #[test]
     fn the_global_cap_binds_across_addresses_and_refused_hits_are_not_counted() {
-        let limiter = SlidingLimiter::new(HOUR, 5, 3);
+        let limiter: SlidingLimiter<IpAddr> = SlidingLimiter::new(HOUR, 5, 3);
         let t0 = Instant::now();
         assert!(limiter.try_acquire(ip(1), t0));
         assert!(limiter.try_acquire(ip(2), t0));
@@ -162,7 +165,7 @@ mod tests {
 
     #[test]
     fn a_failure_throttle_blocks_only_after_the_limit_and_only_that_address() {
-        let limiter = SlidingLimiter::new(HOUR, 3, 0);
+        let limiter: SlidingLimiter<IpAddr> = SlidingLimiter::new(HOUR, 3, 0);
         let t0 = Instant::now();
         assert!(!limiter.is_blocked(ip(1), t0));
         limiter.record(ip(1), t0);
@@ -175,8 +178,18 @@ mod tests {
     }
 
     #[test]
+    fn the_key_can_be_an_account_id() {
+        let limiter: SlidingLimiter<i64> = SlidingLimiter::new(Duration::from_secs(60), 2, 0);
+        let t0 = Instant::now();
+        assert!(limiter.try_acquire(7, t0) && limiter.try_acquire(7, t0));
+        assert!(!limiter.try_acquire(7, t0));
+        assert!(limiter.try_acquire(8, t0));
+        assert!(limiter.try_acquire(7, t0 + Duration::from_secs(60)));
+    }
+
+    #[test]
     fn a_zero_limit_means_unlimited() {
-        let limiter = SlidingLimiter::new(HOUR, 0, 0);
+        let limiter: SlidingLimiter<IpAddr> = SlidingLimiter::new(HOUR, 0, 0);
         let t0 = Instant::now();
         for _ in 0..100 {
             assert!(limiter.try_acquire(ip(1), t0));
@@ -186,7 +199,7 @@ mod tests {
 
     #[test]
     fn a_flood_of_distinct_addresses_is_swept_once_it_has_aged_out() {
-        let limiter = SlidingLimiter::new(HOUR, 5, 0);
+        let limiter: SlidingLimiter<IpAddr> = SlidingLimiter::new(HOUR, 5, 0);
         let t0 = Instant::now();
         for n in 0..(SWEEP_THRESHOLD as u32 + 10) {
             assert!(limiter.try_acquire(IpAddr::from(n.to_be_bytes()), t0));

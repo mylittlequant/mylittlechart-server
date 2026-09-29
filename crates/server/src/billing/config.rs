@@ -19,6 +19,7 @@
 //! identity and sync do not depend on the payment processor being wired.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -215,8 +216,8 @@ pub struct BillingRuntime {
     client: Option<Dig2payClient>,
     webhook_secrets: Vec<Vec<u8>>,
     onion_hosts: Vec<String>,
-    anon_create: SlidingLimiter,
-    key_failures: SlidingLimiter,
+    anon_create: SlidingLimiter<IpAddr>,
+    key_failures: SlidingLimiter<IpAddr>,
 }
 
 impl BillingRuntime {
@@ -241,12 +242,12 @@ impl BillingRuntime {
     }
 
     /// The budget on anonymous checkouts (per IP and overall).
-    pub fn anon_create_limiter(&self) -> &SlidingLimiter {
+    pub fn anon_create_limiter(&self) -> &SlidingLimiter<IpAddr> {
         &self.anon_create
     }
 
     /// The per-IP throttle on failed account-key attempts.
-    pub fn key_failure_limiter(&self) -> &SlidingLimiter {
+    pub fn key_failure_limiter(&self) -> &SlidingLimiter<IpAddr> {
         &self.key_failures
     }
 

@@ -48,7 +48,7 @@ fn invalid_key() -> Response {
 
 /// `429` with a `Retry-After` of the limiter's whole window (the safe upper
 /// bound; the oldest hit leaves sooner).
-fn rate_limited(limiter: &SlidingLimiter) -> Response {
+fn rate_limited(limiter: &SlidingLimiter<IpAddr>) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
         [(header::RETRY_AFTER, limiter.window().as_secs().to_string())],
