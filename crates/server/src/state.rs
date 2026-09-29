@@ -271,6 +271,19 @@ pub struct AppState {
     /// `/health` has exactly one place that decides what an absent daemon
     /// reports.
     alert_daemon_stats: Option<Arc<mlc_alert_daemon::DaemonStats>>,
+
+    /// Short-lived tickets for the live socket. The browser opens that
+    /// socket on the cache edge's own name, so the session cookie
+    /// (SameSite=Strict) is not sent. The page mints the ticket on its
+    /// own edge; the relay redeems it.
+    live_tickets: std::sync::Mutex<std::collections::HashMap<String, LiveTicket>>,
+}
+
+struct LiveTicket {
+    token: String,
+    publish: bool,
+    owner: String,
+    exp: i64,
 }
 
 /// `alert_daemon` object in `/health`'s JSON body (see `main.rs`'s health
@@ -330,7 +343,40 @@ impl AppState {
             build_attest_max_age_secs,
             telemetry_daily_cap,
             alert_daemon_stats,
+            live_tickets: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// One-minute ticket for `wss://<edge>/api/share-live/{token}`.
+    pub fn mint_live_ticket(&self, token: &str, publish: bool, owner: &str) -> String {
+        use rand::Rng;
+        let mut bytes = [0u8; 16];
+        rand::thread_rng().fill(&mut bytes);
+        let ticket: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let mut map = self.live_tickets.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().timestamp();
+        map.retain(|_, row| row.exp > now);
+        map.insert(
+            ticket.clone(),
+            LiveTicket {
+                token: token.to_string(),
+                publish,
+                owner: owner.to_string(),
+                exp,
+            },
+        );
+        ticket
+    }
+
+    pub fn lookup_live_ticket(&self, ticket: &str, token: &str) -> Option<(bool, String)> {
+        let map = self.live_tickets.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().timestamp();
+        let row = map.get(ticket)?;
+        if row.exp < now || row.token != token {
+            return None;
+        }
+        Some((row.publish, row.owner.clone()))
     }
 
     /// Snapshot of the embedded alert daemon's counters for `/health`.

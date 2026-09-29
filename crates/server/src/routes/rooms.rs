@@ -710,7 +710,12 @@ pub async fn clone_room(
         let rows = db::room_live_entities(&conn, &object_id)?;
         let decomposed: Vec<rooms_codec::DecomposedEntity> = rows.into_iter().filter_map(row_to_decomposed).collect();
         let preset = rooms_codec::reassemble_preset(&decomposed);
-        let (preset, stripped) = super::share::clone_preset_with_strip(&conn, preset, caller)?;
+        // Rooms has no Protected/`clone_protected` concept of its own
+        // (Protected is a share-link-only idea, docs/mlc/plans/share-policy-
+        // 2026-09-25.md §6) — always an empty protected list and
+        // `skip_protected_strip: false`, so the protected-element pass is
+        // simply a no-op here, never engaged.
+        let (preset, stripped) = super::share::clone_preset_with_strip(&conn, preset, caller, &[], false)?;
         Ok(Some(RoomCloneOutcome::Cloned { preset, stripped }))
     })
     .await;

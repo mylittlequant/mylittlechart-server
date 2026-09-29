@@ -491,6 +491,10 @@ pub async fn lookup_recipients(
         let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
         let candidates = paid_recipient_candidates(&identity_conn, caller_id, &boosted_ids, &now)?;
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|c| crate::db::visible_in_search(&identity_conn, caller_id, c.id).unwrap_or(true))
+            .collect();
         drop(identity_conn);
         if candidates.is_empty() {
             return Ok(Vec::new());

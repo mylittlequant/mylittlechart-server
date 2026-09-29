@@ -122,11 +122,158 @@ use state::AppState;
 /// touching the edges' nginx config — nginx is provisioned by hand over ssh
 /// and there is no delivery script for it (see the static-file fallback
 /// further down, which still serves everything else).
+///
+/// This is also the fallback [`root_or_share_og`] uses for every request
+/// that is NOT a link-preview crawler's `?share=` fetch — unchanged
+/// behaviour for the overwhelming majority of hits on this path (nginx
+/// itself never even reaches this backend for a plain `/`: it serves its own
+/// copy of `index.html` directly, `ops/nginx-mlc-site.conf`'s `location /`
+/// block — this handler only matters for a direct hit on this backend, or a
+/// share-tagged one nginx detours here on purpose, §9).
 async fn redirect_to_app_root() -> axum::response::Response {
     axum::response::Response::builder()
         .status(301)
         .header("location", "https://mylittlechart.org/")
         .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+/// State for [`root_or_share_og`] — `Arc<AppState>` plus the same
+/// `static_dir` string `outside_api_app` was built with (main() computes it
+/// once, see `STATIC_DIR`'s doc in this file's module comment). Not folded
+/// into `AppState` itself: nothing else needs `static_dir` at runtime, and
+/// `AppState::new`'s constructor is already an established long positional
+/// list several tests build by hand — this stays a small, route-local
+/// bundle instead of growing that list for one handler.
+#[derive(Clone)]
+struct RootAppState {
+    app_state: Arc<AppState>,
+    static_dir: String,
+}
+
+/// Query params `GET /` accepts. `share` mirrors the client's own `?share=`
+/// convention (`mlc-app/src/share_viewer.rs`'s `request_open_share`) — the
+/// same token a recipient's browser fetches `/api/share/{token}` with.
+#[derive(serde::Deserialize)]
+struct ShareQueryParam {
+    #[serde(default)]
+    share: Option<String>,
+}
+
+/// `GET /` — per-link preview card / OG injection
+/// (docs/mlc/plans/share-policy-2026-09-25.md §9). Edge nginx detours every
+/// `?share=` request here (`ops/nginx-mlc-site.conf`, `$mlc_share_preview`
+/// → `@mlc_share_preview`) and this handler returns `STATIC_DIR/index.html`
+/// — the edge app index, copied by `deploy-app.sh` — with that link's
+/// og tags substituted. Every other request — no `share` param at all —
+/// gets the unchanged [`redirect_to_app_root`] 301.
+///
+/// For a `share`-tagged request: reads `static_dir/index.html` (the SAME
+/// file `outside_api_app`'s `ServeDir` would have served — never a
+/// baked-in copy, so a landing-page edit never has to be mirrored into this
+/// crate) and, when the token resolves to a real, live share, substitutes
+/// its `og:title`/`og:image`/`twitter:title`/`twitter:image` tags
+/// (`routes::share::og_tags_for_share` + `inject_og_tags`) before answering.
+/// An unknown/expired/revoked token gets the file back byte-identical — the
+/// same opacity `routes::share`'s own bare-404 doctrine holds for those
+/// three cases, extended here to "no distinguishable behaviour either" —
+/// and a private share whose caller (there is none; this route has no
+/// notion of a caller at all) holds no tier gets the neutral card via
+/// `og_tags_for_share`'s own `visibility == "private"` branch, not a lock
+/// screen (§8.5's lock screen is the OPEN-in-app case; a crawler is never
+/// signed in, so §8.5 is not reachable from here).
+fn share_preview_agent(ua: &str) -> bool {
+    if ua.is_empty() {
+        return true;
+    }
+    let ua = ua.to_ascii_lowercase();
+    [
+        "telegrambot",
+        "facebookexternalhit",
+        "facebot",
+        "twitterbot",
+        "slackbot",
+        "discordbot",
+        "whatsapp",
+        "vkshare",
+        "linkedinbot",
+        "googlebot",
+        "bingbot",
+        "yandex",
+        "baiduspider",
+        "embedly",
+        "pinterest",
+        "redditbot",
+        "applebot",
+    ]
+    .iter()
+    .any(|name| ua.contains(name))
+        || ua.contains("bot")
+        || ua.contains("crawler")
+        || ua.contains("spider")
+}
+
+/// Browser pasted `/?share=`. The token moves into a one-shot cookie and
+/// the address bar becomes `/`. The app turns that cookie into a tab.
+fn redirect_share_into_tab(token: &str) -> axum::response::Response {
+    let cookie = format!("mlc_share={token}; Max-Age=120; Path=/; Secure; SameSite=Lax");
+    axum::response::Response::builder()
+        .status(302)
+        .header("location", "/")
+        .header("set-cookie", cookie)
+        .header("cache-control", "no-store")
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+async fn root_or_share_og(
+    axum::extract::State(state): axum::extract::State<Arc<RootAppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ShareQueryParam>,
+) -> axum::response::Response {
+    let Some(token) = q.share.filter(|t| !t.is_empty()) else {
+        return redirect_to_app_root().await;
+    };
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !share_preview_agent(ua) && token.len() == 32 && token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return redirect_share_into_tab(&token);
+    }
+
+    let index_path = std::path::Path::new(&state.static_dir).join("index.html");
+    let html = match tokio::fs::read_to_string(&index_path).await {
+        Ok(html) => html,
+        Err(_) => return redirect_to_app_root().await,
+    };
+
+    let app_state = state.app_state.clone();
+    let tags = tokio::task::spawn_blocking(move || -> rusqlite::Result<Option<routes::share::OgTags>> {
+        let conn = app_state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = crate::db::get_share_link(&conn, &token)? else {
+            return Ok(None);
+        };
+        let label = crate::db::effective_label_for_user(&conn, row.user_id).unwrap_or_default();
+        Ok(Some(routes::share::og_tags_for_share(&row, &label)))
+    })
+    .await;
+
+    let html = match tags {
+        Ok(Ok(Some(tags))) => routes::share::inject_og_tags(&html, &tags),
+        Ok(Ok(None)) => html,
+        Ok(Err(e)) => {
+            tracing::error!("DB error resolving share for OG injection: {}", e);
+            html
+        }
+        Err(_) => html,
+    };
+
+    axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "text/html; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(axum::body::Body::from(html))
         .unwrap()
 }
 
@@ -1027,6 +1174,26 @@ async fn main() {
     let matrix_router =
         (role == state::ServerRole::Control).then(|| routes::matrix_api_router(app_state.clone()));
 
+    // `/` as its own tiny state-carrying router (see `root_or_share_og`) —
+    // built ahead of the `/api` router below for the same reason
+    // `health_app` is: that router consumes `app_state` by value. Registered
+    // unconditionally (unlike `dash_app`/`blog_app`/`admin_app`, which are
+    // control-role only) because the plain redirect — the ONLY behaviour a
+    // `share`-less request ever gets — must keep working on an edge process
+    // exactly like it did before this route existed. A `share`-tagged
+    // request on an EDGE process (not a real production path — nginx's own
+    // `mlc_backend` upstream always points at the control box, never an
+    // edge) would hit `AppState::control_plane()`'s panic inside
+    // `spawn_blocking`; tokio contains that to a `JoinError` on the awaited
+    // handle, which `root_or_share_og` already treats as "serve the file
+    // unmodified" — a graceful degrade, not a process crash.
+    let root_app = axum::Router::new()
+        .route("/", axum::routing::get(root_or_share_og))
+        .with_state(Arc::new(RootAppState {
+            app_state: app_state.clone(),
+            static_dir: static_dir.clone(),
+        }));
+
     // Assemble the full router. `/api` mounts the role-appropriate route
     // table — see `routes::control_api_router` / `routes::edge_api_router`.
     let api_router = match role {
@@ -1063,12 +1230,11 @@ async fn main() {
             ))
             .layer(axum::middleware::from_fn(no_store_api_headers))
     });
-    let app = axum::Router::new()
-        // Root redirect (see redirect_to_app_root's doc comment) — ahead of
-        // the static fallback so the deleted landing page's index.html, if
-        // it is ever restored on disk by mistake, still cannot answer here.
-        .route("/", axum::routing::get(redirect_to_app_root))
-        .nest("/api", api_router);
+    // `/` (see `root_or_share_og`'s doc comment) merges in alongside
+    // `blog_app`/`health_app`/`outside_api` below — ahead of the static
+    // fallback so the deleted landing page's index.html, if it is ever
+    // restored on disk by mistake, still cannot answer here.
+    let app = axum::Router::new().merge(root_app).nest("/api", api_router);
     let app = match matrix_router {
         Some(matrix_router) => app.nest("/_matrix", matrix_router),
         None => app,

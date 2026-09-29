@@ -40,6 +40,7 @@ pub mod dm;
 pub mod entitlements;
 pub mod forum;
 pub mod forum_v2;
+pub mod groups;
 pub mod heartbeat;
 pub mod link;
 pub mod matrix;
@@ -133,6 +134,13 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/account/redeem", post(account::redeem))
         // Account nick change (cookie-session or bearer auth, same as redeem).
         .route("/account/nick", post(account::set_nick))
+        .route("/account/friends", get(account::friends).post(account::add_friend))
+        .route("/account/privacy", patch(account::set_privacy))
+        .route("/account/friend-invites", post(account::create_friend_invite))
+        .route(
+            "/account/friend-invites/{token}/accept",
+            post(account::accept_friend_invite),
+        )
         // Chart share links. Creation/listing/revoke are authenticated; the
         // two GETs by token are public — the token is the capability (see
         // routes/share.rs). `/share/mine` is a static segment, which matchit
@@ -147,11 +155,44 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
                 .layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route("/share/mine", get(share::list_my_shares))
-        .route("/share/{token}", get(share::get_share).delete(share::delete_share))
+        .route("/share/private-card.png", get(share::get_private_share_card))
+        // Static, before `/share/{token}` — a nick search, not a token.
+        .route("/share/lookup", get(share::lookup_share_nicks))
+        .route(
+            "/share/{token}",
+            get(share::get_share).delete(share::delete_share).patch(share::update_share_policy),
+        )
         .route("/share/{token}/png", get(share::get_share_png))
         // Clone-with-strip (rights v1): auth required, needs the `clone`
         // right on the token (see routes/share.rs's module doc).
         .route("/share/{token}/clone", post(share::clone_share))
+        // Per-account/group share grants (rights v2, §8.2) — owner-only.
+        .route(
+            "/share/{token}/grants",
+            get(share::list_share_grants).post(share::create_share_grant),
+        )
+        .route("/share/{token}/grants/{grant_id}", delete(share::delete_share_grant))
+        .route(
+            "/share/{token}/ops",
+            get(share::get_share_ops).post(share::post_share_ops),
+        )
+        .route("/share/{token}/stream-open", get(share::stream_open))
+        // Per-link preview image + OG injection (§9) — owner-only upload,
+        // public serve (same 404 opacity discipline as /share/{token}/png).
+        .route(
+            "/share/{token}/preview",
+            post(share::upload_share_preview).layer(DefaultBodyLimit::max(share::PREVIEW_MAX_BYTES)),
+        )
+        .route("/share/{token}/preview.png", get(share::get_share_preview))
+        // Owner-curated grant groups (§8.3) — a reusable, named account list
+        // a share grant can target instead of one grant row per account.
+        .route("/groups", get(groups::list_my_groups).post(groups::create_group))
+        .route(
+            "/groups/{id}",
+            patch(groups::rename_group).delete(groups::delete_group),
+        )
+        .route("/groups/{id}/members", post(groups::add_group_member))
+        .route("/groups/{id}/members/{user_id}", delete(groups::remove_group_member))
         // Shared presets (rooms) — server-hosted, per-nick rights, per-entity
         // LWW patch, no live channel yet (Phase 1 — see routes/rooms.rs's
         // module doc). `{kind}` is reserved for future object kinds; Phase 1

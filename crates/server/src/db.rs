@@ -264,6 +264,26 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
             created_at TEXT NOT NULL
         );
 
+        -- Owner-curated named groups (docs/mlc/plans/share-policy-2026-09-25.md
+        -- §1/§8.3) — v1 is manual membership only, no automatic sync from any
+        -- entitlement/paid flag. `object_grants.grantee_group_id` (see the
+        -- ALTER below) references a row here the same way `grantee_user_id`
+        -- references `users(id)`: a share-tier grant targets EITHER one
+        -- account OR one group, never both.
+        CREATE TABLE IF NOT EXISTS grant_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_user_id INTEGER NOT NULL REFERENCES users(id),
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS grant_group_members (
+            group_id INTEGER NOT NULL REFERENCES grant_groups(id),
+            user_id  INTEGER NOT NULL REFERENCES users(id),
+            added_at TEXT NOT NULL,
+            PRIMARY KEY (group_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_grant_group_members_user ON grant_group_members(user_id);
+
         -- Minimal vendor model for strip-on-clone (plan §3, routes/share.rs
         -- clone_share). A `type_id` present here is a user-published
         -- indicator with an owner; a `type_id` absent is a built-in `mli`
@@ -510,6 +530,134 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
     // paid_until above, CREATE TABLE share_links up top is never edited for
     // this column — only this ALTER adds it, on a live database.
     let _ = conn.execute("ALTER TABLE share_links ADD COLUMN clone_allowed INTEGER NOT NULL DEFAULT 0", []);
+    // Safe migration: chart-share policy, link kinds v1 (docs/mlc/plans/
+    // share-policy-2026-09-25.md §1/§11 step 1). `interaction` is "view" |
+    // "interactive" — 'view' is the safe default for every row created
+    // before this column existed (an old client that never chose "view" vs
+    // "interactive" gets the MORE restrictive behaviour). `protected_json`
+    // is a serialized `Vec<ProtectedElementRef>` (routes/share.rs) the
+    // sharer marked Protected at creation time — '[]' for every pre-existing
+    // row, matching "nothing was ever marked Protected before this feature
+    // existed". Like `clone_allowed` above, `CREATE TABLE share_links` up
+    // top is never edited for these two columns — only these ALTERs add
+    // them, on a live database.
+    let _ = conn.execute("ALTER TABLE share_links ADD COLUMN interaction TEXT NOT NULL DEFAULT 'view'", []);
+    let _ = conn.execute("ALTER TABLE share_links ADD COLUMN protected_json TEXT NOT NULL DEFAULT '[]'", []);
+    // Safe migration: chart-share policy v1, Rev 2 (§1/§11 step 2).
+    // `visibility` is "public" | "private" — 'public' for every pre-existing
+    // row, exactly today's behaviour (every link was reachable by anyone who
+    // had it). `preview_path` is reserved for the per-link preview card
+    // (§9, unused until that step lands) — added here to keep this
+    // migration wave's ALTER TABLEs in one batch rather than spread across
+    // two boots. Both, like `interaction`/`protected_json` above, are never
+    // added to `CREATE TABLE share_links` up top — only these ALTERs add
+    // them, on a live database.
+    let _ = conn.execute("ALTER TABLE share_links ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'", []);
+    let _ = conn.execute("ALTER TABLE share_links ADD COLUMN preview_path TEXT NOT NULL DEFAULT ''", []);
+    // Safe migration: chart-share policy, Rev 3 (docs/mlc/plans/share-policy-
+    // 2026-09-25.md, "Rev 3"). `allow_forward` is a NULLABLE integer, not a
+    // `NOT NULL ... DEFAULT` column like its siblings above — deliberately:
+    // NULL means "never explicitly set", and the *effective* value is derived
+    // at READ time from the link's own `visibility` (see
+    // [`ShareLinkRow::effective_allow_forward`]): `true` for a public link,
+    // `false` for a private one. This is what makes a later `PATCH`
+    // visibility change able to move the effective default without ever
+    // touching this column, while a caller who DID set `allow_forward`
+    // explicitly (0 or 1, at create or via PATCH) keeps that exact value
+    // forever, regardless of any later visibility change — the one row this
+    // plan does not want a `NOT NULL DEFAULT` for. Every pre-existing row
+    // reads back NULL here (unset), so it silently starts following its own
+    // `visibility`'s default — `true` for the public links that are the
+    // overwhelming majority of existing rows, matching today's actual
+    // behaviour of "recipients can already forward the raw link text".
+    let _ = conn.execute("ALTER TABLE share_links ADD COLUMN allow_forward INTEGER", []);
+    // Pin keeps a link out of the ring. Unpinned links are the ones creation
+    // burns, oldest first, once the account is at its cap. Existing rows
+    // start unpinned.
+    let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    // One live link per author chart. Empty chart_id is a legacy row that
+    // was minted once and is never reused. `revision` bumps every time the
+    // author republishes that chart onto the same token.
+    let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN chart_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    // Monotonic op log head for live follow and co-edit. Republishing the
+    // preset resets this to 0 and deletes the log: the preset is the new
+    // baseline, later ops are the delta.
+    let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN op_seq INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    // Live is a channel. Off (default) means the link updates on a cadence.
+    let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN live INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE share_links ADD COLUMN live_edge TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE users ADD COLUMN discoverable INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS friendships (
+            user_id INTEGER NOT NULL,
+            friend_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, friend_id)
+        );
+        CREATE TABLE IF NOT EXISTS friend_invites (
+            token TEXT PRIMARY KEY,
+            inviter_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS friend_requests (
+            from_id INTEGER NOT NULL,
+            to_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (from_id, to_id)
+        );
+        CREATE TABLE IF NOT EXISTS blocks (
+            user_id INTEGER NOT NULL,
+            blocked_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, blocked_id)
+        );
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, target_id)
+        );",
+    );
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS share_ops (
+            token TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            object_id TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (token, seq)
+        );",
+    );
+    // Safe migration: per-account/group share rights (§1's new `ShareTier`
+    // core). NULL for every existing `object_grants` row — a grant with no
+    // group target simply never matches via `grant_group_members`, the same
+    // way a NULL `grantee_user_id` already means "no per-account target".
+    let _ = conn.execute("ALTER TABLE object_grants ADD COLUMN grantee_group_id INTEGER REFERENCES grant_groups(id)", []);
     // One-time cleanup: remove device_users entries where device_id doesn't exist
     // in the devices table (old profile_id entries from pre-v0.2.11 bug).
     // `devices` lives in the operational database now (2026-08-30 store
@@ -1721,6 +1869,67 @@ pub fn user_id_for_nick(conn: &Connection, nick: &str) -> Result<Option<i64>> {
         |row| row.get(0),
     )
     .optional()
+}
+
+/// One account a share-settings nick box can grant. `label` stays empty:
+/// the box shows the nick and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareNickHit {
+    pub nick: String,
+    pub label: String,
+}
+
+/// Accounts with a nick, excluding `caller_id`. Match is case-insensitive
+/// substring on the nick only. An account with no nick is not a hit, and a
+/// display name is neither searched nor returned. Exact nick, then nick
+/// prefix, then substring. A published DM key is not required.
+pub fn search_share_nicks(
+    conn: &Connection,
+    caller_id: i64,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<ShareNickHit>> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() || limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let like = format!("%{escaped}%");
+    let prefix = format!("{escaped}%");
+    let mut stmt = conn.prepare(
+        "SELECT nick FROM users
+         WHERE id != ?1
+           AND nick IS NOT NULL AND nick != ''
+           AND LOWER(nick) LIKE ?2 ESCAPE '\\'
+           AND (
+             IFNULL(discoverable, 1) = 1
+             OR EXISTS (
+               SELECT 1 FROM friendships
+               WHERE user_id = ?1 AND friend_id = users.id
+             )
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM blocks WHERE user_id = ?1 AND blocked_id = users.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM blocks WHERE user_id = users.id AND blocked_id = ?1
+           )
+         ORDER BY
+           CASE
+             WHEN LOWER(nick) = ?3 THEN 0
+             WHEN LOWER(nick) LIKE ?4 ESCAPE '\\' THEN 1
+             ELSE 2
+           END,
+           LOWER(nick)
+         LIMIT ?5",
+    )?;
+    let mut rows = stmt.query(params![caller_id, like, q, prefix, limit])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let nick: String = row.get(0)?;
+        out.push(ShareNickHit { nick, label: String::new() });
+    }
+    Ok(out)
 }
 
 /// The label to show for a user: chosen nick, then `display_name`, then
@@ -3199,6 +3408,69 @@ pub struct ShareLinkRow {
     /// Rights v1 (see `effective_rights`): true when the owner opted this
     /// link into the `clone` right at creation time.
     pub clone_allowed: bool,
+    /// Chart-share policy v1 (docs/mlc/plans/share-policy-2026-09-25.md §1):
+    /// `"view"` | `"interactive"` — the live-view interaction floor a link
+    /// grants, consulted by [`effective_share_tier`]. Raw string, same
+    /// storage idiom as `kind` — the `ShareInteraction` enum lives in
+    /// `routes::share`, the one wire-facing layer that parses it.
+    pub interaction: String,
+    /// Serialized `Vec<routes::share::ProtectedElementRef>` — the elements
+    /// the sharer marked Protected at creation time, `'[]'` for every link
+    /// created before this column existed or that never marked anything.
+    pub protected_json: String,
+    /// `"public"` | `"private"` (§1 Rev 2). A private link resolves to no
+    /// rights at all for anyone without an explicit `object_grants` row —
+    /// see [`effective_share_tier`]. `"public"` for every link created
+    /// before this column existed, matching that link's actual historical
+    /// behaviour (reachable by anyone holding the token).
+    pub visibility: String,
+    /// Path of the re-encoded preview PNG relative to `<data_dir>/share/`
+    /// (§9), or empty when no preview has been uploaded yet — same idiom as
+    /// `blob_path`. Set by [`set_share_preview_path`], read by
+    /// `routes::share::get_share_preview` (serving) and
+    /// `routes::share::og_tags_for_share` (OG-tag selection for the
+    /// crawler-facing `GET /` route in `main.rs`).
+    pub preview_path: String,
+    /// [Rev 3] `Some(true)`/`Some(false)` once the owner has explicitly set
+    /// forwarding at create time or via `PATCH /api/share/{token}`; `None`
+    /// for every link that never had it set explicitly (including every row
+    /// created before this column existed) — see the ALTER TABLE's own
+    /// comment above and [`Self::effective_allow_forward`], the ONE place
+    /// that turns this raw, possibly-unset value into the answer a caller
+    /// actually wants.
+    pub allow_forward: Option<bool>,
+    /// Kept out of the ring. Creation burns the oldest unpinned link of the
+    /// same kind once the account is at its cap; a pinned link is never that
+    /// victim.
+    pub pinned: bool,
+    /// Author chart this live link is bound to. Empty on screenshot rows and
+    /// on live rows created before the binding existed.
+    pub chart_id: String,
+    /// Bumps when the author republishes the chart onto this token. The
+    /// clipboard URL carries it as `v` so a messenger refetches the card.
+    pub revision: i64,
+    /// Head of `share_ops` for this token. 0 means no ops since the last
+    /// preset publish.
+    pub op_seq: i64,
+    /// Channel mode. False: viewers catch up on a cadence. True: the same
+    /// log is the live channel.
+    pub live: bool,
+}
+
+impl ShareLinkRow {
+    /// The forwarding flag a caller/UI actually acts on: the explicit value
+    /// if the owner ever set one, otherwise the visibility-keyed default —
+    /// `true` for `"public"`, `false` for anything else (in practice just
+    /// `"private"`). Reading this fresh off `self.visibility` on every call,
+    /// rather than baking a default into the column at write time, is
+    /// exactly what lets a `PATCH` that changes ONLY `visibility` move an
+    /// unset link's effective forwarding without ever writing to
+    /// `allow_forward` — and, symmetrically, lets an explicit value survive
+    /// that same `PATCH` untouched (docs/mlc/plans/share-policy-2026-09-25.md
+    /// Rev 3).
+    pub fn effective_allow_forward(&self) -> bool {
+        self.allow_forward.unwrap_or(self.visibility == "public")
+    }
 }
 
 /// Read one query row into a [`ShareLinkRow`]. Column order must match the
@@ -3215,6 +3487,16 @@ fn share_link_from_row(row: &rusqlite::Row<'_>) -> Result<ShareLinkRow> {
         created_at: row.get(7)?,
         expires_at: row.get(8)?,
         clone_allowed: row.get::<_, i64>(9)? != 0,
+        interaction: row.get(10)?,
+        protected_json: row.get(11)?,
+        visibility: row.get(12)?,
+        preview_path: row.get(13)?,
+        allow_forward: row.get::<_, Option<i64>>(14)?.map(|v| v != 0),
+        pinned: row.get::<_, i64>(15)? != 0,
+        chart_id: row.get(16)?,
+        revision: row.get(17)?,
+        op_seq: row.get(18)?,
+        live: row.get::<_, i64>(19)? != 0,
     })
 }
 
@@ -3236,7 +3518,16 @@ fn generate_share_token() -> String {
 /// [`set_share_blob_path`] once the token is known and the file is written.
 /// `clone_allowed` is the owner's rights-v1 choice at creation time (see
 /// `effective_rights`) — always `false` for a screenshot share today, since
-/// only a live share carries a preset to clone.
+/// only a live share carries a preset to clone. `interaction`/`protected_json`
+/// are the chart-share-policy v1 fields (docs/mlc/plans/share-policy-
+/// 2026-09-25.md §1) — `"view"`/`"[]"` for a screenshot share (same reasoning
+/// as `clone_allowed`: nothing offers to set them for that kind).
+/// `visibility` is `"public"`/`"private"` (§1 Rev 2); `preview_path` starts
+/// empty always — it is stamped later, once a preview image exists (§9).
+/// `allow_forward` is Rev 3's forwarding flag: `None` when the caller never
+/// set it explicitly — the row then follows its own `visibility`'s default
+/// (see [`ShareLinkRow::effective_allow_forward`]) — `Some(v)` when it did;
+/// always `None` for a screenshot share, same reasoning as `clone_allowed`.
 ///
 /// Retries on the vanishingly unlikely PRIMARY KEY collision, same as
 /// [`mint_gift_codes`].
@@ -3250,19 +3541,111 @@ pub fn create_share_link(
     created_at: &str,
     expires_at: &str,
     clone_allowed: bool,
+    interaction: &str,
+    protected_json: &str,
+    visibility: &str,
+    allow_forward: Option<bool>,
 ) -> Result<String> {
     loop {
         let token = generate_share_token();
         let inserted = conn.execute(
-            "INSERT OR IGNORE INTO share_links (token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed)
-             VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9)",
-            params![token, user_id, kind, title, preset_json, blob_bytes, created_at, expires_at, clone_allowed as i64],
+            "INSERT OR IGNORE INTO share_links (token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, allow_forward)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![token, user_id, kind, title, preset_json, blob_bytes, created_at, expires_at, clone_allowed as i64, interaction, protected_json, visibility, allow_forward.map(|v| v as i64)],
         )?;
         if inserted == 1 {
             return Ok(token);
         }
         // PRIMARY KEY collision (vanishingly unlikely) — draw another token.
     }
+}
+
+/// Active live token bound to this author's chart, if one still resolves.
+pub fn find_active_live_share_for_chart(
+    conn: &Connection,
+    user_id: i64,
+    chart_id: &str,
+) -> Result<Option<(String, i64)>> {
+    if chart_id.is_empty() {
+        return Ok(None);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.query_row(
+        "SELECT token, revision FROM share_links
+         WHERE user_id = ?1 AND chart_id = ?2 AND kind = 'live' AND revoked = 0 AND expires_at > ?3
+         ORDER BY created_at DESC LIMIT 1",
+        params![user_id, chart_id, now],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+/// Publish the author's current chart onto one stable live link.
+///
+/// An empty `chart_id` always mints a new token (legacy clients). A non-empty
+/// id reuses the active row for that chart and bumps `revision`. Returns
+/// `(token, revision, expires_at, created)`.
+pub fn publish_live_share(
+    conn: &Connection,
+    user_id: i64,
+    chart_id: &str,
+    title: &str,
+    preset_json: &str,
+    created_at: &str,
+    expires_at: &str,
+    clone_allowed: bool,
+    interaction: &str,
+    protected_json: &str,
+    visibility: &str,
+    allow_forward: Option<bool>,
+) -> Result<(String, i64, String, bool)> {
+    if let Some((token, revision)) = find_active_live_share_for_chart(conn, user_id, chart_id)? {
+        let next = revision.saturating_add(1).max(1);
+        conn.execute(
+            "UPDATE share_links
+             SET title = ?1, preset_json = ?2, expires_at = ?3, revision = ?4,
+                 clone_allowed = ?5, interaction = ?6, protected_json = ?7,
+                 visibility = ?8, allow_forward = ?9
+             WHERE token = ?10 AND user_id = ?11",
+            params![
+                title,
+                preset_json,
+                expires_at,
+                next,
+                clone_allowed as i64,
+                interaction,
+                protected_json,
+                visibility,
+                allow_forward.map(|v| v as i64),
+                token,
+                user_id,
+            ],
+        )?;
+        reset_share_ops(conn, &token)?;
+        return Ok((token, next, expires_at.to_string(), false));
+    }
+    let token = create_share_link(
+        conn,
+        user_id,
+        "live",
+        title,
+        preset_json,
+        0,
+        created_at,
+        expires_at,
+        clone_allowed,
+        interaction,
+        protected_json,
+        visibility,
+        allow_forward,
+    )?;
+    if !chart_id.is_empty() {
+        conn.execute(
+            "UPDATE share_links SET chart_id = ?1, revision = 1 WHERE token = ?2 AND user_id = ?3",
+            params![chart_id, token, user_id],
+        )?;
+    }
+    Ok((token, 1, expires_at.to_string(), true))
 }
 
 /// Stamp the real blob path onto a freshly created screenshot share (see
@@ -3281,7 +3664,7 @@ pub fn set_share_blob_path(conn: &Connection, token: &str, blob_path: &str) -> R
 pub fn get_share_link(conn: &Connection, token: &str) -> Result<Option<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.query_row(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision, op_seq, live
          FROM share_links
          WHERE token = ?1 AND revoked = 0 AND expires_at > ?2",
         params![token, now],
@@ -3313,7 +3696,7 @@ pub fn share_usage(conn: &Connection, user_id: i64) -> Result<(u64, u64)> {
 pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLinkRow>> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed
+        "SELECT token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, clone_allowed, interaction, protected_json, visibility, preview_path, allow_forward, pinned, chart_id, revision, op_seq, live
          FROM share_links
          WHERE user_id = ?1 AND revoked = 0 AND expires_at > ?2
          ORDER BY created_at DESC",
@@ -3324,6 +3707,441 @@ pub fn list_share_links(conn: &Connection, user_id: i64) -> Result<Vec<ShareLink
         out.push(share_link_from_row(row)?);
     }
     Ok(out)
+}
+
+/// Stamp the re-encoded preview PNG's path onto a share link, owner-only —
+/// the `user_id` in the WHERE clause makes "someone else's token" answer
+/// `false` exactly like "no such token" (same discipline as [`revoke_share`]).
+/// `routes::share::upload_share_preview`'s write path.
+pub fn set_share_preview_path(
+    conn: &Connection,
+    token: &str,
+    owner_user_id: i64,
+    preview_path: &str,
+) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE share_links SET preview_path = ?1 WHERE token = ?2 AND user_id = ?3",
+        params![preview_path, token, owner_user_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Update a subset of a link's own policy fields after creation, owner-only
+/// (docs/mlc/plans/share-policy-2026-09-25.md §3 called changing a link's
+/// policy post-creation a non-goal for v1 — revisited here on explicit
+/// product instruction: `interaction`/`visibility`/`protected_json` may now
+/// be changed through this one path; `clone_allowed` still cannot, see
+/// `routes::share::update_share_policy`'s doc comment). Each `Some`
+/// argument is written; `None` leaves that column untouched. Returns
+/// `false` for an unknown token or a non-owner caller — same "someone
+/// else's token" 404 discipline as every other owner-scoped write here.
+///
+/// `allow_forward` (Rev 3) follows the exact same "`None` = untouched"
+/// convention as the other three — writing `Some(v)` here is what makes a
+/// value "explicit" for [`ShareLinkRow::effective_allow_forward`]'s purposes
+/// from this call onward, including surviving a LATER call that changes only
+/// `visibility`: that later call passes `allow_forward: None` and this
+/// function then does not touch the column at all, leaving the earlier
+/// explicit value exactly as it was.
+pub fn update_share_link_policy(
+    conn: &Connection,
+    token: &str,
+    owner_user_id: i64,
+    interaction: Option<&str>,
+    visibility: Option<&str>,
+    protected_json: Option<&str>,
+    allow_forward: Option<bool>,
+    clone_allowed: Option<bool>,
+    pinned: Option<bool>,
+) -> Result<bool> {
+    let owns: bool = conn
+        .query_row(
+            "SELECT 1 FROM share_links WHERE token = ?1 AND user_id = ?2",
+            params![token, owner_user_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !owns {
+        return Ok(false);
+    }
+    if let Some(v) = interaction {
+        conn.execute("UPDATE share_links SET interaction = ?1 WHERE token = ?2", params![v, token])?;
+    }
+    if let Some(v) = visibility {
+        conn.execute(
+            "UPDATE share_links SET visibility = ?1, revision = revision + 1 WHERE token = ?2",
+            params![v, token],
+        )?;
+    }
+    if let Some(v) = protected_json {
+        conn.execute("UPDATE share_links SET protected_json = ?1 WHERE token = ?2", params![v, token])?;
+    }
+    if let Some(v) = allow_forward {
+        conn.execute(
+            "UPDATE share_links SET allow_forward = ?1 WHERE token = ?2",
+            params![v as i64, token],
+        )?;
+    }
+    if let Some(v) = clone_allowed {
+        conn.execute(
+            "UPDATE share_links SET clone_allowed = ?1 WHERE token = ?2",
+            params![v as i64, token],
+        )?;
+    }
+    if let Some(v) = pinned {
+        conn.execute(
+            "UPDATE share_links SET pinned = ?1 WHERE token = ?2",
+            params![v as i64, token],
+        )?;
+    }
+    Ok(true)
+}
+
+/// Hidden accounts stay out of nick search unless `caller` already friended them.
+pub fn visible_in_search(conn: &Connection, caller: i64, target: i64) -> Result<bool> {
+    if caller == target || blocked_either(conn, caller, target)? {
+        return Ok(false);
+    }
+    let discoverable: i64 = conn
+        .query_row(
+            "SELECT IFNULL(discoverable, 1) FROM users WHERE id = ?1",
+            params![target],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(1);
+    if discoverable != 0 {
+        return Ok(true);
+    }
+    let friend: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM friendships WHERE user_id = ?1 AND friend_id = ?2",
+            params![caller, target],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(friend.is_some())
+}
+
+pub fn account_discoverable(conn: &Connection, user_id: i64) -> Result<bool> {
+    let v: Option<i64> = conn
+        .query_row(
+            "SELECT IFNULL(discoverable, 1) FROM users WHERE id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(v.unwrap_or(1) != 0)
+}
+
+pub fn set_account_discoverable(conn: &Connection, user_id: i64, on: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE users SET discoverable = ?1 WHERE id = ?2",
+        params![on as i64, user_id],
+    )?;
+    Ok(())
+}
+
+pub fn list_friend_nicks(conn: &Connection, user_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT u.nick FROM friendships f
+         JOIN users u ON u.id = f.friend_id
+         WHERE f.user_id = ?1 AND u.nick IS NOT NULL AND u.nick != ''
+         ORDER BY LOWER(u.nick)",
+    )?;
+    let mut rows = stmt.query(params![user_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
+}
+
+pub fn create_friend_invite(conn: &Connection, inviter: i64, now: &str, expires: &str) -> Result<String> {
+    let token = generate_share_token();
+    conn.execute(
+        "INSERT INTO friend_invites (token, inviter_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+        params![token, inviter, now, expires],
+    )?;
+    Ok(token)
+}
+
+/// Both directions, so each side finds the other. Returns false if the
+/// invite is missing, expired, or is the inviter accepting their own link.
+pub fn accept_friend_invite(conn: &Connection, token: &str, accepter: i64, now: &str) -> Result<bool> {
+    let inviter: Option<i64> = conn
+        .query_row(
+            "SELECT inviter_id FROM friend_invites WHERE token = ?1 AND expires_at > ?2",
+            params![token, now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(inviter) = inviter else {
+        return Ok(false);
+    };
+    if inviter == accepter {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
+        params![inviter, accepter, now],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
+        params![accepter, inviter, now],
+    )?;
+    conn.execute("DELETE FROM friend_invites WHERE token = ?1", params![token])?;
+    Ok(true)
+}
+
+fn blocked_either(conn: &Connection, a: i64, b: i64) -> Result<bool> {
+    let hit: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM blocks WHERE (user_id = ?1 AND blocked_id = ?2) OR (user_id = ?2 AND blocked_id = ?1)",
+            params![a, b],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(hit.is_some())
+}
+
+fn user_by_nick(conn: &Connection, nick: &str) -> Result<Option<(i64, String)>> {
+    let nick = nick.trim();
+    if nick.is_empty() {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT id, nick FROM users WHERE nick IS NOT NULL AND nick != '' AND LOWER(nick) = LOWER(?1)",
+        params![nick],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+fn nicks_for(conn: &Connection, sql: &str, user_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params![user_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
+}
+
+pub struct SocialLists {
+    pub discoverable: bool,
+    pub friends: Vec<String>,
+    pub incoming: Vec<String>,
+    pub outgoing: Vec<String>,
+    pub subscriptions: Vec<String>,
+    pub blocked: Vec<String>,
+}
+
+pub fn social_lists(conn: &Connection, user_id: i64) -> Result<SocialLists> {
+    Ok(SocialLists {
+        discoverable: account_discoverable(conn, user_id)?,
+        friends: list_friend_nicks(conn, user_id)?,
+        incoming: nicks_for(
+            conn,
+            "SELECT u.nick FROM friend_requests r JOIN users u ON u.id = r.from_id
+             WHERE r.to_id = ?1 AND u.nick IS NOT NULL AND u.nick != '' ORDER BY LOWER(u.nick)",
+            user_id,
+        )?,
+        outgoing: nicks_for(
+            conn,
+            "SELECT u.nick FROM friend_requests r JOIN users u ON u.id = r.to_id
+             WHERE r.from_id = ?1 AND u.nick IS NOT NULL AND u.nick != '' ORDER BY LOWER(u.nick)",
+            user_id,
+        )?,
+        subscriptions: nicks_for(
+            conn,
+            "SELECT u.nick FROM subscriptions s JOIN users u ON u.id = s.target_id
+             WHERE s.user_id = ?1 AND u.nick IS NOT NULL AND u.nick != '' ORDER BY LOWER(u.nick)",
+            user_id,
+        )?,
+        blocked: nicks_for(
+            conn,
+            "SELECT u.nick FROM blocks b JOIN users u ON u.id = b.blocked_id
+             WHERE b.user_id = ?1 AND u.nick IS NOT NULL AND u.nick != '' ORDER BY LOWER(u.nick)",
+            user_id,
+        )?,
+    })
+}
+
+fn link_friends(conn: &Connection, a: i64, b: i64, now: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
+        params![a, b, now],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
+        params![b, a, now],
+    )?;
+    conn.execute("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2", params![a, b])?;
+    conn.execute("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2", params![b, a])?;
+    Ok(())
+}
+
+fn unlink(conn: &Connection, a: i64, b: i64) -> Result<()> {
+    conn.execute("DELETE FROM friendships WHERE user_id = ?1 AND friend_id = ?2", params![a, b])?;
+    conn.execute("DELETE FROM friendships WHERE user_id = ?1 AND friend_id = ?2", params![b, a])?;
+    conn.execute("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2", params![a, b])?;
+    conn.execute("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2", params![b, a])?;
+    conn.execute("DELETE FROM subscriptions WHERE user_id = ?1 AND target_id = ?2", params![a, b])?;
+    conn.execute("DELETE FROM subscriptions WHERE user_id = ?1 AND target_id = ?2", params![b, a])?;
+    Ok(())
+}
+
+/// `request` does not create a friendship. `approve` does, both ways.
+/// `subscribe` is one row, from the caller to the nick, with no friendship.
+/// `block` removes friendship, requests, and subscriptions in both directions.
+pub fn social_act(conn: &Connection, caller: i64, nick: &str, action: &str, now: &str) -> Result<std::result::Result<(), &'static str>> {
+    let Some((target, _)) = user_by_nick(conn, nick)? else {
+        return Ok(Err("no such nick"));
+    };
+    if target == caller {
+        return Ok(Err("that is you"));
+    }
+    let blocked = blocked_either(conn, caller, target)?;
+    match action {
+        "request" => {
+            if blocked {
+                return Ok(Err("blocked"));
+            }
+            let already: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM friendships WHERE user_id = ?1 AND friend_id = ?2",
+                    params![caller, target],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if already.is_some() {
+                return Ok(Ok(()));
+            }
+            let incoming: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM friend_requests WHERE from_id = ?1 AND to_id = ?2",
+                    params![target, caller],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if incoming.is_some() {
+                link_friends(conn, caller, target, now)?;
+                return Ok(Ok(()));
+            }
+            conn.execute(
+                "INSERT OR IGNORE INTO friend_requests (from_id, to_id, created_at) VALUES (?1, ?2, ?3)",
+                params![caller, target, now],
+            )?;
+            Ok(Ok(()))
+        }
+        "approve" => {
+            if blocked {
+                return Ok(Err("blocked"));
+            }
+            let incoming: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM friend_requests WHERE from_id = ?1 AND to_id = ?2",
+                    params![target, caller],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if incoming.is_none() {
+                return Ok(Err("no request"));
+            }
+            link_friends(conn, caller, target, now)?;
+            Ok(Ok(()))
+        }
+        "remove" => {
+            conn.execute("DELETE FROM friendships WHERE user_id = ?1 AND friend_id = ?2", params![caller, target])?;
+            conn.execute("DELETE FROM friendships WHERE user_id = ?1 AND friend_id = ?2", params![target, caller])?;
+            Ok(Ok(()))
+        }
+        "block" => {
+            unlink(conn, caller, target)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO blocks (user_id, blocked_id, created_at) VALUES (?1, ?2, ?3)",
+                params![caller, target, now],
+            )?;
+            Ok(Ok(()))
+        }
+        "unblock" => {
+            conn.execute(
+                "DELETE FROM blocks WHERE user_id = ?1 AND blocked_id = ?2",
+                params![caller, target],
+            )?;
+            Ok(Ok(()))
+        }
+        "subscribe" => {
+            if blocked {
+                return Ok(Err("blocked"));
+            }
+            conn.execute(
+                "INSERT OR IGNORE INTO subscriptions (user_id, target_id, created_at) VALUES (?1, ?2, ?3)",
+                params![caller, target, now],
+            )?;
+            Ok(Ok(()))
+        }
+        "unsubscribe" => {
+            conn.execute(
+                "DELETE FROM subscriptions WHERE user_id = ?1 AND target_id = ?2",
+                params![caller, target],
+            )?;
+            Ok(Ok(()))
+        }
+        _ => Ok(Err("no such nick")),
+    }
+}
+
+/// Edge that owns this token's live socket. Empty until the first publisher claims it.
+pub fn share_live_edge(conn: &Connection, token: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT IFNULL(live_edge, '') FROM share_links WHERE token = ?1",
+        params![token],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Sets `live_edge` only while it is still empty. Returns the edge that owns the token.
+pub fn claim_share_live_edge(conn: &Connection, token: &str, edge: &str) -> Result<Option<String>> {
+    if edge == "utah" || edge == "ams" {
+        conn.execute(
+            "UPDATE share_links SET live_edge = ?1 WHERE token = ?2 AND IFNULL(live_edge, '') = ''",
+            params![edge, token],
+        )?;
+    }
+    share_live_edge(conn, token)
+}
+
+/// Owner sets whether this token is a live channel or a cadence link.
+pub fn set_share_live(conn: &Connection, token: &str, owner_user_id: i64, live: bool) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE share_links SET live = ?1 WHERE token = ?2 AND user_id = ?3 AND kind = 'live'",
+        params![live as i64, token, owner_user_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Revoke the oldest active unpinned share of `kind` for this account.
+/// Returns false when every active share of that kind is pinned, so the
+/// caller can still refuse creation instead of burning a pinned link.
+pub fn burn_oldest_unpinned_share(conn: &Connection, user_id: i64, kind: &str) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let token: Option<String> = conn
+        .query_row(
+            "SELECT token FROM share_links
+             WHERE user_id = ?1 AND kind = ?2 AND revoked = 0 AND pinned = 0 AND expires_at > ?3
+             ORDER BY created_at ASC LIMIT 1",
+            params![user_id, kind, now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(token) = token else {
+        return Ok(false);
+    };
+    revoke_share(conn, user_id, &token)
 }
 
 /// Revoke one share link, owner-only: the `user_id` in the WHERE clause is
@@ -3469,6 +4287,11 @@ pub struct ObjectGrantRow {
     pub owner_user_id: i64,
     /// `None` = public ("anyone with the link").
     pub grantee_user_id: Option<i64>,
+    /// `None` unless this row targets a [`grant_groups`] row instead of one
+    /// account. Widened in alongside chart-share policy v1 Rev 2 (§1/§8.1);
+    /// rooms' own grants (`routes::rooms`) never set this — a room grant
+    /// always targets one account or is public, never a group.
+    pub grantee_group_id: Option<i64>,
     pub right: String,
     pub expires_at: Option<String>,
     pub created_at: String,
@@ -3481,9 +4304,10 @@ fn object_grant_from_row(row: &rusqlite::Row<'_>) -> Result<ObjectGrantRow> {
         object_id: row.get(2)?,
         owner_user_id: row.get(3)?,
         grantee_user_id: row.get(4)?,
-        right: row.get(5)?,
-        expires_at: row.get(6)?,
-        created_at: row.get(7)?,
+        grantee_group_id: row.get(5)?,
+        right: row.get(6)?,
+        expires_at: row.get(7)?,
+        created_at: row.get(8)?,
     })
 }
 
@@ -3547,7 +4371,7 @@ pub fn revoke_object_grant(conn: &Connection, grant_id: i64, owner_user_id: i64)
 /// only counts live ones.
 pub fn list_object_grants(conn: &Connection, object_kind: &str, object_id: &str) -> Result<Vec<ObjectGrantRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, object_kind, object_id, owner_user_id, grantee_user_id, right, expires_at, created_at
+        "SELECT id, object_kind, object_id, owner_user_id, grantee_user_id, grantee_group_id, right, expires_at, created_at
          FROM object_grants WHERE object_kind = ?1 AND object_id = ?2 ORDER BY created_at DESC",
     )?;
     let mut rows = stmt.query(params![object_kind, object_id])?;
@@ -3619,6 +4443,510 @@ pub fn effective_object_rights(
         rights.push("edit");
     }
     Ok(rights)
+}
+
+// ============================================================================
+// Chart-share policy v1, Rev 2 — per-account/group share rights
+// (docs/mlc/plans/share-policy-2026-09-25.md §1/§8.1-§8.3). A share-object
+// grant row is `object_grants.object_kind = "chart"`, `object_id = <share
+// token>` (not the underlying preset id — the token is server-minted,
+// globally unique by construction, and ties the grant's natural lifecycle to
+// the share's own: revoking the share makes its grants moot without a
+// separate cascade). `right` carries one of `ShareTier::as_str`'s four
+// strings — a vocabulary distinct from rooms' own `{view,clone,edit}` set on
+// the SAME table, never confused because every reader here filters by
+// `object_kind = 'chart'` first.
+// ============================================================================
+
+/// One of the four tiers a share link (or a per-account/group grant on it)
+/// can resolve to, low -> high (`Ord`/`PartialOrd` follow declaration order,
+/// so `max()` picks the strongest tier a caller holds from any source).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ShareTier {
+    View,
+    Interactive,
+    Clone,
+    CloneProtected,
+}
+
+impl ShareTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShareTier::View => "view",
+            ShareTier::Interactive => "interactive",
+            ShareTier::Clone => "clone",
+            ShareTier::CloneProtected => "clone_protected",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "view" => Some(ShareTier::View),
+            "interactive" => Some(ShareTier::Interactive),
+            "clone" => Some(ShareTier::Clone),
+            "clone_protected" => Some(ShareTier::CloneProtected),
+            _ => None,
+        }
+    }
+}
+
+/// The highest [`ShareTier`] `caller` holds on `row` — the ONE function both
+/// `GET /api/share/{token}` and `POST /api/share/{token}/clone` call, fresh,
+/// on every request, so neither route ever trusts a client-supplied rights
+/// claim (owner requirement: "even if a link leaks, the server re-checks the
+/// requester's rights on open and on clone").
+///
+/// - Owner (`caller == Some(row.user_id)`): always [`ShareTier::CloneProtected`]
+///   — implicit, matches [`effective_rights`]'s owner rule.
+/// - Otherwise: the MAX of (a) every live (non-expired) `object_grants` row
+///   on `("chart", row.token)` matching `caller` directly (`grantee_user_id`)
+///   OR via `grant_group_members` (`grantee_group_id`), parsed through
+///   [`ShareTier::from_str`] (a row with an unrecognized `right` string is
+///   skipped, not treated as an error), and (b), ONLY when
+///   `row.visibility == "public"`, the link's own floor: `View` always,
+///   `+Interactive` if `row.interaction == "interactive"`, `+Clone` if
+///   `row.clone_allowed`.
+/// - A PRIVATE row skips (b) entirely — an ungranted caller (anonymous or
+///   not) gets `None`. `caller: None` (anonymous) never matches (a): SQLite's
+///   `= NULL` predicate is never true, including against a NULL-valued
+///   column, so an anonymous caller's grant query returns no rows by
+///   construction, with no special case needed. A PUBLIC row always yields
+///   at least `Some(View)`.
+pub fn effective_share_tier(
+    conn: &Connection,
+    row: &ShareLinkRow,
+    caller: Option<i64>,
+) -> Result<Option<ShareTier>> {
+    if caller == Some(row.user_id) {
+        return Ok(Some(ShareTier::CloneProtected));
+    }
+
+    let mut best: Option<ShareTier> = None;
+
+    if let Some(caller_id) = caller {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut stmt = conn.prepare(
+            "SELECT right FROM object_grants
+             WHERE object_kind = 'chart' AND object_id = ?1
+               AND (expires_at IS NULL OR expires_at > ?2)
+               AND (
+                 grantee_user_id = ?3
+                 OR grantee_group_id IN (SELECT group_id FROM grant_group_members WHERE user_id = ?3)
+               )",
+        )?;
+        let mut rows = stmt.query(params![row.token, now, caller_id])?;
+        while let Some(r) = rows.next()? {
+            let right: String = r.get(0)?;
+            // `edit` is not a ShareTier. It lets the grantee open a private
+            // link (at least View) and is checked again by
+            // `share_caller_can_edit`. It does not grant clone.
+            if right == "edit" {
+                best = Some(best.map_or(ShareTier::View, |b: ShareTier| b.max(ShareTier::View)));
+                continue;
+            }
+            if let Some(tier) = ShareTier::from_str(&right) {
+                best = Some(best.map_or(tier, |b: ShareTier| b.max(tier)));
+            }
+        }
+    }
+
+    if row.visibility == "public" {
+        let mut floor = ShareTier::View;
+        if row.interaction == "interactive" {
+            floor = floor.max(ShareTier::Interactive);
+        }
+        if row.clone_allowed {
+            floor = floor.max(ShareTier::Clone);
+        }
+        best = Some(best.map_or(floor, |b: ShareTier| b.max(floor)));
+    }
+
+    Ok(best)
+}
+
+/// Create or refresh one per-account/group [`ShareTier`] grant on a share
+/// token — the write side of [`effective_share_tier`]. Exactly one of
+/// `grantee_user_id`/`grantee_group_id` must be `Some`; upserts against the
+/// tuple `(object_id, grantee_user_id, grantee_group_id)` the same way
+/// [`upsert_object_grant`] does for its own `right` column, so re-granting a
+/// DIFFERENT tier to the same target replaces the row rather than piling up
+/// duplicates with conflicting tiers.
+pub fn upsert_share_grant(
+    conn: &Connection,
+    token: &str,
+    owner_user_id: i64,
+    grantee_user_id: Option<i64>,
+    grantee_group_id: Option<i64>,
+    tier: ShareTier,
+    expires_at: Option<&str>,
+    now: &str,
+) -> Result<i64> {
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM object_grants
+             WHERE object_kind = 'chart' AND object_id = ?1
+               AND right != 'edit'
+               AND ((grantee_user_id IS NULL AND ?2 IS NULL) OR grantee_user_id = ?2)
+               AND ((grantee_group_id IS NULL AND ?3 IS NULL) OR grantee_group_id = ?3)",
+            params![token, grantee_user_id, grantee_group_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let Some(id) = existing {
+        conn.execute(
+            "UPDATE object_grants SET right = ?1, expires_at = ?2, created_at = ?3 WHERE id = ?4",
+            params![tier.as_str(), expires_at, now, id],
+        )?;
+        return Ok(id);
+    }
+
+    conn.execute(
+        "INSERT INTO object_grants (object_kind, object_id, owner_user_id, grantee_user_id, grantee_group_id, right, expires_at, created_at)
+         VALUES ('chart', ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![token, owner_user_id, grantee_user_id, grantee_group_id, tier.as_str(), expires_at, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// One applied chart op. `seq` is the token's monotonic head at insert time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareOpRow {
+    pub seq: i64,
+    pub user_id: i64,
+    pub kind: String,
+    pub object_id: String,
+    pub body: String,
+}
+
+/// Drop the op log and zero the head. The preset just published is the
+/// baseline; a subscriber whose cursor is past the new head treats that as
+/// a reset and reads from 0.
+pub fn reset_share_ops(conn: &Connection, token: &str) -> Result<()> {
+    conn.execute("DELETE FROM share_ops WHERE token = ?1", params![token])?;
+    conn.execute(
+        "UPDATE share_links SET op_seq = 0 WHERE token = ?1",
+        params![token],
+    )?;
+    Ok(())
+}
+
+/// Owner, or a live `object_grants` row with `right = 'edit'`. Clone and
+/// view grants do not count. Screenshot links are not editable.
+pub fn share_caller_can_edit(conn: &Connection, row: &ShareLinkRow, caller: i64) -> Result<bool> {
+    if row.kind != "live" {
+        return Ok(false);
+    }
+    if caller == row.user_id {
+        return Ok(true);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let hit: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM object_grants
+             WHERE object_kind = 'chart' AND object_id = ?1
+               AND right = 'edit'
+               AND (expires_at IS NULL OR expires_at > ?2)
+               AND (
+                 grantee_user_id = ?3
+                 OR grantee_group_id IN (SELECT group_id FROM grant_group_members WHERE user_id = ?3)
+               )
+             LIMIT 1",
+            params![row.token, now, caller],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(hit.is_some())
+}
+
+/// Insert an edit grant without replacing a view/clone row for the same nick.
+pub fn upsert_share_edit_grant(
+    conn: &Connection,
+    token: &str,
+    owner_user_id: i64,
+    grantee_user_id: Option<i64>,
+    grantee_group_id: Option<i64>,
+    expires_at: Option<&str>,
+    now: &str,
+) -> Result<i64> {
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM object_grants
+             WHERE object_kind = 'chart' AND object_id = ?1
+               AND right = 'edit'
+               AND ((grantee_user_id IS NULL AND ?2 IS NULL) OR grantee_user_id = ?2)
+               AND ((grantee_group_id IS NULL AND ?3 IS NULL) OR grantee_group_id = ?3)",
+            params![token, grantee_user_id, grantee_group_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        conn.execute(
+            "UPDATE object_grants SET expires_at = ?1, created_at = ?2 WHERE id = ?3",
+            params![expires_at, now, id],
+        )?;
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT INTO object_grants (object_kind, object_id, owner_user_id, grantee_user_id, grantee_group_id, right, expires_at, created_at)
+         VALUES ('chart', ?1, ?2, ?3, ?4, 'edit', ?5, ?6)",
+        params![token, owner_user_id, grantee_user_id, grantee_group_id, expires_at, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Append ops in one transaction. Returns the assigned seqs, in order.
+/// Empty input returns the current head as an empty vec and does not bump.
+pub fn append_share_ops(
+    conn: &Connection,
+    token: &str,
+    user_id: i64,
+    ops: &[(String, String, String)],
+    now: &str,
+) -> Result<Vec<i64>> {
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The caller holds the identity connection lock for this whole call,
+    // so two appends cannot interleave.
+    let head: i64 = conn.query_row(
+        "SELECT op_seq FROM share_links WHERE token = ?1",
+        params![token],
+        |row| row.get(0),
+    )?;
+    let mut seqs = Vec::with_capacity(ops.len());
+    let mut seq = head;
+    for (kind, object_id, body) in ops {
+        seq = seq.saturating_add(1);
+        if kind == "gesture" || kind == "viewport" {
+            conn.execute(
+                "DELETE FROM share_ops WHERE token = ?1 AND kind = ?2",
+                params![token, kind],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO share_ops (token, seq, user_id, kind, object_id, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![token, seq, user_id, kind, object_id, body, now],
+        )?;
+        seqs.push(seq);
+    }
+    conn.execute(
+        "UPDATE share_links SET op_seq = ?1 WHERE token = ?2",
+        params![seq, token],
+    )?;
+    Ok(seqs)
+}
+
+/// Ops with `seq > after`, ascending, at most `limit`.
+pub fn list_share_ops_after(
+    conn: &Connection,
+    token: &str,
+    after: i64,
+    limit: i64,
+) -> Result<(i64, Vec<ShareOpRow>)> {
+    let head: i64 = conn
+        .query_row(
+            "SELECT op_seq FROM share_links WHERE token = ?1",
+            params![token],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let mut stmt = conn.prepare(
+        "SELECT seq, user_id, kind, object_id, body FROM share_ops
+         WHERE token = ?1 AND seq > ?2
+         ORDER BY seq ASC
+         LIMIT ?3",
+    )?;
+    let mut rows = stmt.query(params![token, after, limit])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(ShareOpRow {
+            seq: row.get(0)?,
+            user_id: row.get(1)?,
+            kind: row.get(2)?,
+            object_id: row.get(3)?,
+            body: row.get(4)?,
+        });
+    }
+    Ok((head, out))
+}
+
+// ============================================================================
+// Owner-curated grant groups (docs/mlc/plans/share-policy-2026-09-25.md
+// §1/§8.3): a reusable, named list of accounts a chart-share owner can grant
+// a ShareTier to as one unit (`upsert_share_grant`'s `grantee_group_id`)
+// instead of one grant row per account. v1 is manual membership only — no
+// automatic sync from any entitlement/paid flag (see `entitlements.rs`'s own
+// note on this).
+// ============================================================================
+
+/// One row of `grant_groups`, with its live member count.
+pub struct GrantGroupRow {
+    pub id: i64,
+    pub owner_user_id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub member_count: i64,
+}
+
+/// Create a new group, owned by `owner_user_id`.
+pub fn create_grant_group(conn: &Connection, owner_user_id: i64, name: &str, now: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO grant_groups (owner_user_id, name, created_at) VALUES (?1, ?2, ?3)",
+        params![owner_user_id, name, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Whether `group_id` exists and is owned by `owner_user_id` — the one
+/// ownership check every group route, and `routes::share::create_share_grant`
+/// (validating a `grantee_group_id` grant target), run before touching a
+/// group.
+pub fn grant_group_is_owned_by(conn: &Connection, group_id: i64, owner_user_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM grant_groups WHERE id = ?1 AND owner_user_id = ?2",
+            params![group_id, owner_user_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// A group's own name, or `None` once the id is gone — the label
+/// `routes::share::list_share_grants` shows for a group-targeted grant.
+pub fn grant_group_name(conn: &Connection, group_id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT name FROM grant_groups WHERE id = ?1",
+        params![group_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Rename a group, owner-only — `false` for someone else's group or an
+/// unknown id (same "someone else's row answers like no such row"
+/// discipline as [`revoke_share`]).
+pub fn rename_grant_group(conn: &Connection, group_id: i64, owner_user_id: i64, name: &str) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE grant_groups SET name = ?1 WHERE id = ?2 AND owner_user_id = ?3",
+        params![name, group_id, owner_user_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Delete a group, owner-only. Cascades its own membership rows. Any
+/// `object_grants` row still targeting the deleted id is orphaned (its
+/// `grantee_group_id` set to `NULL`) rather than deleted — plan §8.3's
+/// intent ("it simply never matches anyone again") requires exactly this
+/// UPDATE first: `object_grants.grantee_group_id` carries a real
+/// `REFERENCES grant_groups(id)` under `PRAGMA foreign_keys=ON` (see
+/// `init_db`), so deleting the group row FIRST, with a live grant still
+/// pointing at it, fails with a foreign-key-constraint error in production
+/// exactly the same way it does in this crate's own test fixtures — nulling
+/// the reference first is not an optimization, it is what makes the delete
+/// possible at all. A row with `grantee_user_id` ALSO `NULL` (a group-only
+/// grant) does not thereby become a "public" grant: [`effective_share_tier`]'s
+/// own query only ever matches a row via `grantee_user_id = caller` or
+/// `grantee_group_id IN (...)` — a row with both `NULL` matches neither
+/// condition and is inert, exactly the "never matches anyone again" outcome
+/// this function promises.
+pub fn delete_grant_group(conn: &Connection, group_id: i64, owner_user_id: i64) -> Result<bool> {
+    if !grant_group_is_owned_by(conn, group_id, owner_user_id)? {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE object_grants SET grantee_group_id = NULL WHERE grantee_group_id = ?1",
+        params![group_id],
+    )?;
+    conn.execute("DELETE FROM grant_group_members WHERE group_id = ?1", params![group_id])?;
+    conn.execute("DELETE FROM grant_groups WHERE id = ?1", params![group_id])?;
+    Ok(true)
+}
+
+/// The caller's own groups, newest first, each with its live member count —
+/// `GET /api/groups`.
+pub fn list_grant_groups(conn: &Connection, owner_user_id: i64) -> Result<Vec<GrantGroupRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT g.id, g.owner_user_id, g.name, g.created_at,
+                (SELECT COUNT(*) FROM grant_group_members m WHERE m.group_id = g.id) AS member_count
+         FROM grant_groups g WHERE g.owner_user_id = ?1 ORDER BY g.created_at DESC",
+    )?;
+    let mut rows = stmt.query(params![owner_user_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(GrantGroupRow {
+            id: row.get(0)?,
+            owner_user_id: row.get(1)?,
+            name: row.get(2)?,
+            created_at: row.get(3)?,
+            member_count: row.get(4)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Count of a group's live members — the input to
+/// [`entitlements::group_member_add_allowed`]'s fan-out ceiling.
+pub fn count_grant_group_members(conn: &Connection, group_id: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM grant_group_members WHERE group_id = ?1",
+        params![group_id],
+        |row| row.get(0),
+    )
+}
+
+/// Count of groups `owner_user_id` owns — the input to
+/// [`entitlements::group_create_allowed`]'s ceiling.
+pub fn count_grant_groups(conn: &Connection, owner_user_id: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM grant_groups WHERE owner_user_id = ?1",
+        params![owner_user_id],
+        |row| row.get(0),
+    )
+}
+
+/// Add one member by already-resolved `user_id`, owner-only — `false` for a
+/// group the caller does not own. `INSERT OR IGNORE` makes re-adding an
+/// existing member a harmless no-op rather than a duplicate-row error.
+pub fn add_grant_group_member(
+    conn: &Connection,
+    group_id: i64,
+    owner_user_id: i64,
+    user_id: i64,
+    now: &str,
+) -> Result<bool> {
+    if !grant_group_is_owned_by(conn, group_id, owner_user_id)? {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO grant_group_members (group_id, user_id, added_at) VALUES (?1, ?2, ?3)",
+        params![group_id, user_id, now],
+    )?;
+    Ok(true)
+}
+
+/// Remove one member, owner-only — `false` for a group the caller does not
+/// own; removing a member who was never in the group is a harmless no-op
+/// (same `DELETE ... WHERE` idiom as [`revoke_share`], just not reported
+/// separately from "not your group" — both already answer the same way the
+/// route needs: proceed silently either way once ownership holds).
+pub fn remove_grant_group_member(
+    conn: &Connection,
+    group_id: i64,
+    owner_user_id: i64,
+    user_id: i64,
+) -> Result<bool> {
+    if !grant_group_is_owned_by(conn, group_id, owner_user_id)? {
+        return Ok(false);
+    }
+    conn.execute(
+        "DELETE FROM grant_group_members WHERE group_id = ?1 AND user_id = ?2",
+        params![group_id, user_id],
+    )?;
+    Ok(true)
 }
 
 // ============================================================================
@@ -6531,7 +7859,27 @@ mod tests {
                 created_at  TEXT    NOT NULL,
                 expires_at  TEXT    NOT NULL,
                 revoked     INTEGER NOT NULL DEFAULT 0,
-                clone_allowed INTEGER NOT NULL DEFAULT 0
+                clone_allowed INTEGER NOT NULL DEFAULT 0,
+                interaction TEXT NOT NULL DEFAULT 'view',
+                protected_json TEXT NOT NULL DEFAULT '[]',
+                visibility TEXT NOT NULL DEFAULT 'public',
+                preview_path TEXT NOT NULL DEFAULT '',
+                allow_forward INTEGER,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                chart_id TEXT NOT NULL DEFAULT '',
+                revision INTEGER NOT NULL DEFAULT 1,
+                op_seq INTEGER NOT NULL DEFAULT 0,
+                live INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE share_ops (
+                token TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (token, seq)
             );
 
             CREATE TABLE auth_tokens (
@@ -6651,7 +7999,7 @@ mod tests {
         let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        let token = super::create_share_link(&conn, uid, "live", "t", "{}", 0, &now, &future_ts(), false)
+        let token = super::create_share_link(&conn, uid, "live", "t", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create");
         assert_eq!(token.len(), 32);
 
@@ -6670,6 +8018,42 @@ mod tests {
         assert!(super::get_share_link(&conn, &token).expect("query").is_none());
         // Revoking twice is not a success either.
         assert!(!super::revoke_share(&conn, uid, &token).expect("revoke"));
+    }
+
+    /// Chart-share policy v1 (docs/mlc/plans/share-policy-2026-09-25.md §1,
+    /// §11 step 1): `interaction`/`protected_json` round-trip through
+    /// `create_share_link` -> `get_share_link` unchanged, and a row inserted
+    /// with the ALTER TABLE's own bare defaults (simulating a link created
+    /// before this column existed) reads back as `"view"`/`"[]"` — the "old
+    /// links keep today's behaviour" migration guarantee.
+    #[test]
+    fn share_link_interaction_and_protected_json_roundtrip() {
+        let conn = share_test_conn();
+        let uid = insert_share_user(&conn, "erin", Some("pub-erin"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let protected = r#"[{"kind":"primitive","id":"7"}]"#;
+        let token = super::create_share_link(
+            &conn, uid, "live", "t", "{}", 0, &now, &future_ts(), false, "interactive", protected, "public", None,
+        )
+        .expect("create");
+        let row = super::get_share_link(&conn, &token).expect("query").expect("row");
+        assert_eq!(row.interaction, "interactive");
+        assert_eq!(row.protected_json, protected);
+
+        // A bare INSERT that never names these two columns (an old row) gets
+        // the ALTER TABLE's own defaults, not a NULL/panic.
+        conn.execute(
+            "INSERT INTO share_links (token, user_id, kind, title, preset_json, blob_path, blob_bytes, created_at, expires_at, revoked, clone_allowed)
+             VALUES ('legacytoken000000000000000000legacy', ?1, 'live', 'old', '{}', '', 0, ?2, ?3, 0, 0)",
+            rusqlite::params![uid, now, future_ts()],
+        )
+        .expect("insert legacy row");
+        let legacy = super::get_share_link(&conn, "legacytoken000000000000000000legacy")
+            .expect("query")
+            .expect("row");
+        assert_eq!(legacy.interaction, "view");
+        assert_eq!(legacy.protected_json, "[]");
     }
 
     // ---- extend_paid_until / grant_paid_days (admin `paid-days` grant) ----
@@ -6776,14 +8160,14 @@ mod tests {
 
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (0, 0));
 
-        super::create_share_link(&conn, uid, "live", "l1", "{}", 0, &now, &future_ts(), false)
+        super::create_share_link(&conn, uid, "live", "l1", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create");
-        let shot = super::create_share_link(&conn, uid, "screenshot", "s1", "", 42, &now, &future_ts(), false)
+        let shot = super::create_share_link(&conn, uid, "screenshot", "s1", "", 42, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create");
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (1, 1));
 
         // Expired and revoked rows stop counting.
-        super::create_share_link(&conn, uid, "live", "l2", "{}", 0, &now, &past_ts(), false)
+        super::create_share_link(&conn, uid, "live", "l2", "{}", 0, &now, &past_ts(), false, "view", "[]", "public", None)
             .expect("create");
         super::revoke_share(&conn, uid, &shot).expect("revoke");
         assert_eq!(super::share_usage(&conn, uid).expect("usage"), (1, 0));
@@ -6796,17 +8180,17 @@ mod tests {
 
         let older = super::create_share_link(
             &conn, uid, "live", "old", "{}", 0,
-            "2026-01-01T00:00:00+00:00", &future_ts(), false,
+            "2026-01-01T00:00:00+00:00", &future_ts(), false, "view", "[]", "public", None,
         )
         .expect("create");
         let newer = super::create_share_link(
             &conn, uid, "screenshot", "new", "", 1,
-            "2026-02-01T00:00:00+00:00", &future_ts(), false,
+            "2026-02-01T00:00:00+00:00", &future_ts(), false, "view", "[]", "public", None,
         )
         .expect("create");
         super::create_share_link(
             &conn, uid, "live", "dead", "{}", 0,
-            "2026-03-01T00:00:00+00:00", &past_ts(), false,
+            "2026-03-01T00:00:00+00:00", &past_ts(), false, "view", "[]", "public", None,
         )
         .expect("create");
 
@@ -6821,14 +8205,14 @@ mod tests {
         let uid = insert_share_user(&conn, "dave", Some("pub-dave"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        let live_expired = super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &past_ts(), false)
+        let live_expired = super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &past_ts(), false, "view", "[]", "public", None)
             .expect("create");
         let shot_expired =
-            super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &past_ts(), false)
+            super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &past_ts(), false, "view", "[]", "public", None)
                 .expect("create");
         super::set_share_blob_path(&conn, &shot_expired, &format!("{}/{}.png", uid, shot_expired))
             .expect("stamp blob path");
-        let alive = super::create_share_link(&conn, uid, "live", "ok", "{}", 0, &now, &future_ts(), false)
+        let alive = super::create_share_link(&conn, uid, "live", "ok", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create");
 
         let removed = super::cleanup_expired_share_links(&conn).expect("cleanup");
@@ -6869,9 +8253,9 @@ mod tests {
         let uid = insert_share_user(&conn, "gina", Some("pub-gina"));
         let now = chrono::Utc::now().to_rfc3339();
 
-        super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &future_ts(), false)
+        super::create_share_link(&conn, uid, "live", "l", "{}", 0, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create live");
-        let shot = super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &future_ts(), false)
+        let shot = super::create_share_link(&conn, uid, "screenshot", "s", "", 7, &now, &future_ts(), false, "view", "[]", "public", None)
             .expect("create screenshot");
         let blob_path = format!("{}/{}.png", uid, shot);
         super::set_share_blob_path(&conn, &shot, &blob_path).expect("stamp blob path");
@@ -8132,7 +9516,11 @@ mod
     /// `shared_preset_entities.updated_by` naming no user) fails the same
     /// way it would in production instead of silently passing in-memory —
     /// exercised on purpose by
-    /// `apply_room_patch_db_error_rolls_back_whole_batch`.
+    /// `apply_room_patch_db_error_rolls_back_whole_batch`. `object_grants`
+    /// carries `grantee_group_id` (a bare column, no FK — this fixture never
+    /// creates `grant_groups`) only so `list_object_grants`'s widened SELECT
+    /// (chart-share policy v1 Rev 2, §8.2) matches this table's shape too;
+    /// rooms' own tests still never populate it.
     fn rooms_test_conn() -> Connection {
         let conn = share_test_conn();
         conn.execute_batch(
@@ -8143,6 +9531,7 @@ mod
                 object_id TEXT NOT NULL,
                 owner_user_id INTEGER NOT NULL REFERENCES users(id),
                 grantee_user_id INTEGER REFERENCES users(id),
+                grantee_group_id INTEGER,
                 right TEXT NOT NULL,
                 expires_at TEXT,
                 created_at TEXT NOT NULL
@@ -8879,6 +10268,342 @@ mod
         let rights = super::effective_object_rights(&conn, "preset", "room-1", owner, Some(grantee)).expect("rights");
         assert_eq!(rights, vec!["view"]);
     }
+
+    // ---- Chart-share policy v1, Rev 2 — effective_share_tier ----
+    // (docs/mlc/plans/share-policy-2026-09-25.md §1/§11 step 2)
+
+    /// `share_test_conn`'s schema plus the per-account/group grant tables
+    /// this feature needs: `object_grants` WITH `grantee_group_id` (unlike
+    /// `rooms_test_conn`'s own copy, which predates it and is left alone —
+    /// rooms' own tests never exercise group grants), `grant_groups`,
+    /// `grant_group_members`.
+    fn share_rights_test_conn() -> Connection {
+        let conn = share_test_conn();
+        conn.execute_batch(
+            "
+            CREATE TABLE object_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                object_kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                owner_user_id INTEGER NOT NULL REFERENCES users(id),
+                grantee_user_id INTEGER REFERENCES users(id),
+                grantee_group_id INTEGER REFERENCES grant_groups(id),
+                right TEXT NOT NULL,
+                expires_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE grant_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL REFERENCES users(id),
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE grant_group_members (
+                group_id INTEGER NOT NULL REFERENCES grant_groups(id),
+                user_id  INTEGER NOT NULL REFERENCES users(id),
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (group_id, user_id)
+            );
+            ",
+        )
+        .expect("share rights test schema");
+        conn
+    }
+
+    /// Create a live share row with an explicit `visibility`/`interaction`/
+    /// `clone_allowed` — the knobs `effective_share_tier`'s tests vary.
+    fn make_share(
+        conn: &Connection,
+        owner: i64,
+        interaction: &str,
+        clone_allowed: bool,
+        visibility: &str,
+    ) -> super::ShareLinkRow {
+        let now = chrono::Utc::now().to_rfc3339();
+        let token = super::create_share_link(
+            conn, owner, "live", "t", "{}", 0, &now, &future_ts(), clone_allowed, interaction, "[]", visibility, None,
+        )
+        .expect("create");
+        super::get_share_link(conn, &token).expect("query").expect("row")
+    }
+
+    #[test]
+    fn effective_share_tier_owner_is_always_clone_protected() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let row = make_share(&conn, owner, "view", false, "private");
+
+        assert_eq!(
+            super::effective_share_tier(&conn, &row, Some(owner)).expect("tier"),
+            Some(super::ShareTier::CloneProtected)
+        );
+    }
+
+    #[test]
+    fn effective_share_tier_public_link_floor_alone_no_grants() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let stranger = insert_share_user(&conn, "stranger", Some("pub-stranger"));
+
+        let view_only = make_share(&conn, owner, "view", false, "public");
+        assert_eq!(
+            super::effective_share_tier(&conn, &view_only, Some(stranger)).expect("tier"),
+            Some(super::ShareTier::View)
+        );
+        assert_eq!(
+            super::effective_share_tier(&conn, &view_only, None).expect("tier"),
+            Some(super::ShareTier::View),
+            "an anonymous caller gets the same public floor"
+        );
+
+        let interactive_clonable = make_share(&conn, owner, "interactive", true, "public");
+        assert_eq!(
+            super::effective_share_tier(&conn, &interactive_clonable, Some(stranger)).expect("tier"),
+            Some(super::ShareTier::Clone)
+        );
+    }
+
+    #[test]
+    fn effective_share_tier_private_link_with_no_grant_is_none() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let stranger = insert_share_user(&conn, "stranger", Some("pub-stranger"));
+        let row = make_share(&conn, owner, "interactive", true, "private");
+
+        assert_eq!(super::effective_share_tier(&conn, &row, Some(stranger)).expect("tier"), None);
+        assert_eq!(
+            super::effective_share_tier(&conn, &row, None).expect("tier"),
+            None,
+            "an anonymous caller on a private link is also locked out"
+        );
+    }
+
+    #[test]
+    fn effective_share_tier_private_link_with_a_direct_grant() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let grantee = insert_share_user(&conn, "grantee", Some("pub-grantee"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        super::upsert_share_grant(&conn, &row.token, owner, Some(grantee), None, super::ShareTier::Clone, None, &now)
+            .expect("grant");
+
+        assert_eq!(
+            super::effective_share_tier(&conn, &row, Some(grantee)).expect("tier"),
+            Some(super::ShareTier::Clone)
+        );
+
+        let other = insert_share_user(&conn, "other", Some("pub-other"));
+        assert_eq!(super::effective_share_tier(&conn, &row, Some(other)).expect("tier"), None);
+    }
+
+    #[test]
+    fn effective_share_tier_private_link_with_a_group_grant() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let member = insert_share_user(&conn, "member", Some("pub-member"));
+        let non_member = insert_share_user(&conn, "nonmember", Some("pub-nonmember"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let group_id = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create group");
+        super::add_grant_group_member(&conn, group_id, owner, member, &now).expect("add member");
+        super::upsert_share_grant(
+            &conn, &row.token, owner, None, Some(group_id), super::ShareTier::CloneProtected, None, &now,
+        )
+        .expect("grant");
+
+        assert_eq!(
+            super::effective_share_tier(&conn, &row, Some(member)).expect("tier"),
+            Some(super::ShareTier::CloneProtected)
+        );
+        assert_eq!(super::effective_share_tier(&conn, &row, Some(non_member)).expect("tier"), None);
+    }
+
+    #[test]
+    fn effective_share_tier_an_expired_grant_does_not_count() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let grantee = insert_share_user(&conn, "grantee", Some("pub-grantee"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        super::upsert_share_grant(
+            &conn, &row.token, owner, Some(grantee), None, super::ShareTier::Clone, Some(&past_ts()), &now,
+        )
+        .expect("grant");
+
+        assert_eq!(super::effective_share_tier(&conn, &row, Some(grantee)).expect("tier"), None);
+    }
+
+    #[test]
+    fn effective_share_tier_grant_below_the_public_floor_never_lowers_the_result() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let grantee = insert_share_user(&conn, "grantee", Some("pub-grantee"));
+        // Public floor already reaches Clone (interactive + clone_allowed);
+        // the grant below it (View) must never win over the floor — max, not
+        // override.
+        let row = make_share(&conn, owner, "interactive", true, "public");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        super::upsert_share_grant(&conn, &row.token, owner, Some(grantee), None, super::ShareTier::View, None, &now)
+            .expect("grant");
+
+        assert_eq!(
+            super::effective_share_tier(&conn, &row, Some(grantee)).expect("tier"),
+            Some(super::ShareTier::Clone)
+        );
+    }
+
+    /// Revoking a share grant (`revoke_object_grant`, the same generic
+    /// function rooms' own grant CRUD uses) stops it from counting on the
+    /// very next `effective_share_tier` call — owner instruction 1's "even
+    /// if a link leaks, the server re-checks the requester's rights" holds
+    /// for a grant that existed and was pulled, not just for one that never
+    /// existed (already proven by `effective_share_tier_private_link_with_no_grant_is_none`).
+    #[test]
+    fn revoking_a_share_grant_stops_it_on_the_next_effective_share_tier_call() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let grantee = insert_share_user(&conn, "grantee", Some("pub-grantee"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let grant_id = super::upsert_share_grant(
+            &conn, &row.token, owner, Some(grantee), None, super::ShareTier::Clone, None, &now,
+        )
+        .expect("grant");
+        assert_eq!(
+            super::effective_share_tier(&conn, &row, Some(grantee)).expect("tier"),
+            Some(super::ShareTier::Clone)
+        );
+
+        assert!(super::revoke_object_grant(&conn, grant_id, owner).expect("revoke"));
+        assert_eq!(super::effective_share_tier(&conn, &row, Some(grantee)).expect("tier"), None);
+    }
+
+    /// `list_object_grants` projects `grantee_group_id` (widened alongside
+    /// `ObjectGrantRow` for §8.2's grant-listing route) — a group-targeted
+    /// share grant round-trips through it with `grantee_user_id: None`,
+    /// `grantee_group_id: Some(group_id)`.
+    #[test]
+    fn list_object_grants_projects_grantee_group_id() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+        let group_id = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create group");
+
+        super::upsert_share_grant(
+            &conn, &row.token, owner, None, Some(group_id), super::ShareTier::Clone, None, &now,
+        )
+        .expect("grant");
+
+        let grants = super::list_object_grants(&conn, "chart", &row.token).expect("list");
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].grantee_user_id, None);
+        assert_eq!(grants[0].grantee_group_id, Some(group_id));
+    }
+
+    // ---- Chart-share policy v1, Rev 2 — grant groups (§8.3) ----
+
+    #[test]
+    fn grant_group_create_rename_delete_owner_only() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let stranger = insert_share_user(&conn, "stranger", Some("pub-stranger"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let group_id = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create");
+        assert!(super::grant_group_is_owned_by(&conn, group_id, owner).expect("owned"));
+        assert!(!super::grant_group_is_owned_by(&conn, group_id, stranger).expect("owned"));
+
+        // A non-owner cannot rename or delete it.
+        assert!(!super::rename_grant_group(&conn, group_id, stranger, "hijacked").expect("rename"));
+        assert!(!super::delete_grant_group(&conn, group_id, stranger).expect("delete"));
+        assert_eq!(
+            super::grant_group_name(&conn, group_id).expect("name"),
+            Some("subscribers".to_string())
+        );
+
+        // The owner can.
+        assert!(super::rename_grant_group(&conn, group_id, owner, "vip").expect("rename"));
+        assert_eq!(super::grant_group_name(&conn, group_id).expect("name"), Some("vip".to_string()));
+        assert!(super::delete_grant_group(&conn, group_id, owner).expect("delete"));
+        assert_eq!(super::grant_group_name(&conn, group_id).expect("name"), None);
+    }
+
+    #[test]
+    fn grant_group_membership_add_remove_owner_only() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let stranger = insert_share_user(&conn, "stranger", Some("pub-stranger"));
+        let member = insert_share_user(&conn, "member", Some("pub-member"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let group_id = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create");
+
+        // A non-owner cannot add or remove a member.
+        assert!(!super::add_grant_group_member(&conn, group_id, stranger, member, &now).expect("add"));
+        assert_eq!(super::count_grant_group_members(&conn, group_id).expect("count"), 0);
+
+        // The owner can, idempotently.
+        assert!(super::add_grant_group_member(&conn, group_id, owner, member, &now).expect("add"));
+        assert!(super::add_grant_group_member(&conn, group_id, owner, member, &now).expect("add again"));
+        assert_eq!(super::count_grant_group_members(&conn, group_id).expect("count"), 1);
+
+        assert!(!super::remove_grant_group_member(&conn, group_id, stranger, member).expect("remove"));
+        assert_eq!(super::count_grant_group_members(&conn, group_id).expect("count"), 1);
+        assert!(super::remove_grant_group_member(&conn, group_id, owner, member).expect("remove"));
+        assert_eq!(super::count_grant_group_members(&conn, group_id).expect("count"), 0);
+    }
+
+    #[test]
+    fn list_grant_groups_is_scoped_to_the_caller_and_carries_member_counts() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let other_owner = insert_share_user(&conn, "other-owner", Some("pub-other-owner"));
+        let member = insert_share_user(&conn, "member", Some("pub-member"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let g1 = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create g1");
+        super::add_grant_group_member(&conn, g1, owner, member, &now).expect("add");
+        super::create_grant_group(&conn, other_owner, "not-mine", &now).expect("create g2");
+
+        let groups = super::list_grant_groups(&conn, owner).expect("list");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, g1);
+        assert_eq!(groups[0].member_count, 1);
+    }
+
+    /// Deleting a group leaves any `object_grants` row still targeting it in
+    /// place (plan §8.3's "no cascade needed" rule) — `effective_share_tier`
+    /// simply stops matching anyone for it, since `grant_group_members` has
+    /// nothing left to join against.
+    #[test]
+    fn deleting_a_grant_group_leaves_its_share_grant_inert_not_erroring() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let member = insert_share_user(&conn, "member", Some("pub-member"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let group_id = super::create_grant_group(&conn, owner, "subscribers", &now).expect("create");
+        super::add_grant_group_member(&conn, group_id, owner, member, &now).expect("add");
+        super::upsert_share_grant(
+            &conn, &row.token, owner, None, Some(group_id), super::ShareTier::Clone, None, &now,
+        )
+        .expect("grant");
+        assert_eq!(
+            super::effective_share_tier(&conn, &row, Some(member)).expect("tier"),
+            Some(super::ShareTier::Clone)
+        );
+
+        assert!(super::delete_grant_group(&conn, group_id, owner).expect("delete"));
+        assert_eq!(super::effective_share_tier(&conn, &row, Some(member)).expect("tier"), None);
+    }
 }
 
 /// In-memory plaintext connection with the parts of the production schema the
@@ -8917,4 +10642,163 @@ pub(crate) fn init_test_conn() -> Connection {
     )
     .expect("test schema");
     conn
+}
+
+#[cfg(test)]
+mod share_nick_search_tests {
+    use super::search_share_nicks;
+    use rusqlite::Connection;
+
+    fn conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                nick TEXT,
+                display_name TEXT NOT NULL DEFAULT '',
+                discoverable INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE friendships (
+                user_id INTEGER NOT NULL,
+                friend_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, friend_id)
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert(conn: &Connection, id: i64, nick: Option<&str>, display: &str) {
+        conn.execute(
+            "INSERT INTO users (id, nick, display_name) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, nick, display],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn search_share_nicks_finds_a_nick_without_a_dm_key_and_skips_the_caller() {
+        let conn = conn();
+        insert(&conn, 1, Some("zeng3ld"), "ZENG3LD");
+        insert(&conn, 32, Some("moderator"), "к кк");
+        insert(&conn, 37, Some("admin"), "KONSTANTIN NO");
+        insert(&conn, 2, None, "anti");
+
+        let as_admin = search_share_nicks(&conn, 37, "mod", 8).unwrap();
+        assert_eq!(as_admin.len(), 1);
+        assert_eq!(as_admin[0].nick, "moderator");
+        assert_eq!(as_admin[0].label, "");
+
+        let self_search = search_share_nicks(&conn, 37, "admin", 8).unwrap();
+        assert!(self_search.is_empty());
+
+        // Display name is not a search key and is not returned.
+        let by_display = search_share_nicks(&conn, 37, "к", 8).unwrap();
+        assert!(by_display.is_empty());
+
+        // No nick: not searchable, even when the display name matches the query.
+        let unnamed = search_share_nicks(&conn, 37, "anti", 8).unwrap();
+        assert!(unnamed.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod share_op_tests {
+    use super::{append_share_ops, list_share_ops_after, share_caller_can_edit, upsert_share_edit_grant, upsert_share_grant, ShareTier};
+    use rusqlite::Connection;
+
+    fn conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE share_links (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                op_seq INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE share_ops (
+                token TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (token, seq)
+            );
+            CREATE TABLE object_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                object_kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                owner_user_id INTEGER NOT NULL,
+                grantee_user_id INTEGER,
+                grantee_group_id INTEGER,
+                right TEXT NOT NULL,
+                expires_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE grant_group_members (
+                group_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO share_links (token, user_id, kind) VALUES ('t', 1, 'live')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn ops_append_in_order_and_edit_grant_does_not_replace_clone() {
+        let conn = conn();
+        let seqs = append_share_ops(
+            &conn,
+            "t",
+            1,
+            &[
+                ("primitive_upsert".into(), "p:1".into(), "{}".into()),
+                ("primitive_delete".into(), "p:1".into(), String::new()),
+            ],
+            "now",
+        )
+        .unwrap();
+        assert_eq!(seqs, vec![1, 2]);
+        let (head, page) = list_share_ops_after(&conn, "t", 1, 10).unwrap();
+        assert_eq!(head, 2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].kind, "primitive_delete");
+
+        let link = super::ShareLinkRow {
+            token: "t".into(),
+            user_id: 1,
+            kind: "live".into(),
+            title: String::new(),
+            preset_json: String::new(),
+            blob_path: String::new(),
+            blob_bytes: 0,
+            created_at: String::new(),
+            expires_at: "2999".into(),
+            clone_allowed: true,
+            interaction: "view".into(),
+            protected_json: "[]".into(),
+            visibility: "private".into(),
+            preview_path: String::new(),
+            allow_forward: None,
+            pinned: false,
+            chart_id: String::new(),
+            revision: 1,
+            op_seq: 2,
+            live: false,
+        };
+        assert!(!share_caller_can_edit(&conn, &link, 2).unwrap());
+        upsert_share_grant(&conn, "t", 1, Some(2), None, ShareTier::Clone, None, "now").unwrap();
+        upsert_share_edit_grant(&conn, "t", 1, Some(2), None, None, "now").unwrap();
+        assert!(share_caller_can_edit(&conn, &link, 2).unwrap());
+        let tier = super::effective_share_tier(&conn, &link, Some(2)).unwrap();
+        assert_eq!(tier, Some(ShareTier::Clone));
+    }
 }

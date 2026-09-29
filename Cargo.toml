@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.dependencies]
-axum = { version = "0.8", features = ["multipart"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -63,3 +63,10 @@ tower = { version = "0.5", default-features = false, features = ["limit", "util"
 # Pure-Rust Unicode Normalization Forms (NFC) — the one text-cleaning
 # primitive `std` has no equivalent for; see `crates/server/src/text_policy.rs`.
 unicode-normalization = "0.1"
+# Per-link preview image decode/re-encode (docs/mlc/plans/share-policy-
+# 2026-09-25.md §9) — PNG-only feature set keeps the build minimal (no
+# jpeg/webp/etc pulled in). Pinned to the EXACT version already vetted in
+# the mylittlechart client's own Cargo.lock (`mylittlechart/Cargo.lock`,
+# `image` 0.25.10) rather than a caret range, so this crate never resolves a
+# different `image` release than the one already reviewed.
+image = { version = "=0.25.10", default-features = false, features = ["png"] }

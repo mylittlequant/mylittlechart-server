@@ -14,7 +14,7 @@
 //! cooldown logic; see its doc comment. Same authentication as `redeem`.
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -283,6 +283,179 @@ pub async fn set_nick(
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse::new("Internal error")),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct PrivacyBody {
+    pub discoverable: bool,
+}
+
+/// GET /api/account/friends — discoverable flag and friend nicks.
+pub async fn friends(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::social_lists(&conn, user_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(lists)) => Json(serde_json::json!({
+            "discoverable": lists.discoverable,
+            "friends": lists.friends,
+            "incoming": lists.incoming,
+            "outgoing": lists.outgoing,
+            "subscriptions": lists.subscriptions,
+            "blocked": lists.blocked,
+        }))
+        .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Database error")),
+        )
+            .into_response(),
+    }
+}
+
+/// PATCH /api/account/privacy — whether nick search may find this account.
+pub async fn set_privacy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PrivacyBody>,
+) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    let on = body.discoverable;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::set_account_discoverable(&conn, user_id, on)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Json(serde_json::json!({ "discoverable": on })).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Database error")),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct AddFriendBody {
+    pub nick: String,
+    #[serde(default)]
+    pub action: String,
+}
+
+/// POST /api/account/friends — add a nick that search can already see.
+pub async fn add_friend(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AddFriendBody>,
+) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    let nick = body.nick;
+    let action = if body.action.is_empty() { "request".to_string() } else { body.action };
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<std::result::Result<(), &'static str>> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::db::social_act(&conn, user_id, &nick, &action, &now)
+    })
+    .await;
+    match result {
+        Ok(Ok(Ok(()))) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(Ok(Err("that is you"))) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("that is you")),
+        )
+            .into_response(),
+        Ok(Ok(Err("blocked"))) => (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new("blocked")),
+        )
+            .into_response(),
+        Ok(Ok(Err("no request"))) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("no request")),
+        )
+            .into_response(),
+        Ok(Ok(Err(_))) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new("no such nick")),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Database error")),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/account/friend-invites — a link the other person opens to become friends.
+pub async fn create_friend_invite(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<String> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now();
+        let exp = (now + chrono::Duration::days(14)).to_rfc3339();
+        crate::db::create_friend_invite(&conn, user_id, &now.to_rfc3339(), &exp)
+    })
+    .await;
+    match result {
+        Ok(Ok(token)) => Json(serde_json::json!({
+            "token": token,
+            "url_path": format!("/?friend={token}"),
+        }))
+        .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Database error")),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/account/friend-invites/{token}/accept
+pub async fn accept_friend_invite(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Response {
+    let user_id = match resolve_user_id(state.clone(), &headers).await {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::db::accept_friend_invite(&conn, &token, user_id, &now)
+    })
+    .await;
+    match result {
+        Ok(Ok(true)) => Json(serde_json::json!({ "accepted": true })).into_response(),
+        Ok(Ok(false)) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invite is not valid")),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("Database error")),
         )
             .into_response(),
     }

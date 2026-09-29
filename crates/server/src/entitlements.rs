@@ -313,8 +313,8 @@ impl ShareKind {
 /// Free limits also apply to anonymous callers, who cannot create shares at
 /// all (creation is authenticated-only) — they exist here so
 /// `GET /api/entitlements` can still state a maximum for them.
-pub const FREE_LIVE_SHARE_LIMIT: u64 = 1;
-pub const PAID_LIVE_SHARE_LIMIT: u64 = 10;
+pub const FREE_LIVE_SHARE_LIMIT: u64 = 25;
+pub const PAID_LIVE_SHARE_LIMIT: u64 = 100;
 pub const FREE_SCREENSHOT_SHARE_LIMIT: u64 = 10;
 pub const PAID_SCREENSHOT_SHARE_LIMIT: u64 = 100;
 
@@ -407,8 +407,40 @@ pub fn shared_preset_create_allowed(current_hosted: i64, is_ladder_paid: bool) -
 /// live (non-expired) grants it already holds (`db::count_object_grants`).
 /// Unlike room hosting, creating a grant carries no paid requirement of its
 /// own — the room's owner already had to be ladder-paid to host it.
+///
+/// A chart-share grant (`routes::share::create_share_grant`) reuses this
+/// exact function against `db::count_object_grants(&conn, "chart", &token)`
+/// — the fan-out reasoning ("bounds a live-channel/notification cost per
+/// object") applies identically to a share token, so this is not a
+/// rooms-only rule despite the doc comment's original room framing.
 pub fn grant_create_allowed(current_grants: i64) -> bool {
     current_grants < MAX_GRANTS_PER_OBJECT
+}
+
+// ============================================================================
+// Owner-curated grant groups (docs/mlc/plans/share-policy-2026-09-25.md §8.3)
+// ============================================================================
+
+/// Groups one account may own at once. No paid requirement — a group is a
+/// list an owner curates for their OWN chart shares, not a hosted object
+/// with a per-account cost the way a shared-preset room is.
+pub const MAX_GROUPS_PER_OWNER: i64 = 50;
+
+/// Members one group may hold at once — bounds the same per-object grant
+/// fan-out [`MAX_GRANTS_PER_OBJECT`] bounds, one join away (a group grant on
+/// a share resolves through every one of its members).
+pub const MAX_MEMBERS_PER_GROUP: i64 = 500;
+
+/// Decide whether `caller` may create one more group, given how many it
+/// already owns (`db::count_grant_groups`).
+pub fn group_create_allowed(current_groups: i64) -> bool {
+    current_groups < MAX_GROUPS_PER_OWNER
+}
+
+/// Decide whether one more member may be added to a group, given how many
+/// it already holds (`db::count_grant_group_members`).
+pub fn group_member_add_allowed(current_members: i64) -> bool {
+    current_members < MAX_MEMBERS_PER_GROUP
 }
 
 // ============================================================================
@@ -567,18 +599,18 @@ mod tests {
 
     #[test]
     fn share_create_allowed_free_tier_boundaries() {
-        // Free: 1 live, 10 screenshots — the boundary count itself is refused.
-        assert!(share_create_allowed(ShareKind::Live, 0, false));
-        assert!(!share_create_allowed(ShareKind::Live, 1, false));
+        // Free: 25 live, 10 screenshots — the boundary count itself is refused.
+        assert!(share_create_allowed(ShareKind::Live, 24, false));
+        assert!(!share_create_allowed(ShareKind::Live, 25, false));
         assert!(share_create_allowed(ShareKind::Screenshot, 9, false));
         assert!(!share_create_allowed(ShareKind::Screenshot, 10, false));
     }
 
     #[test]
     fn share_create_allowed_paid_tier_boundaries() {
-        // Paid: 10 live, 100 screenshots.
-        assert!(share_create_allowed(ShareKind::Live, 9, true));
-        assert!(!share_create_allowed(ShareKind::Live, 10, true));
+        // Paid: 100 live, 100 screenshots.
+        assert!(share_create_allowed(ShareKind::Live, 99, true));
+        assert!(!share_create_allowed(ShareKind::Live, 100, true));
         assert!(share_create_allowed(ShareKind::Screenshot, 99, true));
         assert!(!share_create_allowed(ShareKind::Screenshot, 100, true));
     }
@@ -621,6 +653,18 @@ mod tests {
     fn grant_create_allowed_boundary_at_the_grant_ceiling() {
         assert!(grant_create_allowed(MAX_GRANTS_PER_OBJECT - 1));
         assert!(!grant_create_allowed(MAX_GRANTS_PER_OBJECT));
+    }
+
+    #[test]
+    fn group_create_allowed_boundary_at_the_owner_ceiling() {
+        assert!(group_create_allowed(MAX_GROUPS_PER_OWNER - 1));
+        assert!(!group_create_allowed(MAX_GROUPS_PER_OWNER));
+    }
+
+    #[test]
+    fn group_member_add_allowed_boundary_at_the_group_ceiling() {
+        assert!(group_member_add_allowed(MAX_MEMBERS_PER_GROUP - 1));
+        assert!(!group_member_add_allowed(MAX_MEMBERS_PER_GROUP));
     }
 
     #[test]
