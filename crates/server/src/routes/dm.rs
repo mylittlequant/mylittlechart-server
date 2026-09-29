@@ -791,8 +791,11 @@ pub async fn create_message(
             let now_str = now.to_rfc3339();
             let id = dm_db::create_message(&social_conn, conversation_id, user_id, &nonce, &ciphertext, &now_str)
                 .map_err(SendMessageRefusal::Message)?;
+            // The bridge takes `db` -> `social` -> `messenger` in that order
+            // (see its doc); `social` must not still be held here.
+            drop(social_conn);
 
-            let wake_ids = bridge_legacy_dm_send_and_resolve_wake_set(&state, &social_conn, conversation_id, &conversation, &now_str);
+            let wake_ids = bridge_legacy_dm_send_and_resolve_wake_set(&state, conversation_id, &conversation, &now_str);
             Ok((id, now_str, wake_ids))
         },
     )
@@ -812,22 +815,28 @@ pub async fn create_message(
 
 /// The bridge step [`create_message`] runs right after its own insert
 /// commits (module doc above) — pulled out to its own function so
-/// `create_message` stays readable. Locks `messenger` (and, briefly,
-/// `identity`) itself; `social` is the caller's already-open connection
-/// (read-only from here on, same as every other `matrix_migration` read).
-/// Returns the room's wake set on success, `None` on ANY failure (bridging,
-/// or the follow-up wake-set lookup) — already logged here, never the
-/// caller's to handle.
+/// `create_message` stays readable.
+///
+/// Lock order is `db` -> `social` -> `messenger`, the same order every
+/// other path that holds more than one of them uses (the device reaper and
+/// `device_auth` take `db` then `messenger`). The caller must hold none of
+/// them. Taking `messenger` before `db` here would deadlock against the
+/// hourly reaper. `social` is only read from here on, same as every other
+/// `matrix_migration` read. Returns the room's wake set on success, `None`
+/// on ANY failure (bridging, or the follow-up wake-set lookup) — already
+/// logged here, never the caller's to handle.
 fn bridge_legacy_dm_send_and_resolve_wake_set(
     state: &AppState,
-    social: &rusqlite::Connection,
     conversation_id: i64,
     conversation: &dm_db::DmConversation,
     now: &str,
 ) -> Option<HashSet<i64>> {
-    let mut messenger_conn = state.control_plane().messenger_conn();
     let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-    let bridge_result = crate::matrix_migration::bridge_legacy_dm_send(&mut messenger_conn, social, &identity_conn, conversation, now);
+    let social_conn = state.control_plane().social_conn();
+    let mut messenger_conn = state.control_plane().messenger_conn();
+    let bridge_result =
+        crate::matrix_migration::bridge_legacy_dm_send(&mut messenger_conn, &social_conn, &identity_conn, conversation, now);
+    drop(social_conn);
     drop(identity_conn);
 
     let room_id = match bridge_result {
