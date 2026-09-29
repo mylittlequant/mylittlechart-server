@@ -21,6 +21,13 @@
 //! of a Matrix-subset messenger design — see `_archive/conversations_db.rs`
 //! at the repo root.)
 //!
+//! `share_hub` lives here for a different reason: its WebSocket behaviour
+//! (tickets, rooms, bounds, close codes) is tested from `tests/share_hub.rs`
+//! with real WebSocket clients, and an integration test can only reach this
+//! library target, never the binary's module tree. It depends on nothing in
+//! the binary either: accounts and share rights come in through its
+//! `ShareAuthority` trait, implemented by `share_live.rs` in the binary.
+//!
 //! `mylittlechart-server` (the binary) automatically links against this
 //! same-package library crate — reach this module from bin-crate code
 //! (`main.rs`, `state.rs`, and eventually `routes::rooms`) as
@@ -28,3 +35,4 @@
 //! named. It depends on nothing in the binary crate's own module tree.
 
 pub mod live;
+pub mod share_hub;
