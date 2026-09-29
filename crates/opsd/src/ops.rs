@@ -222,13 +222,16 @@ fn parse_box_state(stdout: &str) -> BoxState {
     }
 }
 
-/// Mode of every secret file the unlock places in the box tmpfs. The SFTP
-/// upload runs as the ssh user (root), so the owner is root. The `mlc-server`
-/// unit sets no `User=` (`docs/mlc/audits/grok-share-arc-server-audit-2026-09-29.md`
-/// section 2.2), so the process runs as root and reads `dbkey` and the dig2pay
-/// files the same way. Should the unit ever drop to a service user, `dbkey`
-/// and these files need the same chown at once.
+/// Mode of the boot secrets (`dbkey`, `server.env`) in the box tmpfs. The SFTP
+/// upload runs as the ssh user (root), so the owner is root.
 const SECRET_FILE_MODE: u32 = 0o600;
+
+/// Mode of the secrets the server process itself reads at runtime (the
+/// dig2pay files). The server does not run as root: a `0600 root` dig2pay
+/// file failed with EACCES on the first production unlock (2026-09-30), so
+/// these go `0640` and are handed to group `mlc`, the group that owns
+/// `/run/mlc`.
+const SERVICE_SECRET_MODE: u32 = 0o640;
 
 /// One optional secret the unlock delivers after `server.env`.
 struct OptionalSecret {
@@ -292,7 +295,7 @@ fn skipped_step(secret: &OptionalSecret, reason: &str) -> String {
 
 fn delivered_step(secret: &OptionalSecret, bytes: usize) -> String {
     format!(
-        "{} delivered to {} ({bytes} bytes, 0600 root)",
+        "{} delivered to {} ({bytes} bytes, 0640 root:mlc)",
         secret.name, secret.remote_path
     )
 }
@@ -308,10 +311,23 @@ async fn deliver_optional_secrets(session: &SshSession, dir: &Path, steps: &mut 
             OptionalSecretLoad::Skipped(reason) => steps.push(skipped_step(secret, reason)),
             OptionalSecretLoad::Ready(bytes) => {
                 match session
-                    .upload(&bytes, secret.remote_path, SECRET_FILE_MODE)
+                    .upload(&bytes, secret.remote_path, SERVICE_SECRET_MODE)
                     .await
                 {
-                    Ok(()) => steps.push(delivered_step(secret, bytes.len())),
+                    Ok(()) => {
+                        let grp = session
+                            .exec(&format!("chgrp mlc {} && echo GRP_OK", secret.remote_path))
+                            .await;
+                        match grp {
+                            Ok(out) if out.stdout.contains("GRP_OK") => {
+                                steps.push(delivered_step(secret, bytes.len()))
+                            }
+                            _ => steps.push(format!(
+                                "{} delivered but NOT readable by the server: chgrp mlc failed; unlock continues",
+                                secret.name
+                            )),
+                        }
+                    }
                     Err(e) => steps.push(format!(
                         "{} NOT delivered: upload failed ({e}); unlock continues",
                         secret.name
@@ -527,6 +543,8 @@ mod tests {
             ]
         );
         assert_eq!(SECRET_FILE_MODE, 0o600);
+        // The server reads the dig2pay files as a non-root service user.
+        assert_eq!(SERVICE_SECRET_MODE, 0o640);
     }
 
     fn secret_test_dir(tag: &str) -> std::path::PathBuf {
@@ -579,7 +597,7 @@ mod tests {
         let secret = &DIG2PAY_SECRETS[0];
         assert_eq!(
             delivered_step(secret, 7),
-            "dig2pay-api-key delivered to /run/mlc/dig2pay-api-key (7 bytes, 0600 root)"
+            "dig2pay-api-key delivered to /run/mlc/dig2pay-api-key (7 bytes, 0640 root:mlc)"
         );
         assert_eq!(
             skipped_step(secret, "not present locally"),
