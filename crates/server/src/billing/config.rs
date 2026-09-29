@@ -2,7 +2,7 @@
 //!
 //! | Variable | Meaning |
 //! |---|---|
-//! | `DIG2PAY_BASE_URL` | merchant API base, e.g. `http://10.83.1.1:37300` over the `wg-mlc` tunnel. Empty (the default) leaves checkout/change disabled. |
+//! | `DIG2PAY_BASE_URL` | merchant API base; production `https://pay.zen-geldmaschine.net/api/v1` (public API). Empty (the default) leaves checkout/change disabled. |
 //! | `DIG2PAY_API_KEY_FILE` | file holding the merchant bearer key, one line |
 //! | `DIG2PAY_WEBHOOK_SECRET_FILES` | comma-separated files, one HMAC secret each; several live at once during a rotation |
 //! | `DIG2PAY_TIMEOUT_SECS` | overall timeout of one merchant API call (default 15) |
