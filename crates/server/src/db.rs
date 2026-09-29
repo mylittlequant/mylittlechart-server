@@ -209,7 +209,7 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         );
 
         -- Gift / trial codes: an admin mints one, an account redeems it once
-        -- and gains paid time (see db::mint_gift_codes / db::redeem_gift_code).
+        -- and gains paid time (see db::mint_gift_batch / db::redeem_gift_code).
         -- `code` is generated server-side, never accepted from a caller — see
         -- generate_gift_code. `redeemed_by`/`redeemed_at` stay NULL until the
         -- single conditional UPDATE in redeem_gift_code claims the row.
@@ -931,7 +931,23 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
     // `users` is in its final shape.
     crate::billing::store::migrate(&conn)?;
 
+    // The staff audit trail and the gift-code batch / creator / revoke
+    // columns behind the in-app admin tab (`routes/staff.rs`) — additive and
+    // idempotent.
+    crate::staff::migrate(&conn)?;
+    migrate_gift_codes(&conn)?;
+
     Ok(conn)
+}
+
+/// Gift codes grow a batch id, the creating account and a revoke stamp.
+/// `batch_id`/`created_by` are NULL on a row minted before batches existed;
+/// `revoked_at` is set on an unredeemed code whose batch was revoked.
+fn migrate_gift_codes(conn: &Connection) -> Result<()> {
+    crate::billing::store::add_column_if_missing(conn, "gift_codes", "batch_id", "TEXT")?;
+    crate::billing::store::add_column_if_missing(conn, "gift_codes", "created_by", "INTEGER")?;
+    crate::billing::store::add_column_if_missing(conn, "gift_codes", "revoked_at", "TEXT")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_gift_codes_batch ON gift_codes(batch_id);")
 }
 
 /// Outcome of [`cleanup_orphan_users`] — how many rows each rule removed,
@@ -3063,7 +3079,7 @@ pub struct ReleaseRow {
 // ============================================================================
 // Gift / trial codes
 //
-// An admin mints a code (`mint_gift_codes`); an account redeems it once
+// An admin mints a code (`mint_gift_batch`); an account redeems it once
 // (`redeem_gift_code`) and its `paid_until` moves forward. This is how a
 // paid account is granted today, ahead of billing, and it stays the vehicle
 // for support-issued gifts/trials once billing exists too.
@@ -3071,7 +3087,7 @@ pub struct ReleaseRow {
 
 /// Characters usable in a generated gift code: uppercase letters and digits,
 /// minus the pairs a human misreads over the phone or copying by hand
-/// (`O`/`0`, `I`/`1`). Never accepted from a caller — see [`mint_gift_codes`],
+/// (`O`/`0`, `I`/`1`). Never accepted from a caller — see [`mint_gift_batch`],
 /// the only producer of a code.
 const GIFT_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -3080,7 +3096,7 @@ const GIFT_CODE_LEN: usize = 10;
 
 /// Generate one random gift code from [`GIFT_CODE_ALPHABET`]. A collision
 /// with an already-minted code is possible but vanishingly unlikely at this
-/// alphabet size and length (32^10) — [`mint_gift_codes`] still retries on
+/// alphabet size and length (32^10) — [`mint_gift_batch`] still retries on
 /// the rare `PRIMARY KEY` collision rather than trusting uniqueness.
 fn generate_gift_code() -> String {
     use rand::Rng;
@@ -3090,38 +3106,157 @@ fn generate_gift_code() -> String {
         .collect()
 }
 
-/// Mint `count` new single-use gift/trial codes, each granting `grants_days`
-/// days of paid access from the moment it is redeemed (see
-/// [`redeem_gift_code`]). `note` is stored for support to see why a batch
-/// was minted — it is never shown to the redeeming account.
+/// How a gift code is stored: the SHA-256 digest of the code, hex. A code has
+/// ~50 bits of entropy and is single-use, so a digest at rest is enough to keep
+/// the database from being a list of live codes. Rows minted before batches
+/// existed hold the plain code in the same column; [`redeem_gift_code`] finds
+/// either.
+fn gift_code_digest(code: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(code.as_bytes()))
+}
+
+/// A freshly minted batch of gift codes.
+pub struct GiftBatch {
+    /// The batch id (`gb_…`), the handle for listing and revoking.
+    pub batch_id: String,
+    /// The plain codes. They exist here, in the response that hands them to the
+    /// operator, and nowhere else: only their digests are stored.
+    pub codes: Vec<String>,
+}
+
+/// Mint `count` new single-use gift/trial codes as one batch, each granting
+/// `grants_days` days of paid access from the moment it is redeemed (see
+/// [`redeem_gift_code`]). `note` is stored for support to see why a batch was
+/// minted — it is never shown to the redeeming account. `created_by` is the
+/// staff account that minted it (`None` for the ops route behind the shared
+/// secret, which carries no account).
 ///
 /// Returns the generated codes. This is the only place a gift code is ever
-/// readable: no query anywhere else selects `code` back out of the table, so
-/// a code that already went out cannot be recovered by reading the
-/// database — only reissued as a new one.
-pub fn mint_gift_codes(
+/// readable: the table holds only digests, and no query anywhere selects
+/// `code` back out of it, so a code that already went out cannot be recovered
+/// by reading the database — only reissued as a new one. The whole batch is
+/// written or none of it (a savepoint, so it also nests inside a caller's
+/// transaction, as the staff route's audited action does).
+pub fn mint_gift_batch(
     conn: &Connection,
     count: u32,
     grants_days: i64,
     note: &str,
+    created_by: Option<i64>,
     now: &str,
-) -> Result<Vec<String>> {
-    let mut codes = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        loop {
-            let code = generate_gift_code();
-            let inserted = conn.execute(
-                "INSERT OR IGNORE INTO gift_codes (code, grants_days, note, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![code, grants_days, note, now],
-            )?;
-            if inserted == 1 {
-                codes.push(code);
-                break;
+) -> Result<GiftBatch> {
+    use rand::Rng;
+    let batch_id = format!("gb_{}", hex::encode(rand::thread_rng().gen::<[u8; 8]>()));
+    conn.execute_batch("SAVEPOINT gift_mint;")?;
+    let minted = (|| -> Result<Vec<String>> {
+        let mut codes = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            loop {
+                let code = generate_gift_code();
+                let inserted = conn.execute(
+                    "INSERT OR IGNORE INTO gift_codes (code, grants_days, note, created_at, batch_id, created_by)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![gift_code_digest(&code), grants_days, note, now, batch_id, created_by],
+                )?;
+                if inserted == 1 {
+                    codes.push(code);
+                    break;
+                }
+                // PRIMARY KEY collision (vanishingly unlikely) — draw another code.
             }
-            // PRIMARY KEY collision (vanishingly unlikely) — draw another code.
+        }
+        Ok(codes)
+    })();
+    match minted {
+        Ok(codes) => {
+            conn.execute_batch("RELEASE gift_mint;")?;
+            Ok(GiftBatch { batch_id, codes })
+        }
+        Err(e) => {
+            // The original failure is what the caller needs; a failed rollback
+            // on top of it adds nothing.
+            let _ = conn.execute_batch("ROLLBACK TO gift_mint; RELEASE gift_mint;");
+            Err(e)
         }
     }
-    Ok(codes)
+}
+
+/// One row of the staff batch list — counts and metadata, never a code.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GiftBatchSummary {
+    /// The batch id.
+    pub batch_id: String,
+    /// The note the batch was minted with.
+    pub note: String,
+    /// Days each code grants.
+    pub days: i64,
+    /// Codes in the batch.
+    pub count: i64,
+    /// Codes redeemed so far.
+    pub redeemed: i64,
+    /// Unredeemed codes that were revoked.
+    pub revoked: i64,
+    /// When the batch was minted, RFC 3339.
+    pub created_at: String,
+    /// The nick of the staff account that minted it, if it has one.
+    pub created_by_nick: Option<String>,
+}
+
+/// Every batch, newest first. Codes minted before batches existed have no
+/// batch and are not listed.
+pub fn list_gift_batches(conn: &Connection) -> Result<Vec<GiftBatchSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT batch_id, MIN(note), MIN(grants_days), COUNT(*),
+                SUM(redeemed_by IS NOT NULL), SUM(redeemed_by IS NULL AND revoked_at IS NOT NULL),
+                MIN(created_at), MIN(created_by)
+         FROM gift_codes WHERE batch_id IS NOT NULL
+         GROUP BY batch_id
+         ORDER BY MIN(created_at) DESC, MIN(rowid) DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                GiftBatchSummary {
+                    batch_id: row.get(0)?,
+                    note: row.get(1)?,
+                    days: row.get(2)?,
+                    count: row.get(3)?,
+                    redeemed: row.get(4)?,
+                    revoked: row.get(5)?,
+                    created_at: row.get(6)?,
+                    created_by_nick: None,
+                },
+                row.get::<_, Option<i64>>(7)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    let mut batches = Vec::with_capacity(rows.len());
+    for (mut batch, created_by) in rows {
+        if let Some(user_id) = created_by {
+            batch.created_by_nick = nick_for_user(conn, user_id)?;
+        }
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+/// Revoke every UNREDEEMED code of `batch_id`; codes already redeemed keep the
+/// days they granted. `None` when no such batch exists, else how many codes
+/// were revoked just now (`0` on a repeat).
+pub fn revoke_gift_batch(conn: &Connection, batch_id: &str, now: &str) -> Result<Option<usize>> {
+    let exists = conn
+        .query_row("SELECT 1 FROM gift_codes WHERE batch_id = ?1 LIMIT 1", params![batch_id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(None);
+    }
+    let revoked = conn.execute(
+        "UPDATE gift_codes SET revoked_at = ?2 WHERE batch_id = ?1 AND redeemed_by IS NULL AND revoked_at IS NULL",
+        params![batch_id, now],
+    )?;
+    Ok(Some(revoked))
 }
 
 /// `max(now, existing paid_until) + days` — the one place the "extend, never
@@ -3165,7 +3300,7 @@ pub enum RedeemOutcome {
 ///
 /// The `grants_days` lookup ahead of the `UPDATE` does not carry that same
 /// race risk: it is immutable once a code is minted (see
-/// [`mint_gift_codes`]), so nothing about it can go stale between the read
+/// [`mint_gift_batch`]), so nothing about it can go stale between the read
 /// and the write — it exists only to size the grant, not to decide whether
 /// one happens.
 ///
@@ -3178,24 +3313,42 @@ pub fn redeem_gift_code(
     user_id: i64,
     now: &str,
 ) -> Result<RedeemOutcome> {
-    let grants_days: Option<i64> = conn
+    // A code is stored as its digest; a row minted before digests existed
+    // holds the plain code. A digest is 64 hex characters and a plain code 10,
+    // so the two can never match each other's rows.
+    let digest = gift_code_digest(code);
+    let row: Option<(i64, Option<String>)> = conn
         .query_row(
-            "SELECT grants_days FROM gift_codes WHERE code = ?1",
-            params![code],
-            |row| row.get(0),
+            "SELECT grants_days, revoked_at FROM gift_codes WHERE code = ?1 OR code = ?2",
+            params![digest, code],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(grants_days) = grants_days else {
+    let Some((grants_days, revoked_at)) = row else {
         return Ok(RedeemOutcome::NotFound);
     };
+    // A revoked code is no code at all.
+    if revoked_at.is_some() {
+        return Ok(RedeemOutcome::NotFound);
+    }
 
     // The one statement that decides single-use — see the doc comment above.
     let rows = conn.execute(
-        "UPDATE gift_codes SET redeemed_by = ?1, redeemed_at = ?2 WHERE code = ?3 AND redeemed_by IS NULL",
-        params![user_id, now, code],
+        "UPDATE gift_codes SET redeemed_by = ?1, redeemed_at = ?2
+         WHERE (code = ?3 OR code = ?4) AND redeemed_by IS NULL AND revoked_at IS NULL",
+        params![user_id, now, digest, code],
     )?;
     if rows != 1 {
-        return Ok(RedeemOutcome::AlreadyUsed);
+        // Lost a race, or revoked between the read and the write.
+        let revoked_meanwhile: Option<String> = conn
+            .query_row(
+                "SELECT revoked_at FROM gift_codes WHERE code = ?1 OR code = ?2",
+                params![digest, code],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        return Ok(if revoked_meanwhile.is_some() { RedeemOutcome::NotFound } else { RedeemOutcome::AlreadyUsed });
     }
 
     let existing_until: Option<String> = conn
@@ -3573,7 +3726,7 @@ fn generate_share_token() -> String {
 /// always `None` for a screenshot share, same reasoning as `clone_allowed`.
 ///
 /// Retries on the vanishingly unlikely PRIMARY KEY collision, same as
-/// [`mint_gift_codes`].
+/// [`mint_gift_batch`].
 pub fn create_share_link(
     conn: &Connection,
     user_id: i64,
@@ -10729,5 +10882,67 @@ mod share_op_tests {
         assert!(share_caller_can_edit(&conn, &link, 2).unwrap());
         let tier = super::effective_share_tier(&conn, &link, Some(2)).unwrap();
         assert_eq!(tier, Some(ShareTier::Clone));
+    }
+}
+
+#[cfg(test)]
+mod gift_batch_tests {
+    use crate::billing::testkit::{conn, seed_user};
+    use rusqlite::params;
+
+    #[test]
+    fn a_batch_is_stored_as_digests_with_its_batch_creator_and_note() {
+        let conn = conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let batch = super::mint_gift_batch(&conn, 4, 30, "wave one", Some(7), &now).expect("mint");
+        assert!(batch.batch_id.starts_with("gb_"));
+        assert_eq!(batch.codes.len(), 4);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM gift_codes WHERE batch_id = ?1 AND created_by = 7 AND note = 'wave one' AND LENGTH(code) = 64", params![batch.batch_id], |r| r.get(0))
+            .expect("count");
+        assert_eq!(rows, 4);
+        for code in &batch.codes {
+            let plain: i64 = conn.query_row("SELECT COUNT(*) FROM gift_codes WHERE code = ?1", params![code], |r| r.get(0)).expect("count");
+            assert_eq!(plain, 0);
+        }
+    }
+
+    #[test]
+    fn minting_nests_in_a_caller_transaction_and_rolls_back_with_it() {
+        let conn = conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        {
+            let tx = conn.unchecked_transaction().expect("tx");
+            super::mint_gift_batch(&tx, 3, 5, "", None, &now).expect("mint inside a transaction");
+            drop(tx); // rolled back
+        }
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM gift_codes", [], |r| r.get(0)).expect("count");
+        assert_eq!(left, 0);
+        super::mint_gift_batch(&conn, 3, 5, "", None, &now).expect("mint outside one");
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM gift_codes", [], |r| r.get(0)).expect("count");
+        assert_eq!(left, 3);
+    }
+
+    #[test]
+    fn redeem_revoke_and_the_batch_counts() {
+        let conn = conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let user = seed_user(&conn, "redeemer");
+        let other = seed_user(&conn, "second");
+        let batch = super::mint_gift_batch(&conn, 3, 10, "counts", None, &now).expect("mint");
+        assert!(matches!(super::redeem_gift_code(&conn, &batch.codes[0], user, &now).expect("redeem"), super::RedeemOutcome::Redeemed(_)));
+        assert!(matches!(super::redeem_gift_code(&conn, &batch.codes[0], other, &now).expect("again"), super::RedeemOutcome::AlreadyUsed));
+        assert_eq!(super::revoke_gift_batch(&conn, &batch.batch_id, &now).expect("revoke"), Some(2));
+        assert_eq!(super::revoke_gift_batch(&conn, &batch.batch_id, &now).expect("repeat"), Some(0));
+        assert_eq!(super::revoke_gift_batch(&conn, "gb_missing", &now).expect("missing"), None);
+        for code in &batch.codes[1..] {
+            assert!(matches!(super::redeem_gift_code(&conn, code, other, &now).expect("revoked"), super::RedeemOutcome::NotFound));
+        }
+        assert!(super::user_paid_until(&conn, user).expect("paid").is_some(), "the redeemed code keeps its days");
+        assert!(super::user_paid_until(&conn, other).expect("paid").is_none());
+        let listed = super::list_gift_batches(&conn).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].count, listed[0].redeemed, listed[0].revoked, listed[0].days), (3, 1, 2, 10));
+        assert_eq!(listed[0].created_by_nick, None);
     }
 }

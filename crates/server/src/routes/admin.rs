@@ -415,20 +415,23 @@ pub async fn mint_gift_codes(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::mint_gift_codes(&conn, count, days, &note, &now)
+        // The same function the staff route mints through; no operator
+        // account is behind the shared secret, so `created_by` is empty.
+        crate::db::mint_gift_batch(&conn, count, days, &note, None, &now)
     })
     .await;
 
     match result {
-        Ok(Ok(codes)) => {
+        Ok(Ok(batch)) => {
             // Count and metadata only — never the codes themselves.
             tracing::info!(
-                "Minted {} gift code(s): days={} note={:?}",
-                codes.len(),
+                "Minted {} gift code(s) in batch {}: days={} note={:?}",
+                batch.codes.len(),
+                batch.batch_id,
                 days,
                 req.note,
             );
-            Json(MintGiftCodesResponse { codes }).into_response()
+            Json(MintGiftCodesResponse { codes: batch.codes }).into_response()
         }
         Ok(Err(e)) => {
             tracing::error!("DB error minting gift codes: {}", e);
@@ -455,13 +458,13 @@ pub struct GrantPaidDaysRequest {
 /// Closed range [`GrantPaidDaysRequest::days`] must fall in — the lower
 /// bound rules out a no-op/negative grant, the upper bound (10 years) rules
 /// out a typo turning into an effectively permanent account.
-const MIN_PAID_DAYS: i64 = 1;
-const MAX_PAID_DAYS: i64 = 3650;
+pub(crate) const MIN_PAID_DAYS: i64 = 1;
+pub(crate) const MAX_PAID_DAYS: i64 = 3650;
 
 /// Whether `days` falls inside the closed `[MIN_PAID_DAYS, MAX_PAID_DAYS]`
 /// range `grant_paid_days` accepts — split out of the handler so the bound
 /// itself is unit-testable without a database.
-fn paid_days_in_bounds(days: i64) -> bool {
+pub(crate) fn paid_days_in_bounds(days: i64) -> bool {
     (MIN_PAID_DAYS..=MAX_PAID_DAYS).contains(&days)
 }
 

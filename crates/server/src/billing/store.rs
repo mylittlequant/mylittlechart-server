@@ -144,7 +144,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn add_column_if_missing(conn: &Connection, table: &str, column: &str, declaration: &str) -> Result<()> {
+pub(crate) fn add_column_if_missing(conn: &Connection, table: &str, column: &str, declaration: &str) -> Result<()> {
     let present: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
         params![table, column],

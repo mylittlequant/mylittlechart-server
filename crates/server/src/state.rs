@@ -249,6 +249,10 @@ pub struct AppState {
     /// Not a constructor argument: `new`'s positional list is long and
     /// several tests build it by hand.
     billing: Option<Arc<crate::billing::BillingRuntime>>,
+
+    /// Writes per minute a staff account may make through `/api/staff/*`
+    /// (`crate::staff::WRITES_PER_MINUTE`), keyed by account id.
+    staff_writes: crate::billing::throttle::SlidingLimiter<i64>,
 }
 
 struct LiveTicket {
@@ -317,6 +321,11 @@ impl AppState {
             alert_daemon_stats,
             live_tickets: std::sync::Mutex::new(std::collections::HashMap::new()),
             billing: None,
+            staff_writes: crate::billing::throttle::SlidingLimiter::new(
+                std::time::Duration::from_secs(60),
+                crate::staff::WRITES_PER_MINUTE,
+                0,
+            ),
         }
     }
 
@@ -324,6 +333,11 @@ impl AppState {
     pub fn with_billing(mut self, billing: crate::billing::BillingRuntime) -> Self {
         self.billing = Some(Arc::new(billing));
         self
+    }
+
+    /// The per-actor write budget of the staff routes.
+    pub fn staff_write_limiter(&self) -> &crate::billing::throttle::SlidingLimiter<i64> {
+        &self.staff_writes
     }
 
     /// The billing adapter's runtime, if one was attached.

@@ -83,6 +83,12 @@ To stop permanently (no restart): `touch data/stop-server` before sending restar
 | POST | `/api/auth/account-key` | None (per-IP failure throttle) | `{account_key}` → a session (`{status, user_id, public_id, session_id}` + cookie) for an ACTIVE anonymous account; every unusable key is the same 401 |
 | POST | `/api/account/key/rotate` | Cookie session or Bearer | An anonymous account gets a new key; the old one stops working |
 | POST | `/api/admin/users/{id}/grants` | Bearer ADMIN_SECRET (loopback listener) | Add an operator lifetime grant to the ledger `{grant, admin_user_id, note}`; `GET` lists the ledger, `DELETE /api/admin/users/{id}/grants/{grant_id}` revokes an operator row |
+| POST | `/api/staff/gift-codes` | Cookie session or Bearer, forum role `admin` (anything else, including no session, is the same `403 forbidden`; writes are limited to 30/minute per actor; every action writes a `staff_audit` row) | `{days 1..=365, count 1..=200, note?}` → `201 {batch_id, days, count, note, codes:[…]}`; the codes are returned once and stored only as SHA-256 digests |
+| GET | `/api/staff/gift-batches` | as above | `[{batch_id, note, days, count, redeemed, revoked, created_at, created_by_nick}]`, newest first, no code values |
+| POST | `/api/staff/gift-batches/{id}/revoke` | as above | `{batch_id, revoked}`: unredeemed codes of the batch stop working, redeemed ones keep their days |
+| POST | `/api/staff/grants/paid-days` | as above | `{nick, days 1..=3650}` → `{nick, paid_until}` |
+| POST | `/api/staff/grants/lifetime` | as above | `{nick, grant, note}` → operator row in the lifetime-grant ledger (`201`, or `200` when already in force); `POST /api/staff/grants/lifetime/revoke {nick, grant}` → `{nick, grant, revoked}` |
+| GET | `/api/staff/user?nick=` | as above | One account's grants, ledger rows and roles (exact nick only) |
 | POST | `/api/billing/webhook` | `X-Dig2pay-Signature` | dig2pay's signed callback (`t=…,v1=…`, HMAC-SHA256 over `"{t}.{raw body}"`, 5-minute window, rotation-aware, deduplicated on the event id); unknown kinds are stored and answered 200 |
 | POST | `/api/heartbeat` | None | Device keep-alive |
 | POST | `/api/telemetry` | Optional Bearer token | Submit usage metrics |

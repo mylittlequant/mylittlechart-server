@@ -131,6 +131,7 @@ mod ratelimit;
 mod rooms_codec;
 mod routes;
 mod social_db;
+mod staff;
 mod state;
 mod syncstore;
 mod text_policy;

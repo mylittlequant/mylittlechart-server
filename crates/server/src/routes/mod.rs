@@ -52,6 +52,7 @@ pub mod proxy;
 pub mod rooms;
 pub mod sessions;
 pub mod share;
+pub mod staff;
 pub mod sync;
 pub mod telemetry;
 pub mod tg_login;
@@ -151,6 +152,16 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/billing/anon-invoice/{id}", get(anon_account::anon_invoice))
         .route("/auth/account-key", post(anon_account::sign_in))
         .route("/account/key/rotate", post(anon_account::rotate))
+        // The in-app admin tab (routes/staff.rs): the same operations as the
+        // loopback `/admin/*` routes, for a signed-in account holding the
+        // `admin` forum role. Everyone else gets a 403.
+        .route("/staff/gift-codes", post(staff::mint_gift_codes))
+        .route("/staff/gift-batches", get(staff::list_gift_batches))
+        .route("/staff/gift-batches/{id}/revoke", post(staff::revoke_gift_batch))
+        .route("/staff/grants/paid-days", post(staff::grant_paid_days))
+        .route("/staff/grants/lifetime", post(staff::grant_lifetime))
+        .route("/staff/grants/lifetime/revoke", post(staff::revoke_lifetime))
+        .route("/staff/user", get(staff::user_lookup))
         .route(
             "/billing/webhook",
             post(billing::webhook).layer(DefaultBodyLimit::max(billing::WEBHOOK_MAX_BODY_BYTES)),
