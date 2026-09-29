@@ -2151,7 +2151,9 @@ const PREVIEW_MAX_DIM: u32 = 2048;
 /// card aspect ratio (1.91:1). The source image is scaled to FIT inside
 /// this canvas (never cropped, never upscaled past its own resolution) and
 /// centered on a solid background — letterboxed, not filled — so a
-/// non-16:9-ish chart screenshot never has its edges cut off.
+/// non-16:9-ish chart screenshot never has its edges cut off. Only the card
+/// test reads these two (nothing in a non-test build does).
+#[cfg(test)]
 const PREVIEW_OUTPUT_WIDTH: u32 = 1200;
 const PREVIEW_OUTPUT_HEIGHT: u32 = 630;
 /// Long edge of the chart PNG stored on disk. The served card is always
@@ -2169,6 +2171,7 @@ enum PreviewError {
     DimensionsOutOfBounds,
     EncodeFailed,
 }
+#[cfg(test)]
 
 impl PreviewError {
     fn to_response(self) -> Response {
@@ -2426,6 +2429,9 @@ fn in_rounded_rect(x: i32, y: i32, w: i32, h: i32, r: i32) -> bool {
     if x < 0 || y < 0 || x >= w || y >= h {
         return false;
     }
+/// The card template as shipped. Only the card test compares against it
+/// (nothing in a non-test build does).
+#[cfg(test)]
     let r = r.max(0).min(w / 2).min(h / 2);
     if r == 0 {
         return true;
