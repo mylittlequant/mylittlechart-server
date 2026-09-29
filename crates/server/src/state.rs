@@ -240,6 +240,15 @@ pub struct AppState {
     /// (SameSite=Strict) is not sent. The page mints the ticket on its
     /// own edge; the relay redeems it.
     live_tickets: std::sync::Mutex<std::collections::HashMap<String, LiveTicket>>,
+
+    /// The dig2pay billing adapter's loaded configuration (plan catalog,
+    /// merchant client, webhook secrets, onion hosts) — `Some` on a
+    /// control-role process that called [`AppState::with_billing`], `None`
+    /// otherwise (edge role, and the route-table tests). Every billing
+    /// handler answers `503 billing_not_configured` while this is `None`.
+    /// Not a constructor argument: `new`'s positional list is long and
+    /// several tests build it by hand.
+    billing: Option<Arc<crate::billing::BillingRuntime>>,
 }
 
 struct LiveTicket {
@@ -307,7 +316,19 @@ impl AppState {
             telemetry_daily_cap,
             alert_daemon_stats,
             live_tickets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            billing: None,
         }
+    }
+
+    /// Attach the billing adapter's runtime (see the `billing` field).
+    pub fn with_billing(mut self, billing: crate::billing::BillingRuntime) -> Self {
+        self.billing = Some(Arc::new(billing));
+        self
+    }
+
+    /// The billing adapter's runtime, if one was attached.
+    pub fn billing(&self) -> Option<Arc<crate::billing::BillingRuntime>> {
+        self.billing.clone()
     }
 
     /// One-minute ticket for `wss://<edge>/api/share-live/{token}`.

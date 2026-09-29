@@ -8,9 +8,11 @@
 //! [`free_features`] / [`resolve_for_user`] — there is one mechanism, not
 //! two living side by side.
 //!
-//! There is no billing system yet, so paid access today comes only from
-//! `db::user_is_paid` (gift/trial code redemption — see `db.rs`'s
-//! `gift_codes` table and `routes::account::redeem`). [`paid_features`] is
+//! Paid access comes only from `db::user_is_paid`: a future `paid_until`
+//! (gift/trial code redemption — see `db.rs`'s `gift_codes` table and
+//! `routes::account::redeem` — or an operator grant), a lifetime account, or
+//! a running quant subscription, the last two bought through the dig2pay
+//! billing adapter (`billing/mod.rs`). [`paid_features`] is
 //! the seam: it takes the already-resolved paid/not-paid fact, not a
 //! `user_id`, so this module never gains a database dependency and its tests
 //! keep running with no database at all. [`resolve_for_user`]'s callers
@@ -206,7 +208,7 @@ fn parse_free_features(raw: &str) -> FeatureSet {
 }
 
 // ============================================================================
-// Per-user paid claims (seam — no billing system yet)
+// Per-user paid claims (seam)
 // ============================================================================
 
 /// The entitlements a paid account holds beyond the free set.

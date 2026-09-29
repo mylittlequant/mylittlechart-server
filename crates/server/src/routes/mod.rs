@@ -34,6 +34,7 @@ use crate::state::AppState;
 pub mod account;
 pub mod admin;
 pub mod agent_keys;
+pub mod billing;
 pub mod dashboard;
 pub mod device_auth;
 pub mod dm;
@@ -133,6 +134,18 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/account/redeem", post(account::redeem))
         // Account nick change (cookie-session or bearer auth, same as redeem).
         .route("/account/nick", post(account::set_nick))
+        // dig2pay billing adapter (see routes/billing.rs): five signed-in
+        // routes, plus the processor's own callback — authenticated by its
+        // signature rather than a session, and body-limited on its own.
+        .route("/billing/plans", get(billing::plans))
+        .route("/billing/me", get(billing::me))
+        .route("/billing/checkout", post(billing::checkout))
+        .route("/billing/invoice/{id}", get(billing::invoice))
+        .route("/billing/change", post(billing::change))
+        .route(
+            "/billing/webhook",
+            post(billing::webhook).layer(DefaultBodyLimit::max(billing::WEBHOOK_MAX_BODY_BYTES)),
+        )
         .route("/account/friends", get(account::friends).post(account::add_friend))
         .route("/account/privacy", patch(account::set_privacy))
         .route("/account/friend-invites", post(account::create_friend_invite))

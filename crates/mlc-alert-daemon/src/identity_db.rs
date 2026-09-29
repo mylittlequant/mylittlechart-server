@@ -92,17 +92,29 @@ pub fn user_alert_items(conn: &Connection, user_id: i64) -> Result<Vec<AlertItem
 }
 
 /// Whether `user_id`'s paid access is currently in effect — same rule as
-/// `mylittlechart-server`'s `db::user_is_paid` (`paid_until` compared to
-/// now), reimplemented here rather than shared: that crate ships no
-/// library surface to depend on (`crates/server/src/lib.rs` is empty; the
-/// server is a bin-only crate).
+/// `mylittlechart-server`'s `db::user_is_paid`, reimplemented here rather
+/// than shared: that crate ships no library surface to depend on for this
+/// (its `lib.rs` hosts only `live`; everything else is bin-only).
+///
+/// Paid is the union of four legs: a future `paid_until` (the legacy column),
+/// a lifetime flag (`lifetime_paid` / `lifetime_anon`, set by the dig2pay
+/// billing adapter), or a running quant period (`quant_active_until`). The
+/// server's `init_db` adds the last three columns before this daemon ever
+/// opens the database.
 pub fn user_is_paid(conn: &Connection, user_id: i64) -> Result<bool> {
-    let paid_until: Option<String> = conn
-        .query_row("SELECT paid_until FROM users WHERE id = ?1", params![user_id], |row| row.get(0))
-        .optional()?
-        .flatten();
-    Ok(match paid_until {
-        Some(until) => until.as_str() > chrono::Utc::now().to_rfc3339().as_str(),
+    let row: Option<(Option<String>, i64, i64, Option<String>)> = conn
+        .query_row(
+            "SELECT paid_until, lifetime_paid, lifetime_anon, quant_active_until FROM users WHERE id = ?1",
+            params![user_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let future = |moment: &Option<String>| moment.as_deref().is_some_and(|m| m > now.as_str());
+    Ok(match row {
+        Some((paid_until, lifetime_paid, lifetime_anon, quant_until)) => {
+            future(&paid_until) || lifetime_paid != 0 || lifetime_anon != 0 || future(&quant_until)
+        }
         None => false,
     })
 }

@@ -48,6 +48,24 @@
 //!                            Edge never opens a database — it boots with no
 //!                            control plane and mounts only the stateless
 //!                            subset (see routes::edge_api_router).
+//!   DIG2PAY_BASE_URL       — dig2pay merchant API base (control role only),
+//!                            e.g. `http://10.83.1.1:37300` over the `wg-mlc`
+//!                            tunnel. Empty (default): checkout and plan
+//!                            changes answer 503. See `billing::config`.
+//!   DIG2PAY_API_KEY_FILE   — file holding the merchant bearer key
+//!   DIG2PAY_WEBHOOK_SECRET_FILES — comma-separated files, one HMAC secret
+//!                            each (several live at once during a rotation)
+//!   DIG2PAY_TIMEOUT_SECS   — timeout of one merchant API call (default: 15)
+//!   MLC_BILLING_ONION_HOSTS — comma-separated `Host` names of the onion
+//!                            vhost; the Tor plan variants are offered only
+//!                            to requests carrying one of them
+//!   MLC_BILLING_PLAN_PAID / _ANON / _PAID_TOR / _ANON_TOR — ids of the four
+//!                            one-time account plans (defaults:
+//!                            mlc-paid-account-v1, mlc-anon-account-v1,
+//!                            mlc-paid-account-tor-v1, mlc-anon-account-tor-v1)
+//!   MLC_BILLING_QUANT_QUOTAS — `plan_id=quota` pairs, comma-separated: the
+//!                            quant quota of each monthly tier (no quota
+//!                            number lives in code)
 //!   MLC_ALERT_DAEMON       — "1" to run the `mlc-alert-daemon` account-wide
 //!                            price-alert evaluation loop as a background
 //!                            task on this process's own tokio runtime
@@ -91,6 +109,7 @@ use tower_http::timeout::TimeoutLayer;
 
 mod account_merge;
 mod auth;
+mod billing;
 mod build_attest;
 mod db;
 mod dm_db;
@@ -781,8 +800,13 @@ async fn main() {
         }
     };
 
+    // The dig2pay billing adapter (control role only — every billing route
+    // reads the identity database). Reads its key/secret files here and never
+    // fails: whatever is not configured leaves that half disabled.
+    let billing = (role == state::ServerRole::Control).then(billing::BillingRuntime::from_env);
+
     // Build shared application state.
-    let app_state = Arc::new(AppState::new(
+    let app_state = AppState::new(
         control_plane,
         admin_secret,
         github_client_id,
@@ -800,7 +824,11 @@ async fn main() {
         build_attest_max_age_secs,
         telemetry_daily_cap,
         alert_daemon_stats,
-    ));
+    );
+    let app_state = Arc::new(match billing {
+        Some(billing) => app_state.with_billing(billing),
+        None => app_state,
+    });
 
     // Start the Telegram login bot (background task) — control role only.
     // The bot calls db::confirm_tg_login_token synchronously via the closure,

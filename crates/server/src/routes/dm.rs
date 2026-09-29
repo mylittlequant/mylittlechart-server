@@ -476,8 +476,10 @@ struct PaidCandidate {
     public_id: String,
 }
 
-/// Every recipient candidate for [`lookup_recipients`]: accounts with an
-/// unexpired `paid_until` (bounded by [`PAID_CANDIDATE_LIMIT`]) PLUS
+/// Every recipient candidate for [`lookup_recipients`]: accounts that are
+/// paid right now — an unexpired `paid_until`, a lifetime flag, or a running
+/// quant period, the same legs `db::user_is_paid` decides (bounded by
+/// [`PAID_CANDIDATE_LIMIT`]) — PLUS
 /// `boosted_ids` — accounts that reach [`Class::Paid`] via
 /// [`social_db::ladder_boosted_user_ids`] (trusted standing, or a
 /// moderator/admin role) regardless of their own subscription (owner ruling
@@ -497,7 +499,8 @@ fn paid_recipient_candidates(
     {
         let mut stmt = identity_conn.prepare(
             "SELECT id, nick, display_name, public_id FROM users
-             WHERE paid_until IS NOT NULL AND paid_until > ?1 AND id != ?2
+             WHERE (paid_until > ?1 OR lifetime_paid = 1 OR lifetime_anon = 1 OR quant_active_until > ?1)
+               AND id != ?2
              LIMIT ?3",
         )?;
         let mut rows = stmt.query(params![now, caller_id, PAID_CANDIDATE_LIMIT])?;
@@ -1188,7 +1191,11 @@ mod tests {
                 created_at TEXT NOT NULL DEFAULT '',
                 public_id TEXT,
                 nick TEXT,
-                paid_until TEXT
+                paid_until TEXT,
+                lifetime_paid INTEGER NOT NULL DEFAULT 0,
+                lifetime_anon INTEGER NOT NULL DEFAULT 0,
+                quant_tier TEXT,
+                quant_active_until TEXT
             );",
         )
         .expect("identity test schema");

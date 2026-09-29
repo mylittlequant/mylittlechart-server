@@ -925,6 +925,12 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         ")?;
     }
 
+    // dig2pay billing tables and the `users` entitlement columns
+    // (lifetime_paid, lifetime_anon, quant_tier, quant_active_until) —
+    // additive and idempotent, see `billing::store::migrate`. Runs last so
+    // `users` is in its final shape.
+    crate::billing::store::migrate(&conn)?;
+
     Ok(conn)
 }
 
@@ -2813,12 +2819,19 @@ pub fn user_paid_until(conn: &Connection, user_id: i64) -> Result<Option<String>
 
 /// Whether this account's paid access is currently in effect.
 ///
-/// `paid_until` is a moment, so this is a comparison against now rather than a
-/// stored yes/no: an expired subscription stops granting anything without
-/// anybody having to remember to flip a flag. The rule itself lives in
-/// `user_paid_until`; this is just its presence check.
+/// "Paid" is the union of four legs, decided here and nowhere else:
+/// a future `paid_until` (the legacy column — see [`user_paid_until`]), a
+/// lifetime flag (`lifetime_paid` / `lifetime_anon`, bought through the
+/// dig2pay billing adapter), or a running quant subscription period
+/// (`quant_active_until`). Every leg is a moment or a flag compared against
+/// now at read time, so an expired subscription stops granting anything
+/// without anybody having to remember to flip a flag. The billing legs live
+/// in `billing::entitle`.
 pub fn user_is_paid(conn: &Connection, user_id: i64) -> Result<bool> {
-    Ok(user_paid_until(conn, user_id)?.is_some())
+    if user_paid_until(conn, user_id)?.is_some() {
+        return Ok(true);
+    }
+    crate::billing::entitle::has_entitlement(conn, user_id, chrono::Utc::now())
 }
 
 /// Paid status for many accounts at once — the batched counterpart to
@@ -2851,14 +2864,25 @@ pub fn users_paid_batch(conn: &Connection, user_ids: &[i64]) -> Result<std::coll
         let paid = until.is_some_and(|u| u.as_str() > now.as_str());
         out.insert(id, paid);
     }
+    drop(rows);
+    drop(stmt);
+
+    // The billing legs (lifetime flags, running quant period) for whoever the
+    // legacy column left unpaid — see `user_is_paid`.
+    let unpaid: Vec<i64> = out.iter().filter(|(_, paid)| !**paid).map(|(id, _)| *id).collect();
+    for id in crate::billing::entitle::entitled_among(conn, &unpaid, chrono::Utc::now())? {
+        out.insert(id, true);
+    }
     Ok(out)
 }
 
-/// Grant or revoke paid access by writing the moment it ends.
+/// Grant or revoke the legacy time-bound paid access by writing the moment it
+/// ends.
 ///
-/// `None` revokes. Used by the admin endpoint today and by the billing
-/// webhook once it exists — one writer, so the two cannot disagree about what
-/// paid means.
+/// `None` revokes. Used by the admin endpoint and gift-code redemption. The
+/// dig2pay billing webhook does NOT write this column: account purchases
+/// grant lifetime flags and quant tiers grant a subscription period (see
+/// `billing::entitle`), both of which `user_is_paid` also honours.
 pub fn set_user_paid_until(conn: &Connection, user_id: i64, until: Option<&str>) -> Result<()> {
     conn.execute(
         "UPDATE users SET paid_until = ?1 WHERE id = ?2",
@@ -7720,6 +7744,10 @@ mod tests {
                 nick TEXT,
                 nick_changed_at TEXT,
                 paid_until TEXT,
+                lifetime_paid INTEGER NOT NULL DEFAULT 0,
+                lifetime_anon INTEGER NOT NULL DEFAULT 0,
+                quant_tier TEXT,
+                quant_active_until TEXT,
                 UNIQUE(provider, provider_user_id)
             );
             CREATE UNIQUE INDEX idx_users_nick_lower ON users(LOWER(nick)) WHERE nick IS NOT NULL;
@@ -10539,6 +10567,12 @@ mod share_nick_search_tests {
                 friend_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, friend_id)
+            );
+            CREATE TABLE blocks (
+                user_id INTEGER NOT NULL,
+                blocked_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, blocked_id)
             );",
         )
         .unwrap();

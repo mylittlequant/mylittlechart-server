@@ -37,6 +37,23 @@ DISCORD_CLIENT_SECRET=
 
 # Telegram Bot Token (https://t.me/BotFather)
 TELEGRAM_BOT_TOKEN=
+
+# dig2pay billing (control box only). Empty = checkout and plan changes are
+# disabled (503). Production value once the wg-mlc tunnel is up:
+#   DIG2PAY_BASE_URL=http://10.83.1.1:37300
+DIG2PAY_BASE_URL=
+# Files (never the values) holding the merchant bearer key and the webhook
+# HMAC secret(s); several secret files, comma-separated, during a rotation.
+DIG2PAY_API_KEY_FILE=
+DIG2PAY_WEBHOOK_SECRET_FILES=
+# Host name(s) of the onion vhost — the Tor plan variants are offered only to
+# requests arriving with one of these Host headers.
+MLC_BILLING_ONION_HOSTS=
+# Quant quota per monthly tier: plan_id=quota, comma-separated.
+MLC_BILLING_QUANT_QUOTAS=
+# The one-time account plan ids default to mlc-paid-account-v1,
+# mlc-anon-account-v1, mlc-paid-account-tor-v1 and mlc-anon-account-tor-v1;
+# override with MLC_BILLING_PLAN_PAID / _ANON / _PAID_TOR / _ANON_TOR.
 ENVEOF
     chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
     chmod 600 "$APP_DIR/.env"

@@ -56,6 +56,13 @@ To stop permanently (no restart): `touch data/stop-server` before sending restar
 | `BUILD_ATTEST_PUBKEY` | `""` | No | Hex Ed25519 public key(s), comma-separated, for build attestation verification |
 | `BUILD_ATTEST_ENFORCE` | `false` | No | If `true`, reject client requests that fail build attestation check |
 | `BUILD_ATTEST_MAX_AGE_DAYS` | `365` | No | Maximum age of a build attestation token before it is considered expired |
+| `DIG2PAY_BASE_URL` | `""` | For billing | dig2pay merchant API, e.g. `http://10.83.1.1:37300` over the `wg-mlc` tunnel. Empty: `/api/billing/checkout` and `/change` answer 503 |
+| `DIG2PAY_API_KEY_FILE` | `""` | For billing | File holding the merchant bearer key (never the key itself) |
+| `DIG2PAY_WEBHOOK_SECRET_FILES` | `""` | For billing | Comma-separated files, one webhook HMAC secret each; several during a rotation. Empty: `/api/billing/webhook` answers 503 |
+| `DIG2PAY_TIMEOUT_SECS` | `15` | No | Timeout of one merchant API call |
+| `MLC_BILLING_ONION_HOSTS` | `""` | For Tor plans | Comma-separated `Host` names of the onion vhost; the Tor plan variants are offered only to requests carrying one |
+| `MLC_BILLING_PLAN_PAID` / `_ANON` / `_PAID_TOR` / `_ANON_TOR` | `mlc-paid-account-v1` / `mlc-anon-account-v1` / `mlc-paid-account-tor-v1` / `mlc-anon-account-tor-v1` | No | Ids of the four one-time account plans on the processor |
+| `MLC_BILLING_QUANT_QUOTAS` | `""` | No | `plan_id=quota` pairs, comma-separated: the quant quota of each monthly tier |
 
 ## API Endpoints
 
@@ -63,6 +70,12 @@ To stop permanently (no restart): `touch data/stop-server` before sending restar
 |--------|------|------|-------------|
 | POST | `/api/admin/register-release` | Bearer ADMIN_SECRET | Register a release manifest row (JSON: platform, version, channel, filename, sha256, file_size, release_notes, signature). Metadata only — the artifact itself is uploaded to both public edges by `mlc-opsd` (`crates/opsd`) before this is ever called; see "Upload a New Release" below. |
 | POST | `/api/admin/restart` | Bearer ADMIN_SECRET | Trigger graceful shutdown (wrapper auto-restarts) |
+| GET | `/api/billing/plans` | Cookie session or Bearer | Plans offered to this request; the Tor account variants only when the `Host` is a configured onion host |
+| GET | `/api/billing/me` | Cookie session or Bearer | Paid status (legacy `paid_until`, lifetime flags, quant tier + quota), credit balance, subscription, open invoices |
+| POST | `/api/billing/checkout` | Cookie session or Bearer | `{plan_id}` → `{invoice_id, plan_id, pay:[{chain, asset, address, amount, expires_at, qr_svg}]}` via the dig2pay merchant API |
+| GET | `/api/billing/invoice/{id}` | Cookie session or Bearer | One of the caller's own invoices (another account's is a 404) with the processor's live status |
+| POST | `/api/billing/change` | Cookie session or Bearer | `{plan_id}` → move a running quant subscription (upgrade charged now, downgrade at renewal) |
+| POST | `/api/billing/webhook` | `X-Dig2pay-Signature` | dig2pay's signed callback (`t=…,v1=…`, HMAC-SHA256 over `"{t}.{raw body}"`, 5-minute window, rotation-aware, deduplicated on the event id); unknown kinds are stored and answered 200 |
 | POST | `/api/heartbeat` | None | Device keep-alive |
 | POST | `/api/telemetry` | Optional Bearer token | Submit usage metrics |
 | GET | `/api/updates/latest?platform=win64` | None | Get latest version manifest |

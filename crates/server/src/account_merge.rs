@@ -414,6 +414,10 @@ fn apply_identity_merge(
         params![into, from],
     )?;
     merge_paid_until_and_nick(conn, from, into)?;
+    // dig2pay billing: entitlements OR-ed / later quant period kept / credit
+    // summed, and the subscription, invoice and event rows re-pointed so the
+    // purchases (and their refunds) follow the surviving account.
+    crate::billing::store::merge_user(conn, from, into)?;
     conn.execute("DELETE FROM users WHERE id = ?1", params![from])?;
     Ok(())
 }
@@ -1510,5 +1514,57 @@ mod tests {
         let items = crate::syncstore::pull_by_profile(&conn, &store, into, "prof").expect("pull");
         let survivor = items.iter().find(|i| i.sync_id == "p1").expect("survivor item");
         assert_eq!(survivor.modified_at, 100);
+    }
+
+    /// A merge carries the loser's purchases to the survivor: entitlements
+    /// combine, credit adds up, and the subscription/invoice rows follow — so
+    /// a later refund webhook still finds (and can revoke) what was bought.
+    #[test]
+    fn execute_carries_billing_state_to_the_survivor() {
+        let db = Mutex::new(identity_conn());
+        let social_m = Mutex::new(social_conn());
+        let dir = TestDir::new();
+        let store = SyncStore::new(dir.0.join("sync"));
+        let now = chrono::Utc::now();
+
+        let (from, into) = {
+            let conn = db.lock().expect("lock");
+            let from = seed_user(&conn, "github", "f9", "from-user");
+            let into = seed_user(&conn, "google", "i9", "into-user");
+            crate::billing::entitle::grant_lifetime(&conn, from, crate::billing::plans::Grant::LifetimeAnon)
+                .expect("from anon");
+            crate::billing::entitle::add_credit(&conn, from, 2_000_000, now).expect("from credit");
+            crate::billing::entitle::add_credit(&conn, into, 500_000, now).expect("into credit");
+            crate::billing::store::record_customer(&conn, from, "cus_from", &from.to_string(), now)
+                .expect("customer");
+            conn.execute(
+                "INSERT INTO billing_subscriptions
+                    (checkout_key, user_id, plan_id, subscription_id, external_user_ref, state, created_at, updated_at)
+                 VALUES ('k', ?1, 'mlc-anon-account-v1', 'sub_9', ?2, 'paid', ?3, ?3)",
+                params![from, from.to_string(), now.to_rfc3339()],
+            )
+            .expect("subscription");
+            conn.execute(
+                "INSERT INTO billing_invoices
+                    (invoice_id, user_id, subscription_id, plan_id, kind, status, grant_kind, grant_state, created_at, updated_at)
+                 VALUES ('grp_9', ?1, 'sub_9', 'mlc-anon-account-v1', 'initial', 'settled', 'lifetime_anon', 'granted', ?2, ?2)",
+                params![from, now.to_rfc3339()],
+            )
+            .expect("invoice");
+            (from, into)
+        };
+
+        execute(&db, &social_m, &store, &dir.0, from, into, None).expect("execute");
+
+        let conn = db.lock().expect("lock");
+        let view = crate::billing::entitle::entitlement_view(&conn, into, chrono::Utc::now()).expect("view");
+        assert!(view.lifetime_anon && view.paid);
+        assert_eq!(crate::billing::entitle::credit_balance(&conn, into).expect("credit"), 2_500_000);
+        assert_eq!(crate::billing::store::customer_for_user(&conn, into).expect("customer").as_deref(), Some("cus_from"));
+        let invoice = crate::billing::store::invoice_for_user(&conn, into, "grp_9").expect("query").expect("moved");
+        assert_eq!(invoice.user_id, into);
+        let sub = crate::billing::store::subscription_by_id(&conn, "sub_9").expect("query").expect("moved");
+        assert_eq!(sub.user_id, into);
+        assert_eq!(sub.external_user_ref, from.to_string(), "dig2pay still knows the purchase by its original reference");
     }
 }

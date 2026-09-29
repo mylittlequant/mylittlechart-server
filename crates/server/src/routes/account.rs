@@ -32,7 +32,7 @@ use crate::state::AppState;
 /// shared, following the existing pattern of `routes::entitlements`'s own
 /// `resolve_caller`, since each caller's exact anonymous/error handling
 /// differs and there is no third caller yet to justify extracting it.
-async fn resolve_user_id(state: Arc<AppState>, headers: &HeaderMap) -> Result<i64, StatusCode> {
+pub(crate) async fn resolve_user_id(state: Arc<AppState>, headers: &HeaderMap) -> Result<i64, StatusCode> {
     let session_id = extract_session_id(headers);
     let ua_hash = extract_ua_hash(headers);
     let bearer: Option<String> = headers

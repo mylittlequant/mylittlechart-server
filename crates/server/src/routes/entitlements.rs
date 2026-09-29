@@ -21,6 +21,7 @@ use axum::{
 use std::sync::Arc;
 
 use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_token};
+use crate::billing::entitle::EntitlementView;
 use crate::entitlements;
 use crate::models::types::ErrorResponse;
 use crate::state::AppState;
@@ -91,6 +92,10 @@ async fn resolve_caller(
 ///   "expires_at": 1774903600000,
 ///   "paid": true,
 ///   "paid_until": "2026-10-04T00:00:00Z",
+///   "lifetime_paid": false,
+///   "lifetime_anon": false,
+///   "quant_tier": null,
+///   "quant_active_until": null,
 ///   "share_limits": {
 ///     "live": { "used": 0, "max": 10 },
 ///     "screenshot": { "used": 3, "max": 100 }
@@ -101,7 +106,11 @@ async fn resolve_caller(
 /// after it passes rather than cache the set indefinitely. `paid` and
 /// `paid_until` say the caller's paid status explicitly, so a client can
 /// show "Free" / "Paid until <date>" without inferring it from a feature
-/// name; `paid_until` is `null` for a free or anonymous caller.
+/// name; `paid_until` is `null` for a free or anonymous caller. `paid` is
+/// true for any of four legs — a future `paid_until` (the legacy column), a
+/// lifetime account (`lifetime_paid` / `lifetime_anon`), or a running quant
+/// period (`quant_tier` + `quant_active_until`) — so `paid_until` alone no
+/// longer says whether the caller is paid.
 /// `share_limits` reports active-share usage against the tier ceiling per
 /// kind (see `entitlements::share_limit`); anonymous callers get the free
 /// tier maxima with `used: 0` — they cannot create shares at all, but the
@@ -121,15 +130,15 @@ pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: Heade
     // Anonymous (no credential) never touches the database — None/false and
     // zero usage without a round-trip. An authenticated caller's paid fact
     // and share usage still need one.
-    let (paid_until, live_used, shot_used): (Option<String>, u64, u64) = match user_id {
-        None => (None, 0, 0),
+    let (paid_view, live_used, shot_used): (EntitlementView, u64, u64) = match user_id {
+        None => (EntitlementView::default(), 0, 0),
         Some(uid) => {
             let result = tokio::task::spawn_blocking(
-                move || -> rusqlite::Result<(Option<String>, u64, u64)> {
+                move || -> rusqlite::Result<(EntitlementView, u64, u64)> {
                     let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-                    let until = crate::db::user_paid_until(&conn, uid)?;
+                    let view = crate::billing::entitle::entitlement_view(&conn, uid, chrono::Utc::now())?;
                     let (live, shot) = crate::db::share_usage(&conn, uid)?;
-                    Ok((until, live, shot))
+                    Ok((view, live, shot))
                 },
             )
             .await;
@@ -153,7 +162,7 @@ pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: Heade
             }
         }
     };
-    let is_paid = paid_until.is_some();
+    let is_paid = paid_view.paid;
 
     let features = entitlements::resolve_for_user(is_paid);
     let expires_at = chrono::Utc::now().timestamp_millis() + ENTITLEMENTS_TTL_SECS * 1000;
@@ -162,7 +171,11 @@ pub async fn get_entitlements(State(state): State<Arc<AppState>>, headers: Heade
         "features": features.wire_names(),
         "expires_at": expires_at,
         "paid": is_paid,
-        "paid_until": paid_until,
+        "paid_until": paid_view.paid_until,
+        "lifetime_paid": paid_view.lifetime_paid,
+        "lifetime_anon": paid_view.lifetime_anon,
+        "quant_tier": paid_view.quant_tier,
+        "quant_active_until": paid_view.quant_active_until,
         "share_limits": {
             "live": {
                 "used": live_used,
