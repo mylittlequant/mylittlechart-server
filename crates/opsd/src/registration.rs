@@ -25,7 +25,8 @@ the control box (mlc-c2-1, holds identity/social/sync data) and both public edge
 nginx-only). This is not the mylittlechart.org backend itself (see mylittlechart-server's own .nemo-service.toml) \
 — it deploys, publishes, unlocks and backs that backend up. Capabilities: deploy a musl server binary to control \
 with health-verified auto-rollback, publish a signed release artifact to both edges then register its manifest on \
-control, boot-unlock (push the SQLCipher key + server.env to control's tmpfs and start mlc-server), pull encrypted \
+control, boot-unlock (push the SQLCipher key + server.env and the dig2pay API key + webhook secret to control's \
+tmpfs and start mlc-server), pull encrypted \
 backups to the opbox, restart a whitelisted systemd unit (mlc-server/nginx/nftables/fail2ban), and an autonomous \
 60s watch loop that detects control being down for the key and unlocks it without operator action.";
 

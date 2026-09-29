@@ -65,8 +65,10 @@ command string is built. Drops the unit's traffic/connections for the restart du
 const LOGS_DESC: &str = "Journal tail from control (query unit=, default mlc-server; lines=, default 50, \
 clamped 1..500 server-side; unit restricted to the same whitelist as /api/restart). Read-only, safe.";
 const UNLOCK_DESC: &str = "Boot-unlock: pushes the canonical sqlcipher.key + server.env to control's tmpfs \
-(0600, root), starts mlc-server, verifies health. Also the watch loop's own recovery action. Places a live \
-secret on the box, even if only in tmpfs.";
+(0600, root), plus the dig2pay merchant API key and webhook secret (dig2pay/api-key, dig2pay/webhook-secret \
+-> /run/mlc/dig2pay-api-key, /run/mlc/dig2pay-webhook-secret; optional, skipped when absent locally), starts \
+mlc-server, verifies health. Also the watch loop's own recovery action. Places live secrets on the box, even \
+if only in tmpfs.";
 const BOX_STATE_DESC: &str = "mlc-server state on control: is the SQLCipher key present in tmpfs, is the \
 journal stuck waiting for it. Read-only, safe.";
 const DEPLOY_DESC: &str = "Body {path} — local path on the opbox to a musl server binary. Uploads to \

@@ -24,7 +24,7 @@ pub const BOX_HOST: &str = "144.172.97.2";
 pub const BOX_PORT: u16 = 22;
 pub const BOX_USER: &str = "root";
 /// Name of the per-box directory under `env/` holding that box's canonical
-/// secrets (`sqlcipher.key`, `server.env`) and opsd state.
+/// secrets (`sqlcipher.key`, `server.env`, `dig2pay/`) and opsd state.
 pub const BOX_CANON_DIR: &str = "mlc-c2-1";
 /// SSH key file under `env/` used to reach the box.
 pub const BOX_SSH_KEY: &str = "mlc-c2-box";
@@ -94,6 +94,9 @@ pub struct BoxConfig {
     pub canon_key_path: PathBuf,
     /// Canonical server.env secrets, pushed to box tmpfs on unlock.
     pub canon_env_path: PathBuf,
+    /// Directory holding the optional dig2pay secrets (`api-key`,
+    /// `webhook-secret`), pushed to box tmpfs on unlock when present.
+    pub canon_dig2pay_dir: PathBuf,
 }
 
 /// Compile-time defaults for one public edge — nginx-only boxes that serve
@@ -229,6 +232,7 @@ fn resolve_paths_with_edges() -> Result<(PathBuf, BoxConfig, Vec<EdgeConfig>, Pa
         ),
         canon_key_path: env_dir.join(&canon_dir).join("sqlcipher.key"),
         canon_env_path: env_dir.join(&canon_dir).join("server.env"),
+        canon_dig2pay_dir: env_dir.join(&canon_dir).join("dig2pay"),
     };
     let edges = resolve_edges(&env_dir);
     Ok((state_dir, box_cfg, edges, env_dir))

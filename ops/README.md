@@ -136,7 +136,7 @@ committed. State db: `env/mlc-c2-1/opsd/opsd.sqlite` (WAL; `audit_log`,
 | `GET /api/box/state` | bearer | mlc-server state, dbkey in tmpfs?, journal stuck at key wait? |
 | `GET /api/logs?unit=&lines=` | bearer | journal tail (unit whitelist, lines clamped to 1..500) |
 | `POST /api/restart {"unit"}` | bearer | whitelist only: `mlc-server` / `nginx` / `nftables` / `fail2ban` |
-| `POST /api/unlock` | bearer | boot-unlock: push canon `sqlcipher.key` + `server.env` to control's tmpfs (0600 root), start `mlc-server`, verify health |
+| `POST /api/unlock` | bearer | boot-unlock: push canon `sqlcipher.key` + `server.env` to control's tmpfs (0600 root), then the optional dig2pay secrets (`env/mlc-c2-1/dig2pay/api-key` → `/run/mlc/dig2pay-api-key`, `env/mlc-c2-1/dig2pay/webhook-secret` → `/run/mlc/dig2pay-webhook-secret`, 0600 root; a file absent locally is skipped with a step line, never fails the unlock), start `mlc-server`, verify health |
 | `POST /api/deploy {"path"}` | bearer | upload musl binary to **control** → sha256 check → save `.prev` → stop/mv/start → health-poll 30×3s against the unit's own `BIND_ADDR` → auto-rollback to `.prev` on failure; verdict + `builds`/`audit_log` records |
 | `POST /api/release/publish {"path","platform","version","channel","release_notes","signature"}` | bearer | upload artifact to **every edge**, sha256-verify each, unwind what already landed if any edge fails, then register the manifest row on control (`POST /api/admin/register-release`, run from inside a box ssh session against the admin listener's loopback address — see "Admin API listener" below; NOT reachable over WireGuard at all since the 2026-09-22 split) |
 | `POST /api/backup/now` | bearer | `systemctl start mlc-backup.service` on control + list `/var/lib/mlc/backups` |
@@ -262,7 +262,11 @@ and each script's own header comment for the full contract.
 
 - `key-push` (`POST /api/unlock`) is the SQLCipher boot design: key pushed to
   tmpfs `/run/mlc/dbkey` on control, the app reads and unlinks its own copy
-  at boot, the key never touches box disk.
+  at boot, the key never touches box disk. The same unlock delivers the
+  dig2pay merchant API key and webhook secret to `/run/mlc/dig2pay-api-key`
+  and `/run/mlc/dig2pay-webhook-secret`; `server.env` names them through
+  `DIG2PAY_API_KEY_FILE` / `DIG2PAY_WEBHOOK_SECRET_FILES`. Step lines and
+  errors carry file names and byte counts only, never content.
 - Backups are PULL-model: the box holds no outbound credentials; compromise
   of the box cannot destroy or poison the backup archive.
 - Public traffic does **not** run through a Cloudflare Tunnel on this

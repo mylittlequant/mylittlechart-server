@@ -39,11 +39,14 @@ DISCORD_CLIENT_SECRET=
 TELEGRAM_BOT_TOKEN=
 
 # dig2pay billing (control box only). Empty = checkout and plan changes are
-# disabled (503). Production value once the wg-mlc tunnel is up:
-#   DIG2PAY_BASE_URL=http://10.83.1.1:37300
+# disabled (503). Production value (a public API; no tunnel):
+#   DIG2PAY_BASE_URL=https://pay.zen-geldmaschine.net/api/v1
 DIG2PAY_BASE_URL=
 # Files (never the values) holding the merchant bearer key and the webhook
 # HMAC secret(s); several secret files, comma-separated, during a rotation.
+# Production paths, delivered to the box tmpfs by the opsd unlock:
+#   DIG2PAY_API_KEY_FILE=/run/mlc/dig2pay-api-key
+#   DIG2PAY_WEBHOOK_SECRET_FILES=/run/mlc/dig2pay-webhook-secret
 DIG2PAY_API_KEY_FILE=
 DIG2PAY_WEBHOOK_SECRET_FILES=
 # Host name(s) of the onion vhost — the Tor plan variants are offered only to

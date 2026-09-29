@@ -41,7 +41,8 @@ enum Cmd {
     Daemon,
     /// systemd states, app health, disk/mem, uptime of the box.
     Status,
-    /// Deliver dbkey + server.env to box tmpfs, start mlc-server, verify.
+    /// Deliver dbkey + server.env + dig2pay secrets to box tmpfs, start
+    /// mlc-server, verify.
     Unlock,
     /// Restart a whitelisted unit: mlc-server | nginx | nftables | fail2ban
     /// (the list of record is `state::UNIT_WHITELIST`).

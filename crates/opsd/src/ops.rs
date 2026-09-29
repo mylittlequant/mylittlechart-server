@@ -5,6 +5,7 @@
 //! through reqwest. (`curl` appears ONLY inside remote shell strings executed
 //! on the box, where it probes the loopback-only app port.)
 
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -221,9 +222,110 @@ fn parse_box_state(stdout: &str) -> BoxState {
     }
 }
 
-/// boot-unlock: push the canonical SQLCipher key + server.env into the box
-/// tmpfs, start mlc-server, verify loopback health. The box keeps no copy of
-/// either secret on disk (`/run` is tmpfs; modes 0600 root).
+/// Mode of every secret file the unlock places in the box tmpfs. The SFTP
+/// upload runs as the ssh user (root), so the owner is root. The `mlc-server`
+/// unit sets no `User=` (`docs/mlc/audits/grok-share-arc-server-audit-2026-09-29.md`
+/// section 2.2), so the process runs as root and reads `dbkey` and the dig2pay
+/// files the same way. Should the unit ever drop to a service user, `dbkey`
+/// and these files need the same chown at once.
+const SECRET_FILE_MODE: u32 = 0o600;
+
+/// One optional secret the unlock delivers after `server.env`.
+struct OptionalSecret {
+    /// Name used in step lines.
+    name: &'static str,
+    /// File name under `BoxConfig::canon_dig2pay_dir`.
+    local_file: &'static str,
+    /// Destination in the box tmpfs; `server.env` points
+    /// `DIG2PAY_API_KEY_FILE` / `DIG2PAY_WEBHOOK_SECRET_FILES` at these.
+    remote_path: &'static str,
+}
+
+const DIG2PAY_SECRETS: [OptionalSecret; 2] = [
+    OptionalSecret {
+        name: "dig2pay-api-key",
+        local_file: "api-key",
+        remote_path: "/run/mlc/dig2pay-api-key",
+    },
+    OptionalSecret {
+        name: "dig2pay-webhook-secret",
+        local_file: "webhook-secret",
+        remote_path: "/run/mlc/dig2pay-webhook-secret",
+    },
+];
+
+/// What reading one optional local secret produced.
+#[derive(Debug, PartialEq, Eq)]
+enum OptionalSecretLoad {
+    /// Trimmed content, ready to upload.
+    Ready(Vec<u8>),
+    /// Nothing to upload; the reason is a fixed phrase, never file content.
+    Skipped(&'static str),
+}
+
+/// Read one optional secret like the dbkey: whole file, surrounding
+/// whitespace (including a CRLF) trimmed. A missing, unreadable, non-UTF-8 or
+/// blank file is a skip, never an error.
+fn load_optional_secret(path: &Path) -> OptionalSecretLoad {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                OptionalSecretLoad::Skipped("file is empty")
+            } else {
+                OptionalSecretLoad::Ready(trimmed.as_bytes().to_vec())
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            OptionalSecretLoad::Skipped("not present locally")
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            OptionalSecretLoad::Skipped("file is not valid UTF-8")
+        }
+        Err(_) => OptionalSecretLoad::Skipped("file is unreadable"),
+    }
+}
+
+fn skipped_step(secret: &OptionalSecret, reason: &str) -> String {
+    format!("{} skipped: {reason}", secret.name)
+}
+
+fn delivered_step(secret: &OptionalSecret, bytes: usize) -> String {
+    format!(
+        "{} delivered to {} ({bytes} bytes, 0600 root)",
+        secret.name, secret.remote_path
+    )
+}
+
+/// Deliver the optional dig2pay secrets found under `dir`. Nothing here can
+/// fail the unlock: an absent file is skipped and a failed upload is recorded
+/// as a step, because the billing adapter degrades to 503 without its
+/// secrets while the SQLCipher key is what the boot actually depends on.
+/// Step lines carry names, paths and byte counts only, never content.
+async fn deliver_optional_secrets(session: &SshSession, dir: &Path, steps: &mut Vec<String>) {
+    for secret in &DIG2PAY_SECRETS {
+        match load_optional_secret(&dir.join(secret.local_file)) {
+            OptionalSecretLoad::Skipped(reason) => steps.push(skipped_step(secret, reason)),
+            OptionalSecretLoad::Ready(bytes) => {
+                match session
+                    .upload(&bytes, secret.remote_path, SECRET_FILE_MODE)
+                    .await
+                {
+                    Ok(()) => steps.push(delivered_step(secret, bytes.len())),
+                    Err(e) => steps.push(format!(
+                        "{} NOT delivered: upload failed ({e}); unlock continues",
+                        secret.name
+                    )),
+                }
+            }
+        }
+    }
+}
+
+/// boot-unlock: push the canonical SQLCipher key + server.env (and, when
+/// present, the dig2pay API key + webhook secret) into the box tmpfs, start
+/// mlc-server, verify loopback health. The box keeps no copy of any of these
+/// secrets on disk (`/run` is tmpfs; modes 0600 root).
 pub async fn unlock(state: &Arc<OpsdState>) -> Result<UnlockOutcome, OpsdError> {
     let mut steps: Vec<String> = Vec::new();
 
@@ -249,13 +351,14 @@ pub async fn unlock(state: &Arc<OpsdState>) -> Result<UnlockOutcome, OpsdError> 
     steps.push("tmpfs dir /run/mlc ready".into());
 
     session
-        .upload(dbkey.trim().as_bytes(), "/run/mlc/dbkey", 0o600)
+        .upload(dbkey.trim().as_bytes(), "/run/mlc/dbkey", SECRET_FILE_MODE)
         .await?;
     steps.push("dbkey delivered (0600 root)".into());
     session
-        .upload(&server_env, "/run/mlc/server.env", 0o600)
+        .upload(&server_env, "/run/mlc/server.env", SECRET_FILE_MODE)
         .await?;
     steps.push("server.env delivered (0600 root)".into());
+    deliver_optional_secrets(&session, &state.box_cfg.canon_dig2pay_dir, &mut steps).await;
 
     let out = session.exec("systemctl start mlc-server").await?;
     if out.exit_code != Some(0) {
@@ -408,5 +511,79 @@ mod tests {
         assert!(check_unit("mlc-server").is_ok());
         assert!(check_unit("mlc-server; rm -rf /").is_err());
         assert!(check_unit("$(id)").is_err());
+    }
+
+    #[test]
+    fn dig2pay_secrets_map_local_files_to_the_paths_the_billing_adapter_reads() {
+        let map: Vec<(&str, &str)> = DIG2PAY_SECRETS
+            .iter()
+            .map(|s| (s.local_file, s.remote_path))
+            .collect();
+        assert_eq!(
+            map,
+            vec![
+                ("api-key", "/run/mlc/dig2pay-api-key"),
+                ("webhook-secret", "/run/mlc/dig2pay-webhook-secret"),
+            ]
+        );
+        assert_eq!(SECRET_FILE_MODE, 0o600);
+    }
+
+    fn secret_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("opsd-secret-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    #[test]
+    fn optional_secret_is_trimmed_like_the_dbkey() {
+        let dir = secret_test_dir("trim");
+        let path = dir.join("api-key");
+        std::fs::write(&path, "  tok-123\r\n").expect("write test file");
+        assert_eq!(
+            load_optional_secret(&path),
+            OptionalSecretLoad::Ready(b"tok-123".to_vec())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn absent_empty_and_non_utf8_secrets_are_skipped_not_errors() {
+        let dir = secret_test_dir("skip");
+        assert_eq!(
+            load_optional_secret(&dir.join("missing")),
+            OptionalSecretLoad::Skipped("not present locally")
+        );
+        let blank = dir.join("blank");
+        std::fs::write(&blank, "\r\n \n").expect("write test file");
+        assert_eq!(
+            load_optional_secret(&blank),
+            OptionalSecretLoad::Skipped("file is empty")
+        );
+        let binary = dir.join("binary");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).expect("write test file");
+        assert_eq!(
+            load_optional_secret(&binary),
+            OptionalSecretLoad::Skipped("file is not valid UTF-8")
+        );
+        // A directory where the file should be is unreadable, not fatal.
+        assert_eq!(
+            load_optional_secret(&dir),
+            OptionalSecretLoad::Skipped("file is unreadable")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_lines_carry_names_paths_and_counts_only() {
+        let secret = &DIG2PAY_SECRETS[0];
+        assert_eq!(
+            delivered_step(secret, 7),
+            "dig2pay-api-key delivered to /run/mlc/dig2pay-api-key (7 bytes, 0600 root)"
+        );
+        assert_eq!(
+            skipped_step(secret, "not present locally"),
+            "dig2pay-api-key skipped: not present locally"
+        );
     }
 }
