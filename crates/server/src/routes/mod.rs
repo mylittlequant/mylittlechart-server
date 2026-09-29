@@ -176,6 +176,9 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
             get(share::get_share_ops).post(share::post_share_ops),
         )
         .route("/share/{token}/stream-open", get(share::stream_open))
+        // The live hub socket (ticket from stream-open above). Its own
+        // first segment, so it never meets `/share/{token}`.
+        .route("/share-live/{token}", get(crate::share_live::share_live_socket))
         // Per-link preview image + OG injection (§9) — owner-only upload,
         // public serve (same 404 opacity discipline as /share/{token}/png).
         .route(

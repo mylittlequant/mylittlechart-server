@@ -95,8 +95,9 @@ mod build_attest;
 mod db;
 mod dm_db;
 mod entitlements;
-// `live` lives in the library target (`lib.rs`), not here — see that
-// file's doc comment for why.
+// `live` and `share_hub` live in the library target (`lib.rs`), not here —
+// see that file's doc comment for why. `share_live` below is the glue that
+// binds the hub to this crate's accounts and share rights.
 mod models;
 mod nick_policy;
 mod notify;
@@ -105,6 +106,7 @@ mod pathutil;
 mod ratelimit;
 mod rooms_codec;
 mod routes;
+mod share_live;
 mod social_db;
 mod state;
 mod syncstore;
@@ -801,6 +803,12 @@ async fn main() {
         telemetry_daily_cap,
         alert_daemon_stats,
     ));
+
+    // Live share hub background work (shutdown close, periodic rights
+    // re-check) — control role only: the hub's rights live in the database.
+    if role == state::ServerRole::Control {
+        share_live::spawn_hub_tasks(app_state.clone(), shutdown_tx.subscribe());
+    }
 
     // Start the Telegram login bot (background task) — control role only.
     // The bot calls db::confirm_tg_login_token synchronously via the closure,

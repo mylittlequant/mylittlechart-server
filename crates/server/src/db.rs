@@ -1,5 +1,6 @@
 //! SQLite database initialization and query helpers.
 
+use mylittlechart_server::share_hub::Access;
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
 /// Default path to the SQLCipher key file (tmpfs, pushed by the operator).
@@ -601,6 +602,9 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         "ALTER TABLE share_links ADD COLUMN live INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // UNUSED since the live hub (2026-09-29): every room lives in this process,
+    // so no edge owns a token. Nothing reads or writes the column; it stays
+    // only so existing databases and this ALTER keep matching.
     let _ = conn.execute(
         "ALTER TABLE share_links ADD COLUMN live_edge TEXT NOT NULL DEFAULT ''",
         [],
@@ -4094,25 +4098,26 @@ pub fn social_act(conn: &Connection, caller: i64, nick: &str, action: &str, now:
     }
 }
 
-/// Edge that owns this token's live socket. Empty until the first publisher claims it.
-pub fn share_live_edge(conn: &Connection, token: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT IFNULL(live_edge, '') FROM share_links WHERE token = ?1",
-        params![token],
-        |row| row.get(0),
-    )
-    .optional()
-}
-
-/// Sets `live_edge` only while it is still empty. Returns the edge that owns the token.
-pub fn claim_share_live_edge(conn: &Connection, token: &str, edge: &str) -> Result<Option<String>> {
-    if edge == "utah" || edge == "ams" {
-        conn.execute(
-            "UPDATE share_links SET live_edge = ?1 WHERE token = ?2 AND IFNULL(live_edge, '') = ''",
-            params![edge, token],
-        )?;
+/// What `caller` (`None` = signed out) may do on live share `token` right
+/// now: the one rule behind `stream-open`, the socket upgrade and every
+/// revocation re-check of the live hub. An unknown, revoked, expired or
+/// non-live token is [`Access::Gone`]; a share the caller has no view right on
+/// is [`Access::Locked`]; otherwise `publish` is the owner or an `edit` grant.
+pub fn share_live_access(conn: &Connection, token: &str, caller: Option<i64>) -> Result<Access> {
+    let Some(row) = get_share_link(conn, token)? else {
+        return Ok(Access::Gone);
+    };
+    if row.kind != "live" {
+        return Ok(Access::Gone);
     }
-    share_live_edge(conn, token)
+    if effective_share_tier(conn, &row, caller)?.is_none() {
+        return Ok(Access::Locked);
+    }
+    let publish = match caller {
+        Some(user_id) => share_caller_can_edit(conn, &row, user_id)?,
+        None => false,
+    };
+    Ok(Access::Granted { publish })
 }
 
 /// Owner sets whether this token is a live channel or a cadence link.
@@ -4124,10 +4129,11 @@ pub fn set_share_live(conn: &Connection, token: &str, owner_user_id: i64, live: 
     Ok(n > 0)
 }
 
-/// Revoke the oldest active unpinned share of `kind` for this account.
-/// Returns false when every active share of that kind is pinned, so the
-/// caller can still refuse creation instead of burning a pinned link.
-pub fn burn_oldest_unpinned_share(conn: &Connection, user_id: i64, kind: &str) -> Result<bool> {
+/// Revoke the oldest active unpinned share of `kind` for this account and
+/// return its token. Returns `None` when every active share of that kind is
+/// pinned, so the caller can still refuse creation instead of burning a
+/// pinned link, and can close the live sockets of the token that did burn.
+pub fn burn_oldest_unpinned_share(conn: &Connection, user_id: i64, kind: &str) -> Result<Option<String>> {
     let now = chrono::Utc::now().to_rfc3339();
     let token: Option<String> = conn
         .query_row(
@@ -4139,9 +4145,9 @@ pub fn burn_oldest_unpinned_share(conn: &Connection, user_id: i64, kind: &str) -
         )
         .optional()?;
     let Some(token) = token else {
-        return Ok(false);
+        return Ok(None);
     };
-    revoke_share(conn, user_id, &token)
+    Ok(revoke_share(conn, user_id, &token)?.then_some(token))
 }
 
 /// Revoke one share link, owner-only: the `user_id` in the WHERE clause is
@@ -4352,6 +4358,19 @@ pub fn upsert_object_grant(
         params![object_kind, object_id, owner_user_id, grantee_user_id, right, expires_at, now],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// The share token a chart grant sits on, owner-scoped like
+/// [`revoke_object_grant`]. Read BEFORE the revoke so the live hub knows which
+/// room to re-check once the row is gone.
+pub fn chart_grant_token(conn: &Connection, grant_id: i64, owner_user_id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT object_id FROM object_grants
+         WHERE id = ?1 AND owner_user_id = ?2 AND object_kind = 'chart'",
+        params![grant_id, owner_user_id],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Revoke one grant, owner-only — the `owner_user_id` in the WHERE clause is
@@ -7668,6 +7687,7 @@ pub fn forum_author_label(conn: &Connection, user_id: i64) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{Connection, db_key_hex};
+    use mylittlechart_server::share_hub::Access;
 
     #[test]
     fn db_key_hex_parses_hex_raw_and_whitespace() {
@@ -10273,6 +10293,159 @@ mod
 
         let other = insert_share_user(&conn, "other", Some("pub-other"));
         assert_eq!(super::effective_share_tier(&conn, &row, Some(other)).expect("tier"), None);
+    }
+
+    // ---- Live hub access — the one rule behind stream-open, the socket
+    // upgrade and every revocation re-check ----
+
+    #[test]
+    fn share_live_access_owner_publishes_and_a_stranger_is_locked_out_of_a_private_link() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let stranger = insert_share_user(&conn, "stranger", Some("pub-stranger"));
+        let row = make_share(&conn, owner, "view", false, "private");
+
+        assert_eq!(
+            super::share_live_access(&conn, &row.token, Some(owner)).expect("access"),
+            Access::Granted { publish: true }
+        );
+        assert_eq!(super::share_live_access(&conn, &row.token, Some(stranger)).expect("access"), Access::Locked);
+        assert_eq!(super::share_live_access(&conn, &row.token, None).expect("access"), Access::Locked);
+    }
+
+    #[test]
+    fn share_live_access_view_grant_views_and_edit_grant_publishes() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let viewer = insert_share_user(&conn, "viewer", Some("pub-viewer"));
+        let editor = insert_share_user(&conn, "editor", Some("pub-editor"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        super::upsert_share_grant(&conn, &row.token, owner, Some(viewer), None, super::ShareTier::Clone, None, &now)
+            .expect("view grant");
+        super::upsert_share_edit_grant(&conn, &row.token, owner, Some(editor), None, None, &now).expect("edit grant");
+
+        assert_eq!(
+            super::share_live_access(&conn, &row.token, Some(viewer)).expect("access"),
+            Access::Granted { publish: false }
+        );
+        assert_eq!(
+            super::share_live_access(&conn, &row.token, Some(editor)).expect("access"),
+            Access::Granted { publish: true }
+        );
+    }
+
+    #[test]
+    fn share_live_access_a_public_link_lets_a_signed_out_viewer_in_without_publishing() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let row = make_share(&conn, owner, "view", false, "public");
+
+        assert_eq!(
+            super::share_live_access(&conn, &row.token, None).expect("access"),
+            Access::Granted { publish: false }
+        );
+    }
+
+    #[test]
+    fn share_live_access_follows_a_revoked_grant_a_private_switch_and_a_revoked_share() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let editor = insert_share_user(&conn, "editor", Some("pub-editor"));
+        let row = make_share(&conn, owner, "view", false, "public");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let grant = super::upsert_share_edit_grant(&conn, &row.token, owner, Some(editor), None, None, &now)
+            .expect("edit grant");
+        assert_eq!(
+            super::share_live_access(&conn, &row.token, Some(editor)).expect("access"),
+            Access::Granted { publish: true }
+        );
+
+        // Grant revoked: still a viewer of the public link, no longer a publisher.
+        assert!(super::revoke_object_grant(&conn, grant, owner).expect("revoke grant"));
+        assert_eq!(
+            super::share_live_access(&conn, &row.token, Some(editor)).expect("access"),
+            Access::Granted { publish: false }
+        );
+
+        // Visibility switched to private: the signed-out viewer and the ex-editor lose the view right.
+        assert!(super::update_share_link_policy(
+            &conn, &row.token, owner, None, Some("private"), None, None, None, None
+        )
+        .expect("policy"));
+        assert_eq!(super::share_live_access(&conn, &row.token, None).expect("access"), Access::Locked);
+        assert_eq!(super::share_live_access(&conn, &row.token, Some(editor)).expect("access"), Access::Locked);
+        assert_eq!(
+            super::share_live_access(&conn, &row.token, Some(owner)).expect("access"),
+            Access::Granted { publish: true }
+        );
+
+        // Share revoked: gone for everybody, the owner included.
+        assert!(super::revoke_share(&conn, owner, &row.token).expect("revoke share"));
+        assert_eq!(super::share_live_access(&conn, &row.token, Some(owner)).expect("access"), Access::Gone);
+        assert_eq!(super::share_live_access(&conn, &row.token, None).expect("access"), Access::Gone);
+    }
+
+    #[test]
+    fn share_live_access_an_expired_edit_grant_no_longer_publishes() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let editor = insert_share_user(&conn, "editor", Some("pub-editor"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        super::upsert_share_edit_grant(&conn, &row.token, owner, Some(editor), None, Some(&past_ts()), &now)
+            .expect("edit grant");
+
+        assert_eq!(super::share_live_access(&conn, &row.token, Some(editor)).expect("access"), Access::Locked);
+    }
+
+    #[test]
+    fn share_live_access_unknown_and_screenshot_tokens_are_gone() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let shot = super::create_share_link(
+            &conn, owner, "screenshot", "s", "", 10, &now, &future_ts(), false, "view", "[]", "public", None,
+        )
+        .expect("screenshot");
+
+        assert_eq!(super::share_live_access(&conn, "no-such-token", Some(owner)).expect("access"), Access::Gone);
+        assert_eq!(super::share_live_access(&conn, &shot, Some(owner)).expect("access"), Access::Gone);
+    }
+
+    #[test]
+    fn chart_grant_token_names_the_share_a_grant_sits_on_for_its_owner_only() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let grantee = insert_share_user(&conn, "grantee", Some("pub-grantee"));
+        let row = make_share(&conn, owner, "view", false, "private");
+        let now = chrono::Utc::now().to_rfc3339();
+        let grant = super::upsert_share_edit_grant(&conn, &row.token, owner, Some(grantee), None, None, &now)
+            .expect("edit grant");
+
+        assert_eq!(super::chart_grant_token(&conn, grant, owner).expect("token"), Some(row.token));
+        assert_eq!(super::chart_grant_token(&conn, grant, grantee).expect("token"), None);
+        assert_eq!(super::chart_grant_token(&conn, grant + 100, owner).expect("token"), None);
+    }
+
+    #[test]
+    fn burning_the_oldest_share_names_the_token_it_revoked() {
+        let conn = share_rights_test_conn();
+        let owner = insert_share_user(&conn, "owner", Some("pub-owner"));
+        let older = super::create_share_link(
+            &conn, owner, "live", "old", "{}", 0, &past_ts(), &future_ts(), false, "view", "[]", "public", None,
+        )
+        .expect("older share");
+        let _newer = make_share(&conn, owner, "view", false, "public");
+
+        assert_eq!(
+            super::burn_oldest_unpinned_share(&conn, owner, "live").expect("burn"),
+            Some(older.clone())
+        );
+        assert_eq!(super::share_live_access(&conn, &older, Some(owner)).expect("access"), Access::Gone);
     }
 
     #[test]
