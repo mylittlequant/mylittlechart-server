@@ -1596,9 +1596,10 @@ fn redact_content_per_v11(event_type: &str, content: &str) -> Result<String, Mat
 }
 
 /// Redact `target_event_id`: store the `m.room.redaction` event itself
-/// (`redacts = target_event_id`), set the target's `redacted_by`, and
-/// strip the target's `content` per [`redact_content_per_v11`]. All inside
-/// one transaction.
+/// (`redacts = target_event_id`, and `content.redacts = target_event_id`,
+/// the room-version-11 location clients read), set the target's
+/// `redacted_by`, and strip the target's `content` per
+/// [`redact_content_per_v11`]. All inside one transaction.
 ///
 /// Refuses with:
 /// - [`MatrixStoreError::UnknownEventId`] if `target_event_id` does not
@@ -1639,10 +1640,13 @@ fn redact_event_in_tx(
     }
 
     let stream_id = next_stream_id(tx)?;
-    let redaction_content = match reason {
-        Some(r) => serde_json::json!({ "reason": r }).to_string(),
-        None => "{}".to_string(),
-    };
+    // Room version 11 carries the redaction's target in `content.redacts`
+    // (the `redacts` column keeps serving the older top-level shape).
+    let mut redaction_content = serde_json::json!({ "redacts": target_event_id });
+    if let Some(r) = reason {
+        redaction_content["reason"] = serde_json::Value::String(r.to_string());
+    }
+    let redaction_content = redaction_content.to_string();
     tx.execute(
         "INSERT INTO events (stream_id, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts, txn_id, redacts)
          VALUES (?1, ?2, ?3, ?4, 'm.room.redaction', NULL, ?5, ?6, NULL, ?7)",
@@ -2915,6 +2919,31 @@ mod tests {
             assert_eq!(got, expected, "event_type={event_type}");
             assert_eq!(target.redacted_by.as_deref(), Some("$redaction"), "event_type={event_type}");
         }
+    }
+
+    #[test]
+    fn redaction_content_carries_the_target_as_redacts_for_every_write_path() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        insert_timeline_event(&mut conn, "$t1", ROOM, 1, "m.room.message", "{}", 1000, None).expect("insert t1");
+        insert_timeline_event(&mut conn, "$t2", ROOM, 1, "m.room.message", "{}", 1100, None).expect("insert t2");
+        insert_timeline_event(&mut conn, "$t3", ROOM, 1, "m.room.message", "{}", 1200, None).expect("insert t3");
+
+        let plain = redact_event(&mut conn, ROOM, "$t1", "$r1", 1, None, 2000).expect("plain redact");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&plain.content).expect("json"), serde_json::json!({ "redacts": "$t1" }));
+        assert_eq!(plain.redacts.as_deref(), Some("$t1"));
+
+        let marked = redact_event_marked(&mut conn, ROOM, "$t2", "$r2", 1, Some("spam"), &serde_json::json!({ "org.mylittlechart.site_moderation": true }), 2100)
+            .expect("marked redact");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&marked.content).expect("json"),
+            serde_json::json!({ "redacts": "$t2", "reason": "spam", "org.mylittlechart.site_moderation": true })
+        );
+
+        let deduped = redact_event_deduped(&mut conn, "DEV1", "txn-1", ROOM, "$t3", "$r3", 1, None, 2200, T0).expect("deduped redact");
+        let DedupedWrite::New(event) = deduped else { panic!("first write is new") };
+        let stored = get_event(&conn, &event.event_id).expect("get").expect("row exists");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&stored.content).expect("json")["redacts"], "$t3");
     }
 
     #[test]

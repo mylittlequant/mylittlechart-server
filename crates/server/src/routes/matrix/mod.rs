@@ -259,7 +259,10 @@ impl From<serde_json::Error> for MatrixError {
 /// Format one stored [`mylittlechart_server::matrix_store::MatrixEvent`] the
 /// way every `/_matrix/client/v3/*` response must shape it: `event_id`,
 /// `type`, `sender` (mxid), `origin_server_ts`, `content`, `room_id`,
-/// `state_key` (state events only), and `unsigned.age`. `unsigned` also
+/// `state_key` (state events only), a top-level `redacts` (redaction events
+/// only — the older-room-version shape; room version 11 clients read
+/// `content.redacts`, which the stored content carries), and
+/// `unsigned.age`. `unsigned` also
 /// carries:
 /// - `redacted_because` — the formatted redaction event, when this event has
 ///   been redacted (recurses one level; a redaction event redacting another
@@ -316,6 +319,9 @@ pub fn client_event_json(
     });
     if let Some(state_key) = &event.state_key {
         value["state_key"] = serde_json::Value::String(state_key.clone());
+    }
+    if let Some(redacts) = &event.redacts {
+        value["redacts"] = serde_json::Value::String(redacts.clone());
     }
     Ok(value)
 }

@@ -840,6 +840,32 @@ mod tests {
         assert_eq!(err.errcode, "M_FORBIDDEN", "redacting someone else's event requires PowerCheck(redact)");
     }
 
+    // ---- P16 S-b: a redaction event names its target ----
+
+    #[test]
+    fn redaction_event_names_its_target_in_content_and_at_top_level() {
+        let mut conn = test_conn();
+        make_room(&conn, "!r:mylittlechart.org", matrix_store::RoomKind::Group, 1);
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000065", T0).expect("alice");
+        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
+        matrix_store::insert_timeline_event(&mut conn, "$target", "!r:mylittlechart.org", 1, "m.room.encrypted", "{}", 2000, None).expect("alice sends");
+        apply_redact(&mut conn, "!r:mylittlechart.org", 1, &alice, "DEV1", "txn-red", "$target", "$red1", Some("oops"), T0, 3000).expect("redact");
+
+        let latest = matrix_store::max_stream_id(&conn).expect("max stream id");
+        let page = paginate_messages(&conn, "!r:mylittlechart.org", matrix_store::HistoryWindow::All, latest + 1, None, Direction::Backward, 10, &EventFilter::default())
+            .expect("page");
+        let redaction = page.chunk.iter().find(|e| e.event_type == "m.room.redaction").expect("the redaction is in the timeline");
+        let json = client_event_json(&conn, redaction, None).expect("format redaction");
+        assert_eq!(json["content"]["redacts"], "$target", "room v11 carries the target in content.redacts");
+        assert_eq!(json["content"]["reason"], "oops", "the reason survives next to redacts");
+        assert_eq!(json["redacts"], "$target", "the older top-level shape is emitted too");
+
+        let target = matrix_store::get_event(&conn, "$target").expect("query").expect("target exists");
+        let target_json = client_event_json(&conn, &target, None).expect("format target");
+        assert_eq!(target_json["unsigned"]["redacted_because"]["content"]["redacts"], "$target");
+        assert!(target_json.get("redacts").is_none(), "only a redaction event carries a redacts field");
+    }
+
     #[test]
     fn send_is_idempotent_per_txn_id() {
         let mut conn = test_conn();
