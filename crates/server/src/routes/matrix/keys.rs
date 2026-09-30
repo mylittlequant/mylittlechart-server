@@ -142,6 +142,136 @@ pub(super) fn peers_sharing_a_room_with(conn: &Connection, user_id: i64) -> rusq
 }
 
 // ============================================================================
+// Device-list delta — the one `device_lists` computation `/sync` and
+// `/keys/changes` share
+// ============================================================================
+
+/// The `device_lists` object of a sync window: mxids, sorted and de-duplicated.
+pub(super) struct DeviceListDelta {
+    /// Visible users whose device list changed in the window, plus users who
+    /// NEWLY share an encrypted room with the caller (Matrix: "or who now
+    /// share an encrypted room with the client since the previous sync") —
+    /// the client has never queried their keys.
+    pub(super) changed: Vec<String>,
+    /// Users who no longer share any room with the caller: they left/were
+    /// banned from a shared room, or the caller itself left the room. A
+    /// user still sharing another room is never listed.
+    pub(super) left: Vec<String>,
+}
+
+/// Users who entered (`entered`) or stopped sharing (`departed`, before the
+/// still-shares-another-room exclusion the caller applies) an ENCRYPTED room
+/// with `caller_user_id` in `(from_exclusive, to_inclusive]`. Encrypted rooms
+/// only: the client tracks device lists for those alone, and a public
+/// unencrypted channel would otherwise list every one of its members whenever
+/// the caller joins it.
+///
+/// - A joined caller who was already joined at `from_exclusive`: every member
+///   whose membership went from not-in-room (`leave`/`ban`/none) to
+///   `join`/`invite` inside the window entered. (`invite` -> `join` is not
+///   a new share: an invitee was already visible to the joined caller.)
+/// - A joined caller who was NOT joined at `from_exclusive` (just joined, or
+///   accepted an invite): every current `join`/`invite` member entered.
+/// - A caller who left/was banned after being joined at `from_exclusive`:
+///   every current `join`/`invite` member departed.
+fn shared_room_transitions(conn: &Connection, caller_user_id: i64, from_exclusive: i64, to_inclusive: i64) -> rusqlite::Result<(Vec<i64>, Vec<i64>)> {
+    let mut entered = Vec::new();
+    let mut departed = Vec::new();
+    let Some(caller_mxid) = matrix_store::mxid_of(conn, caller_user_id)? else {
+        return Ok((entered, departed));
+    };
+    let in_room = |membership: Membership| matches!(membership, Membership::Join | Membership::Invite);
+
+    // Only a room with a member event inside the window can have changed
+    // who shares it with the caller (the caller's own join/leave is such an
+    // event too), so per-room work is limited to those — one query up front
+    // instead of a handful per room on every sync wake.
+    let caller_rooms = matrix_store::rooms_for_user(conn, caller_user_id, None)?;
+    for room_id in matrix_store::rooms_with_member_events_in_window(conn, &caller_rooms, from_exclusive, to_inclusive)? {
+        let Some(room) = matrix_store::get_room(conn, &room_id)? else { continue };
+        if !room.is_encrypted {
+            continue;
+        }
+        let Some(own) = matrix_store::room_member(conn, &room_id, caller_user_id)? else { continue };
+        let was_joined = matrix_store::membership_at(conn, &room_id, &caller_mxid, from_exclusive)? == Some(Membership::Join);
+
+        match own.membership {
+            Membership::Join if was_joined => {
+                for mxid in matrix_store::member_state_keys_in_window(conn, &room_id, from_exclusive, to_inclusive)? {
+                    let Some(user_id) = matrix_store::user_id_of(conn, &mxid)? else { continue };
+                    if user_id == caller_user_id {
+                        continue;
+                    }
+                    let now_in = matrix_store::room_member(conn, &room_id, user_id)?.is_some_and(|m| in_room(m.membership));
+                    let before_in = matrix_store::membership_at(conn, &room_id, &mxid, from_exclusive)?.is_some_and(in_room);
+                    if now_in && !before_in {
+                        entered.push(user_id);
+                    }
+                }
+            }
+            Membership::Join => {
+                for member in matrix_store::room_members(conn, &room_id, None)? {
+                    if member.user_id != caller_user_id && in_room(member.membership) {
+                        entered.push(member.user_id);
+                    }
+                }
+            }
+            Membership::Leave | Membership::Ban if was_joined => {
+                for member in matrix_store::room_members(conn, &room_id, None)? {
+                    if member.user_id != caller_user_id && in_room(member.membership) {
+                        departed.push(member.user_id);
+                    }
+                }
+            }
+            Membership::Leave | Membership::Ban | Membership::Invite => {}
+        }
+    }
+    Ok((entered, departed))
+}
+
+/// The mxids of `user_ids`, sorted and de-duplicated (a user with no mxid row
+/// cannot be named to a client and is dropped).
+fn sorted_mxids(conn: &Connection, user_ids: &HashSet<i64>) -> rusqlite::Result<Vec<String>> {
+    let mut mxids = Vec::with_capacity(user_ids.len());
+    for &user_id in user_ids {
+        if let Some(mxid) = matrix_store::mxid_of(conn, user_id)? {
+            mxids.push(mxid);
+        }
+    }
+    mxids.sort();
+    mxids.dedup();
+    Ok(mxids)
+}
+
+/// The `device_lists` delta of `(from_exclusive, to_inclusive]` as seen by
+/// `caller_user_id` — see [`DeviceListDelta`]. `/sync` (incremental) and
+/// `GET /keys/changes` both build their answer from this one function so the
+/// two can never disagree.
+pub(super) fn device_list_delta(conn: &Connection, caller_user_id: i64, from_exclusive: i64, to_inclusive: i64) -> rusqlite::Result<DeviceListDelta> {
+    let visible = peers_sharing_a_room_with(conn, caller_user_id)?;
+    let (entered, departed) = shared_room_transitions(conn, caller_user_id, from_exclusive, to_inclusive)?;
+
+    let mut changed_ids: HashSet<i64> = HashSet::new();
+    for user_id in matrix_keys_store::device_list_changes_between(conn, from_exclusive, to_inclusive)? {
+        if visible.contains(&user_id) {
+            changed_ids.insert(user_id);
+        }
+    }
+    changed_ids.extend(entered.into_iter().filter(|user_id| visible.contains(user_id)));
+
+    let caller_rooms = matrix_store::rooms_for_user(conn, caller_user_id, None)?;
+    let mut left_ids: HashSet<i64> = HashSet::new();
+    for user_id in matrix_store::user_ids_with_leave_transition_in_rooms(conn, &caller_rooms, from_exclusive, to_inclusive)? {
+        if !visible.contains(&user_id) {
+            left_ids.insert(user_id);
+        }
+    }
+    left_ids.extend(departed.into_iter().filter(|user_id| !visible.contains(user_id)));
+
+    Ok(DeviceListDelta { changed: sorted_mxids(conn, &changed_ids)?, left: sorted_mxids(conn, &left_ids)? })
+}
+
+// ============================================================================
 // POST /_matrix/client/v3/keys/upload
 // ============================================================================
 
@@ -463,39 +593,14 @@ struct KeysChangesQuery {
     to: Option<String>,
 }
 
-/// DB-only core for `GET /keys/changes` (plan §3.7 / P9 brief): device-list
-/// changes in `(from, to]` filtered to users the caller currently shares a
-/// joined room with (`changed`), plus every user whose `m.room.member`
-/// transitioned to `leave`/`ban` in a room the caller is/was part of AND who
-/// no longer shares ANY joined room with the caller today (`left`).
+/// DB-only core for `GET /keys/changes` (plan §3.7 / P9 brief): the same
+/// `device_lists` delta `/sync` reports for `(from, to]`
+/// ([`device_list_delta`]) — device-list changes and newly shared encrypted
+/// rooms among users the caller can see (`changed`), and users who no longer
+/// share any room with the caller (`left`).
 fn build_keys_changes_response(conn: &Connection, caller_user_id: i64, from_exclusive: i64, to_inclusive: i64) -> Result<serde_json::Value, MatrixError> {
-    let visible = peers_sharing_a_room_with(conn, caller_user_id)?;
-
-    let mut changed = Vec::new();
-    for user_id in matrix_keys_store::device_list_changes_between(conn, from_exclusive, to_inclusive)? {
-        if visible.contains(&user_id) {
-            if let Some(mxid) = matrix_store::mxid_of(conn, user_id)? {
-                changed.push(mxid);
-            }
-        }
-    }
-
-    let caller_rooms = matrix_store::rooms_for_user(conn, caller_user_id, None)?;
-    let mut left = Vec::new();
-    for user_id in matrix_store::user_ids_with_leave_transition_in_rooms(conn, &caller_rooms, from_exclusive, to_inclusive)? {
-        if !visible.contains(&user_id) {
-            if let Some(mxid) = matrix_store::mxid_of(conn, user_id)? {
-                left.push(mxid);
-            }
-        }
-    }
-
-    changed.sort();
-    changed.dedup();
-    left.sort();
-    left.dedup();
-
-    Ok(serde_json::json!({ "changed": changed, "left": left }))
+    let delta = device_list_delta(conn, caller_user_id, from_exclusive, to_inclusive)?;
+    Ok(serde_json::json!({ "changed": delta.changed, "left": delta.left }))
 }
 
 async fn keys_changes(State(state): State<Arc<AppState>>, headers: HeaderMap, Query(query): Query<KeysChangesQuery>) -> Result<impl IntoResponse, MatrixError> {
@@ -1576,6 +1681,140 @@ mod tests {
             expand_send_to_device_targets(&conn, 2, &messages_to(&alice)).expect("expand from an invited caller").is_empty(),
             "an invited caller cannot send to-device messages"
         );
+    }
+
+    // ---- P16 S-f: device_lists.changed / left for shared-room transitions ----
+
+    /// An ENCRYPTED group room whose only member is `creator` (joined).
+    fn make_encrypted_room(conn: &mut Connection, room_id: &str, creator: (i64, &str)) {
+        matrix_store::create_room(
+            conn,
+            room_id,
+            matrix_store::RoomKind::Group,
+            creator.0,
+            T0,
+            true,
+            matrix_store::JoinRule::Invite,
+            matrix_store::HistoryVisibility::Shared,
+            None,
+            None,
+        )
+        .expect("create encrypted room");
+        set_member(conn, room_id, &format!("$creator-{room_id}"), creator.0, creator.1, "join");
+    }
+
+    /// Write `member`'s membership state event, sent by `sender`.
+    fn set_member(conn: &mut Connection, room_id: &str, event_id: &str, sender: i64, member: &str, membership: &str) {
+        let content = serde_json::json!({ "membership": membership }).to_string();
+        matrix_store::apply_state_event(conn, event_id, room_id, sender, "m.room.member", member, &content, 1000, T0).expect("member event");
+    }
+
+    fn delta(conn: &Connection, caller: i64, from: i64) -> (Vec<String>, Vec<String>) {
+        let to = matrix_store::max_stream_id(conn).expect("max stream id");
+        let delta = device_list_delta(conn, caller, from, to).expect("delta");
+        (delta.changed, delta.left)
+    }
+
+    #[test]
+    fn device_list_delta_reports_a_user_who_newly_shares_an_encrypted_room_once() {
+        let mut conn = test_conn();
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000091", T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000091", T0).expect("bob");
+        let carol = matrix_store::ensure_matrix_user(&conn, 3, "carol0000000000000000000000091a", T0).expect("carol");
+        make_encrypted_room(&mut conn, ROOM, (1, &alice));
+
+        let since = matrix_store::max_stream_id(&conn).expect("since");
+        set_member(&mut conn, ROOM, "$bob-join", 2, &bob, "join");
+        set_member(&mut conn, ROOM, "$carol-invite", 1, &carol, "invite");
+        let (changed, left) = delta(&conn, 1, since);
+        let mut expected = vec![bob.clone(), carol.clone()];
+        expected.sort();
+        assert_eq!(changed, expected, "a joiner and an invitee both newly share the room");
+        assert!(left.is_empty());
+
+        // The next window has nothing new: the same users are not reported again.
+        let after = matrix_store::max_stream_id(&conn).expect("after");
+        assert_eq!(delta(&conn, 1, after), (Vec::new(), Vec::new()));
+
+        // invite -> join is not a new share, and neither is a profile update.
+        set_member(&mut conn, ROOM, "$carol-join", 3, &carol, "join");
+        matrix_store::apply_state_event(&mut conn, "$bob-name", ROOM, 2, "m.room.member", &bob, r#"{"membership":"join","displayname":"Bobby"}"#, 1100, T0).expect("bob renames");
+        assert_eq!(delta(&conn, 1, after), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn device_list_delta_reports_every_member_when_the_caller_newly_joins() {
+        let mut conn = test_conn();
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000092", T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000092", T0).expect("bob");
+        let carol = matrix_store::ensure_matrix_user(&conn, 3, "carol0000000000000000000000092a", T0).expect("carol");
+        make_encrypted_room(&mut conn, ROOM, (2, &bob));
+        set_member(&mut conn, ROOM, "$carol-join", 3, &carol, "join");
+
+        // Merely invited: alice shares nothing yet, so nothing is reported.
+        let before_invite = matrix_store::max_stream_id(&conn).expect("before invite");
+        set_member(&mut conn, ROOM, "$alice-invite", 2, &alice, "invite");
+        assert_eq!(delta(&conn, 1, before_invite), (Vec::new(), Vec::new()), "an invited caller newly shares nothing");
+
+        // Accepting the invite makes every member newly shared.
+        let before_join = matrix_store::max_stream_id(&conn).expect("before join");
+        set_member(&mut conn, ROOM, "$alice-join", 1, &alice, "join");
+        let (changed, left) = delta(&conn, 1, before_join);
+        let mut expected = vec![bob, carol];
+        expected.sort();
+        assert_eq!(changed, expected);
+        assert!(left.is_empty());
+    }
+
+    #[test]
+    fn device_list_delta_lists_peers_left_when_the_caller_leaves_their_last_shared_room() {
+        let mut conn = test_conn();
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000093", T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000093", T0).expect("bob");
+        let carol = matrix_store::ensure_matrix_user(&conn, 3, "carol0000000000000000000000093a", T0).expect("carol");
+        make_encrypted_room(&mut conn, ROOM, (1, &alice));
+        set_member(&mut conn, ROOM, "$bob-join", 2, &bob, "join");
+        set_member(&mut conn, ROOM, "$carol-join", 3, &carol, "join");
+        make_encrypted_room(&mut conn, "!second:mylittlechart.org", (1, &alice));
+        set_member(&mut conn, "!second:mylittlechart.org", "$carol-join-2", 3, &carol, "join");
+
+        let since = matrix_store::max_stream_id(&conn).expect("since");
+        set_member(&mut conn, ROOM, "$alice-leave", 1, &alice, "leave");
+        let (changed, left) = delta(&conn, 1, since);
+        assert_eq!(left, vec![bob.clone()], "bob shared only the room alice left; carol still shares the second room");
+        assert!(changed.is_empty());
+
+        // A peer leaving the last shared room is reported too (the existing rule).
+        let before_peer_leave = matrix_store::max_stream_id(&conn).expect("before peer leave");
+        set_member(&mut conn, "!second:mylittlechart.org", "$carol-leave", 3, &carol, "leave");
+        assert_eq!(delta(&conn, 1, before_peer_leave).1, vec![carol]);
+    }
+
+    #[test]
+    fn device_list_delta_does_not_list_members_of_an_unencrypted_room_as_newly_shared() {
+        let mut conn = test_conn();
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000094", T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000094", T0).expect("bob");
+        make_room_with_members(&mut conn, ROOM, &[(1, &alice)]);
+
+        let since = matrix_store::max_stream_id(&conn).expect("since");
+        set_member(&mut conn, ROOM, "$bob-join", 2, &bob, "join");
+        assert_eq!(delta(&conn, 1, since), (Vec::new(), Vec::new()), "an unencrypted room has no device lists to track");
+    }
+
+    #[test]
+    fn keys_changes_reports_a_newly_shared_peer() {
+        let mut conn = test_conn();
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000095", T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000095", T0).expect("bob");
+        make_encrypted_room(&mut conn, ROOM, (1, &alice));
+
+        let from = matrix_store::max_stream_id(&conn).expect("from");
+        set_member(&mut conn, ROOM, "$bob-join", 2, &bob, "join");
+        let to = matrix_store::max_stream_id(&conn).expect("to");
+        let response = build_keys_changes_response(&conn, 1, from, to).expect("build");
+        assert_eq!(response["changed"], serde_json::json!([bob]));
+        assert_eq!(response["left"], serde_json::json!([]));
     }
 
     // ---- plan §9 P9 test 1: keys_upload_then_query_round_trips_device_keys_verbatim ----

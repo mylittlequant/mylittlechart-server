@@ -1915,6 +1915,64 @@ pub fn rooms_changed_in_window(
     Ok(changed)
 }
 
+/// `mxid`'s membership in `room_id` as of `at_stream_id`: the latest
+/// `m.room.member` event for that state key with `stream_id <= at_stream_id`,
+/// or `None` when there was none yet (or its content carries no known
+/// membership). The point-in-time counterpart of [`room_member`] — the
+/// device-list delta needs "what was this user's membership BEFORE the sync
+/// window opened" to tell a newly shared room from a profile update.
+pub fn membership_at(conn: &Connection, room_id: &str, mxid: &str, at_stream_id: i64) -> rusqlite::Result<Option<Membership>> {
+    let content: Option<String> = conn
+        .query_row(
+            "SELECT content FROM events
+             WHERE room_id = ?1 AND event_type = 'm.room.member' AND state_key = ?2 AND stream_id <= ?3
+             ORDER BY stream_id DESC LIMIT 1",
+            params![room_id, mxid, at_stream_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(content
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.get("membership").and_then(|m| m.as_str()).and_then(Membership::from_wire_name)))
+}
+
+/// Every room in `room_ids` that has at least one `m.room.member` event with
+/// `stream_id` in `(from_exclusive, to_inclusive]` — ONE indexed query for
+/// the whole room set, so the device-list delta only does per-room work for
+/// rooms where a membership could have changed (an incremental `/sync` runs
+/// it on every wake; see [`rooms_changed_in_window`] for the same rule).
+/// Returns an empty vec without querying when `room_ids` is empty.
+pub fn rooms_with_member_events_in_window(conn: &Connection, room_ids: &[String], from_exclusive: i64, to_inclusive: i64) -> rusqlite::Result<Vec<String>> {
+    if room_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; room_ids.len()].join(",");
+    let sql = format!(
+        "SELECT DISTINCT room_id FROM events
+         WHERE event_type = 'm.room.member' AND stream_id > ? AND stream_id <= ? AND room_id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&from_exclusive, &to_inclusive];
+    for room_id in room_ids {
+        bound.push(room_id as &dyn rusqlite::ToSql);
+    }
+    let rows = stmt.query_map(bound.as_slice(), |row| row.get(0))?;
+    rows.collect()
+}
+
+/// Every mxid (state key) that has an `m.room.member` event in `room_id`
+/// with `stream_id` in `(from_exclusive, to_inclusive]` — the candidates
+/// whose membership MAY have changed inside the window; the caller compares
+/// [`room_member`] against [`membership_at`] to find the real transitions.
+pub fn member_state_keys_in_window(conn: &Connection, room_id: &str, from_exclusive: i64, to_inclusive: i64) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT state_key FROM events
+         WHERE room_id = ?1 AND event_type = 'm.room.member' AND state_key IS NOT NULL AND stream_id > ?2 AND stream_id <= ?3",
+    )?;
+    let rows = stmt.query_map(params![room_id, from_exclusive, to_inclusive], |row| row.get(0))?;
+    rows.collect()
+}
+
 /// Every `user_id` whose `m.room.member` state transitioned to `leave` or
 /// `ban` in one of `room_ids`, with `stream_id` in `(from_exclusive,
 /// to_inclusive]` — `routes::matrix::keys`'s `GET /keys/changes`
@@ -3678,6 +3736,39 @@ mod tests {
 
         let empty = user_ids_with_leave_transition_in_rooms(&conn, &[], 0, i64::MAX).expect("empty room set");
         assert!(empty.is_empty());
+    }
+
+    // ---- P16 S-f: point-in-time membership and the window's member candidates ----
+
+    #[test]
+    fn membership_at_reads_the_state_as_of_a_stream_position() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        let alice = ensure_matrix_user(&conn, 2, "alice00000000000000000000000081", T0).expect("alice");
+        let bob = ensure_matrix_user(&conn, 3, "bob0000000000000000000000000081", T0).expect("bob");
+
+        let alice_joined = apply_state_event(&mut conn, "$a1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins").stream_id;
+        let bob_invited = apply_state_event(&mut conn, "$b1", ROOM, 1, "m.room.member", &bob, r#"{"membership":"invite"}"#, 1100, T0).expect("bob invited").stream_id;
+        let bob_joined = apply_state_event(&mut conn, "$b2", ROOM, 3, "m.room.member", &bob, r#"{"membership":"join","displayname":"Bob"}"#, 1200, T0).expect("bob joins").stream_id;
+
+        assert_eq!(membership_at(&conn, ROOM, &bob, alice_joined).expect("query"), None, "bob had no member event yet");
+        assert_eq!(membership_at(&conn, ROOM, &bob, bob_invited).expect("query"), Some(Membership::Invite));
+        assert_eq!(membership_at(&conn, ROOM, &bob, bob_joined).expect("query"), Some(Membership::Join));
+        assert_eq!(membership_at(&conn, ROOM, &alice, bob_invited).expect("query"), Some(Membership::Join));
+
+        let mut window = member_state_keys_in_window(&conn, ROOM, bob_invited, bob_joined).expect("window");
+        window.sort();
+        assert_eq!(window, vec![bob.clone()], "only bob has a member event after `bob_invited`");
+        let mut all = member_state_keys_in_window(&conn, ROOM, 0, bob_joined).expect("whole history");
+        all.sort();
+        let mut expected = vec![alice, bob];
+        expected.sort();
+        assert_eq!(all, expected);
+
+        let rooms = [ROOM.to_string(), "!other:mylittlechart.org".to_string()];
+        assert_eq!(rooms_with_member_events_in_window(&conn, &rooms, bob_invited, bob_joined).expect("rooms"), vec![ROOM.to_string()]);
+        assert!(rooms_with_member_events_in_window(&conn, &rooms, bob_joined, i64::MAX).expect("rooms after the last member event").is_empty());
+        assert!(rooms_with_member_events_in_window(&conn, &[], 0, i64::MAX).expect("empty room set").is_empty());
     }
 
     // ---- P16 S-d: adopting a native DM room for a legacy conversation ----

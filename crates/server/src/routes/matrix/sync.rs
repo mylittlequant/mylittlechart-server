@@ -702,32 +702,16 @@ fn build_sync_response(
     // Device lists: omitted entirely on an initial/`full_state` sync (a
     // fresh client queries `/keys/query` for every room member outright —
     // an incremental DELTA has no meaning against no prior state).
+    //
+    // Incrementally, `changed` also carries users who newly share an
+    // encrypted room with the caller (a join/invite since `since`), and `left`
+    // users who no longer share any room with it — see
+    // [`super::keys::device_list_delta`], which `/keys/changes` shares.
     let (device_lists_changed, device_lists_left) = if is_initial {
         (Vec::<String>::new(), Vec::<String>::new())
     } else {
-        let visible_peers = super::keys::peers_sharing_a_room_with(conn, caller_user_id)?;
-        let mut changed = Vec::new();
-        for user_id in matrix_keys_store::device_list_changes_between(conn, since_stream, upto)? {
-            if visible_peers.contains(&user_id) {
-                if let Some(mxid) = matrix_store::mxid_of(conn, user_id)? {
-                    changed.push(mxid);
-                }
-            }
-        }
-        let caller_rooms = matrix_store::rooms_for_user(conn, caller_user_id, None)?;
-        let mut left = Vec::new();
-        for user_id in matrix_store::user_ids_with_leave_transition_in_rooms(conn, &caller_rooms, since_stream, upto)? {
-            if !visible_peers.contains(&user_id) {
-                if let Some(mxid) = matrix_store::mxid_of(conn, user_id)? {
-                    left.push(mxid);
-                }
-            }
-        }
-        changed.sort();
-        changed.dedup();
-        left.sort();
-        left.dedup();
-        (changed, left)
+        let delta = super::keys::device_list_delta(conn, caller_user_id, since_stream, upto)?;
+        (delta.changed, delta.left)
     };
 
     let otk_counts = matrix_keys_store::count_one_time_keys(conn, caller_user_id, caller_device_id)?;
@@ -1187,6 +1171,52 @@ mod tests {
         let left = response["device_lists"]["left"].as_array().expect("left");
         assert!(left.iter().any(|v| v == &dave), "dave left the only room he shared with alice: {left:?}");
         assert!(!left.iter().any(|v| v == &bob), "bob never left — he must not appear in `left`");
+    }
+
+    // ---- P16 S-f: device_lists covers newly shared encrypted rooms ----
+
+    #[test]
+    fn device_lists_report_users_who_newly_share_an_encrypted_room_and_who_stop_sharing() {
+        let mut conn = test_conn();
+        let room_id = "!encrypted:mylittlechart.org";
+        matrix_store::create_room(
+            &conn,
+            room_id,
+            matrix_store::RoomKind::Group,
+            1,
+            T0,
+            true,
+            matrix_store::JoinRule::Invite,
+            matrix_store::HistoryVisibility::Shared,
+            None,
+            None,
+        )
+        .expect("create encrypted room");
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, &format!("user{:0>28}", 1), T0).expect("alice");
+        matrix_store::apply_state_event(&mut conn, "$alicejoin", room_id, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 200, T0).expect("alice joins");
+        let since = matrix_store::max_stream_id(&conn).expect("max stream id");
+
+        // Bob joins inside the window; no device list changed at all.
+        let bob = join_room(&mut conn, room_id, 2, "$bobjoin", 300);
+        let typing = live::TypingRegistry::new();
+        let filter = SyncFilter::default();
+        let response =
+            build_sync_response(&conn, &typing, 1, &alice, "DEV1", Some(sync_token::SyncToken { stream_id: since, typing_gen: 0 }), &filter, false, Instant::now())
+                .expect("sync after bob joins");
+        let changed = response["device_lists"]["changed"].as_array().expect("changed");
+        assert!(changed.iter().any(|v| v == &bob), "bob newly shares an encrypted room with alice: {changed:?}");
+        assert!(response["device_lists"]["left"].as_array().expect("left").is_empty());
+
+        // The next sync (since = the previous next_batch) does not repeat him.
+        let token = next_batch_of(&response);
+        let quiet = build_sync_response(&conn, &typing, 1, &alice, "DEV1", Some(token), &filter, false, Instant::now()).expect("quiet sync");
+        assert!(quiet["device_lists"]["changed"].as_array().expect("changed").is_empty(), "already reported once");
+
+        // Alice leaves the only room she shares with bob: he lands in `left`.
+        matrix_store::apply_state_event(&mut conn, "$aliceleave", room_id, 1, "m.room.member", &alice, r#"{"membership":"leave"}"#, 400, T0).expect("alice leaves");
+        let after_leave = build_sync_response(&conn, &typing, 1, &alice, "DEV1", Some(token), &filter, false, Instant::now()).expect("sync after alice leaves");
+        let left = after_leave["device_lists"]["left"].as_array().expect("left");
+        assert!(left.iter().any(|v| v == &bob), "bob no longer shares any room with alice: {left:?}");
     }
 
     // ---- consistent_cut_ignores_events_after_upto ----
