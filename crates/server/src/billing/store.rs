@@ -130,7 +130,23 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             created_at   TEXT    NOT NULL,
             activated_at TEXT,
             rotated_at   TEXT
-        );",
+        );
+
+        CREATE TABLE IF NOT EXISTS registration_invites (
+            id          TEXT    PRIMARY KEY,
+            code_hash   TEXT    NOT NULL UNIQUE,
+            nick        TEXT    NOT NULL,
+            nick_lower  TEXT    NOT NULL,
+            paid_days   INTEGER NOT NULL DEFAULT 0,
+            note        TEXT    NOT NULL DEFAULT '',
+            created_at  TEXT    NOT NULL,
+            expires_at  TEXT    NOT NULL,
+            created_by  INTEGER,
+            redeemed_at TEXT,
+            redeemed_by INTEGER,
+            revoked_at  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_registration_invites_nick ON registration_invites(nick_lower);",
     )?;
     add_column_if_missing(conn, "users", "lifetime_paid", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "users", "lifetime_anon", "INTEGER NOT NULL DEFAULT 0")?;

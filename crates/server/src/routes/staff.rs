@@ -25,6 +25,9 @@
 //! | `POST /api/staff/grants/lifetime {nick, grant, note}` | add an operator lifetime grant to the ledger |
 //! | `POST /api/staff/grants/lifetime/revoke {nick, grant}` | revoke the operator lifetime grants of that kind |
 //! | `GET /api/staff/user?nick=` | one account's grants and roles (exact nick only) |
+//! | `POST /api/staff/invites {nick, paid_days, note}` | issue a one-time registration invite; the code comes back ONCE |
+//! | `GET /api/staff/invites` | the invites and their status, no code values |
+//! | `POST /api/staff/invites/{id}/revoke` | withdraw a pending invite and release its nick |
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,6 +43,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::billing::grants;
+use crate::billing::invite::{IssueRefusal, Revoked};
 use crate::models::types::ErrorResponse;
 use crate::routes::account::resolve_user_id;
 use crate::routes::admin::{paid_days_in_bounds, MAX_PAID_DAYS, MIN_PAID_DAYS};
@@ -455,6 +459,134 @@ pub async fn revoke_lifetime(State(state): State<Arc<AppState>>, headers: Header
     .await
     {
         Ok((nick, revoked)) => Json(json!({ "nick": nick, "grant": grant.as_str(), "revoked": revoked })).into_response(),
+        Err(response) => response,
+    }
+}
+
+// ============================================================================
+// Registration invites
+// ============================================================================
+
+/// Request body of `POST /api/staff/invites`.
+#[derive(Deserialize)]
+pub struct IssueInviteBody {
+    /// The nick the new account will get. A reserved nick is allowed; one held
+    /// by an account or by another pending invite is not.
+    pub nick: String,
+    /// Paid days the account starts with: 0 (none) or 1..=3650.
+    #[serde(default)]
+    pub paid_days: i64,
+    /// Why (optional, at most 200 characters).
+    #[serde(default)]
+    pub note: String,
+}
+
+/// `POST /api/staff/invites {nick, paid_days, note}` -> `201`
+///
+/// ```json
+/// { "id": "inv_…", "invite_code": "K7Q2-M9XP-TA4B-C8DE-F0GH", "nick": "nix",
+///   "paid_days": 365, "note": "early friend", "expires_at": "2026-…" }
+/// ```
+/// The code is single-use, stored only as a SHA-256 digest, and returned here
+/// ONCE. The nick is held for the invite until it is redeemed, revoked or
+/// expired (30 days). `400` for a bad nick, days or note, `409 nick taken`.
+pub async fn issue_invite(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(body): Json<IssueInviteBody>) -> Response {
+    let actor = match staff(&state, &headers).await {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    if let Err(response) = spend_write(&state, &actor) {
+        return response;
+    }
+    let Some(nick) = clean_nick(&body.nick) else {
+        return reply(StatusCode::BAD_REQUEST, "nick is required");
+    };
+    if body.paid_days != 0 && !paid_days_in_bounds(body.paid_days) {
+        return reply(StatusCode::BAD_REQUEST, &format!("paid_days must be 0 or between {MIN_PAID_DAYS} and {MAX_PAID_DAYS}"));
+    }
+    let Some(note) = clean_gift_note(&body.note) else {
+        return reply(StatusCode::BAD_REQUEST, "note must be at most 200 printable characters");
+    };
+    let (paid_days, actor_id) = (body.paid_days, actor.user_id);
+    let issued = audited(&state, &actor, "invites.issue", move |conn| {
+        let issued = match crate::billing::invite::issue(conn, &nick, paid_days, &note, actor_id, chrono::Utc::now())? {
+            Ok(issued) => issued,
+            Err(IssueRefusal::NickInvalid) => return Ok(Err((StatusCode::BAD_REQUEST, "nick is not valid"))),
+            Err(IssueRefusal::NickForbidden) => return Ok(Err((StatusCode::BAD_REQUEST, "this nick is not allowed"))),
+            Err(IssueRefusal::NickTaken) => return Ok(Err((StatusCode::CONFLICT, "nick taken"))),
+        };
+        // The code itself is never part of the audit row.
+        let params = json!({ "invite_id": issued.id, "nick": nick, "paid_days": paid_days, "note": note, "expires_at": issued.expires_at });
+        let answer = json!({
+            "id": issued.id,
+            "invite_code": issued.code,
+            "nick": nick,
+            "paid_days": paid_days,
+            "note": note,
+            "expires_at": issued.expires_at,
+        });
+        Ok(Ok(Done { target: format!("invite:{}", issued.id), params, value: answer }))
+    })
+    .await;
+    match issued {
+        Ok(answer) => {
+            // The id only: a code never reaches a log line.
+            tracing::info!("staff {} issued registration invite {}", actor.user_id, answer["id"].as_str().unwrap_or_default());
+            (StatusCode::CREATED, Json(answer)).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+/// `GET /api/staff/invites` -> `200`, newest first, no code values:
+///
+/// ```json
+/// [ { "id": "inv_…", "nick": "nix", "paid_days": 365, "note": "early friend",
+///     "status": "pending", "created_at": "…", "expires_at": "…",
+///     "redeemed_at": null, "revoked_at": null, "created_by_nick": "alice" } ]
+/// ```
+/// `status` is `pending`, `redeemed`, `revoked` or `expired`.
+pub async fn list_invites(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let actor = match staff(&state, &headers).await {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    match audited(&state, &actor, "invites.list", |conn| {
+        let rows = crate::billing::invite::list(conn, chrono::Utc::now())?;
+        let params = json!({ "invites": rows.len() });
+        Ok(Ok(Done { value: rows, target: "invites".to_string(), params }))
+    })
+    .await
+    {
+        Ok(rows) => Json(rows).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// `POST /api/staff/invites/{id}/revoke` -> `200 {"id", "revoked": true}`, or
+/// `"revoked": false` on a repeat. The invite's nick is released. `404` for an
+/// unknown invite, `409 already redeemed` once the account exists.
+pub async fn revoke_invite(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(invite_id): Path<String>) -> Response {
+    let actor = match staff(&state, &headers).await {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    if let Err(response) = spend_write(&state, &actor) {
+        return response;
+    }
+    let id = invite_id.clone();
+    match audited(&state, &actor, "invites.revoke", move |conn| {
+        let revoked = match crate::billing::invite::revoke(conn, &id, chrono::Utc::now())? {
+            Revoked::NotFound => return Ok(Err((StatusCode::NOT_FOUND, "no such invite"))),
+            Revoked::AlreadyRedeemed => return Ok(Err((StatusCode::CONFLICT, "already redeemed"))),
+            Revoked::Now => true,
+            Revoked::Before => false,
+        };
+        Ok(Ok(Done { value: revoked, target: format!("invite:{id}"), params: json!({ "invite_id": id, "revoked": revoked }) }))
+    })
+    .await
+    {
+        Ok(revoked) => Json(json!({ "id": invite_id, "revoked": revoked })).into_response(),
         Err(response) => response,
     }
 }

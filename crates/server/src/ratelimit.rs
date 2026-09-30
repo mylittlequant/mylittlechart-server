@@ -84,7 +84,7 @@ fn classify(path: &str, method: &Method) -> BucketKind {
     // The two unauthenticated anonymous-account routes (a key guess and an
     // account creation) get the strict class too, on top of their own
     // per-hour budgets in `billing::throttle`.
-    if path == "/auth/account-key" || path == "/billing/anon-checkout" {
+    if path == "/auth/account-key" || path == "/auth/invite/redeem" || path == "/billing/anon-checkout" {
         return BucketKind::Oauth;
     }
     match *method {
@@ -266,6 +266,7 @@ mod tests {
     fn the_anonymous_account_routes_are_in_the_strict_class() {
         assert_eq!(classify("/auth/account-key", &Method::POST), BucketKind::Oauth);
         assert_eq!(classify("/billing/anon-checkout", &Method::POST), BucketKind::Oauth);
+        assert_eq!(classify("/auth/invite/redeem", &Method::POST), BucketKind::Oauth);
         assert_eq!(classify("/billing/checkout", &Method::POST), BucketKind::ApiWrite);
     }
 

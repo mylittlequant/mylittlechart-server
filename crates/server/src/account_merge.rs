@@ -1591,13 +1591,15 @@ mod tests {
         let social_m = Mutex::new(social_conn());
         let dir = TestDir::new();
         let store = SyncStore::new(dir.0.join("sync"));
-        let (anon, oauth) = {
+        let (anon, invited, oauth) = {
             let conn = db.lock().expect("lock");
-            let key = crate::billing::anon::AccountKey::generate();
+            let key = crate::billing::anon::Credential::random();
             let anon = crate::billing::anon::create_pending(&conn, &key, chrono::Utc::now()).expect("anon");
-            (anon, seed_user(&conn, "github", "oauth-1", "oauth-user"))
+            // An account opened by a registration invite is an active anonymous one.
+            let invited = crate::billing::anon::create_active(&conn, &crate::billing::anon::Credential::random(), chrono::Utc::now()).expect("invited");
+            (anon, invited, seed_user(&conn, "github", "oauth-1", "oauth-user"))
         };
-        for (from, into, side) in [(anon, oauth, "from"), (oauth, anon, "into")] {
+        for (from, into, side) in [(anon, oauth, "from"), (oauth, anon, "into"), (invited, oauth, "from"), (oauth, invited, "into")] {
             let err = execute(&db, &social_m, &store, &dir.0, from, into, None).expect_err("must refuse");
             assert!(matches!(err, MergeError::AnonymousAccount { side: s, .. } if s == side), "{err:?}");
             let plan_err = plan(&db, &social_m, &store, from, into).expect_err("a dry run refuses too");
@@ -1605,9 +1607,9 @@ mod tests {
         }
         let conn = db.lock().expect("lock");
         let survivors: i64 = conn
-            .query_row("SELECT COUNT(*) FROM users WHERE id IN (?1, ?2)", params![anon, oauth], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM users WHERE id IN (?1, ?2, ?3)", params![anon, invited, oauth], |r| r.get(0))
             .expect("count");
-        assert_eq!(survivors, 2, "nothing was merged or deleted");
+        assert_eq!(survivors, 3, "nothing was merged or deleted");
     }
 
     /// A merge carries the loser's purchases to the survivor: entitlements

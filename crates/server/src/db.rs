@@ -2035,7 +2035,7 @@ pub fn set_nick(
     }
 
     let lower = nick.to_lowercase();
-    if is_nick_reserved(conn, &lower)? {
+    if is_nick_reserved(conn, &lower)? || crate::billing::invite::nick_held(conn, &lower, chrono::Utc::now())? {
         return Err(NickError::Reserved);
     }
     let reserved_handles: Vec<crate::nick_policy::ReservedHandle<'_>> = reserved_cache

@@ -83,6 +83,7 @@ pub(crate) fn flow_error(e: FlowError) -> Response {
         FlowError::SamePlan => error(StatusCode::BAD_REQUEST, "same_plan"),
         FlowError::ChangePending => error(StatusCode::CONFLICT, "change_pending"),
         FlowError::NotFound => error(StatusCode::NOT_FOUND, "not_found"),
+        FlowError::CredentialInUse => error(StatusCode::CONFLICT, "credential_in_use"),
         // dig2pay refused the request itself (a change it will not make, a
         // change already pending): the caller's business, so say why.
         FlowError::Gateway(GatewayError::Refused { status: status @ (400 | 409 | 422), message }) => {

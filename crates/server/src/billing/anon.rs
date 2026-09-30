@@ -1,30 +1,31 @@
 //! Anonymous ("numbered") accounts: the account with no OAuth, bought with
-//! `mlc-anon-account*` and entered with an account key alone.
+//! `mlc-anon-account*` (or created by a registration invite, see
+//! [`super::invite`]) and entered with a client-derived credential alone.
 //!
 //! # Lifecycle
 //!
 //! 1. `POST /api/billing/anon-checkout` creates a PENDING user
-//!    (`users.provider = 'anon'`, no email, no OAuth link) and an
-//!    account key, then opens the dig2pay subscription with that user's id as
-//!    the `external_user_ref`. The key is returned once.
+//!    (`users.provider = 'anon'`, no email, no OAuth link) holding the
+//!    credential's hash, then opens the dig2pay subscription with that user's
+//!    id as the `external_user_ref`.
 //! 2. `payment_confirmed` for that subscription activates the account and
 //!    creates its `lifetime_anon` + `lifetime_paid` grants (source = the
-//!    invoice). Until then the key can only read its own invoice.
-//! 3. `POST /api/auth/account-key` turns the key of an ACTIVE account into a
-//!    session. `POST /api/account/key/rotate` replaces the key.
+//!    invoice). Until then the credential can only read its own invoice.
+//! 3. `POST /api/auth/account-key` turns the credential of an ACTIVE account
+//!    into a session. `POST /api/account/key/rotate` replaces it.
 //! 4. A pending account whose invoice expired more than a day ago is deleted
 //!    with its billing rows ([`gc_pending`]); a late webhook for it then
 //!    matches nothing and is recorded as `unmatched`.
 //!
-//! # The key
+//! # The credential
 //!
-//! 128 random bits, shown as 26 Crockford base32 characters in groups of
-//! four (`XXXX-XXXX-…-XX`). Only its SHA-256 is stored — a key with 128 bits
-//! of entropy needs no slow hash, and the index on the hash is the
-//! comparator. [`AccountKey`] has no `Display` and a redacted `Debug`, and no
-//! code path in this crate formats it into a log line or an error body; the
-//! only place it is rendered is [`AccountKey::reveal`], for the one response
-//! that hands it to the buyer.
+//! The client holds a 32-byte secret `K` and sends `C = HKDF(K, "auth")`,
+//! 32 bytes as 64 hex characters (docs/mlc/plans/anon-account-one-key-a1b).
+//! The server never sees `K`, never generates a credential, and stores only
+//! `SHA-256(C)` over the 32 raw bytes: `C` has 256 bits of entropy, so no slow
+//! hash is needed and the unique index on the hash is the comparator.
+//! [`Credential`] has no `Display` and a redacted `Debug`, and no code path in
+//! this crate formats it into a log line or an error body.
 
 use chrono::{DateTime, Duration, Utc};
 use mylittlechart_server::live::LiveRegistry;
@@ -39,72 +40,46 @@ pub const PROVIDER: &str = "anon";
 /// A pending account whose invoice expired longer ago than this is deleted.
 pub const GC_GRACE: Duration = Duration::hours(24);
 
-const KEY_BYTES: usize = 16;
-const KEY_CHARS: usize = 26;
-const GROUP: usize = 4;
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const CREDENTIAL_BYTES: usize = 32;
 
-/// A 128-bit account key.
+/// The client-derived login credential: 32 bytes, sent as 64 hex characters.
 #[derive(Clone)]
-pub struct AccountKey([u8; KEY_BYTES]);
+pub struct Credential([u8; CREDENTIAL_BYTES]);
 
-impl std::fmt::Debug for AccountKey {
+impl std::fmt::Debug for Credential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("AccountKey(<redacted>)")
+        f.write_str("Credential(<redacted>)")
     }
 }
 
-impl AccountKey {
-    /// A fresh random key.
-    pub fn generate() -> Self {
+impl Credential {
+    /// Parse what a client sent: exactly 64 hex characters (either case), no
+    /// surrounding whitespace. `None` for anything else, the old 26-character
+    /// Crockford keys included.
+    pub fn parse(input: &str) -> Option<Self> {
+        if input.len() != CREDENTIAL_BYTES * 2 {
+            return None;
+        }
+        let mut bytes = [0u8; CREDENTIAL_BYTES];
+        hex::decode_to_slice(input, &mut bytes).ok()?;
+        Some(Self(bytes))
+    }
+
+    /// Hex SHA-256 of the credential bytes: the only form that is stored.
+    pub fn hash_hex(&self) -> String {
+        hex::encode(Sha256::digest(self.0))
+    }
+
+    /// A random credential, for tests that stand in for a client.
+    #[cfg(test)]
+    pub fn random() -> Self {
         Self(rand::thread_rng().gen())
     }
 
-    /// The key as the buyer sees it: Crockford base32, groups of four.
-    /// Call only when building the response that hands it over.
-    pub fn reveal(&self) -> String {
-        let n = u128::from_be_bytes(self.0);
-        let mut out = String::with_capacity(KEY_CHARS + KEY_CHARS / GROUP);
-        for i in 0..KEY_CHARS {
-            if i > 0 && i % GROUP == 0 {
-                out.push('-');
-            }
-            let shift = 5 * (KEY_CHARS - 1 - i);
-            let index = ((n >> shift) & 31) as usize;
-            out.push(char::from(CROCKFORD[index]));
-        }
-        out
-    }
-
-    /// Parse what a user typed or pasted: case, hyphens and spaces are
-    /// ignored, and Crockford's look-alike rules apply (`O` reads as `0`,
-    /// `I` and `L` as `1`). `None` for anything that is not a key.
-    pub fn parse(input: &str) -> Option<Self> {
-        let mut n: u128 = 0;
-        let mut chars = 0usize;
-        for c in input.chars() {
-            if c == '-' || c.is_whitespace() {
-                continue;
-            }
-            let c = match c.to_ascii_uppercase() {
-                'O' => '0',
-                'I' | 'L' => '1',
-                other => other,
-            };
-            let value = u128::try_from(CROCKFORD.iter().position(|b| char::from(*b) == c)?).ok()?;
-            // Exactly 26 characters; the first carries only the top 3 bits of 128.
-            if chars >= KEY_CHARS || (chars == 0 && value > 7) {
-                return None;
-            }
-            n = (n << 5) | value;
-            chars += 1;
-        }
-        (chars == KEY_CHARS).then(|| Self(n.to_be_bytes()))
-    }
-
-    /// Hex SHA-256 of the key bytes — the only form that is stored.
-    pub fn hash_hex(&self) -> String {
-        hex::encode(Sha256::digest(self.0))
+    /// The credential as a client sends it, for tests.
+    #[cfg(test)]
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
     }
 }
 
@@ -155,21 +130,61 @@ pub fn is_anonymous(conn: &Connection, user_id: i64) -> Result<bool> {
         .is_some())
 }
 
-/// Create a PENDING anonymous user holding `key`, and return its id. The user
-/// has no email, no display name and no OAuth link.
-pub fn create_pending(conn: &Connection, key: &AccountKey, now: DateTime<Utc>) -> Result<i64> {
+/// Whether some anonymous account already holds `credential`.
+pub fn credential_in_use(conn: &Connection, credential: &Credential) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM billing_anon_accounts WHERE key_hash = ?1",
+            params![credential.hash_hex()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Create an anonymous user and its credential row with `status`; returns the
+/// user id. The user has no email, no display name and no OAuth link. One
+/// savepoint, so a refused credential row (the unique hash) leaves no user.
+fn insert_account(conn: &Connection, credential: &Credential, status: AccountStatus, now: DateTime<Utc>) -> Result<i64> {
     let stamp = now.to_rfc3339();
     let opaque: [u8; 16] = rand::thread_rng().gen();
-    let user_id = crate::db::upsert_user(conn, PROVIDER, &hex::encode(opaque), "", None, &stamp)?;
-    conn.execute(
-        "INSERT INTO billing_anon_accounts (user_id, key_hash, status, created_at) VALUES (?1, ?2, 'pending', ?3)",
-        params![user_id, key.hash_hex(), stamp],
-    )?;
-    Ok(user_id)
+    conn.execute_batch("SAVEPOINT anon_account;")?;
+    let created = (|| -> Result<i64> {
+        let user_id = crate::db::upsert_user(conn, PROVIDER, &hex::encode(opaque), "", None, &stamp)?;
+        let activated_at = (status == AccountStatus::Active).then_some(stamp.as_str());
+        conn.execute(
+            "INSERT INTO billing_anon_accounts (user_id, key_hash, status, created_at, activated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![user_id, credential.hash_hex(), status.as_str(), stamp, activated_at],
+        )?;
+        Ok(user_id)
+    })();
+    match created {
+        Ok(user_id) => {
+            conn.execute_batch("RELEASE anon_account;")?;
+            Ok(user_id)
+        }
+        Err(e) => {
+            // The original failure is what the caller needs.
+            let _ = conn.execute_batch("ROLLBACK TO anon_account; RELEASE anon_account;");
+            Err(e)
+        }
+    }
+}
+
+/// Create a PENDING anonymous user holding `credential` (a checkout), and
+/// return its id.
+pub fn create_pending(conn: &Connection, credential: &Credential, now: DateTime<Utc>) -> Result<i64> {
+    insert_account(conn, credential, AccountStatus::Pending, now)
+}
+
+/// Create an ACTIVE anonymous user holding `credential` (a redeemed
+/// registration invite), and return its id.
+pub fn create_active(conn: &Connection, credential: &Credential, now: DateTime<Utc>) -> Result<i64> {
+    insert_account(conn, credential, AccountStatus::Active, now)
 }
 
 /// The anonymous account holding `key`, if it exists and its user does too.
-pub fn find_by_key(conn: &Connection, key: &AccountKey) -> Result<Option<AnonAccount>> {
+pub fn find_by_key(conn: &Connection, key: &Credential) -> Result<Option<AnonAccount>> {
     let row: Option<(i64, String)> = conn
         .query_row(
             "SELECT a.user_id, a.status FROM billing_anon_accounts a
@@ -206,14 +221,32 @@ pub fn activate(conn: &Connection, user_id: i64, now: DateTime<Utc>) -> Result<(
     Ok(())
 }
 
-/// Replace the key of ACTIVE anonymous account `user_id`; the old key stops
-/// working at once. `false` when the account is not an active anonymous one.
-pub fn rotate_key(conn: &Connection, user_id: i64, new_key: &AccountKey, now: DateTime<Utc>) -> Result<bool> {
+/// What [`rotate_key`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rotation {
+    /// The hash was swapped; the old credential is dead.
+    Done,
+    /// The account is not an active anonymous one.
+    NotAnonymous,
+    /// Another account already holds the new credential.
+    InUse,
+}
+
+/// Replace the credential of ACTIVE anonymous account `user_id`; the old one
+/// stops working at once.
+pub fn rotate_key(conn: &Connection, user_id: i64, new_key: &Credential, now: DateTime<Utc>) -> Result<Rotation> {
     let changed = conn.execute(
         "UPDATE billing_anon_accounts SET key_hash = ?1, rotated_at = ?2 WHERE user_id = ?3 AND status = 'active'",
         params![new_key.hash_hex(), now.to_rfc3339(), user_id],
-    )?;
-    Ok(changed > 0)
+    );
+    match changed {
+        Ok(0) => Ok(Rotation::NotAnonymous),
+        Ok(_) => Ok(Rotation::Done),
+        Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
+            Ok(Rotation::InUse)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Delete an anonymous account and every billing row that hangs off it
@@ -333,8 +366,8 @@ mod tests {
         }
     }
 
-    fn pending_with_invoice(conn: &Connection, id: &str, expires: DateTime<Utc>, now: DateTime<Utc>) -> (AccountKey, i64) {
-        let key = AccountKey::generate();
+    fn pending_with_invoice(conn: &Connection, id: &str, expires: DateTime<Utc>, now: DateTime<Utc>) -> (Credential, i64) {
+        let key = Credential::random();
         let uid = create_pending(conn, &key, now).expect("create");
         conn.execute(
             "INSERT INTO billing_subscriptions
@@ -352,76 +385,54 @@ mod tests {
         conn.query_row("SELECT 1 FROM users WHERE id = ?1", params![uid], |_| Ok(())).optional().expect("query").is_some()
     }
 
-    // ------------------------------------------------------------- the key
+    // ------------------------------------------------------- the credential
 
     #[test]
-    fn a_key_is_26_crockford_characters_in_groups_of_four() {
-        for _ in 0..50 {
-            let shown = AccountKey::generate().reveal();
-            assert_eq!(shown.len(), 26 + 6, "26 characters and 6 hyphens: {shown}");
-            let groups: Vec<&str> = shown.split('-').collect();
-            assert_eq!(groups.len(), 7);
-            assert!(groups[..6].iter().all(|g| g.len() == 4));
-            assert_eq!(groups[6].len(), 2);
-            assert!(shown.chars().filter(|c| *c != '-').all(|c| CROCKFORD.contains(&(c as u8))));
-            assert!(shown.chars().next().is_some_and(|c| "01234567".contains(c)), "128 bits leave the first character at 3 bits");
-        }
+    fn a_credential_is_exactly_64_hex_characters_in_either_case() {
+        let credential = Credential::random();
+        let shown = credential.to_hex();
+        assert_eq!(shown.len(), 64);
+        assert_eq!(Credential::parse(&shown).expect("lower").hash_hex(), credential.hash_hex());
+        assert_eq!(Credential::parse(&shown.to_uppercase()).expect("upper").hash_hex(), credential.hash_hex());
     }
 
     #[test]
-    fn a_key_round_trips_and_forgives_case_hyphens_spaces_and_lookalikes() {
-        let key = AccountKey::generate();
-        let shown = key.reveal();
-        let parsed = AccountKey::parse(&shown).expect("parse");
-        assert_eq!(parsed.hash_hex(), key.hash_hex());
-
-        let sloppy = shown.to_lowercase().replace('-', " ");
-        assert_eq!(AccountKey::parse(&sloppy).expect("lower case, spaces").hash_hex(), key.hash_hex());
-        assert_eq!(AccountKey::parse(&shown.replace('-', "")).expect("no hyphens").hash_hex(), key.hash_hex());
-
-        // A key that contains a 0 or a 1 reads the same with O, I and L typed instead.
-        let zeros_and_ones = (0..)
-            .map(|_| AccountKey::generate())
-            .find(|k| {
-                let s = k.reveal();
-                s.contains('0') && s.contains('1')
-            })
-            .expect("a key with both digits turns up quickly");
-        let typed = zeros_and_ones.reveal().replace('0', "o").replace('1', "l");
-        assert_eq!(AccountKey::parse(&typed).expect("look-alikes").hash_hex(), zeros_and_ones.hash_hex());
-    }
-
-    #[test]
-    fn anything_that_is_not_a_key_does_not_parse() {
-        let good = AccountKey::generate().reveal();
-        let plain = good.replace('-', "");
+    fn anything_that_is_not_a_credential_does_not_parse() {
+        let good = Credential::random().to_hex();
         for bad in [
             "",
             "hello",
-            &plain[..25],
-            &format!("{plain}0"),
-            &format!("{}U{}", &plain[..10], &plain[11..]),
-            &format!("8{}", &plain[1..]),
-            &format!("{}!", &plain[..25]),
+            &good[..63],
+            &format!("{good}0"),
+            &format!(" {good}"),
+            &format!("{good} "),
+            &format!("{}g{}", &good[..10], &good[11..]),
+            &format!("{}-{}", &good[..32], &good[32..]),
+            // The retired 128-bit Crockford key format.
+            "0F4Z-ABCD-EFGH-JKMN-PQRS-TV",
+            "0F4ZABCDEFGHJKMNPQRSTV",
         ] {
-            assert!(AccountKey::parse(bad).is_none(), "{bad:?}");
+            assert!(Credential::parse(bad).is_none(), "{bad:?}");
         }
     }
 
     #[test]
-    fn keys_do_not_collide_and_the_stored_form_is_a_hash() {
-        let a = AccountKey::generate();
-        let b = AccountKey::generate();
+    fn credentials_do_not_collide_and_the_stored_form_is_the_sha256_of_the_bytes() {
+        let a = Credential::random();
+        let b = Credential::random();
         assert_ne!(a.hash_hex(), b.hash_hex());
         assert_eq!(a.hash_hex().len(), 64);
-        assert!(!a.hash_hex().contains(&a.reveal().replace('-', "")));
+        assert!(!a.hash_hex().contains(&a.to_hex()));
+        // SHA-256 of 32 zero bytes: a fixed answer a client can reproduce.
+        let zero = Credential::parse(&"0".repeat(64)).expect("zero credential");
+        assert_eq!(zero.hash_hex(), "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925");
     }
 
     #[test]
-    fn the_key_never_renders_through_debug() {
-        let key = AccountKey::generate();
-        let shown = key.reveal();
-        assert_eq!(format!("{key:?}"), "AccountKey(<redacted>)");
+    fn the_credential_never_renders_through_debug() {
+        let credential = Credential::random();
+        let shown = credential.to_hex();
+        assert_eq!(format!("{credential:?}"), "Credential(<redacted>)");
         let account = AnonAccount { user_id: 1, status: AccountStatus::Active };
         assert!(!format!("{account:?}").contains(&shown));
     }
@@ -431,7 +442,7 @@ mod tests {
     #[test]
     fn a_pending_account_has_no_email_no_oauth_link_and_only_its_key_hash_stored() {
         let conn = conn();
-        let key = AccountKey::generate();
+        let key = Credential::random();
         let uid = create_pending(&conn, &key, Utc::now()).expect("create");
         assert!(is_anonymous(&conn, uid).expect("anon"));
         assert!(!is_anonymous(&conn, seed_user(&conn, "oauth")).expect("oauth user"));
@@ -450,32 +461,60 @@ mod tests {
         assert_eq!(status_of(&conn, uid).expect("status"), Some(AccountStatus::Pending));
         let found = find_by_key(&conn, &key).expect("find").expect("account");
         assert_eq!(found, AnonAccount { user_id: uid, status: AccountStatus::Pending });
-        assert!(find_by_key(&conn, &AccountKey::generate()).expect("find").is_none());
+        assert!(find_by_key(&conn, &Credential::random()).expect("find").is_none());
     }
 
     #[test]
     fn activation_rotation_and_the_old_key() {
         let conn = conn();
         let now = Utc::now();
-        let old = AccountKey::generate();
+        let old = Credential::random();
         let uid = create_pending(&conn, &old, now).expect("create");
-        let new = AccountKey::generate();
-        assert!(!rotate_key(&conn, uid, &new, now).expect("rotate"), "a pending account has no key to rotate");
+        let new = Credential::random();
+        assert_eq!(rotate_key(&conn, uid, &new, now).expect("rotate"), Rotation::NotAnonymous, "a pending account has no key to rotate");
 
         activate(&conn, uid, now).expect("activate");
         activate(&conn, uid, now).expect("activate again");
         assert_eq!(status_of(&conn, uid).expect("status"), Some(AccountStatus::Active));
-        assert!(rotate_key(&conn, uid, &new, now).expect("rotate"));
+        assert_eq!(rotate_key(&conn, uid, &new, now).expect("rotate"), Rotation::Done);
         assert!(find_by_key(&conn, &old).expect("find").is_none(), "the old key is dead");
         assert_eq!(find_by_key(&conn, &new).expect("find").map(|a| a.user_id), Some(uid));
-        assert!(!rotate_key(&conn, seed_user(&conn, "oauth"), &new, now).expect("rotate"), "not an anonymous account");
+        assert_eq!(rotate_key(&conn, seed_user(&conn, "oauth"), &new, now).expect("rotate"), Rotation::NotAnonymous, "not an anonymous account");
+        let other = create_pending(&conn, &Credential::random(), now).expect("other");
+        activate(&conn, other, now).expect("activate");
+        assert_eq!(rotate_key(&conn, other, &new, now).expect("rotate"), Rotation::InUse, "a credential another account holds");
+        assert!(find_by_key(&conn, &new).expect("find").is_some_and(|a| a.user_id == uid), "the holder is unchanged");
+        assert!(credential_in_use(&conn, &new).expect("in use"));
+        assert!(!credential_in_use(&conn, &Credential::random()).expect("in use"));
+    }
+
+    #[test]
+    fn a_refused_credential_row_leaves_no_user_behind() {
+        let conn = conn();
+        let credential = Credential::random();
+        create_pending(&conn, &credential, Utc::now()).expect("first");
+        let users: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).expect("count");
+        assert!(create_pending(&conn, &credential, Utc::now()).is_err(), "the hash is unique");
+        assert!(create_active(&conn, &credential, Utc::now()).is_err());
+        let after: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).expect("count");
+        assert_eq!(users, after);
+    }
+
+    #[test]
+    fn an_active_account_can_be_created_directly() {
+        let conn = conn();
+        let credential = Credential::random();
+        let uid = create_active(&conn, &credential, Utc::now()).expect("active");
+        assert_eq!(status_of(&conn, uid).expect("status"), Some(AccountStatus::Active));
+        assert_eq!(find_by_key(&conn, &credential).expect("find").map(|a| a.user_id), Some(uid));
+        assert!(is_anonymous(&conn, uid).expect("anon"));
     }
 
     #[test]
     fn a_key_whose_user_is_gone_finds_nothing() {
         let conn = conn();
         let (mut mx, live) = matrix_side();
-        let key = AccountKey::generate();
+        let key = Credential::random();
         let uid = create_pending(&conn, &key, Utc::now()).expect("create");
         crate::db::delete_account(&conn, uid).expect("delete");
         assert!(find_by_key(&conn, &key).expect("find").is_none());
@@ -541,8 +580,8 @@ mod tests {
         let conn = conn();
         let (mut mx, live) = matrix_side();
         let now = Utc::now();
-        let old = create_pending(&conn, &AccountKey::generate(), now - Duration::hours(30)).expect("old");
-        let young = create_pending(&conn, &AccountKey::generate(), now - Duration::hours(2)).expect("young");
+        let old = create_pending(&conn, &Credential::random(), now - Duration::hours(30)).expect("old");
+        let young = create_pending(&conn, &Credential::random(), now - Duration::hours(2)).expect("young");
         assert_eq!(gc_pending(&conn, &mut mx, &live, now).expect("gc").deleted, 1);
         assert!(!exists(&conn, old) && exists(&conn, young));
     }
@@ -610,14 +649,14 @@ mod tests {
         let conn = conn();
         let (mut mx, live) = matrix_side();
         let now = Utc::now();
-        let key = AccountKey::generate();
+        let key = Credential::random();
         let unfinished = create_pending(&conn, &key, now).expect("create");
         assert!(discard_unfinished(&conn, &mut mx, &live, unfinished).expect("discard"));
         assert!(!exists(&conn, unfinished));
 
         let (_, with_invoice) = pending_with_invoice(&conn, "held", now + Duration::hours(1), now);
         assert!(!discard_unfinished(&conn, &mut mx, &live, with_invoice).expect("discard"), "a payer already holds an address for it");
-        let active = create_pending(&conn, &AccountKey::generate(), now).expect("create");
+        let active = create_pending(&conn, &Credential::random(), now).expect("create");
         activate(&conn, active, now).expect("activate");
         assert!(!discard_unfinished(&conn, &mut mx, &live, active).expect("discard"));
         assert!(!discard_unfinished(&conn, &mut mx, &live, seed_user(&conn, "oauth")).expect("discard"));
@@ -629,7 +668,7 @@ mod tests {
     fn no_flow_attaches_an_oauth_identity_to_an_anonymous_account() {
         let conn = conn();
         let now = Utc::now();
-        let anon = create_pending(&conn, &AccountKey::generate(), now).expect("create");
+        let anon = create_pending(&conn, &Credential::random(), now).expect("create");
         // Explicit linking is refused outright.
         let err = crate::db::link_provider_to_user(&conn, anon, "github", "gh-1", "gh", None, &now.to_rfc3339())
             .expect_err("an anonymous account takes no provider identity");
@@ -665,7 +704,7 @@ mod tests {
     fn the_orphan_sweep_leaves_a_fresh_anonymous_account_alone() {
         let conn = conn();
         let now = Utc::now();
-        let anon = create_pending(&conn, &AccountKey::generate(), now).expect("create");
+        let anon = create_pending(&conn, &Credential::random(), now).expect("create");
         activate(&conn, anon, now).expect("activate");
         let report = crate::db::cleanup_orphan_users(&conn).expect("sweep");
         assert_eq!(report.removed_recent_self_ref, 0);

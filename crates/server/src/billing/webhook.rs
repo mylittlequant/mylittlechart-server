@@ -1623,7 +1623,7 @@ mod tests {
     fn an_anonymous_purchase_writes_two_ledger_rows_and_activates_a_pending_account() {
         let conn = conn();
         let now = Utc::now();
-        let key = crate::billing::anon::AccountKey::generate();
+        let key = crate::billing::anon::Credential::random();
         let uid = crate::billing::anon::create_pending(&conn, &key, now).expect("pending");
         seed_purchase(&conn, uid, "mlc-anon-account-v1", "sub_1", "inv_1");
         assert_eq!(

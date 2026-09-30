@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use rand::Rng;
 use rusqlite::Connection;
 
-use super::anon::{self, AccountKey};
+use super::anon::{self, Credential};
 use super::client::{GatewayError, PayOption, Proration};
 use super::entitle::{self, EntitlementView};
 use super::plans::Grant;
@@ -45,6 +45,8 @@ pub enum FlowError {
     ChangePending,
     /// No such invoice for this account (also: someone else's).
     NotFound,
+    /// Another anonymous account already holds the credential.
+    CredentialInUse,
     /// dig2pay failed or refused.
     Gateway(GatewayError),
     /// The database failed.
@@ -245,19 +247,22 @@ async fn checkout_for(
 
 /// `POST /api/billing/anon-checkout` result.
 pub struct AnonCheckoutView {
-    /// The account key, shown once. Never stored in this form.
-    pub account_key: String,
     /// dig2pay's invoice id.
     pub invoice_id: String,
     /// Every way to pay it.
     pub pay: Vec<PayOption>,
 }
 
-/// Buy an anonymous account: create a PENDING anonymous user holding a fresh
-/// key, open the dig2pay subscription under that user's id, and hand back the
-/// key with the invoice. If the invoice cannot be opened the pending account
-/// is removed again: the payer holds no key and no address.
-pub async fn anon_checkout(state: &Arc<AppState>, plan_id: &str, onion: bool) -> Result<AnonCheckoutView, FlowError> {
+/// Buy an anonymous account: create a PENDING anonymous user holding the
+/// client's credential hash and open the dig2pay subscription under that
+/// user's id. If the invoice cannot be opened the pending account is removed
+/// again: the payer holds no address.
+pub async fn anon_checkout(
+    state: &Arc<AppState>,
+    plan_id: &str,
+    onion: bool,
+    credential: Credential,
+) -> Result<AnonCheckoutView, FlowError> {
     let billing = state.billing().ok_or(FlowError::NotConfigured)?;
     billing.client().ok_or(FlowError::NotConfigured)?;
     let sold_anonymously = billing
@@ -268,11 +273,18 @@ pub async fn anon_checkout(state: &Arc<AppState>, plan_id: &str, onion: bool) ->
         return Err(FlowError::PlanNotAvailable);
     }
 
-    let key = AccountKey::generate();
-    let for_db = key.clone();
-    let user_id = with_db(state, move |conn| anon::create_pending(conn, &for_db, Utc::now())).await?;
+    let created = with_db(state, move |conn| {
+        if anon::credential_in_use(conn, &credential)? {
+            return Ok(None);
+        }
+        anon::create_pending(conn, &credential, Utc::now()).map(Some)
+    })
+    .await?;
+    let Some(user_id) = created else {
+        return Err(FlowError::CredentialInUse);
+    };
     match checkout_for(state, user_id, plan_id, onion, true).await {
-        Ok(view) => Ok(AnonCheckoutView { account_key: key.reveal(), invoice_id: view.invoice_id, pay: view.pay }),
+        Ok(view) => Ok(AnonCheckoutView { invoice_id: view.invoice_id, pay: view.pay }),
         Err(e) => {
             if let Err(cleanup) = with_db_and_messenger(state, move |conn, messenger, live| anon::discard_unfinished(conn, messenger, live, user_id)).await {
                 tracing::warn!("billing: could not discard the unfinished anonymous account {user_id}: {cleanup:?}");

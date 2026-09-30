@@ -156,6 +156,7 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/billing/anon-invoice/{id}", get(anon_account::anon_invoice))
         .route("/auth/account-key", post(anon_account::sign_in))
         .route("/account/key/rotate", post(anon_account::rotate))
+        .route("/auth/invite/redeem", post(anon_account::redeem_invite))
         // The in-app admin tab (routes/staff.rs): the same operations as the
         // loopback `/admin/*` routes, for a signed-in account holding the
         // `admin` forum role. Everyone else gets a 403.
@@ -166,6 +167,8 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/staff/grants/lifetime", post(staff::grant_lifetime))
         .route("/staff/grants/lifetime/revoke", post(staff::revoke_lifetime))
         .route("/staff/user", get(staff::user_lookup))
+        .route("/staff/invites", post(staff::issue_invite).get(staff::list_invites))
+        .route("/staff/invites/{id}/revoke", post(staff::revoke_invite))
         .route(
             "/billing/webhook",
             post(billing::webhook).layer(DefaultBodyLimit::max(billing::WEBHOOK_MAX_BODY_BYTES)),

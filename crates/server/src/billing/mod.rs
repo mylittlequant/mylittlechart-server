@@ -79,6 +79,7 @@ pub mod config;
 pub mod entitle;
 pub mod flow;
 pub mod grants;
+pub mod invite;
 pub mod plans;
 pub mod signature;
 pub mod store;
