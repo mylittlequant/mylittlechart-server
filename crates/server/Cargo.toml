@@ -7,10 +7,6 @@ edition = "2021"
 name = "mylittlechart-server"
 path = "src/main.rs"
 
-[[bin]]
-name = "mlc-edge-live"
-path = "src/bin/edge_live.rs"
-
 [dependencies]
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -43,6 +39,12 @@ base64 = { workspace = true }
 tower = { workspace = true }
 unicode-normalization = { workspace = true }
 image = { workspace = true }
+
+# Real WebSocket clients for `tests/share_hub.rs`. Both crates are already in
+# the graph (axum's `ws` feature pulls them in); nothing new is resolved.
+[dev-dependencies]
+tokio-tungstenite = "0.28"
+futures-util = { version = "0.3", features = ["sink"] }
 
 # Static musl builds cannot link a system OpenSSL, so the deploy target — and
 # only the deploy target — builds it from source. Features are additive, so

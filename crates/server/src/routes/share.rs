@@ -43,6 +43,8 @@ use axum::{
 };
 use std::sync::Arc;
 
+use mylittlechart_server::share_hub::{Access, Identity};
+
 use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_token};
 use crate::entitlements::{self, ShareKind};
 use crate::models::types::ErrorResponse;
@@ -120,7 +122,7 @@ async fn resolve_user_id(state: Arc<AppState>, headers: &HeaderMap) -> Result<i6
 /// (session cookie, then bearer token; "no credential", "invalid", and
 /// "expired" all fold to anonymous rather than an error) — duplicated per
 /// this file's existing pattern rather than shared.
-async fn resolve_caller_optional(
+pub(crate) async fn resolve_caller_optional(
     state: Arc<AppState>,
     headers: &HeaderMap,
 ) -> Result<Option<i64>, StatusCode> {
@@ -198,7 +200,8 @@ async fn check_share_entitlement(
     user_id: i64,
     kind: ShareKind,
 ) -> Result<(), Response> {
-    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+    let hub_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(bool, Vec<String>)> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let (live_count, shot_count) = crate::db::share_usage(&conn, user_id)?;
         let is_paid = crate::db::user_is_paid(&conn, user_id)?;
@@ -209,19 +212,28 @@ async fn check_share_entitlement(
         let kind_str = kind.as_str();
         let limit = entitlements::share_limit(kind, is_paid);
         let mut current = current;
+        let mut burned = Vec::new();
         while current >= limit {
-            if !crate::db::burn_oldest_unpinned_share(&conn, user_id, kind_str)? {
-                break;
+            match crate::db::burn_oldest_unpinned_share(&conn, user_id, kind_str)? {
+                Some(token) => burned.push(token),
+                None => break,
             }
             current -= 1;
         }
-        Ok(entitlements::share_create_allowed(kind, current, is_paid))
+        Ok((entitlements::share_create_allowed(kind, current, is_paid), burned))
     })
     .await;
 
+    // A burned share is a revoked share: its live sockets close at once.
+    if let Ok(Ok((_, burned))) = &result {
+        for token in burned {
+            crate::share_live::reconcile(&hub_state, token).await;
+        }
+    }
+
     match result {
-        Ok(Ok(true)) => Ok(()),
-        Ok(Ok(false)) => Err((
+        Ok(Ok((true, _))) => Ok(()),
+        Ok(Ok((false, _))) => Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse::new(
                 "share limit reached: every share of this kind is pinned — unpin or revoke one",
@@ -461,6 +473,7 @@ pub async fn create_live_share(
                 .into_response();
         }
     };
+    let hub_state = state.clone();
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(String, String, i64)> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let is_paid = crate::db::user_is_paid(&conn, user_id)?;
@@ -486,6 +499,14 @@ pub async fn create_live_share(
         Ok((token, expires_at, revision))
     })
     .await;
+
+    if let Ok(Ok((token, _, _))) = &result {
+        if republish {
+            // A republish rewrites `visibility`: sockets that lost their view
+            // right close now instead of at the next periodic re-check.
+            crate::share_live::reconcile(&hub_state, token).await;
+        }
+    }
 
     match result {
         Ok(Ok((token, expires_at, revision))) => Json(serde_json::json!({
@@ -1066,6 +1087,8 @@ pub async fn delete_share(
     };
 
     let share_root = state.control_plane().share_root.clone();
+    let hub_state = state.clone();
+    let hub_token = token.clone();
     let result =
         tokio::task::spawn_blocking(move || -> rusqlite::Result<(bool, Option<String>)> {
             let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
@@ -1082,6 +1105,10 @@ pub async fn delete_share(
             Ok((revoked, blob_path))
         })
         .await;
+
+    if let Ok(Ok((true, _))) = &result {
+        crate::share_live::reconcile(&hub_state, &hub_token).await;
+    }
 
     match result {
         Ok(Ok((true, blob_path))) => {
@@ -1442,34 +1469,21 @@ pub async fn post_share_ops(
     }
 }
 
-/// `GET /api/share/{token}/stream-open` — one lookup before a live socket.
-/// The edge relay forwards the browser cookie and sets `X-Mlc-Edge`.
-/// A publisher claims the edge while `live_edge` is empty. Frames after
-/// this do not come back here.
-fn edge_public_origin(edge: &str) -> &'static str {
-    match edge {
-        "utah" => "https://utah.mylittlechart.org",
-        "ams" => "https://ams.mylittlechart.org",
-        _ => "",
-    }
-}
-
+/// `GET /api/share/{token}/stream-open` — the ticket for a live socket.
+///
+/// Answers `{ticket, publish, expires_in_s}`: a single-use, 128-bit ticket
+/// bound to this share and to the caller (the account, or "signed out"), and
+/// the caller's CURRENT right to publish. The socket is
+/// `GET /api/share-live/{token}?ticket=` (see `mylittlechart_server::share_hub`).
+///
+/// 404 for an unknown, revoked or non-live share; 403 when the caller has no
+/// view right or the room already holds its ceiling of sockets; 503 when the
+/// ticket book is full.
 pub async fn stream_open(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Response {
-    if let Some(ticket) = headers.get("x-mlc-ticket").and_then(|v| v.to_str().ok()) {
-        if let Some((publish, owner)) = state.lookup_live_ticket(ticket, &token) {
-            return Json(serde_json::json!({
-                "publish": publish,
-                "owner": owner,
-                "origin": edge_public_origin(&owner),
-            }))
-            .into_response();
-        }
-        return StatusCode::NOT_FOUND.into_response();
-    }
     let caller = match resolve_caller_optional(state.clone(), &headers).await {
         Ok(uid) => uid,
         Err(_) => {
@@ -1480,48 +1494,33 @@ pub async fn stream_open(
                 .into_response();
         }
     };
-    let edge = headers
-        .get("x-mlc-edge")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Result<serde_json::Value, StatusCode>> {
-        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(row) = crate::db::get_share_link(&conn, &token)? else {
-            return Ok(Err(StatusCode::NOT_FOUND));
-        };
-        if row.kind != "live" {
-            return Ok(Err(StatusCode::NOT_FOUND));
+    let access = match crate::share_live::access_for(&state, &token, caller).await {
+        Ok(access) => access,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+                .into_response();
         }
-        if crate::db::effective_share_tier(&conn, &row, caller)?.is_none() {
-            return Ok(Err(StatusCode::NOT_FOUND));
-        }
-        let publish = match caller {
-            Some(uid) => crate::db::share_caller_can_edit(&conn, &row, uid)?,
-            None => false,
-        };
-        let owner = if publish {
-            crate::db::claim_share_live_edge(&conn, &row.token, &edge)?.unwrap_or_default()
-        } else {
-            crate::db::share_live_edge(&conn, &row.token)?.unwrap_or_default()
-        };
-        let ticket = state.mint_live_ticket(&row.token, publish, &owner);
-        Ok(Ok(serde_json::json!({
-            "publish": publish,
-            "owner": owner,
-            "origin": edge_public_origin(&owner),
+    };
+    let publish = match access {
+        Access::Gone => return StatusCode::NOT_FOUND.into_response(),
+        Access::Locked => return StatusCode::FORBIDDEN.into_response(),
+        Access::Granted { publish } => publish,
+    };
+    let hub = &state.share_hub;
+    if hub.room_is_full(&token) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match hub.mint_ticket(&token, Identity::from(caller)) {
+        Some(ticket) => Json(serde_json::json!({
             "ticket": ticket,
-        })))
-    })
-    .await;
-    match result {
-        Ok(Ok(Ok(body))) => Json(body).into_response(),
-        Ok(Ok(Err(status))) => status.into_response(),
-        _ => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::new("Database error")),
-        )
-            .into_response(),
+            "publish": publish,
+            "expires_in_s": hub.limits().ticket_ttl.as_secs(),
+        }))
+        .into_response(),
+        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -1688,15 +1687,24 @@ pub async fn delete_share_grant(
         Err(status) => return auth_err(status),
     };
 
-    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+    let hub_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<(bool, Option<String>)> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::revoke_object_grant(&conn, grant_id, user_id)
+        // The path's token is only what the client was looking at; the grant
+        // row says which share it really sits on, and so which room to re-check.
+        let share_token = crate::db::chart_grant_token(&conn, grant_id, user_id)?;
+        let revoked = crate::db::revoke_object_grant(&conn, grant_id, user_id)?;
+        Ok((revoked, share_token))
     })
     .await;
 
+    if let Ok(Ok((true, Some(share_token)))) = &result {
+        crate::share_live::reconcile(&hub_state, share_token).await;
+    }
+
     match result {
-        Ok(Ok(true)) => Json(serde_json::json!({ "revoked": true })).into_response(),
-        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok((true, _))) => Json(serde_json::json!({ "revoked": true })).into_response(),
+        Ok(Ok((false, _))) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => {
             tracing::error!("DB error revoking share grant: {}", e);
             (
@@ -1801,6 +1809,8 @@ pub async fn update_share_policy(
     let pinned = body.pinned;
     let live = body.live;
 
+    let hub_state = state.clone();
+    let hub_token = token.clone();
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
         let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(live) = live {
@@ -1819,6 +1829,12 @@ pub async fn update_share_policy(
         )
     })
     .await;
+
+    if let Ok(Ok(true)) = &result {
+        // `visibility` back to private takes the view right from everyone the
+        // link never granted: those sockets close now.
+        crate::share_live::reconcile(&hub_state, &hub_token).await;
+    }
 
     match result {
         Ok(Ok(true)) => Json(serde_json::json!({ "updated": true })).into_response(),
@@ -2151,8 +2167,11 @@ const PREVIEW_MAX_DIM: u32 = 2048;
 /// card aspect ratio (1.91:1). The source image is scaled to FIT inside
 /// this canvas (never cropped, never upscaled past its own resolution) and
 /// centered on a solid background — letterboxed, not filled — so a
-/// non-16:9-ish chart screenshot never has its edges cut off.
+/// non-16:9-ish chart screenshot never has its edges cut off. Only the card
+/// test reads these two (nothing in a non-test build does).
+#[cfg(test)]
 const PREVIEW_OUTPUT_WIDTH: u32 = 1200;
+#[cfg(test)]
 const PREVIEW_OUTPUT_HEIGHT: u32 = 630;
 /// Long edge of the chart PNG stored on disk. The served card is always
 /// [`PREVIEW_OUTPUT_WIDTH`]×[`PREVIEW_OUTPUT_HEIGHT`]; this cap is only the
@@ -2410,6 +2429,9 @@ const FADE_X: u32 = 560;
 const FADE_W: u32 = 90;
 const CARD_BG: [u8; 4] = [0x13, 0x17, 0x22, 255];
 
+/// The card template as shipped. Only the card test compares against it
+/// (nothing in a non-test build does).
+#[cfg(test)]
 fn card_template() -> &'static image::RgbaImage {
     static CELL: std::sync::OnceLock<image::RgbaImage> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {

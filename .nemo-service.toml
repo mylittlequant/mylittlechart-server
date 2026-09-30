@@ -552,6 +552,20 @@ public = false
 
 [[endpoints]]
 method = "GET"
+path = "/api/share/{token}/stream-open"
+description = "Ticket for the live socket of a live share. Signed-out callers are allowed (session cookie or bearer optional). Answers {ticket, publish, expires_in_s}: a single-use 128-bit ticket bound to the share and to the caller, valid 30 s, and the caller's CURRENT right to publish (owner or an edit grant). 404 for an unknown, revoked or non-live share; 403 without a view right or when the room already holds 256 sockets; 503 when too many tickets are pending."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
+path = "/api/share-live/{token}"
+description = "WebSocket of the live hub (?ticket= from stream-open). Refused BEFORE the upgrade: 401 for a missing, expired, used or foreign ticket, 403 without a view right or with a full room, 404 for a revoked or unknown share. First frame {\"t\":\"welcome\",\"publish\":bool}; publishers' frames are relayed to every other socket in the room; closes 1008 (viewer frame or rate over 60/s), 1009 (frame over 64 KiB), 1013 (cannot keep up), 4003 (access revoked; reconnect to learn the new publish right)."
+auth = "none"
+public = true
+
+[[endpoints]]
+method = "GET"
 path = "/api/forum/threads"
 description = "Paid in-app forum v1 (entitlements::Feature::Forum — never in the free set): list visible threads, newest activity first. Query limit=&before=, same one-row-lookahead pagination as GET /api/posts. Authed AND paid; 401 signed-out, 403 unpaid."
 auth = "bearer"
