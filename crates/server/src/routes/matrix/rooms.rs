@@ -410,8 +410,9 @@ fn resolve_target_user(identity_conn: &Connection, messenger_conn: &Connection, 
 /// `user_b` (both `join`/`invite`, neither `leave`d out); otherwise free the
 /// pair key on that dead room (`rooms.dm_pair_key` is `UNIQUE`, so a fresh
 /// room reusing this pair key needs the slot released first) and return
-/// `None`, telling the caller to mint a new room.
-fn find_reusable_dm_room(conn: &Connection, pair_key: &str, user_a: i64, user_b: i64) -> rusqlite::Result<Option<String>> {
+/// `None`, telling the caller to mint a new room. `pub(crate)` — the legacy-DM
+/// migration adopts a live native DM through the same lookup.
+pub(crate) fn find_reusable_dm_room(conn: &Connection, pair_key: &str, user_a: i64, user_b: i64) -> rusqlite::Result<Option<String>> {
     let Some(existing) = matrix_store::room_by_dm_pair_key(conn, pair_key)? else {
         return Ok(None);
     };

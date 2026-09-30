@@ -2699,10 +2699,24 @@ pub fn catch_up_dm_conversation(
     receipts: &[LegacyDmReadReceipt],
 ) -> Result<DmMigrationCounts, MatrixStoreError> {
     let tx = conn.transaction()?;
+    let counts = catch_up_dm_in_tx(&tx, room_id, messages, receipts)?;
+    tx.commit()?;
+    Ok(counts)
+}
 
+/// The body of [`catch_up_dm_conversation`], inside the caller's transaction —
+/// shared with [`adopt_dm_room_for_legacy`], so an adopted native room takes
+/// its legacy messages and read positions through exactly the same code as
+/// an already-migrated room's catch-up.
+fn catch_up_dm_in_tx(
+    tx: &Transaction,
+    room_id: &str,
+    messages: &[LegacyDmMessageImport],
+    receipts: &[LegacyDmReadReceipt],
+) -> Result<DmMigrationCounts, MatrixStoreError> {
     for message in messages {
         insert_timeline_event_in_tx(
-            &tx,
+            tx,
             &message.event_id,
             room_id,
             message.sender_user_id,
@@ -2711,18 +2725,87 @@ pub fn catch_up_dm_conversation(
             message.origin_server_ts,
             None,
         )?;
-        insert_legacy_dm_message_map(&tx, message.legacy_message_id, &message.event_id)?;
+        insert_legacy_dm_message_map(tx, message.legacy_message_id, &message.event_id)?;
     }
 
     let mut receipts_set = 0usize;
     for receipt in receipts {
-        let Some(target_event_id) = legacy_dm_message_event_id(&tx, receipt.up_to_legacy_message_id)? else { continue };
-        upsert_receipt_in_tx(&tx, room_id, receipt.reader_user_id, ReceiptType::Read, &target_event_id, receipt.ts_ms)?;
+        let Some(target_event_id) = legacy_dm_message_event_id(tx, receipt.up_to_legacy_message_id)? else { continue };
+        upsert_receipt_in_tx(tx, room_id, receipt.reader_user_id, ReceiptType::Read, &target_event_id, receipt.ts_ms)?;
         receipts_set += 1;
     }
 
-    tx.commit()?;
     Ok(DmMigrationCounts { messages_imported: messages.len(), receipts_set })
+}
+
+/// What [`adopt_dm_room_for_legacy`] needs to bind a native DM room to a
+/// legacy conversation, grouped for the same lint-clean reason
+/// [`RoomBootstrap`]'s doc states.
+#[derive(Debug, Clone, Copy)]
+pub struct DmAdoption<'a> {
+    /// The live native DM room that already holds the pair's `dm_pair_key`.
+    pub room_id: &'a str,
+    /// The legacy `dm_conversations.id` the room is bound to.
+    pub legacy_dm_id: i64,
+    /// The pair's `org.mylittlechart.legacy_dm_key` state events. Each is
+    /// written only when the room has no current event for its
+    /// `(event_type, state_key)` yet — an existing key event is never
+    /// overwritten.
+    pub key_events: &'a [NewStateEvent],
+    pub key_events_origin_server_ts: i64,
+    /// RFC3339 stamp for the member/state bookkeeping of the key events.
+    pub now: &'a str,
+}
+
+/// Bind an EXISTING native DM room to legacy conversation
+/// `adoption.legacy_dm_id`, instead of minting a second room for the same
+/// pair (`rooms.dm_pair_key` is `UNIQUE`, so a second insert is refused):
+/// sets `rooms.legacy_dm_id`, writes any missing legacy key state event,
+/// then imports `messages` and `receipts` through the shared catch-up
+/// body ([`catch_up_dm_in_tx`]) — all in ONE transaction, so a failure
+/// leaves the room exactly as it was. `messages` follow
+/// [`catch_up_dm_conversation`]'s contract (not yet in
+/// `legacy_dm_message_map`, ascending by `legacy_message_id`).
+///
+/// Returns `Ok(None)`, having written nothing, when `room_id` is not a DM
+/// room without a legacy binding (missing, another kind, or already bound to
+/// a legacy conversation) — the caller decides what that means.
+pub fn adopt_dm_room_for_legacy(
+    conn: &mut Connection,
+    adoption: DmAdoption<'_>,
+    messages: &[LegacyDmMessageImport],
+    receipts: &[LegacyDmReadReceipt],
+) -> Result<Option<DmMigrationCounts>, MatrixStoreError> {
+    let tx = conn.transaction()?;
+
+    let bound = tx.execute(
+        "UPDATE rooms SET legacy_dm_id = ?1 WHERE id = ?2 AND kind = 'dm' AND legacy_dm_id IS NULL",
+        params![adoption.legacy_dm_id, adoption.room_id],
+    )?;
+    if bound == 0 {
+        return Ok(None);
+    }
+
+    for event in adoption.key_events {
+        if current_state_event(&tx, adoption.room_id, &event.event_type, &event.state_key)?.is_some() {
+            continue;
+        }
+        apply_state_event_in_tx(
+            &tx,
+            &event.event_id,
+            adoption.room_id,
+            event.sender_user_id,
+            &event.event_type,
+            &event.state_key,
+            &event.content,
+            adoption.key_events_origin_server_ts,
+            adoption.now,
+        )?;
+    }
+
+    let counts = catch_up_dm_in_tx(&tx, adoption.room_id, messages, receipts)?;
+    tx.commit()?;
+    Ok(Some(counts))
 }
 
 // ============================================================================
@@ -3595,5 +3678,99 @@ mod tests {
 
         let empty = user_ids_with_leave_transition_in_rooms(&conn, &[], 0, i64::MAX).expect("empty room set");
         assert!(empty.is_empty());
+    }
+
+    // ---- P16 S-d: adopting a native DM room for a legacy conversation ----
+
+    fn native_dm_room(conn: &Connection) {
+        create_room(conn, ROOM, RoomKind::Dm, 1, T0, true, JoinRule::Invite, HistoryVisibility::Shared, Some("1:2"), None).expect("create dm room");
+    }
+
+    fn legacy_import(legacy_message_id: i64, event_id: &str) -> LegacyDmMessageImport {
+        LegacyDmMessageImport {
+            legacy_message_id,
+            event_id: event_id.to_string(),
+            sender_user_id: 1,
+            content: "{}".to_string(),
+            origin_server_ts: 1000 + legacy_message_id,
+        }
+    }
+
+    fn adoption_of(legacy_dm_id: i64) -> DmAdoption<'static> {
+        DmAdoption { room_id: ROOM, legacy_dm_id, key_events: &[], key_events_origin_server_ts: 500, now: T0 }
+    }
+
+    #[test]
+    fn adopt_dm_room_for_legacy_binds_the_room_and_imports_the_messages() {
+        let mut conn = test_conn();
+        native_dm_room(&conn);
+
+        let counts = adopt_dm_room_for_legacy(&mut conn, adoption_of(7), &[legacy_import(1, "$l1"), legacy_import(2, "$l2")], &[])
+            .expect("adopt")
+            .expect("the room is adoptable");
+        assert_eq!(counts.messages_imported, 2);
+        assert_eq!(room_by_legacy_dm_id(&conn, 7).expect("query").expect("bound").id, ROOM);
+        assert_eq!(highest_mapped_legacy_message_id(&conn, ROOM).expect("query"), Some(2));
+        assert_eq!(get_event(&conn, "$l1").expect("query").expect("imported").room_id, ROOM);
+    }
+
+    #[test]
+    fn adopt_dm_room_for_legacy_writes_a_key_event_only_where_the_room_has_none() {
+        let mut conn = test_conn();
+        native_dm_room(&conn);
+        let existing = apply_state_event(&mut conn, "$k-existing", ROOM, 1, "org.mylittlechart.legacy_dm_key", "@a:mylittlechart.org", r#"{"public_key_b64":"AAAA"}"#, 900, T0)
+            .expect("existing key event");
+        let key_events = [
+            NewStateEvent {
+                event_id: "$k-a".to_string(),
+                sender_user_id: 1,
+                event_type: "org.mylittlechart.legacy_dm_key".to_string(),
+                state_key: "@a:mylittlechart.org".to_string(),
+                content: r#"{"public_key_b64":"BBBB"}"#.to_string(),
+            },
+            NewStateEvent {
+                event_id: "$k-b".to_string(),
+                sender_user_id: 2,
+                event_type: "org.mylittlechart.legacy_dm_key".to_string(),
+                state_key: "@b:mylittlechart.org".to_string(),
+                content: r#"{"public_key_b64":"CCCC"}"#.to_string(),
+            },
+        ];
+        let adoption = DmAdoption { key_events: &key_events, ..adoption_of(7) };
+        adopt_dm_room_for_legacy(&mut conn, adoption, &[], &[]).expect("adopt").expect("adoptable");
+
+        let a = current_state_event(&conn, ROOM, "org.mylittlechart.legacy_dm_key", "@a:mylittlechart.org").expect("query").expect("still present");
+        assert_eq!(a.event_id, existing.event_id, "an existing key event is never overwritten");
+        let b = current_state_event(&conn, ROOM, "org.mylittlechart.legacy_dm_key", "@b:mylittlechart.org").expect("query").expect("added");
+        assert_eq!(b.event_id, "$k-b");
+    }
+
+    #[test]
+    fn adopt_dm_room_for_legacy_refuses_a_room_that_is_bound_or_not_a_dm() {
+        let mut conn = test_conn();
+        make_room(&conn);
+        assert!(adopt_dm_room_for_legacy(&mut conn, adoption_of(7), &[legacy_import(1, "$l1")], &[]).expect("adopt").is_none(), "a group room is never adopted");
+        assert!(room_by_legacy_dm_id(&conn, 7).expect("query").is_none());
+
+        let mut bound = test_conn();
+        create_room(&bound, ROOM, RoomKind::Dm, 1, T0, true, JoinRule::Invite, HistoryVisibility::Shared, Some("1:2"), Some(9)).expect("create bound room");
+        assert!(adopt_dm_room_for_legacy(&mut bound, adoption_of(7), &[legacy_import(1, "$l1")], &[]).expect("adopt").is_none(), "an already-bound room is never re-bound");
+        assert_eq!(room_by_legacy_dm_id(&bound, 9).expect("query").expect("still bound to 9").id, ROOM);
+        assert!(get_event(&bound, "$l1").expect("query").is_none(), "a refused adoption writes nothing");
+    }
+
+    #[test]
+    fn adopt_dm_room_for_legacy_rolls_back_the_binding_when_an_import_fails() {
+        let mut conn = test_conn();
+        native_dm_room(&conn);
+
+        // The second import reuses the first one's event id — refused by the
+        // UNIQUE index, after the room was already bound inside the transaction.
+        let result = adopt_dm_room_for_legacy(&mut conn, adoption_of(7), &[legacy_import(1, "$dup"), legacy_import(2, "$dup")], &[]);
+        assert!(result.is_err());
+
+        assert!(room_by_legacy_dm_id(&conn, 7).expect("query").is_none(), "the binding must roll back with the failed import");
+        assert!(get_event(&conn, "$dup").expect("query").is_none(), "no imported event survives");
+        assert_eq!(highest_mapped_legacy_message_id(&conn, ROOM).expect("query"), None);
     }
 }

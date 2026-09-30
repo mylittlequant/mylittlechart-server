@@ -47,6 +47,25 @@
 //! write error, an unparseable timestamp) is caught here, logged with that
 //! conversation's id, and never touches any other conversation.
 //!
+//! # A native DM for the pair already exists (P16)
+//!
+//! `rooms.dm_pair_key` is `UNIQUE`, so a legacy conversation cannot get a room
+//! of its own when a native Matrix DM already holds its pair key (the
+//! migration's insert used to fail on that constraint, and the live bridge
+//! swallowed the failure — the legacy messages reached no room).
+//! [`migrate_one_conversation`] therefore asks
+//! [`crate::routes::matrix::rooms::find_reusable_dm_room`] first — the same
+//! lookup a native `createRoom` uses. A live native DM (both parties
+//! `join`/`invite`) is ADOPTED ([`adopt_native_dm_room`]): the room gets the
+//! conversation's `legacy_dm_id`, any legacy key state event it lacks, and
+//! every legacy message and read position, in one transaction, through the
+//! same catch-up body an already-migrated room uses. A dead native DM (one
+//! party left) has its pair key freed by that lookup and the conversation is
+//! migrated into a fresh room, as before. Boot migration and the live bridge
+//! both go through [`migrate_one_conversation`], so both behave alike, and
+//! once adopted the room is found by `legacy_dm_id` like any other migrated
+//! room.
+//!
 //! # Catch-up (P15): the old `/dm/conversations*` routes stay live
 //!
 //! `routes::dm`'s legacy send-message and read-marker routes keep working
@@ -90,7 +109,7 @@ use mylittlechart_server::matrix_store::{self, RoomKind};
 
 use crate::db;
 use crate::dm_db;
-use crate::routes::matrix::rooms::{dm_pair_key, invite_power_level, power_levels_content, room_kind_settings, state_event};
+use crate::routes::matrix::rooms::{dm_pair_key, find_reusable_dm_room, invite_power_level, power_levels_content, room_kind_settings, state_event};
 
 /// State event type for a migrated room's copy of each member's DM identity
 /// key (plan §2 manager decision 5). Content:
@@ -389,6 +408,17 @@ fn migrate_one_conversation(
     let lo_mxid = matrix_store::ensure_matrix_user(messenger, conv.user_lo, &lo_public_id, now)?;
     let hi_mxid = matrix_store::ensure_matrix_user(messenger, conv.user_hi, &hi_public_id, now)?;
 
+    // A native Matrix DM for this pair may already exist (`rooms.dm_pair_key`
+    // is UNIQUE, so a second room for the pair cannot be inserted). If it is
+    // still live for both parties, the legacy conversation joins THAT room
+    // instead of getting one of its own; a dead one has its pair key freed
+    // here and the migration below mints a fresh room, exactly like a native
+    // `createRoom` reusing the pair.
+    let pair_key = dm_pair_key(conv.user_lo, conv.user_hi);
+    if let Some(native_room_id) = find_reusable_dm_room(messenger, &pair_key, conv.user_lo, conv.user_hi)? {
+        return adopt_native_dm_room(messenger, social, &native_room_id, conv, (lo_mxid.as_str(), hi_mxid.as_str()), now);
+    }
+
     let (join_rule, history_visibility, is_encrypted) = room_kind_settings(RoomKind::Dm);
     let invite_level = invite_power_level(RoomKind::Dm, None);
     let bootstrap_origin_ts = rfc3339_to_millis(&conv.created_at)?;
@@ -414,19 +444,7 @@ fn migrate_one_conversation(
             serde_json::json!({ "algorithm": "m.megolm.v1.aes-sha2" }),
         ));
     }
-    for (user_id, mxid) in [(conv.user_lo, lo_mxid.as_str()), (conv.user_hi, hi_mxid.as_str())] {
-        if let Some(identity_key) = dm_db::get_identity_key(social, user_id)? {
-            state_events.push(state_event(
-                LEGACY_DM_KEY_EVENT_TYPE,
-                mxid,
-                user_id,
-                serde_json::json!({
-                    "public_key_b64": STANDARD.encode(&identity_key.public_key),
-                    "legacy_conversation_id": conv.id,
-                }),
-            ));
-        }
-    }
+    state_events.extend(legacy_dm_key_events(social, conv, (lo_mxid.as_str(), hi_mxid.as_str()))?);
 
     let messages = list_dm_messages(social, conv.id, 0)?;
     let message_imports: Vec<matrix_store::LegacyDmMessageImport> =
@@ -440,7 +458,6 @@ fn migrate_one_conversation(
         ];
 
     let room_id = matrix_store::new_room_id();
-    let pair_key = dm_pair_key(conv.user_lo, conv.user_hi);
     let bootstrap = matrix_store::RoomBootstrap {
         room_id: &room_id,
         kind: RoomKind::Dm,
@@ -457,6 +474,69 @@ fn migrate_one_conversation(
     let (_room, counts) = matrix_store::migrate_dm_conversation(messenger, bootstrap, &state_events, bootstrap_origin_ts, extras)?;
 
     Ok(ConversationOutcome::Migrated { messages_imported: counts.messages_imported, receipts_set: counts.receipts_set })
+}
+
+/// Every `org.mylittlechart.legacy_dm_key` state event `conv`'s room needs —
+/// one per party that has published a DM identity key
+/// (`(lo_mxid, hi_mxid)` are `conv.user_lo`'s and `conv.user_hi`'s mxids).
+/// Shared by a fresh migration and by [`adopt_native_dm_room`].
+fn legacy_dm_key_events(
+    social: &Connection,
+    conv: &LegacyConversation,
+    (lo_mxid, hi_mxid): (&str, &str),
+) -> Result<Vec<matrix_store::NewStateEvent>, ConversationMigrationError> {
+    let mut events = Vec::new();
+    for (user_id, mxid) in [(conv.user_lo, lo_mxid), (conv.user_hi, hi_mxid)] {
+        if let Some(identity_key) = dm_db::get_identity_key(social, user_id)? {
+            events.push(state_event(
+                LEGACY_DM_KEY_EVENT_TYPE,
+                mxid,
+                user_id,
+                serde_json::json!({
+                    "public_key_b64": STANDARD.encode(&identity_key.public_key),
+                    "legacy_conversation_id": conv.id,
+                }),
+            ));
+        }
+    }
+    Ok(events)
+}
+
+/// Bind the live native DM room `room_id` to legacy conversation `conv`
+/// rather than creating a second room for the same pair: sets
+/// `rooms.legacy_dm_id`, adds the legacy key state events the room lacks, and
+/// imports every legacy message and read position through the shared
+/// catch-up body — ONE transaction
+/// ([`mylittlechart_server::matrix_store::adopt_dm_room_for_legacy`]). The
+/// native room's members, power levels and history are left as they are; no
+/// `m.direct` hint is written (the native room's own creator already
+/// recorded the direct room). A room that is already bound to a legacy
+/// conversation is reported as [`ConversationOutcome::Skipped`].
+fn adopt_native_dm_room(
+    messenger: &mut Connection,
+    social: &Connection,
+    room_id: &str,
+    conv: &LegacyConversation,
+    mxids: (&str, &str),
+    now: &str,
+) -> Result<ConversationOutcome, ConversationMigrationError> {
+    let key_events = legacy_dm_key_events(social, conv, mxids)?;
+    let messages = list_dm_messages(social, conv.id, 0)?;
+    let message_imports: Vec<matrix_store::LegacyDmMessageImport> =
+        messages.iter().map(|message| legacy_dm_message_import(conv.id, message)).collect::<Result<_, _>>()?;
+    let receipts = conversation_read_receipts(social, conv)?;
+
+    let adoption = matrix_store::DmAdoption {
+        room_id,
+        legacy_dm_id: conv.id,
+        key_events: &key_events,
+        key_events_origin_server_ts: rfc3339_to_millis(now)?,
+        now,
+    };
+    match matrix_store::adopt_dm_room_for_legacy(messenger, adoption, &message_imports, &receipts)? {
+        Some(counts) => Ok(ConversationOutcome::Migrated { messages_imported: counts.messages_imported, receipts_set: counts.receipts_set }),
+        None => Ok(ConversationOutcome::Skipped(format!("native DM room {room_id} is already bound to another legacy conversation"))),
+    }
 }
 
 // ============================================================================
@@ -1098,6 +1178,148 @@ mod tests {
 
         let room_count: i64 = messenger.query_row("SELECT COUNT(*) FROM rooms", [], |r| r.get(0)).expect("count");
         assert_eq!(room_count, 1, "the second send must not create a second room");
+    }
+
+    // ---- P16 S-d: a native DM already exists for the pair ----
+
+    /// A native Matrix DM between `conv`'s two users, exactly the shape
+    /// `createRoom` with `is_direct` writes: one room holding the pair key,
+    /// `lo` joined, `hi` in the given membership. Returns the room id.
+    fn native_dm_room(messenger: &mut Connection, identity: &Connection, conv: &dm_db::DmConversation, hi_membership: &str) -> String {
+        let lo_public_id = db::get_user_public_id(identity, conv.user_lo).expect("lo public id");
+        let hi_public_id = db::get_user_public_id(identity, conv.user_hi).expect("hi public id");
+        let lo_mxid = matrix_store::ensure_matrix_user(messenger, conv.user_lo, &lo_public_id, NOW).expect("lo mxid");
+        let hi_mxid = matrix_store::ensure_matrix_user(messenger, conv.user_hi, &hi_public_id, NOW).expect("hi mxid");
+
+        let room_id = matrix_store::new_room_id();
+        let (join_rule, history_visibility, is_encrypted) = room_kind_settings(RoomKind::Dm);
+        let pair_key = dm_pair_key(conv.user_lo, conv.user_hi);
+        let state_events = vec![
+            state_event("m.room.create", "", conv.user_lo, serde_json::json!({ "room_version": matrix_store::MATRIX_ROOM_VERSION })),
+            state_event("m.room.member", &lo_mxid, conv.user_lo, serde_json::json!({ "membership": "join" })),
+            state_event("m.room.member", &hi_mxid, conv.user_lo, serde_json::json!({ "membership": hi_membership })),
+        ];
+        let bootstrap = matrix_store::RoomBootstrap {
+            room_id: &room_id,
+            kind: RoomKind::Dm,
+            creator_user_id: conv.user_lo,
+            created_at: NOW,
+            is_encrypted,
+            join_rule,
+            history_visibility,
+            dm_pair_key: Some(pair_key.as_str()),
+            legacy_dm_id: None,
+        };
+        matrix_store::create_room_with_state(messenger, bootstrap, &state_events, 1000).expect("native DM room");
+        room_id
+    }
+
+    fn room_count(messenger: &Connection) -> i64 {
+        messenger.query_row("SELECT COUNT(*) FROM rooms", [], |r| r.get(0)).expect("count")
+    }
+
+    #[test]
+    fn legacy_conversation_is_adopted_by_the_existing_native_dm_room() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        let native_room_id = native_dm_room(&mut messenger, &identity, &conv, "join");
+        let native_create = matrix_store::current_state_event(&messenger, &native_room_id, "m.room.create", "").expect("query").expect("exists");
+
+        let lo_key = vec![1u8; dm_db::DM_PUBLIC_KEY_LEN];
+        dm_db::upsert_identity_key(&social, conv.user_lo, &lo_key, "2026-09-01T00:00:00+00:00").expect("publish lo key");
+        let nonce = [0u8; dm_db::DM_NONCE_LEN];
+        let msg_a = dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"one", "2026-09-01T00:01:00+00:00").expect("insert 1");
+        let msg_b = dm_db::create_message(&social, conv.id, conv.user_hi, &nonce, b"two", "2026-09-01T00:02:00+00:00").expect("insert 2");
+        dm_db::mark_read(&social, conv.id, conv.user_hi, msg_a, "2026-09-01T00:05:00+00:00").expect("mark read");
+
+        let report = migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("migrate");
+        assert_eq!(report.conversations_migrated, 1);
+        assert_eq!(report.conversations_skipped, 0);
+        assert_eq!(report.messages_imported, 2);
+
+        assert_eq!(room_count(&messenger), 1, "the pair keeps exactly one room");
+        let room = matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").expect("bound");
+        assert_eq!(room.id, native_room_id, "the legacy conversation is bound to the native room");
+        for legacy_message_id in [msg_a, msg_b] {
+            let event_id = matrix_store::legacy_dm_message_event_id(&messenger, legacy_message_id).expect("query").expect("mapped");
+            let event = matrix_store::get_event(&messenger, &event_id).expect("query").expect("exists");
+            assert_eq!(event.room_id, native_room_id, "message {legacy_message_id} landed in the native room");
+            assert_eq!(event.event_type, "org.mylittlechart.legacy_dm");
+        }
+
+        let receipt = matrix_store::get_receipt(&messenger, &native_room_id, conv.user_hi, ReceiptType::Read).expect("query").expect("receipt set");
+        assert_eq!(receipt.event_id, matrix_store::legacy_dm_message_event_id(&messenger, msg_a).expect("query").expect("mapped"));
+
+        let lo_mxid = matrix_store::mxid_of(&messenger, conv.user_lo).expect("query").expect("registered");
+        let key_event = matrix_store::current_state_event(&messenger, &native_room_id, LEGACY_DM_KEY_EVENT_TYPE, &lo_mxid)
+            .expect("query")
+            .expect("the legacy key state event was added to the native room");
+        let key_content: serde_json::Value = serde_json::from_str(&key_event.content).expect("json");
+        assert_eq!(STANDARD.decode(key_content["public_key_b64"].as_str().expect("string")).expect("base64"), lo_key);
+
+        let native_create_after =
+            matrix_store::current_state_event(&messenger, &native_room_id, "m.room.create", "").expect("query").expect("exists");
+        assert_eq!(native_create_after.event_id, native_create.event_id, "the native room's own state is untouched");
+    }
+
+    #[test]
+    fn boot_migration_after_an_adoption_is_a_noop_until_new_messages_arrive() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        let native_room_id = native_dm_room(&mut messenger, &identity, &conv, "join");
+        let nonce = [0u8; dm_db::DM_NONCE_LEN];
+        dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"one", "2026-09-01T00:01:00+00:00").expect("insert 1");
+        migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("first boot adopts the native room");
+
+        let events_before: i64 = messenger.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).expect("count");
+        let second = migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("second boot");
+        assert_eq!(second, MigrationReport::default(), "an adopted conversation needs nothing on the next boot");
+        let events_after: i64 = messenger.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).expect("count");
+        assert_eq!(events_before, events_after);
+        assert_eq!(room_count(&messenger), 1);
+
+        dm_db::create_message(&social, conv.id, conv.user_hi, &nonce, b"two", "2026-09-01T00:02:00+00:00").expect("insert 2");
+        let third = migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("third boot");
+        assert_eq!(third.messages_caught_up, 1, "a later legacy message is caught up into the adopted room");
+        let event_id = matrix_store::legacy_dm_message_event_id(&messenger, 2).expect("query").expect("mapped");
+        assert_eq!(matrix_store::get_event(&messenger, &event_id).expect("query").expect("exists").room_id, native_room_id);
+    }
+
+    #[test]
+    fn bridge_legacy_dm_send_adopts_a_native_dm_room_instead_of_failing() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        // The peer has been invited but has not joined yet: still a live DM.
+        let native_room_id = native_dm_room(&mut messenger, &identity, &conv, "invite");
+        let nonce = [0u8; dm_db::DM_NONCE_LEN];
+        let msg = dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"first", "2026-09-01T00:01:00+00:00").expect("insert 1");
+
+        let room_id = bridge_legacy_dm_send(&mut messenger, &social, &identity, &conv, NOW).expect("the bridge must not hit the pair-key constraint");
+        assert_eq!(room_id, native_room_id);
+        assert_eq!(room_count(&messenger), 1);
+        let event_id = matrix_store::legacy_dm_message_event_id(&messenger, msg).expect("query").expect("mapped");
+        assert_eq!(matrix_store::get_event(&messenger, &event_id).expect("query").expect("exists").room_id, native_room_id);
+
+        // The next send takes the ordinary catch-up path into the same room.
+        let msg2 = dm_db::create_message(&social, conv.id, conv.user_hi, &nonce, b"second", "2026-09-01T00:02:00+00:00").expect("insert 2");
+        assert_eq!(bridge_legacy_dm_send(&mut messenger, &social, &identity, &conv, NOW).expect("second bridge"), native_room_id);
+        let event_id2 = matrix_store::legacy_dm_message_event_id(&messenger, msg2).expect("query").expect("mapped");
+        assert_eq!(matrix_store::get_event(&messenger, &event_id2).expect("query").expect("exists").room_id, native_room_id);
+    }
+
+    #[test]
+    fn a_dead_native_dm_room_does_not_capture_the_legacy_conversation() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        let native_room_id = native_dm_room(&mut messenger, &identity, &conv, "leave");
+        let nonce = [0u8; dm_db::DM_NONCE_LEN];
+        dm_db::create_message(&social, conv.id, conv.user_lo, &nonce, b"hello", "2026-09-01T00:01:00+00:00").expect("insert 1");
+
+        let report = migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("migrate");
+        assert_eq!(report.conversations_migrated, 1);
+
+        let legacy_room = matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").expect("bound");
+        assert_ne!(legacy_room.id, native_room_id, "the dead native room is not reused");
+        assert_eq!(room_count(&messenger), 2);
+        let dead = matrix_store::get_room(&messenger, &native_room_id).expect("query").expect("still exists");
+        assert!(dead.dm_pair_key.is_none(), "the dead room released the pair key");
+        assert_eq!(legacy_room.dm_pair_key.as_deref(), Some("1:2"));
     }
 
     #[test]
