@@ -784,11 +784,16 @@ pub async fn merge_users(
     let into = req.into;
     let dry_run = req.dry_run;
 
+    let hub_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let control = state.control_plane();
         if dry_run {
             crate::account_merge::plan(&control.db, &control.social, &control.sync_store, from, into)
+                .map(|summary| (summary, Vec::new()))
         } else {
+            // The live rooms whose rights the merge changes, read before it
+            // moves the rows.
+            let touched_shares = crate::account_merge::share_tokens_touched_by(&control.db, from)?;
             crate::account_merge::execute(
                 &control.db,
                 &control.social,
@@ -798,12 +803,21 @@ pub async fn merge_users(
                 into,
                 keep_vault,
             )
+            .map(|summary| (summary, touched_shares))
         }
     })
     .await;
 
+    // The merged-away account's sockets are bound to an id that no longer
+    // exists: the hub re-checks each touched room now instead of on its timer.
+    if let Ok(Ok((_, touched_shares))) = &result {
+        for token in touched_shares {
+            crate::share_live::reconcile(&hub_state, token).await;
+        }
+    }
+
     match result {
-        Ok(Ok(summary)) => Json(summary).into_response(),
+        Ok(Ok((summary, _))) => Json(summary).into_response(),
         Ok(Err(crate::account_merge::MergeError::SameUser)) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new("from and into must be different user ids")),

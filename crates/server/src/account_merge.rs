@@ -212,6 +212,32 @@ pub fn plan(
 }
 
 // ============================================================================
+// share_tokens_touched_by — which live rooms a merge changes rights in
+// ============================================================================
+
+/// Every share token whose live room can change rights when `from` is merged
+/// away: each share `from` owns (its owner becomes `into`), and each chart
+/// grant `from` owns or holds (re-pointed to `into`). A socket the hub holds
+/// for `from` is bound to `from`'s account id, which no longer exists after
+/// the merge, so the hub must re-check these rooms at once
+/// (`share_live::reconcile`) instead of waiting for its periodic sweep.
+///
+/// Read BEFORE [`execute`] moves the rows. Locks `db` alone and drops the
+/// guard before returning (this module's lock discipline). A token that is
+/// not live has an empty room, so re-checking it costs nothing.
+pub fn share_tokens_touched_by(db: &Mutex<Connection>, from: i64) -> Result<Vec<String>, MergeError> {
+    let identity_conn = db.lock().unwrap_or_else(|e| e.into_inner());
+    let mut stmt = identity_conn.prepare(
+        "SELECT token FROM share_links WHERE user_id = ?1
+         UNION
+         SELECT object_id FROM object_grants
+         WHERE object_kind = 'chart' AND (owner_user_id = ?1 OR grantee_user_id = ?1)",
+    )?;
+    let tokens = stmt.query_map(params![from], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(tokens)
+}
+
+// ============================================================================
 // execute — the real merge
 // ============================================================================
 
@@ -1144,6 +1170,38 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Live rooms touched by a merge
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn share_tokens_touched_by_lists_the_shares_and_chart_grants_of_the_merged_away_account() {
+        let identity = identity_conn();
+        let now = now();
+        let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        let from = seed_user(&identity, "github", "from", "from");
+        let into = seed_user(&identity, "github", "into", "into");
+        let third = seed_user(&identity, "github", "third", "third");
+        let make = |owner: i64| {
+            crate::db::create_share_link(&identity, owner, "live", "t", "{}", 0, &now, &future, false, "view", "[]", "public", None)
+                .expect("share")
+        };
+        let owned_by_from = make(from);
+        let owned_by_into = make(into);
+        let edited_by_from = make(third);
+        let granted_by_from = make(into);
+        crate::db::upsert_share_edit_grant(&identity, &edited_by_from, third, Some(from), None, None, &now).expect("grant to from");
+        crate::db::upsert_share_edit_grant(&identity, &granted_by_from, into, Some(third), None, None, &now).expect("unrelated grant");
+
+        let db = Mutex::new(identity);
+        let mut touched = share_tokens_touched_by(&db, from).expect("touched");
+        touched.sort();
+        let mut expected = vec![owned_by_from, edited_by_from];
+        expected.sort();
+        assert_eq!(touched, expected);
+        assert!(!touched.contains(&owned_by_into) && !touched.contains(&granted_by_from));
     }
 
     // ------------------------------------------------------------------
