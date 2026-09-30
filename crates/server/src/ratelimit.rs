@@ -53,7 +53,8 @@ impl BucketKind {
     /// faster than they refill.
     fn limits(self) -> (f64, f64) {
         match self {
-            BucketKind::AuthPoll => (30.0, 60.0 / 60.0),
+            // 60 per minute is 1 token per second.
+            BucketKind::AuthPoll => (30.0, 1.0),
             BucketKind::Oauth => (20.0, 20.0 / 60.0),
             BucketKind::ApiWrite => (120.0, 120.0 / 60.0),
             BucketKind::ApiRead => (600.0, 600.0 / 60.0),
