@@ -73,7 +73,7 @@ To stop permanently (no restart): `touch data/stop-server` before sending restar
 |--------|------|------|-------------|
 | POST | `/api/admin/register-release` | Bearer ADMIN_SECRET | Register a release manifest row (JSON: platform, version, channel, filename, sha256, file_size, release_notes, signature). Metadata only — the artifact itself is uploaded to both public edges by `mlc-opsd` (`crates/opsd`) before this is ever called; see "Upload a New Release" below. |
 | POST | `/api/admin/restart` | Bearer ADMIN_SECRET | Trigger graceful shutdown (wrapper auto-restarts) |
-| GET | `/api/billing/plans` | Cookie session or Bearer | Plans offered to this request; the Tor account variants only when the `Host` is a configured onion host |
+| GET | `/api/billing/plans` | None (public) | Plans offered to this request; the Tor account variants only when the `Host` is a configured onion host |
 | GET | `/api/billing/me` | Cookie session or Bearer | Paid status (legacy `paid_until`, lifetime flags, quant tier + quota), credit balance, subscription, open invoices |
 | POST | `/api/billing/checkout` | Cookie session or Bearer | `{plan_id}` → `{invoice_id, plan_id, pay:[{chain, asset, address, amount, expires_at, qr_svg}]}` via the dig2pay merchant API |
 | GET | `/api/billing/invoice/{id}` | Cookie session or Bearer | One of the caller's own invoices (another account's is a 404) with the processor's live status |

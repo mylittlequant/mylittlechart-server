@@ -1,10 +1,17 @@
 //! `/api/billing/*` — the dig2pay billing adapter.
 //!
+//! One public route, open to signed-out visitors (an anonymous account is
+//! bought by someone with no session yet; the general per-IP read limiter in
+//! front of `/api` covers it like every other public GET):
+//!
+//! | Route | Purpose |
+//! |---|---|
+//! | `GET /api/billing/plans` | the plans offered to THIS request (Tor variants only on the onion vhost); no per-user state |
+//!
 //! Signed-in routes (session cookie or bearer, like `/api/account/*`):
 //!
 //! | Route | Purpose |
 //! |---|---|
-//! | `GET /api/billing/plans` | the plans offered to THIS request (Tor variants only on the onion vhost) |
 //! | `GET /api/billing/me` | the account's paid picture, credit, subscription, open invoices |
 //! | `POST /api/billing/checkout {plan_id}` | start (or resume) a purchase → `{invoice_id, plan_id, pay:[…]}` |
 //! | `GET /api/billing/invoice/{id}` | one of the caller's own invoices, with the processor's live status |
@@ -116,7 +123,10 @@ fn plan_json(plan: &Plan) -> Value {
     })
 }
 
-/// `GET /api/billing/plans`
+/// `GET /api/billing/plans` — public: no session is needed and none is read.
+/// The answer holds no per-user state (the catalog depends only on the Host
+/// the request came in on), so a signed-in caller gets exactly what a
+/// signed-out one does.
 ///
 /// ```json
 /// { "onion": false, "checkout_enabled": true,
@@ -133,9 +143,6 @@ fn plan_json(plan: &Plan) -> Value {
 /// (`routes/anon_account.rs`); this signed-in checkout answers
 /// `400 anonymous_only` for it.
 pub async fn plans(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Err(response) = signed_in(&state, &headers).await {
-        return response;
-    }
     let Some(billing) = state.billing() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "billing_not_configured");
     };
@@ -801,11 +808,43 @@ pub(crate) mod tests {
     // ---------------------------------------------------------------- plans
 
     #[tokio::test]
-    async fn plans_need_a_signed_in_caller() {
+    async fn plans_are_public_and_carry_no_per_user_state() {
         let state = app_state(Some(runtime(None)));
+        let (_, token) = sign_in(&state, "planner-public");
         let router = control_api_router(state);
-        let (status, _) = send(&router, Method::GET, "/billing/plans", &[], None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Signed out, clearnet Host: the clearnet catalog.
+        let (status, clearnet) =
+            send(&router, Method::GET, "/billing/plans", &[("host", "mylittlechart.org")], None).await;
+        assert_eq!(status, StatusCode::OK, "{clearnet}");
+        assert_eq!(clearnet["onion"], false);
+        let ids = plan_ids(&clearnet);
+        assert!(ids.contains(&"mlc-paid-account-v1".to_string()));
+        assert!(ids.contains(&"mlc-anon-account-v1".to_string()));
+        assert!(!ids.contains(&DEFAULT_PAID_TOR_ID.to_string()));
+        assert!(!ids.contains(&DEFAULT_ANON_TOR_ID.to_string()));
+
+        // Signed out, onion Host: only the Tor variants of the account plans.
+        let (status, onion) = send(&router, Method::GET, "/billing/plans", &[("host", ONION_HOST)], None).await;
+        assert_eq!(status, StatusCode::OK, "{onion}");
+        assert_eq!(onion["onion"], true);
+        let ids = plan_ids(&onion);
+        assert!(ids.contains(&DEFAULT_PAID_TOR_ID.to_string()));
+        assert!(ids.contains(&DEFAULT_ANON_TOR_ID.to_string()));
+        assert!(!ids.contains(&"mlc-paid-account-v1".to_string()));
+        assert!(!ids.contains(&"mlc-anon-account-v1".to_string()));
+
+        // The body is the catalog and nothing about a caller.
+        for body in [&clearnet, &onion] {
+            let mut keys: Vec<&str> = body.as_object().expect("object").keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["checkout_enabled", "onion", "plans"]);
+        }
+
+        // A session changes nothing.
+        let (status, signed_in_clearnet) = get_json(&router, &token, "/billing/plans", Some("mylittlechart.org")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(signed_in_clearnet, clearnet);
     }
 
     #[tokio::test]

@@ -137,8 +137,11 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/account/redeem", post(account::redeem))
         // Account nick change (cookie-session or bearer auth, same as redeem).
         .route("/account/nick", post(account::set_nick))
-        // dig2pay billing adapter (see routes/billing.rs): five signed-in
-        // routes, plus the processor's own callback — authenticated by its
+        // dig2pay billing adapter (see routes/billing.rs): four signed-in
+        // routes, the PUBLIC plan catalog (an anonymous account is bought by
+        // a visitor with no session; it holds no per-user state and sits
+        // behind the same per-IP read limiter as every other public GET),
+        // plus the processor's own callback — authenticated by its
         // signature rather than a session, and body-limited on its own.
         .route("/billing/plans", get(billing::plans))
         .route("/billing/me", get(billing::me))
