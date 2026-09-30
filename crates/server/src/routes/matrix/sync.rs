@@ -843,16 +843,16 @@ mod tests {
         )
         .expect("create room");
         let mxid = matrix_store::ensure_matrix_user(conn, creator_user_id, &format!("user{creator_user_id:0>28}"), T0).expect("ensure user");
-        matrix_store::apply_state_event(conn, &format!("$create{creator_user_id}"), &room_id, creator_user_id, "m.room.create", "", r#"{"room_version":"11"}"#, 100, T0)
+        matrix_store::apply_state_event(conn, &matrix_store::StateEventWrite { event_id: &format!("$create{creator_user_id}"), room_id: &room_id, sender_user_id: creator_user_id, event_type: "m.room.create", state_key: "", content: r#"{"room_version":"11"}"#, origin_server_ts: 100, now: T0 })
             .expect("create event");
-        matrix_store::apply_state_event(conn, &format!("$join{creator_user_id}"), &room_id, creator_user_id, "m.room.member", &mxid, r#"{"membership":"join"}"#, 200, T0)
+        matrix_store::apply_state_event(conn, &matrix_store::StateEventWrite { event_id: &format!("$join{creator_user_id}"), room_id: &room_id, sender_user_id: creator_user_id, event_type: "m.room.member", state_key: &mxid, content: r#"{"membership":"join"}"#, origin_server_ts: 200, now: T0 })
             .expect("join event");
         (room_id, mxid)
     }
 
     fn join_room(conn: &mut Connection, room_id: &str, user_id: i64, event_id: &str, stream_ts: i64) -> String {
         let mxid = matrix_store::ensure_matrix_user(conn, user_id, &format!("user{user_id:0>28}"), T0).expect("ensure user");
-        matrix_store::apply_state_event(conn, event_id, room_id, user_id, "m.room.member", &mxid, r#"{"membership":"join"}"#, stream_ts, T0).expect("join event");
+        matrix_store::apply_state_event(conn, &matrix_store::StateEventWrite { event_id, room_id, sender_user_id: user_id, event_type: "m.room.member", state_key: &mxid, content: r#"{"membership":"join"}"#, origin_server_ts: stream_ts, now: T0 }).expect("join event");
         mxid
     }
 
@@ -876,7 +876,7 @@ mod tests {
         let r1 = build_sync_response(&conn, &typing, 1, &alice, "DEV1", None, &filter, false, Instant::now()).expect("initial sync");
         let token1 = next_batch_of(&r1);
 
-        matrix_store::insert_timeline_event(&mut conn, "$e1", &room_id, 1, "m.room.message", "{}", 1000, None).expect("insert");
+        matrix_store::insert_timeline_event(&mut conn, "$e1", &room_id, 1, "m.room.message", "{}", 1000).expect("insert");
 
         let r2 = build_sync_response(&conn, &typing, 1, &alice, "DEV1", Some(token1), &filter, false, Instant::now()).expect("second sync");
         let token2 = next_batch_of(&r2);
@@ -898,13 +898,13 @@ mod tests {
 
         // Bob changes his own displayname inside the gap — he never sends
         // anything, so he must NOT be a lazy-load sender.
-        matrix_store::apply_state_event(&mut conn, "$bobname", &room_id, 2, "m.room.member", &bob, r#"{"membership":"join","displayname":"Bobby"}"#, 400, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$bobname", room_id: &room_id, sender_user_id: 2, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"join","displayname":"Bobby"}"#, origin_server_ts: 400, now: T0 })
             .expect("bob renames");
 
         // Alice sends more messages than the filter's own tiny limit, so
         // the returned timeline window truncates BEFORE bob's rename.
         for i in 0..3 {
-            matrix_store::insert_timeline_event(&mut conn, &format!("$msg{i}"), &room_id, 1, "m.room.message", "{}", 500 + i, None).expect("alice sends");
+            matrix_store::insert_timeline_event(&mut conn, &format!("$msg{i}"), &room_id, 1, "m.room.message", "{}", 500 + i).expect("alice sends");
         }
 
         let mut filter = SyncFilter::default();
@@ -951,7 +951,7 @@ mod tests {
         let mut conn = test_conn();
         let (room_id, alice) = make_joined_room(&mut conn, 1);
         let _bob = join_room(&mut conn, &room_id, 2, "$bobjoin", 300);
-        matrix_store::insert_timeline_event(&mut conn, "$m1", &room_id, 2, "m.room.message", "{}", 500, None).expect("bob sends");
+        matrix_store::insert_timeline_event(&mut conn, "$m1", &room_id, 2, "m.room.message", "{}", 500).expect("bob sends");
 
         let typing = live::TypingRegistry::new();
         let filter = SyncFilter::default();
@@ -968,7 +968,7 @@ mod tests {
         let mut conn = test_conn();
         let (room_id, alice) = make_joined_room(&mut conn, 1);
         for i in 0..5 {
-            matrix_store::insert_timeline_event(&mut conn, &format!("$m{i}"), &room_id, 1, "m.room.message", "{}", 500 + i, None).expect("send");
+            matrix_store::insert_timeline_event(&mut conn, &format!("$m{i}"), &room_id, 1, "m.room.message", "{}", 500 + i).expect("send");
         }
 
         let mut filter = SyncFilter::default();
@@ -1010,7 +1010,7 @@ mod tests {
         let mut conn = test_conn();
         let (room_id, alice) = make_joined_room(&mut conn, 1);
         let bob = join_room(&mut conn, &room_id, 2, "$bobjoin", 300);
-        let msg = matrix_store::insert_timeline_event(&mut conn, "$m1", &room_id, 1, "m.room.message", "{}", 500, None).expect("alice sends");
+        let msg = matrix_store::insert_timeline_event(&mut conn, "$m1", &room_id, 1, "m.room.message", "{}", 500).expect("alice sends");
         let since = matrix_store::max_stream_id(&conn).expect("max stream id");
         matrix_store::upsert_receipt(&mut conn, &room_id, 2, ReceiptType::ReadPrivate, &msg.event_id, 600).expect("bob's private receipt");
 
@@ -1033,7 +1033,7 @@ mod tests {
         let mut conn = test_conn();
         let (room_id, _alice) = make_joined_room(&mut conn, 1);
         let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000099", T0).expect("bob");
-        matrix_store::apply_state_event(&mut conn, "$invite_bob", &room_id, 1, "m.room.member", &bob, r#"{"membership":"invite"}"#, 400, T0).expect("invite bob");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$invite_bob", room_id: &room_id, sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"invite"}"#, origin_server_ts: 400, now: T0 }).expect("invite bob");
 
         let typing = live::TypingRegistry::new();
         let filter = SyncFilter::default();
@@ -1055,9 +1055,9 @@ mod tests {
         let mut conn = test_conn();
         let (room_id, alice) = make_joined_room(&mut conn, 1);
         let since = matrix_store::max_stream_id(&conn).expect("max stream id");
-        matrix_store::insert_timeline_event(&mut conn, "$before", &room_id, 1, "m.room.message", "{}", 500, None).expect("before leave");
-        matrix_store::apply_state_event(&mut conn, "$leave", &room_id, 1, "m.room.member", &alice, r#"{"membership":"leave"}"#, 600, T0).expect("alice leaves");
-        matrix_store::insert_timeline_event(&mut conn, "$after", &room_id, 2, "m.room.message", "{}", 700, None).expect("event after the leave (alice must never see it)");
+        matrix_store::insert_timeline_event(&mut conn, "$before", &room_id, 1, "m.room.message", "{}", 500).expect("before leave");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$leave", room_id: &room_id, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"leave"}"#, origin_server_ts: 600, now: T0 }).expect("alice leaves");
+        matrix_store::insert_timeline_event(&mut conn, "$after", &room_id, 2, "m.room.message", "{}", 700).expect("event after the leave (alice must never see it)");
 
         let mut filter = SyncFilter::default();
         filter.room.include_leave = true;
@@ -1086,9 +1086,9 @@ mod tests {
         let room_b = "!roomB:mylittlechart.org".to_string();
         matrix_store::create_room(&conn, &room_b, matrix_store::RoomKind::Group, 2, T0, false, matrix_store::JoinRule::Invite, matrix_store::HistoryVisibility::Shared, None, None)
             .expect("create room B");
-        matrix_store::apply_state_event(&mut conn, "$createB", &room_b, 2, "m.room.create", "", r#"{"room_version":"11"}"#, 700, T0).expect("create event B");
-        matrix_store::insert_timeline_event(&mut conn, "$msgB1", &room_b, 2, "m.room.message", "{}", 750, None).expect("a message before alice joins");
-        matrix_store::apply_state_event(&mut conn, "$joinB", &room_b, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 800, T0).expect("alice joins B");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$createB", room_id: &room_b, sender_user_id: 2, event_type: "m.room.create", state_key: "", content: r#"{"room_version":"11"}"#, origin_server_ts: 700, now: T0 }).expect("create event B");
+        matrix_store::insert_timeline_event(&mut conn, "$msgB1", &room_b, 2, "m.room.message", "{}", 750).expect("a message before alice joins");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$joinB", room_id: &room_b, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 800, now: T0 }).expect("alice joins B");
 
         // A tiny timeline limit so room B's visible window (its OWN join
         // event only) does NOT already cover `m.room.create` — otherwise
@@ -1155,7 +1155,7 @@ mod tests {
         matrix_keys_store::log_device_list_change(&mut conn, 2, T0).expect("bob's device list changed");
         matrix_keys_store::log_device_list_change(&mut conn, 3, T0).expect("carol's device list changed too, but she is not visible to alice");
         matrix_keys_store::log_device_list_change(&mut conn, 4, T0).expect("dave's device list changed just before he leaves");
-        matrix_store::apply_state_event(&mut conn, "$daveleave", &room_id, 4, "m.room.member", &dave, r#"{"membership":"leave"}"#, 900, T0).expect("dave leaves");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$daveleave", room_id: &room_id, sender_user_id: 4, event_type: "m.room.member", state_key: &dave, content: r#"{"membership":"leave"}"#, origin_server_ts: 900, now: T0 }).expect("dave leaves");
 
         let typing = live::TypingRegistry::new();
         let filter = SyncFilter::default();
@@ -1193,7 +1193,7 @@ mod tests {
         )
         .expect("create encrypted room");
         let alice = matrix_store::ensure_matrix_user(&conn, 1, &format!("user{:0>28}", 1), T0).expect("alice");
-        matrix_store::apply_state_event(&mut conn, "$alicejoin", room_id, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 200, T0).expect("alice joins");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$alicejoin", room_id, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 200, now: T0 }).expect("alice joins");
         let since = matrix_store::max_stream_id(&conn).expect("max stream id");
 
         // Bob joins inside the window; no device list changed at all.
@@ -1213,7 +1213,7 @@ mod tests {
         assert!(quiet["device_lists"]["changed"].as_array().expect("changed").is_empty(), "already reported once");
 
         // Alice leaves the only room she shares with bob: he lands in `left`.
-        matrix_store::apply_state_event(&mut conn, "$aliceleave", room_id, 1, "m.room.member", &alice, r#"{"membership":"leave"}"#, 400, T0).expect("alice leaves");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$aliceleave", room_id, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"leave"}"#, origin_server_ts: 400, now: T0 }).expect("alice leaves");
         let after_leave = build_sync_response(&conn, &typing, 1, &alice, "DEV1", Some(token), &filter, false, Instant::now()).expect("sync after alice leaves");
         let left = after_leave["device_lists"]["left"].as_array().expect("left");
         assert!(left.iter().any(|v| v == &bob), "bob no longer shares any room with alice: {left:?}");
@@ -1226,9 +1226,9 @@ mod tests {
         let mut conn = test_conn();
         let (room_id, _alice) = make_joined_room(&mut conn, 1);
         let before = matrix_store::max_stream_id(&conn).expect("max stream id");
-        matrix_store::apply_state_event(&mut conn, "$name1", &room_id, 1, "m.room.name", "", r#"{"name":"first"}"#, 1000, T0).expect("name change 1");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$name1", room_id: &room_id, sender_user_id: 1, event_type: "m.room.name", state_key: "", content: r#"{"name":"first"}"#, origin_server_ts: 1000, now: T0 }).expect("name change 1");
         let mid = matrix_store::max_stream_id(&conn).expect("max stream id after first change");
-        matrix_store::apply_state_event(&mut conn, "$name2", &room_id, 1, "m.room.name", "", r#"{"name":"second"}"#, 2000, T0).expect("name change 2");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$name2", room_id: &room_id, sender_user_id: 1, event_type: "m.room.name", state_key: "", content: r#"{"name":"second"}"#, origin_server_ts: 2000, now: T0 }).expect("name change 2");
 
         let changed = matrix_store::non_member_state_changed_in_window(&conn, &room_id, before, mid).expect("query");
         assert_eq!(changed.len(), 1);
@@ -1242,7 +1242,7 @@ mod tests {
         let mut conn = test_conn();
         let (room_id, alice) = make_joined_room(&mut conn, 1);
         let since = matrix_store::max_stream_id(&conn).expect("max stream id");
-        matrix_store::apply_state_event(&mut conn, "$name1", &room_id, 1, "m.room.name", "", r#"{"name":"first"}"#, 1000, T0).expect("name change");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$name1", room_id: &room_id, sender_user_id: 1, event_type: "m.room.name", state_key: "", content: r#"{"name":"first"}"#, origin_server_ts: 1000, now: T0 }).expect("name change");
 
         let typing = live::TypingRegistry::new();
         let filter = SyncFilter::default();
@@ -1271,13 +1271,13 @@ mod tests {
         for (i, room_id) in extra_room_ids.iter().enumerate() {
             matrix_store::create_room(&conn, room_id, matrix_store::RoomKind::Group, 1, T0, false, matrix_store::JoinRule::Invite, matrix_store::HistoryVisibility::Shared, None, None)
                 .expect("create extra room");
-            matrix_store::apply_state_event(&mut conn, &format!("$extrajoin{i}"), room_id, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 100, T0)
+            matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: &format!("$extrajoin{i}"), room_id, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 100, now: T0 })
                 .expect("alice joins extra room");
         }
         let since = matrix_store::max_stream_id(&conn).expect("max stream id");
 
         // Only room_a changes after `since`.
-        matrix_store::insert_timeline_event(&mut conn, "$only_change", &room_a, 1, "m.room.message", "{}", 1000, None).expect("alice sends in room A");
+        matrix_store::insert_timeline_event(&mut conn, "$only_change", &room_a, 1, "m.room.message", "{}", 1000).expect("alice sends in room A");
         let upto = matrix_store::max_stream_id(&conn).expect("max stream id after the write");
 
         let joined_room_ids = matrix_store::rooms_for_user(&conn, 1, Some(Membership::Join)).expect("joined rooms");
@@ -1307,7 +1307,7 @@ mod tests {
         let (room_id, alice) = make_joined_room(&mut conn, 1);
         let bob = join_room(&mut conn, &room_id, 2, "$bobjoin", 300);
         let _carol = join_room(&mut conn, &room_id, 3, "$caroljoin", 400);
-        matrix_store::insert_timeline_event(&mut conn, "$m1", &room_id, 1, "m.room.message", "{}", 500, None).expect("alice sends");
+        matrix_store::insert_timeline_event(&mut conn, "$m1", &room_id, 1, "m.room.message", "{}", 500).expect("alice sends");
 
         // A tiny timeline limit so the returned window is only alice's
         // latest message — NOT the three older join events (which would
@@ -1355,7 +1355,7 @@ mod tests {
         let conn_for_writer = conn.clone();
         let writer_future = async {
             let mut guard = conn_for_writer.lock().unwrap_or_else(|e| e.into_inner());
-            matrix_store::insert_timeline_event(&mut guard, "$wake1", &room_id, 1, "m.room.message", "{}", 500, None).expect("insert");
+            matrix_store::insert_timeline_event(&mut guard, "$wake1", &room_id, 1, "m.room.message", "{}", 500).expect("insert");
             drop(guard);
             live_registry.wake("user:1");
         };

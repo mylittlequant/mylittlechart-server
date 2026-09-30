@@ -982,9 +982,9 @@ mod tests {
             None,
         )
         .expect("create public channel");
-        matrix_store::apply_state_event(&mut conn, "$name", PUBLIC_ROOM, 1, "m.room.name", "", r#"{"name":"General"}"#, 1000, T0).expect("set name");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$name", room_id: PUBLIC_ROOM, sender_user_id: 1, event_type: "m.room.name", state_key: "", content: r#"{"name":"General"}"#, origin_server_ts: 1000, now: T0 }).expect("set name");
         let member = matrix_store::ensure_matrix_user(&conn, 1, "creator0000000000000000000000a1", T0).expect("mxid");
-        matrix_store::apply_state_event(&mut conn, "$m1", PUBLIC_ROOM, 1, "m.room.member", &member, r#"{"membership":"join"}"#, 1100, T0).expect("join");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: PUBLIC_ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &member, content: r#"{"membership":"join"}"#, origin_server_ts: 1100, now: T0 }).expect("join");
 
         matrix_store::create_room(&conn, ROOM, matrix_store::RoomKind::Group, 1, T0, true, matrix_store::JoinRule::Invite, matrix_store::HistoryVisibility::Shared, None, None)
             .expect("create private group");

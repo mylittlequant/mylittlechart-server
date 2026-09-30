@@ -392,11 +392,15 @@ fn apply_keys_upload(
     Ok(KeysUploadOutcome { otk_counts, device_keys_changed })
 }
 
+/// What `keys_upload`'s blocking half hands back: the caller's one-time-key
+/// counts, and the peers to wake when its device keys changed.
+type KeysUploadResult = (HashMap<String, i64>, Option<HashSet<i64>>);
+
 async fn keys_upload(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(request): Json<KeysUploadRequest>) -> Result<impl IntoResponse, MatrixError> {
     let caller = auth::resolve_matrix_caller(&headers, &state).await?;
     let state_for_blocking = state.clone();
 
-    let (otk_counts, wake_ids) = tokio::task::spawn_blocking(move || -> Result<(HashMap<String, i64>, Option<HashSet<i64>>), MatrixError> {
+    let (otk_counts, wake_ids) = tokio::task::spawn_blocking(move || -> Result<KeysUploadResult, MatrixError> {
         let cp = state_for_blocking.control_plane();
         let now = chrono::Utc::now().to_rfc3339();
         let mut messenger_conn = cp.messenger_conn();
@@ -705,7 +709,7 @@ fn validate_cross_signing_key_object(value: &serde_json::Value, caller_mxid: &st
     if usage.len() != 1 || usage[0].as_str() != Some(expected_usage) {
         return Err(MatrixError::invalid_param(format!("cross-signing key usage must be exactly [\"{expected_usage}\"]")));
     }
-    if !obj.get("keys").and_then(|v| v.as_object()).is_some_and(|k| !k.is_empty()) {
+    if obj.get("keys").and_then(|v| v.as_object()).is_none_or(|k| k.is_empty()) {
         return Err(MatrixError::invalid_param("cross-signing key missing keys"));
     }
     Ok(())
@@ -1562,7 +1566,7 @@ mod tests {
         )
         .expect("create room");
         for (user_id, mxid) in members {
-            matrix_store::apply_state_event(conn, &format!("$member-{user_id}"), room_id, members[0].0, "m.room.member", mxid, r#"{"membership":"join"}"#, 1000, T0)
+            matrix_store::apply_state_event(conn, &matrix_store::StateEventWrite { event_id: &format!("$member-{user_id}"), room_id, sender_user_id: members[0].0, event_type: "m.room.member", state_key: mxid, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
                 .expect("member join");
         }
     }
@@ -1583,8 +1587,8 @@ mod tests {
             None,
         )
         .expect("create room");
-        matrix_store::apply_state_event(conn, "$member-joined", room_id, joined.0, "m.room.member", joined.1, r#"{"membership":"join"}"#, 1000, T0).expect("joined member");
-        matrix_store::apply_state_event(conn, "$member-invited", room_id, joined.0, "m.room.member", invited.1, r#"{"membership":"invite"}"#, 1100, T0).expect("invited member");
+        matrix_store::apply_state_event(conn, &matrix_store::StateEventWrite { event_id: "$member-joined", room_id, sender_user_id: joined.0, event_type: "m.room.member", state_key: joined.1, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("joined member");
+        matrix_store::apply_state_event(conn, &matrix_store::StateEventWrite { event_id: "$member-invited", room_id, sender_user_id: joined.0, event_type: "m.room.member", state_key: invited.1, content: r#"{"membership":"invite"}"#, origin_server_ts: 1100, now: T0 }).expect("invited member");
     }
 
     /// Upload one device with one one-time key for `user_id`.
@@ -1617,10 +1621,10 @@ mod tests {
         assert_eq!(peers_sharing_a_room_with(&conn, 2).expect("bob"), HashSet::from([2]), "an invited caller gets no visibility");
         assert_eq!(peers_sharing_a_room_with(&conn, 3).expect("carol"), HashSet::from([3]), "an unrelated user sees nobody");
 
-        matrix_store::apply_state_event(&mut conn, "$bob-join", ROOM, 2, "m.room.member", &bob, r#"{"membership":"join"}"#, 1200, T0).expect("bob joins");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$bob-join", room_id: ROOM, sender_user_id: 2, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"join"}"#, origin_server_ts: 1200, now: T0 }).expect("bob joins");
         assert_eq!(peers_sharing_a_room_with(&conn, 2).expect("bob joined"), HashSet::from([1, 2]), "once joined, bob sees alice");
 
-        matrix_store::apply_state_event(&mut conn, "$bob-leave", ROOM, 2, "m.room.member", &bob, r#"{"membership":"leave"}"#, 1300, T0).expect("bob leaves");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$bob-leave", room_id: ROOM, sender_user_id: 2, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"leave"}"#, origin_server_ts: 1300, now: T0 }).expect("bob leaves");
         assert_eq!(peers_sharing_a_room_with(&conn, 1).expect("alice after leave"), HashSet::from([1]), "a peer who left is no longer visible");
     }
 
@@ -1706,7 +1710,7 @@ mod tests {
     /// Write `member`'s membership state event, sent by `sender`.
     fn set_member(conn: &mut Connection, room_id: &str, event_id: &str, sender: i64, member: &str, membership: &str) {
         let content = serde_json::json!({ "membership": membership }).to_string();
-        matrix_store::apply_state_event(conn, event_id, room_id, sender, "m.room.member", member, &content, 1000, T0).expect("member event");
+        matrix_store::apply_state_event(conn, &matrix_store::StateEventWrite { event_id, room_id, sender_user_id: sender, event_type: "m.room.member", state_key: member, content: &content, origin_server_ts: 1000, now: T0 }).expect("member event");
     }
 
     fn delta(conn: &Connection, caller: i64, from: i64) -> (Vec<String>, Vec<String>) {
@@ -1738,7 +1742,7 @@ mod tests {
 
         // invite -> join is not a new share, and neither is a profile update.
         set_member(&mut conn, ROOM, "$carol-join", 3, &carol, "join");
-        matrix_store::apply_state_event(&mut conn, "$bob-name", ROOM, 2, "m.room.member", &bob, r#"{"membership":"join","displayname":"Bobby"}"#, 1100, T0).expect("bob renames");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$bob-name", room_id: ROOM, sender_user_id: 2, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"join","displayname":"Bobby"}"#, origin_server_ts: 1100, now: T0 }).expect("bob renames");
         assert_eq!(delta(&conn, 1, after), (Vec::new(), Vec::new()));
     }
 

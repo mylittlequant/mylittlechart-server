@@ -133,8 +133,8 @@ pub(crate) fn osa_distance(a: &str, b: &str) -> usize {
     for (i, row) in dp.iter_mut().enumerate() {
         row[0] = i;
     }
-    for j in 0..=len_b {
-        dp[0][j] = j;
+    for (j, cell) in dp[0].iter_mut().enumerate() {
+        *cell = j;
     }
     for i in 1..=len_a {
         for j in 1..=len_b {

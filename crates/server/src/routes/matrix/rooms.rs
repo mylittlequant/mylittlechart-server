@@ -483,14 +483,16 @@ fn apply_invite(
     let target_mxid = matrix_store::mxid_of(conn, target_user_id)?.ok_or_else(MatrixError::internal)?;
     matrix_store::apply_state_event(
         conn,
-        &matrix_store::new_event_id(),
-        room_id,
-        caller_user_id,
-        "m.room.member",
-        &target_mxid,
-        &invite_member_content(room.kind).to_string(),
-        origin_ts,
-        now,
+        &matrix_store::StateEventWrite {
+            event_id: &matrix_store::new_event_id(),
+            room_id,
+            sender_user_id: caller_user_id,
+            event_type: "m.room.member",
+            state_key: &target_mxid,
+            content: &invite_member_content(room.kind).to_string(),
+            origin_server_ts: origin_ts,
+            now,
+        },
     )?;
 
     let mut ids = member_and_invited_ids(conn, room_id)?;
@@ -586,7 +588,7 @@ pub(super) fn apply_membership_power_action(
     if let Some(reason) = action.reason {
         content["reason"] = serde_json::Value::String(reason.to_string());
     }
-    matrix_store::apply_state_event(conn, &matrix_store::new_event_id(), room_id, caller_user_id, "m.room.member", &target_mxid, &content.to_string(), origin_ts, now)?;
+    matrix_store::apply_state_event(conn, &matrix_store::StateEventWrite { event_id: &matrix_store::new_event_id(), room_id, sender_user_id: caller_user_id, event_type: "m.room.member", state_key: &target_mxid, content: &content.to_string(), origin_server_ts: origin_ts, now })?;
 
     let mut ids = member_and_invited_ids(conn, room_id)?;
     ids.insert(action.target_user_id);
@@ -599,14 +601,16 @@ pub(super) fn apply_membership_power_action(
 fn apply_join(conn: &mut Connection, room_id: &str, caller_user_id: i64, caller_mxid: &str, now: &str, origin_ts: i64) -> Result<HashSet<i64>, MatrixError> {
     matrix_store::apply_state_event(
         conn,
-        &matrix_store::new_event_id(),
-        room_id,
-        caller_user_id,
-        "m.room.member",
-        caller_mxid,
-        &serde_json::json!({ "membership": "join" }).to_string(),
-        origin_ts,
-        now,
+        &matrix_store::StateEventWrite {
+            event_id: &matrix_store::new_event_id(),
+            room_id,
+            sender_user_id: caller_user_id,
+            event_type: "m.room.member",
+            state_key: caller_mxid,
+            content: &serde_json::json!({ "membership": "join" }).to_string(),
+            origin_server_ts: origin_ts,
+            now,
+        },
     )?;
     Ok(member_and_invited_ids(conn, room_id)?)
 }
@@ -627,14 +631,16 @@ fn apply_leave(conn: &mut Connection, room_id: &str, caller_user_id: i64, caller
     let wake_ids = member_and_invited_ids(conn, room_id)?;
     matrix_store::apply_state_event(
         conn,
-        &matrix_store::new_event_id(),
-        room_id,
-        caller_user_id,
-        "m.room.member",
-        caller_mxid,
-        &serde_json::json!({ "membership": "leave" }).to_string(),
-        origin_ts,
-        now,
+        &matrix_store::StateEventWrite {
+            event_id: &matrix_store::new_event_id(),
+            room_id,
+            sender_user_id: caller_user_id,
+            event_type: "m.room.member",
+            state_key: caller_mxid,
+            content: &serde_json::json!({ "membership": "leave" }).to_string(),
+            origin_server_ts: origin_ts,
+            now,
+        },
     )?;
     Ok(wake_ids)
 }
@@ -1145,14 +1151,16 @@ async fn put_state_inner(
         let mut messenger_conn = cp.messenger_conn();
         matrix_store::apply_state_event(
             &mut messenger_conn,
-            &event_id,
-            &room_id_for_blocking,
-            caller.user_id,
-            &event_type_for_blocking,
-            &state_key_for_blocking,
-            &content_str,
-            origin_ts,
-            &now,
+            &matrix_store::StateEventWrite {
+                event_id: &event_id,
+                room_id: &room_id_for_blocking,
+                sender_user_id: caller.user_id,
+                event_type: &event_type_for_blocking,
+                state_key: &state_key_for_blocking,
+                content: &content_str,
+                origin_server_ts: origin_ts,
+                now: &now,
+            },
         )?;
         let wake_ids = member_and_invited_ids(&messenger_conn, &room_id_for_blocking)?;
         Ok((event_id, wake_ids))
@@ -1420,9 +1428,9 @@ mod tests {
         make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000010", T0).expect("alice");
         let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000010", T0).expect("bob");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
             .expect("alice joins");
-        matrix_store::apply_state_event(&mut conn, "$m2", "!r:mylittlechart.org", 1, "m.room.member", &bob, r#"{"membership":"join"}"#, 1100, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m2", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"join"}"#, origin_server_ts: 1100, now: T0 })
             .expect("bob joins");
         // kick's default threshold (Matrix default 50) with no power_levels
         // event at all: alice's level defaults to 0 (users_default), which
@@ -1448,7 +1456,7 @@ mod tests {
         // Grant alice kick power via power_levels, then the same call must
         // succeed and wake bob.
         let power_levels_content = serde_json::json!({ "users": { alice.clone(): 100 } }).to_string();
-        matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1200, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$pl", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.power_levels", state_key: "", content: &power_levels_content, origin_server_ts: 1200, now: T0 })
             .expect("power levels");
         let wake_ids = apply_membership_power_action(
             &mut conn,
@@ -1482,12 +1490,12 @@ mod tests {
         make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
         let owner = matrix_store::ensure_matrix_user(&conn, 1, "owner000000000000000000000041", T0).expect("owner");
         let admin = matrix_store::ensure_matrix_user(&conn, 2, "admin000000000000000000000041", T0).expect("admin");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &owner, r#"{"membership":"join"}"#, 1000, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &owner, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
             .expect("owner joins");
-        matrix_store::apply_state_event(&mut conn, "$m2", "!r:mylittlechart.org", 1, "m.room.member", &admin, r#"{"membership":"join"}"#, 1100, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m2", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &admin, content: r#"{"membership":"join"}"#, origin_server_ts: 1100, now: T0 })
             .expect("admin joins");
         let power_levels_content = serde_json::json!({ "users": { owner.clone(): 100, admin.clone(): 50 }, "kick": 50 }).to_string();
-        matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1200, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$pl", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.power_levels", state_key: "", content: &power_levels_content, origin_server_ts: 1200, now: T0 })
             .expect("power levels");
 
         // admin (level 50) reaches the flat kick threshold (50) but must
@@ -1522,12 +1530,12 @@ mod tests {
         make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000042", T0).expect("alice");
         let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000042", T0).expect("bob");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
             .expect("alice joins");
-        matrix_store::apply_state_event(&mut conn, "$m2", "!r:mylittlechart.org", 1, "m.room.member", &bob, r#"{"membership":"join"}"#, 1100, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m2", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"join"}"#, origin_server_ts: 1100, now: T0 })
             .expect("bob joins");
         let power_levels_content = serde_json::json!({ "users": { alice.clone(): 50, bob.clone(): 50 }, "kick": 50 }).to_string();
-        matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1200, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$pl", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.power_levels", state_key: "", content: &power_levels_content, origin_server_ts: 1200, now: T0 })
             .expect("power levels");
 
         let err = apply_membership_power_action(
@@ -1554,7 +1562,7 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000043", T0).expect("alice");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
             .expect("alice joins");
         // No power_levels event at all — alice's level defaults to 0, far
         // below the default kick threshold of 50 — yet she may still
@@ -1586,10 +1594,10 @@ mod tests {
         make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000011", T0).expect("alice");
         matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000011", T0).expect("bob");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
             .expect("alice joins");
         let power_levels_content = serde_json::json!({ "users": { alice.clone(): 100 } }).to_string();
-        matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1100, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$pl", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.power_levels", state_key: "", content: &power_levels_content, origin_server_ts: 1100, now: T0 })
             .expect("power levels grant alice invite power");
 
         let wake_ids = apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, 2, T0, 2000).expect("invite succeeds");
@@ -1607,12 +1615,12 @@ mod tests {
         make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000012", T0).expect("alice");
         let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000012", T0).expect("bob");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
             .expect("alice joins");
-        matrix_store::apply_state_event(&mut conn, "$m2", "!r:mylittlechart.org", 1, "m.room.member", &bob, r#"{"membership":"join"}"#, 1100, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m2", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"join"}"#, origin_server_ts: 1100, now: T0 })
             .expect("bob joins");
         let power_levels_content = serde_json::json!({ "users": { alice.clone(): 100 } }).to_string();
-        matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1200, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$pl", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.power_levels", state_key: "", content: &power_levels_content, origin_server_ts: 1200, now: T0 })
             .expect("power levels grant alice invite power");
 
         let err = apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, 2, T0, 2000).unwrap_err();
@@ -1633,10 +1641,10 @@ mod tests {
         make_room(&conn, "!r:mylittlechart.org", kind, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, &format!("alice000000000000000000000000{suffix}"), T0).expect("alice");
         let bob = matrix_store::ensure_matrix_user(&conn, 2, &format!("bob00000000000000000000000000{suffix}"), T0).expect("bob");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
             .expect("alice joins");
         let power_levels_content = serde_json::json!({ "users": { alice.clone(): 100 } }).to_string();
-        matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1100, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$pl", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.power_levels", state_key: "", content: &power_levels_content, origin_server_ts: 1100, now: T0 })
             .expect("power levels grant alice invite power");
         apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, 2, T0, 2000).expect("invite succeeds");
         (conn, bob)
@@ -1673,9 +1681,9 @@ mod tests {
         make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000031", T0).expect("alice");
         let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000031", T0).expect("bob");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
             .expect("alice (the inviter) joins");
-        matrix_store::apply_state_event(&mut conn, "$m2", "!r:mylittlechart.org", 1, "m.room.member", &bob, r#"{"membership":"invite"}"#, 1100, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m2", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"invite"}"#, origin_server_ts: 1100, now: T0 })
             .expect("alice invites bob");
 
         let wake_ids = apply_leave(&mut conn, "!r:mylittlechart.org", 2, &bob, T0, 2000).expect("bob rejects the invite via leave");
@@ -1693,7 +1701,7 @@ mod tests {
         make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000032", T0).expect("alice");
         matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000032", T0).expect("bob");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
             .expect("alice joins");
 
         let err = apply_leave(&mut conn, "!r:mylittlechart.org", 2, "@bob:mylittlechart.org", T0, 2000).unwrap_err();
@@ -1709,14 +1717,16 @@ mod tests {
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000013", T0).expect("alice");
         let event = matrix_store::apply_state_event(
             &mut conn,
-            "$m1",
-            "!r:mylittlechart.org",
-            1,
-            "m.room.member",
-            &alice,
-            r#"{"membership":"join"}"#,
-            1000,
-            T0,
+            &matrix_store::StateEventWrite {
+                event_id: "$m1",
+                room_id: "!r:mylittlechart.org",
+                sender_user_id: 1,
+                event_type: "m.room.member",
+                state_key: &alice,
+                content: r#"{"membership":"join"}"#,
+                origin_server_ts: 1000,
+                now: T0,
+            },
         )
         .expect("alice joins");
 
@@ -1734,30 +1744,34 @@ mod tests {
         make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000014", T0).expect("alice");
         let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000014", T0).expect("bob");
-        matrix_store::apply_state_event(&mut conn, "$create", "!r:mylittlechart.org", 1, "m.room.create", "", r#"{"room_version":"11"}"#, 900, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$create", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.create", state_key: "", content: r#"{"room_version":"11"}"#, origin_server_ts: 900, now: T0 })
             .expect("create");
         let join_event = matrix_store::apply_state_event(
             &mut conn,
-            "$m1",
-            "!r:mylittlechart.org",
-            1,
-            "m.room.member",
-            &alice,
-            r#"{"membership":"join"}"#,
-            1000,
-            T0,
+            &matrix_store::StateEventWrite {
+                event_id: "$m1",
+                room_id: "!r:mylittlechart.org",
+                sender_user_id: 1,
+                event_type: "m.room.member",
+                state_key: &alice,
+                content: r#"{"membership":"join"}"#,
+                origin_server_ts: 1000,
+                now: T0,
+            },
         )
         .expect("alice joins");
         let invite_event = matrix_store::apply_state_event(
             &mut conn,
-            "$m2",
-            "!r:mylittlechart.org",
-            1,
-            "m.room.member",
-            &bob,
-            r#"{"membership":"invite"}"#,
-            1100,
-            T0,
+            &matrix_store::StateEventWrite {
+                event_id: "$m2",
+                room_id: "!r:mylittlechart.org",
+                sender_user_id: 1,
+                event_type: "m.room.member",
+                state_key: &bob,
+                content: r#"{"membership":"invite"}"#,
+                origin_server_ts: 1100,
+                now: T0,
+            },
         )
         .expect("bob invited");
 

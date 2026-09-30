@@ -345,7 +345,15 @@ fn apply_moderation_redact(
 
     let event = if site_lever {
         let extra = serde_json::json!({ "org.mylittlechart.site_moderation": true });
-        matrix_store::redact_event_marked(conn, &room.id, target_event_id, redaction_event_id, caller_user_id, reason, &extra, origin_ts)?
+        let redaction = matrix_store::Redaction {
+            room_id: &room.id,
+            target_event_id,
+            redaction_event_id,
+            sender_user_id: caller_user_id,
+            reason,
+            origin_server_ts: origin_ts,
+        };
+        matrix_store::redact_event_marked(conn, &redaction, &extra)?
     } else {
         let caller_membership = matrix_store::room_member(conn, &room.id, caller_user_id)?.map(|m| m.membership);
         if !matches!(caller_membership, Some(Membership::Join)) {
@@ -407,14 +415,16 @@ fn apply_moderation_membership_action(
         }
         let event = matrix_store::apply_state_event(
             conn,
-            &matrix_store::new_event_id(),
-            &room.id,
-            caller_user_id,
-            "m.room.member",
-            target_mxid,
-            &content.to_string(),
-            origin_ts,
-            now,
+            &matrix_store::StateEventWrite {
+                event_id: &matrix_store::new_event_id(),
+                room_id: &room.id,
+                sender_user_id: caller_user_id,
+                event_type: "m.room.member",
+                state_key: target_mxid,
+                content: &content.to_string(),
+                origin_server_ts: origin_ts,
+                now,
+            },
         )?;
 
         let mut wake_ids = rooms::member_and_invited_ids(conn, &room.id)?;
@@ -603,7 +613,7 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!chan:mylittlechart.org", matrix_store::RoomKind::Channel, 1);
         let caller_mxid = matrix_store::ensure_matrix_user(&conn, 99, "siteadmin00000000000000000000001", T0).expect("caller mxid");
-        let author_event = matrix_store::insert_timeline_event(&mut conn, "$msg1", "!chan:mylittlechart.org", 1, "m.room.message", "{}", 1000, None).expect("author sends");
+        let author_event = matrix_store::insert_timeline_event(&mut conn, "$msg1", "!chan:mylittlechart.org", 1, "m.room.message", "{}", 1000).expect("author sends");
         let room = matrix_store::get_room(&conn, "!chan:mylittlechart.org").expect("room").expect("exists");
 
         let outcome = apply_moderation_redact(&mut conn, &room, true, 99, &caller_mxid, &author_event.event_id, "$red1", None, 2000)
@@ -618,20 +628,22 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!r:mylittlechart.org", matrix_store::RoomKind::Group, 1);
         let owner_mxid = matrix_store::ensure_matrix_user(&conn, 1, "owner0000000000000000000000001", T0).expect("owner mxid");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &owner_mxid, r#"{"membership":"join"}"#, 1000, T0).expect("owner joins");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &owner_mxid, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("owner joins");
         matrix_store::apply_state_event(
             &mut conn,
-            "$pl1",
-            "!r:mylittlechart.org",
-            1,
-            "m.room.power_levels",
-            "",
-            &serde_json::json!({ "users": { owner_mxid.clone(): 100 }, "redact": 50 }).to_string(),
-            1100,
-            T0,
+            &matrix_store::StateEventWrite {
+                event_id: "$pl1",
+                room_id: "!r:mylittlechart.org",
+                sender_user_id: 1,
+                event_type: "m.room.power_levels",
+                state_key: "",
+                content: &serde_json::json!({ "users": { owner_mxid.clone(): 100 }, "redact": 50 }).to_string(),
+                origin_server_ts: 1100,
+                now: T0,
+            },
         )
         .expect("power levels");
-        let bob_event = matrix_store::insert_timeline_event(&mut conn, "$bob1", "!r:mylittlechart.org", 2, "m.room.message", "{}", 2000, None).expect("bob sends");
+        let bob_event = matrix_store::insert_timeline_event(&mut conn, "$bob1", "!r:mylittlechart.org", 2, "m.room.message", "{}", 2000).expect("bob sends");
         let room = matrix_store::get_room(&conn, "!r:mylittlechart.org").expect("room").expect("exists");
 
         let outcome = apply_moderation_redact(&mut conn, &room, false, 1, &owner_mxid, &bob_event.event_id, "$red1", None, 3000)
@@ -646,7 +658,7 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!priv:mylittlechart.org", matrix_store::RoomKind::Group, 1);
         let caller_mxid = matrix_store::ensure_matrix_user(&conn, 99, "siteadmin00000000000000000000002", T0).expect("caller mxid");
-        let author_event = matrix_store::insert_timeline_event(&mut conn, "$msg1", "!priv:mylittlechart.org", 1, "m.room.message", "{}", 1000, None).expect("author sends");
+        let author_event = matrix_store::insert_timeline_event(&mut conn, "$msg1", "!priv:mylittlechart.org", 1, "m.room.message", "{}", 1000).expect("author sends");
         let room = matrix_store::get_room(&conn, "!priv:mylittlechart.org").expect("room").expect("exists");
 
         let err = apply_moderation_redact(&mut conn, &room, true, 99, &caller_mxid, &author_event.event_id, "$red1", None, 2000).unwrap_err();
@@ -660,7 +672,7 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!chan:mylittlechart.org", matrix_store::RoomKind::Channel, 1);
         let caller_mxid = matrix_store::ensure_matrix_user(&conn, 99, "siteadmin00000000000000000000003", T0).expect("caller mxid");
-        let author_event = matrix_store::insert_timeline_event(&mut conn, "$msg1", "!chan:mylittlechart.org", 1, "m.room.message", "{}", 1000, None).expect("author sends");
+        let author_event = matrix_store::insert_timeline_event(&mut conn, "$msg1", "!chan:mylittlechart.org", 1, "m.room.message", "{}", 1000).expect("author sends");
         let room = matrix_store::get_room(&conn, "!chan:mylittlechart.org").expect("room").expect("exists");
 
         let outcome = apply_moderation_redact(&mut conn, &room, true, 99, &caller_mxid, &author_event.event_id, "$red1", Some("spam"), 2000).expect("site redact");
@@ -678,9 +690,9 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!chan:mylittlechart.org", matrix_store::RoomKind::Channel, 1);
         let caller_mxid = matrix_store::ensure_matrix_user(&conn, 2, "plainuser0000000000000000000001", T0).expect("caller mxid");
-        matrix_store::apply_state_event(&mut conn, "$m2", "!chan:mylittlechart.org", 2, "m.room.member", &caller_mxid, r#"{"membership":"join"}"#, 1000, T0).expect("caller joins");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m2", room_id: "!chan:mylittlechart.org", sender_user_id: 2, event_type: "m.room.member", state_key: &caller_mxid, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("caller joins");
         let target_mxid = matrix_store::ensure_matrix_user(&conn, 3, "target00000000000000000000000001", T0).expect("target mxid");
-        matrix_store::apply_state_event(&mut conn, "$m3", "!chan:mylittlechart.org", 1, "m.room.member", &target_mxid, r#"{"membership":"join"}"#, 1100, T0).expect("target joins");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m3", room_id: "!chan:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &target_mxid, content: r#"{"membership":"join"}"#, origin_server_ts: 1100, now: T0 }).expect("target joins");
         let room = matrix_store::get_room(&conn, "!chan:mylittlechart.org").expect("room").expect("exists");
 
         let err = apply_moderation_membership_action(

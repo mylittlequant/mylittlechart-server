@@ -877,7 +877,7 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!priv:mylittlechart.org", matrix_store::RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000060", T0).expect("alice");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!priv:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!priv:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
             .expect("alice joins");
         let room = matrix_store::get_room(&conn, "!priv:mylittlechart.org").expect("room").expect("exists");
 
@@ -888,7 +888,7 @@ mod tests {
         assert!(outcome.is_new);
 
         make_room(&conn, "!chan:mylittlechart.org", matrix_store::RoomKind::Channel, 1);
-        matrix_store::apply_state_event(&mut conn, "$m2", "!chan:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m2", room_id: "!chan:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 })
             .expect("alice joins the channel");
         let channel = matrix_store::get_room(&conn, "!chan:mylittlechart.org").expect("room").expect("exists");
         let outcome2 =
@@ -904,14 +904,14 @@ mod tests {
         make_room(&conn, "!r:mylittlechart.org", matrix_store::RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000061", T0).expect("alice");
         matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000061", T0).expect("bob");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("alice joins");
 
-        let alice_event = matrix_store::insert_timeline_event(&mut conn, "$alice1", "!r:mylittlechart.org", 1, "m.room.message", "{}", 2000, None).expect("alice sends");
+        let alice_event = matrix_store::insert_timeline_event(&mut conn, "$alice1", "!r:mylittlechart.org", 1, "m.room.message", "{}", 2000).expect("alice sends");
         let outcome = apply_redact(&mut conn, "!r:mylittlechart.org", 1, &alice, "DEV1", "txn-own", &alice_event.event_id, "$red1", None, T0, 3000)
             .expect("own-event redact succeeds without any power_levels grant");
         assert!(outcome.is_new);
 
-        let bob_event = matrix_store::insert_timeline_event(&mut conn, "$bob1", "!r:mylittlechart.org", 2, "m.room.message", "{}", 4000, None).expect("bob sends");
+        let bob_event = matrix_store::insert_timeline_event(&mut conn, "$bob1", "!r:mylittlechart.org", 2, "m.room.message", "{}", 4000).expect("bob sends");
         let err = apply_redact(&mut conn, "!r:mylittlechart.org", 1, &alice, "DEV1", "txn-other", &bob_event.event_id, "$red2", None, T0, 5000).unwrap_err();
         assert_eq!(err.errcode, "M_FORBIDDEN", "redacting someone else's event requires PowerCheck(redact)");
     }
@@ -923,8 +923,8 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!r:mylittlechart.org", matrix_store::RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000065", T0).expect("alice");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
-        matrix_store::insert_timeline_event(&mut conn, "$target", "!r:mylittlechart.org", 1, "m.room.encrypted", "{}", 2000, None).expect("alice sends");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("alice joins");
+        matrix_store::insert_timeline_event(&mut conn, "$target", "!r:mylittlechart.org", 1, "m.room.encrypted", "{}", 2000).expect("alice sends");
         apply_redact(&mut conn, "!r:mylittlechart.org", 1, &alice, "DEV1", "txn-red", "$target", "$red1", Some("oops"), T0, 3000).expect("redact");
 
         let latest = matrix_store::max_stream_id(&conn).expect("max stream id");
@@ -947,7 +947,7 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!r:mylittlechart.org", matrix_store::RoomKind::Channel, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000062", T0).expect("alice");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("alice joins");
         let room = matrix_store::get_room(&conn, "!r:mylittlechart.org").expect("room").expect("exists");
 
         let first = apply_send(&mut conn, &room, 1, &alice, true, "DEV1", "txn-dup", "$e1", "m.room.message", "{}", T0, 2000).expect("first send");
@@ -987,7 +987,7 @@ mod tests {
     fn replace_from_another_sender_is_refused() {
         let mut conn = test_conn();
         make_room(&conn, "!r:mylittlechart.org", matrix_store::RoomKind::Group, 1);
-        let target = matrix_store::insert_timeline_event(&mut conn, "$target", "!r:mylittlechart.org", 1, "m.room.encrypted", "{}", 1000, None).expect("target");
+        let target = matrix_store::insert_timeline_event(&mut conn, "$target", "!r:mylittlechart.org", 1, "m.room.encrypted", "{}", 1000).expect("target");
 
         let replace_content = serde_json::json!({ "m.relates_to": { "rel_type": "m.replace", "event_id": target.event_id } });
         let err = check_replace_target_sender(&conn, &replace_content, 2).unwrap_err();
@@ -1003,7 +1003,7 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!r:mylittlechart.org", matrix_store::RoomKind::Channel, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000063", T0).expect("alice");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("alice joins");
         let room = matrix_store::get_room(&conn, "!r:mylittlechart.org").expect("room").expect("exists");
 
         for i in 0..BURST_LIMIT_COUNT {
@@ -1022,7 +1022,7 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!r:mylittlechart.org", matrix_store::RoomKind::Channel, 1);
         for i in 1..=5i64 {
-            matrix_store::insert_timeline_event(&mut conn, &format!("$e{i}"), "!r:mylittlechart.org", 1, "m.room.message", "{}", 1000 * i, None).expect("insert");
+            matrix_store::insert_timeline_event(&mut conn, &format!("$e{i}"), "!r:mylittlechart.org", 1, "m.room.message", "{}", 1000 * i).expect("insert");
         }
         let latest = matrix_store::max_stream_id(&conn).expect("max stream id");
 
@@ -1049,7 +1049,7 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!r:mylittlechart.org", matrix_store::RoomKind::Channel, 1);
         for i in 1..=5i64 {
-            matrix_store::insert_timeline_event(&mut conn, &format!("$e{i}"), "!r:mylittlechart.org", 1, "m.room.message", "{}", 1000 * i, None).expect("insert");
+            matrix_store::insert_timeline_event(&mut conn, &format!("$e{i}"), "!r:mylittlechart.org", 1, "m.room.message", "{}", 1000 * i).expect("insert");
         }
         conn
     }
@@ -1121,10 +1121,10 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn, "!r:mylittlechart.org", matrix_store::RoomKind::Group, 1);
         let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000064", T0).expect("alice");
-        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
-        matrix_store::insert_timeline_event(&mut conn, "$before", "!r:mylittlechart.org", 1, "m.room.message", "{}", 2000, None).expect("before leave");
+        matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("alice joins");
+        matrix_store::insert_timeline_event(&mut conn, "$before", "!r:mylittlechart.org", 1, "m.room.message", "{}", 2000).expect("before leave");
         let leave_event =
-            matrix_store::apply_state_event(&mut conn, "$leave", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"leave"}"#, 3000, T0).expect("alice leaves");
+            matrix_store::apply_state_event(&mut conn, &matrix_store::StateEventWrite { event_id: "$leave", room_id: "!r:mylittlechart.org", sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"leave"}"#, origin_server_ts: 3000, now: T0 }).expect("alice leaves");
 
         let room = matrix_store::get_room(&conn, "!r:mylittlechart.org").expect("room").expect("exists");
         let window = matrix_store::visible_upper_bound(&conn, &room, 1).expect("window");

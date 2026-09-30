@@ -731,6 +731,20 @@ fn collect_events(rows: &mut rusqlite::Rows<'_>) -> rusqlite::Result<Vec<MatrixE
     Ok(out)
 }
 
+/// The columns of one timeline event row, grouped for
+/// [`insert_timeline_event_in_tx`] (its callers all build one; the public
+/// writers spell the same fields out as separate arguments).
+#[derive(Debug, Clone, Copy)]
+struct TimelineEventRow<'a> {
+    event_id: &'a str,
+    room_id: &'a str,
+    sender_user_id: i64,
+    event_type: &'a str,
+    content: &'a str,
+    origin_server_ts: i64,
+    txn_id: Option<&'a str>,
+}
+
 /// The `&Transaction`-scoped core of [`insert_timeline_event`]. Room
 /// creation (`createRoom`) never sends a message, so [`create_room_with_state`]
 /// has no timeline events to insert and this function's only caller today is
@@ -739,16 +753,8 @@ fn collect_events(rows: &mut rusqlite::Rows<'_>) -> rusqlite::Result<Vec<MatrixE
 /// mix timeline and state events (e.g. the P12 migration's legacy-message
 /// replay) can call it directly instead of re-deriving a transaction-scoped
 /// version of this logic.
-fn insert_timeline_event_in_tx(
-    tx: &Transaction,
-    event_id: &str,
-    room_id: &str,
-    sender_user_id: i64,
-    event_type: &str,
-    content: &str,
-    origin_server_ts: i64,
-    txn_id: Option<&str>,
-) -> Result<MatrixEvent, MatrixStoreError> {
+fn insert_timeline_event_in_tx(tx: &Transaction, row: &TimelineEventRow<'_>) -> Result<MatrixEvent, MatrixStoreError> {
+    let TimelineEventRow { event_id, room_id, sender_user_id, event_type, content, origin_server_ts, txn_id } = *row;
     let stream_id = next_stream_id(tx)?;
     tx.execute(
         "INSERT INTO events (stream_id, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts, txn_id)
@@ -776,7 +782,9 @@ fn insert_timeline_event_in_tx(
 /// `content` carries a top-level `m.relates_to` (cleartext even for
 /// `m.room.encrypted`, plan §10 item 3) — populate [`relations`]. Refusing
 /// a duplicate `m.annotation` rolls back the whole transaction, so a
-/// refused call leaves no partial `events` row.
+/// refused call leaves no partial `events` row. It never records a `txn_id`:
+/// a write that carries one goes through [`insert_timeline_event_deduped`],
+/// which stores it next to its dedup record in the same transaction.
 pub fn insert_timeline_event(
     conn: &mut Connection,
     event_id: &str,
@@ -785,10 +793,10 @@ pub fn insert_timeline_event(
     event_type: &str,
     content: &str,
     origin_server_ts: i64,
-    txn_id: Option<&str>,
 ) -> Result<MatrixEvent, MatrixStoreError> {
     let tx = conn.transaction()?;
-    let event = insert_timeline_event_in_tx(&tx, event_id, room_id, sender_user_id, event_type, content, origin_server_ts, txn_id)?;
+    let row = TimelineEventRow { event_id, room_id, sender_user_id, event_type, content, origin_server_ts, txn_id: None };
+    let event = insert_timeline_event_in_tx(&tx, &row)?;
     tx.commit()?;
     Ok(event)
 }
@@ -833,7 +841,8 @@ pub fn insert_timeline_event_deduped(
         tx.commit()?;
         return Ok(DedupedWrite::Existing(event));
     }
-    let event = insert_timeline_event_in_tx(&tx, event_id, room_id, sender_user_id, event_type, content, origin_server_ts, Some(txn_id))?;
+    let row = TimelineEventRow { event_id, room_id, sender_user_id, event_type, content, origin_server_ts, txn_id: Some(txn_id) };
+    let event = insert_timeline_event_in_tx(&tx, &row)?;
     txn_dedup_record(&tx, sender_user_id, device_id, txn_id, Some(event_id), now)?;
     tx.commit()?;
     Ok(DedupedWrite::New(event))
@@ -890,23 +899,39 @@ fn apply_state_event_in_tx(
     })
 }
 
+/// One state event for [`apply_state_event`]: its identity, the state slot
+/// it fills, its content, and the two clocks (`origin_server_ts` in
+/// milliseconds for the event row, `now` as RFC 3339 for the membership
+/// cache's `updated_at`).
+#[derive(Debug, Clone, Copy)]
+pub struct StateEventWrite<'a> {
+    pub event_id: &'a str,
+    pub room_id: &'a str,
+    pub sender_user_id: i64,
+    pub event_type: &'a str,
+    pub state_key: &'a str,
+    pub content: &'a str,
+    pub origin_server_ts: i64,
+    pub now: &'a str,
+}
+
 /// Insert one state event and refresh the two projections that read off it:
 /// `current_state` (always) and, for `m.room.member`/`m.room.power_levels`,
 /// the denormalized `room_members` cache (plan §2). All inside one
 /// transaction with the event row.
-pub fn apply_state_event(
-    conn: &mut Connection,
-    event_id: &str,
-    room_id: &str,
-    sender_user_id: i64,
-    event_type: &str,
-    state_key: &str,
-    content: &str,
-    origin_server_ts: i64,
-    now: &str,
-) -> Result<MatrixEvent, MatrixStoreError> {
+pub fn apply_state_event(conn: &mut Connection, write: &StateEventWrite<'_>) -> Result<MatrixEvent, MatrixStoreError> {
     let tx = conn.transaction()?;
-    let event = apply_state_event_in_tx(&tx, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts, now)?;
+    let event = apply_state_event_in_tx(
+        &tx,
+        write.event_id,
+        write.room_id,
+        write.sender_user_id,
+        write.event_type,
+        write.state_key,
+        write.content,
+        write.origin_server_ts,
+        write.now,
+    )?;
     tx.commit()?;
     Ok(event)
 }
@@ -1689,6 +1714,18 @@ pub fn redact_event(
     Ok(event)
 }
 
+/// The redaction [`redact_event_marked`] writes: which event, in which room,
+/// by whom, under which new event id.
+#[derive(Debug, Clone, Copy)]
+pub struct Redaction<'a> {
+    pub room_id: &'a str,
+    pub target_event_id: &'a str,
+    pub redaction_event_id: &'a str,
+    pub sender_user_id: i64,
+    pub reason: Option<&'a str>,
+    pub origin_server_ts: i64,
+}
+
 /// [`redact_event`], but merges `extra_content` into the resulting
 /// `m.room.redaction` event's own content, in the SAME transaction as the
 /// redaction itself — `routes::matrix::moderation`'s (P11) ONLY caller,
@@ -1700,14 +1737,10 @@ pub fn redact_event(
 /// needs this and stays untouched.
 pub fn redact_event_marked(
     conn: &mut Connection,
-    room_id: &str,
-    target_event_id: &str,
-    redaction_event_id: &str,
-    sender_user_id: i64,
-    reason: Option<&str>,
+    redaction: &Redaction<'_>,
     extra_content: &serde_json::Value,
-    origin_server_ts: i64,
 ) -> Result<MatrixEvent, MatrixStoreError> {
+    let Redaction { room_id, target_event_id, redaction_event_id, sender_user_id, reason, origin_server_ts } = *redaction;
     let tx = conn.transaction()?;
     let mut event = redact_event_in_tx(&tx, room_id, target_event_id, redaction_event_id, sender_user_id, reason, origin_server_ts)?;
     let mut content: serde_json::Value = serde_json::from_str(&event.content)?;
@@ -2676,13 +2709,15 @@ pub fn migrate_dm_conversation(
     for message in extras.messages {
         insert_timeline_event_in_tx(
             &tx,
-            &message.event_id,
-            bootstrap.room_id,
-            message.sender_user_id,
-            "org.mylittlechart.legacy_dm",
-            &message.content,
-            message.origin_server_ts,
-            None,
+            &TimelineEventRow {
+                event_id: &message.event_id,
+                room_id: bootstrap.room_id,
+                sender_user_id: message.sender_user_id,
+                event_type: "org.mylittlechart.legacy_dm",
+                content: &message.content,
+                origin_server_ts: message.origin_server_ts,
+                txn_id: None,
+            },
         )?;
         insert_legacy_dm_message_map(&tx, message.legacy_message_id, &message.event_id)?;
         event_id_by_legacy_id.insert(message.legacy_message_id, message.event_id.clone());
@@ -2775,13 +2810,15 @@ fn catch_up_dm_in_tx(
     for message in messages {
         insert_timeline_event_in_tx(
             tx,
-            &message.event_id,
-            room_id,
-            message.sender_user_id,
-            "org.mylittlechart.legacy_dm",
-            &message.content,
-            message.origin_server_ts,
-            None,
+            &TimelineEventRow {
+                event_id: &message.event_id,
+                room_id,
+                sender_user_id: message.sender_user_id,
+                event_type: "org.mylittlechart.legacy_dm",
+                content: &message.content,
+                origin_server_ts: message.origin_server_ts,
+                txn_id: None,
+            },
         )?;
         insert_legacy_dm_message_map(tx, message.legacy_message_id, &message.event_id)?;
     }
@@ -2980,7 +3017,7 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn);
 
-        let event = insert_timeline_event(&mut conn, "$event1", ROOM, 1, "m.room.message", "{}", 1000, None).expect("insert event");
+        let event = insert_timeline_event(&mut conn, "$event1", ROOM, 1, "m.room.message", "{}", 1000).expect("insert event");
         let account_data_stream = upsert_account_data(&mut conn, 1, GLOBAL_ACCOUNT_DATA_ROOM, "m.direct", "{}").expect("account data");
         let receipt_stream = upsert_receipt(&mut conn, ROOM, 1, ReceiptType::Read, "$event1", 1500).expect("receipt");
 
@@ -2998,8 +3035,8 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn);
 
-        apply_state_event(&mut conn, "$e1", ROOM, 1, "m.room.name", "", r#"{"name":"first"}"#, 1000, T0).expect("apply first");
-        apply_state_event(&mut conn, "$e2", ROOM, 1, "m.room.name", "", r#"{"name":"second"}"#, 2000, T0).expect("apply second");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$e1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.name", state_key: "", content: r#"{"name":"first"}"#, origin_server_ts: 1000, now: T0 }).expect("apply first");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$e2", room_id: ROOM, sender_user_id: 1, event_type: "m.room.name", state_key: "", content: r#"{"name":"second"}"#, origin_server_ts: 2000, now: T0 }).expect("apply second");
 
         let current = current_state_event(&conn, ROOM, "m.room.name", "").expect("query").expect("row exists");
         assert_eq!(current.event_id, "$e2");
@@ -3052,7 +3089,7 @@ mod tests {
         for (event_type, content, expected) in cases {
             let mut conn = test_conn();
             make_room(&conn);
-            insert_timeline_event(&mut conn, "$target", ROOM, 1, event_type, content, 1000, None).expect("insert target");
+            insert_timeline_event(&mut conn, "$target", ROOM, 1, event_type, content, 1000).expect("insert target");
             redact_event(&mut conn, ROOM, "$target", "$redaction", 1, None, 2000).expect("redact");
 
             let target = get_event(&conn, "$target").expect("get target").expect("row exists");
@@ -3066,15 +3103,19 @@ mod tests {
     fn redaction_content_carries_the_target_as_redacts_for_every_write_path() {
         let mut conn = test_conn();
         make_room(&conn);
-        insert_timeline_event(&mut conn, "$t1", ROOM, 1, "m.room.message", "{}", 1000, None).expect("insert t1");
-        insert_timeline_event(&mut conn, "$t2", ROOM, 1, "m.room.message", "{}", 1100, None).expect("insert t2");
-        insert_timeline_event(&mut conn, "$t3", ROOM, 1, "m.room.message", "{}", 1200, None).expect("insert t3");
+        insert_timeline_event(&mut conn, "$t1", ROOM, 1, "m.room.message", "{}", 1000).expect("insert t1");
+        insert_timeline_event(&mut conn, "$t2", ROOM, 1, "m.room.message", "{}", 1100).expect("insert t2");
+        insert_timeline_event(&mut conn, "$t3", ROOM, 1, "m.room.message", "{}", 1200).expect("insert t3");
 
         let plain = redact_event(&mut conn, ROOM, "$t1", "$r1", 1, None, 2000).expect("plain redact");
         assert_eq!(serde_json::from_str::<serde_json::Value>(&plain.content).expect("json"), serde_json::json!({ "redacts": "$t1" }));
         assert_eq!(plain.redacts.as_deref(), Some("$t1"));
 
-        let marked = redact_event_marked(&mut conn, ROOM, "$t2", "$r2", 1, Some("spam"), &serde_json::json!({ "org.mylittlechart.site_moderation": true }), 2100)
+        let marked = redact_event_marked(
+            &mut conn,
+            &Redaction { room_id: ROOM, target_event_id: "$t2", redaction_event_id: "$r2", sender_user_id: 1, reason: Some("spam"), origin_server_ts: 2100 },
+            &serde_json::json!({ "org.mylittlechart.site_moderation": true }),
+        )
             .expect("marked redact");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&marked.content).expect("json"),
@@ -3104,7 +3145,21 @@ mod tests {
 
         assert_eq!(txn_dedup_lookup(&conn, 1, "DEV1", "txn-1").expect("lookup 1"), TxnDedupEntry::NotSeen);
 
-        let event = insert_timeline_event(&mut conn, "$e1", ROOM, 1, "m.room.message", "{}", 1000, Some("txn-1")).expect("insert");
+        let event = {
+            let tx = conn.transaction().expect("tx");
+            let row = TimelineEventRow {
+                event_id: "$e1",
+                room_id: ROOM,
+                sender_user_id: 1,
+                event_type: "m.room.message",
+                content: "{}",
+                origin_server_ts: 1000,
+                txn_id: Some("txn-1"),
+            };
+            let event = insert_timeline_event_in_tx(&tx, &row).expect("insert");
+            tx.commit().expect("commit");
+            event
+        };
         txn_dedup_record(&conn, 1, "DEV1", "txn-1", Some(&event.event_id), T0).expect("record");
 
         assert_eq!(
@@ -3122,10 +3177,10 @@ mod tests {
     fn relations_index_populated_from_cleartext_relates_to_even_when_content_is_ciphertext() {
         let mut conn = test_conn();
         make_room(&conn);
-        insert_timeline_event(&mut conn, "$target", ROOM, 1, "m.room.message", "{}", 1000, None).expect("target");
+        insert_timeline_event(&mut conn, "$target", ROOM, 1, "m.room.message", "{}", 1000).expect("target");
 
         let content = r#"{"algorithm":"m.megolm.v1.aes-sha2","ciphertext":"opaque-base64==","sender_key":"opaque","m.relates_to":{"rel_type":"m.annotation","event_id":"$target","key":"a"}}"#;
-        let reaction = insert_timeline_event(&mut conn, "$reaction", ROOM, 2, "m.room.encrypted", content, 2000, None).expect("insert reaction");
+        let reaction = insert_timeline_event(&mut conn, "$reaction", ROOM, 2, "m.room.encrypted", content, 2000).expect("insert reaction");
 
         let (rel_type, target_id, agg_key): (String, String, Option<String>) = conn
             .query_row(
@@ -3166,8 +3221,8 @@ mod tests {
     fn receipt_never_moves_backwards() {
         let mut conn = test_conn();
         make_room(&conn);
-        let e1 = insert_timeline_event(&mut conn, "$e1", ROOM, 1, "m.room.message", "{}", 1000, None).expect("e1");
-        let e2 = insert_timeline_event(&mut conn, "$e2", ROOM, 1, "m.room.message", "{}", 2000, None).expect("e2");
+        let e1 = insert_timeline_event(&mut conn, "$e1", ROOM, 1, "m.room.message", "{}", 1000).expect("e1");
+        let e2 = insert_timeline_event(&mut conn, "$e2", ROOM, 1, "m.room.message", "{}", 2000).expect("e2");
 
         upsert_receipt(&mut conn, ROOM, 9, ReceiptType::Read, &e2.event_id, 5000).expect("advance to e2");
         upsert_receipt(&mut conn, ROOM, 9, ReceiptType::Read, &e1.event_id, 6000).expect("attempted backward move is a no-op");
@@ -3183,13 +3238,13 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn);
         let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000001", T0).expect("alice");
-        apply_state_event(&mut conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 900, T0).expect("alice joins");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$m1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 900, now: T0 }).expect("alice joins");
 
-        insert_timeline_event(&mut conn, "$e1", ROOM, 2, "m.room.message", "{}", 1000, None).expect("e1");
-        let e2 = insert_timeline_event(&mut conn, "$e2", ROOM, 2, "m.room.message", "{}", 2000, None).expect("e2");
-        insert_timeline_event(&mut conn, "$e3", ROOM, 2, "m.room.message", "{}", 3000, None).expect("e3");
-        let e4 = insert_timeline_event(&mut conn, "$e4", ROOM, 2, "m.room.message", "{}", 4000, None).expect("e4");
-        let e5 = insert_timeline_event(&mut conn, "$e5", ROOM, 2, "m.room.message", "{}", 5000, None).expect("e5");
+        insert_timeline_event(&mut conn, "$e1", ROOM, 2, "m.room.message", "{}", 1000).expect("e1");
+        let e2 = insert_timeline_event(&mut conn, "$e2", ROOM, 2, "m.room.message", "{}", 2000).expect("e2");
+        insert_timeline_event(&mut conn, "$e3", ROOM, 2, "m.room.message", "{}", 3000).expect("e3");
+        let e4 = insert_timeline_event(&mut conn, "$e4", ROOM, 2, "m.room.message", "{}", 4000).expect("e4");
+        let e5 = insert_timeline_event(&mut conn, "$e5", ROOM, 2, "m.room.message", "{}", 5000).expect("e5");
 
         // m.read at e2, m.read.private FURTHER AHEAD at e4 — the private
         // receipt must win even though "private" has nothing to do with
@@ -3211,17 +3266,17 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn);
         let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000001", T0).expect("alice");
-        apply_state_event(&mut conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 900, T0).expect("alice joins");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$m1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 900, now: T0 }).expect("alice joins");
 
         // Bob's message-like sends — these count.
-        insert_timeline_event(&mut conn, "$bob-msg", ROOM, 2, "m.room.message", "{}", 1000, None).expect("bob message");
-        insert_timeline_event(&mut conn, "$bob-enc", ROOM, 2, "m.room.encrypted", "{}", 1100, None).expect("bob encrypted");
-        insert_timeline_event(&mut conn, "$bob-legacy", ROOM, 2, "org.mylittlechart.legacy_dm", "{}", 1200, None).expect("bob legacy dm");
+        insert_timeline_event(&mut conn, "$bob-msg", ROOM, 2, "m.room.message", "{}", 1000).expect("bob message");
+        insert_timeline_event(&mut conn, "$bob-enc", ROOM, 2, "m.room.encrypted", "{}", 1100).expect("bob encrypted");
+        insert_timeline_event(&mut conn, "$bob-legacy", ROOM, 2, "org.mylittlechart.legacy_dm", "{}", 1200).expect("bob legacy dm");
 
         // Excluded: alice's own message, a state event, and a reaction.
-        insert_timeline_event(&mut conn, "$alice-msg", ROOM, 1, "m.room.message", "{}", 1300, None).expect("alice's own message");
-        apply_state_event(&mut conn, "$name", ROOM, 2, "m.room.name", "", r#"{"name":"x"}"#, 1400, T0).expect("state event");
-        insert_timeline_event(&mut conn, "$reaction", ROOM, 2, "m.reaction", "{}", 1500, None).expect("reaction");
+        insert_timeline_event(&mut conn, "$alice-msg", ROOM, 1, "m.room.message", "{}", 1300).expect("alice's own message");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$name", room_id: ROOM, sender_user_id: 2, event_type: "m.room.name", state_key: "", content: r#"{"name":"x"}"#, origin_server_ts: 1400, now: T0 }).expect("state event");
+        insert_timeline_event(&mut conn, "$reaction", ROOM, 2, "m.reaction", "{}", 1500).expect("reaction");
 
         let room = get_room(&conn, ROOM).expect("get room").expect("room exists");
         assert_eq!(notification_count(&conn, &room, 1).expect("count"), 3, "only bob's 3 message-like sends count");
@@ -3231,7 +3286,7 @@ mod tests {
     fn notification_count_is_zero_for_a_non_member() {
         let mut conn = test_conn();
         make_room(&conn);
-        insert_timeline_event(&mut conn, "$e1", ROOM, 2, "m.room.message", "{}", 1000, None).expect("e1");
+        insert_timeline_event(&mut conn, "$e1", ROOM, 2, "m.room.message", "{}", 1000).expect("e1");
 
         let room = get_room(&conn, ROOM).expect("get room").expect("room exists");
         assert_eq!(notification_count(&conn, &room, 999).expect("count"), 0, "a caller with no membership row at all sees nothing");
@@ -3243,12 +3298,12 @@ mod tests {
     fn duplicate_annotation_is_refused() {
         let mut conn = test_conn();
         make_room(&conn);
-        insert_timeline_event(&mut conn, "$target", ROOM, 1, "m.room.message", "{}", 1000, None).expect("target");
+        insert_timeline_event(&mut conn, "$target", ROOM, 1, "m.room.message", "{}", 1000).expect("target");
 
         let content = r#"{"m.relates_to":{"rel_type":"m.annotation","event_id":"$target","key":"a"}}"#;
-        insert_timeline_event(&mut conn, "$react1", ROOM, 5, "m.reaction", content, 2000, None).expect("first reaction");
+        insert_timeline_event(&mut conn, "$react1", ROOM, 5, "m.reaction", content, 2000).expect("first reaction");
 
-        let err = insert_timeline_event(&mut conn, "$react2", ROOM, 5, "m.reaction", content, 3000, None).unwrap_err();
+        let err = insert_timeline_event(&mut conn, "$react2", ROOM, 5, "m.reaction", content, 3000).unwrap_err();
         assert!(matches!(err, MatrixStoreError::DuplicateAnnotation));
 
         // The whole transaction must have rolled back — no partial events row.
@@ -3256,7 +3311,7 @@ mod tests {
 
         // A DIFFERENT sender reacting with the same key is a distinct,
         // accepted annotation (not covered by the refusal).
-        let other = insert_timeline_event(&mut conn, "$react3", ROOM, 6, "m.reaction", content, 4000, None).expect("different sender reacts");
+        let other = insert_timeline_event(&mut conn, "$react3", ROOM, 6, "m.reaction", content, 4000).expect("different sender reacts");
         assert_eq!(other.event_id, "$react3");
     }
 
@@ -3266,16 +3321,16 @@ mod tests {
     fn reannotation_after_redaction_is_allowed() {
         let mut conn = test_conn();
         make_room(&conn);
-        insert_timeline_event(&mut conn, "$target", ROOM, 1, "m.room.message", "{}", 1000, None).expect("target");
+        insert_timeline_event(&mut conn, "$target", ROOM, 1, "m.room.message", "{}", 1000).expect("target");
 
         let content = r#"{"m.relates_to":{"rel_type":"m.annotation","event_id":"$target","key":"a"}}"#;
-        let first = insert_timeline_event(&mut conn, "$react1", ROOM, 5, "m.reaction", content, 2000, None).expect("first reaction");
+        let first = insert_timeline_event(&mut conn, "$react1", ROOM, 5, "m.reaction", content, 2000).expect("first reaction");
 
         redact_event(&mut conn, ROOM, &first.event_id, "$redaction", 1, None, 2500).expect("redact the reaction");
 
         // The same sender may now react with the same key again — the
         // redacted prior annotation no longer counts as a duplicate.
-        let second = insert_timeline_event(&mut conn, "$react2", ROOM, 5, "m.reaction", content, 3000, None)
+        let second = insert_timeline_event(&mut conn, "$react2", ROOM, 5, "m.reaction", content, 3000)
             .expect("re-annotation after redaction must succeed");
         assert_eq!(second.event_id, "$react2");
     }
@@ -3286,7 +3341,7 @@ mod tests {
         make_room(&conn);
 
         let content = r#"{"m.relates_to":{"rel_type":"m.annotation","event_id":"$missing","key":"a"}}"#;
-        let err = insert_timeline_event(&mut conn, "$react1", ROOM, 5, "m.reaction", content, 2000, None).unwrap_err();
+        let err = insert_timeline_event(&mut conn, "$react1", ROOM, 5, "m.reaction", content, 2000).unwrap_err();
         assert!(matches!(err, MatrixStoreError::InvalidRelationTarget(ref id) if id == "$missing"));
     }
 
@@ -3297,10 +3352,10 @@ mod tests {
         let other_room = format!("!other:{MATRIX_SERVER_NAME}");
         create_room(&conn, &other_room, RoomKind::Group, 1, T0, false, JoinRule::Invite, HistoryVisibility::Shared, None, None)
             .expect("other room");
-        insert_timeline_event(&mut conn, "$target", &other_room, 1, "m.room.message", "{}", 1000, None).expect("target in other room");
+        insert_timeline_event(&mut conn, "$target", &other_room, 1, "m.room.message", "{}", 1000).expect("target in other room");
 
         let content = r#"{"m.relates_to":{"rel_type":"m.annotation","event_id":"$target","key":"a"}}"#;
-        let err = insert_timeline_event(&mut conn, "$react1", ROOM, 5, "m.reaction", content, 2000, None).unwrap_err();
+        let err = insert_timeline_event(&mut conn, "$react1", ROOM, 5, "m.reaction", content, 2000).unwrap_err();
         assert!(matches!(err, MatrixStoreError::InvalidRelationTarget(ref id) if id == "$target"));
     }
 
@@ -3311,7 +3366,7 @@ mod tests {
         let other_room = format!("!other:{MATRIX_SERVER_NAME}");
         create_room(&conn, &other_room, RoomKind::Group, 1, T0, false, JoinRule::Invite, HistoryVisibility::Shared, None, None)
             .expect("other room");
-        insert_timeline_event(&mut conn, "$target", &other_room, 1, "m.room.message", "{}", 1000, None).expect("target in other room");
+        insert_timeline_event(&mut conn, "$target", &other_room, 1, "m.room.message", "{}", 1000).expect("target in other room");
 
         let err = redact_event(&mut conn, ROOM, "$target", "$redaction", 1, None, 2000).unwrap_err();
         assert!(matches!(err, MatrixStoreError::WrongRoom(ref id) if id == "$target"));
@@ -3322,7 +3377,7 @@ mod tests {
         for event_type in ["m.room.create", "m.room.encryption"] {
             let mut conn = test_conn();
             make_room(&conn);
-            apply_state_event(&mut conn, "$target", ROOM, 1, event_type, "", r#"{"a":1}"#, 1000, T0).expect("apply state event");
+            apply_state_event(&mut conn, &StateEventWrite { event_id: "$target", room_id: ROOM, sender_user_id: 1, event_type, state_key: "", content: r#"{"a":1}"#, origin_server_ts: 1000, now: T0 }).expect("apply state event");
 
             let err = redact_event(&mut conn, ROOM, "$target", "$redaction", 1, None, 2000).unwrap_err();
             assert!(
@@ -3339,7 +3394,7 @@ mod tests {
         let other_room = format!("!other:{MATRIX_SERVER_NAME}");
         create_room(&conn, &other_room, RoomKind::Group, 1, T0, false, JoinRule::Invite, HistoryVisibility::Shared, None, None)
             .expect("other room");
-        let event = insert_timeline_event(&mut conn, "$e1", &other_room, 1, "m.room.message", "{}", 1000, None).expect("event in other room");
+        let event = insert_timeline_event(&mut conn, "$e1", &other_room, 1, "m.room.message", "{}", 1000).expect("event in other room");
 
         let err = upsert_receipt(&mut conn, ROOM, 9, ReceiptType::Read, &event.event_id, 5000).unwrap_err();
         assert!(matches!(err, MatrixStoreError::WrongRoom(ref id) if id == &event.event_id));
@@ -3378,8 +3433,8 @@ mod tests {
         let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000001", T0).expect("alice");
         let bob = ensure_matrix_user(&conn, 2, "bob000000000000000000000000002", T0).expect("bob");
 
-        apply_state_event(&mut conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
-        apply_state_event(&mut conn, "$m2", ROOM, 1, "m.room.member", &bob, r#"{"membership":"invite"}"#, 1100, T0).expect("bob invited");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$m1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("alice joins");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$m2", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"invite"}"#, origin_server_ts: 1100, now: T0 }).expect("bob invited");
 
         let joined = room_members(&conn, ROOM, Some(Membership::Join)).expect("joined members");
         assert_eq!(joined.len(), 1);
@@ -3387,7 +3442,7 @@ mod tests {
         assert_eq!(joined[0].power_level, None);
 
         let power_levels_content = serde_json::json!({"users": {alice.clone(): 100}, "users_default": 0}).to_string();
-        apply_state_event(&mut conn, "$pl1", ROOM, 1, "m.room.power_levels", "", &power_levels_content, 1200, T0).expect("power levels");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$pl1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.power_levels", state_key: "", content: &power_levels_content, origin_server_ts: 1200, now: T0 }).expect("power levels");
 
         let alice_row = room_members(&conn, ROOM, None)
             .expect("all members")
@@ -3404,9 +3459,9 @@ mod tests {
     fn events_in_room_after_and_before_page_in_the_documented_order() {
         let mut conn = test_conn();
         make_room(&conn);
-        let e1 = insert_timeline_event(&mut conn, "$e1", ROOM, 1, "m.room.message", "{}", 1000, None).expect("e1");
-        let e2 = insert_timeline_event(&mut conn, "$e2", ROOM, 1, "m.room.message", "{}", 2000, None).expect("e2");
-        let e3 = insert_timeline_event(&mut conn, "$e3", ROOM, 1, "m.room.message", "{}", 3000, None).expect("e3");
+        let e1 = insert_timeline_event(&mut conn, "$e1", ROOM, 1, "m.room.message", "{}", 1000).expect("e1");
+        let e2 = insert_timeline_event(&mut conn, "$e2", ROOM, 1, "m.room.message", "{}", 2000).expect("e2");
+        let e3 = insert_timeline_event(&mut conn, "$e3", ROOM, 1, "m.room.message", "{}", 3000).expect("e3");
 
         let after = events_in_room_after(&conn, ROOM, e1.stream_id, 10).expect("after");
         assert_eq!(after.iter().map(|e| e.event_id.clone()).collect::<Vec<_>>(), vec![e2.event_id.clone(), e3.event_id.clone()]);
@@ -3437,7 +3492,7 @@ mod tests {
     fn legacy_dm_message_map_insert_and_get_round_trip() {
         let mut conn = test_conn();
         make_room(&conn);
-        let event = insert_timeline_event(&mut conn, "$legacy1", ROOM, 1, "org.mylittlechart.legacy_dm", "{}", 1000, None).expect("insert");
+        let event = insert_timeline_event(&mut conn, "$legacy1", ROOM, 1, "org.mylittlechart.legacy_dm", "{}", 1000).expect("insert");
         insert_legacy_dm_message_map(&conn, 42, &event.event_id).expect("map insert");
         assert_eq!(legacy_dm_message_event_id(&conn, 42).expect("map get"), Some(event.event_id));
         assert_eq!(legacy_dm_message_event_id(&conn, 999).expect("missing"), None);
@@ -3648,7 +3703,7 @@ mod tests {
         let mut conn = test_conn();
         make_room(&conn);
         let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000099", T0).expect("alice");
-        apply_state_event(&mut conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("join");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$m1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("join");
 
         assert_eq!(room_member(&conn, ROOM, 1).expect("member").map(|m| m.membership), Some(Membership::Join));
         assert_eq!(room_member(&conn, ROOM, 999).expect("no such member"), None);
@@ -3658,7 +3713,7 @@ mod tests {
         assert_eq!(forget_membership(&conn, ROOM, 1).expect("forget while joined"), 0);
         assert!(room_member(&conn, ROOM, 1).expect("still a member").is_some());
 
-        apply_state_event(&mut conn, "$m2", ROOM, 1, "m.room.member", &alice, r#"{"membership":"leave"}"#, 2000, T0).expect("leave");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$m2", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"leave"}"#, origin_server_ts: 2000, now: T0 }).expect("leave");
         assert_eq!(forget_membership(&conn, ROOM, 1).expect("forget after leaving"), 1);
         assert_eq!(room_member(&conn, ROOM, 1).expect("gone"), None);
     }
@@ -3672,9 +3727,9 @@ mod tests {
         let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000098", T0).expect("alice");
         let bob = ensure_matrix_user(&conn, 2, "bob0000000000000000000000000098", T0).expect("bob");
 
-        let e1 = apply_state_event(&mut conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
+        let e1 = apply_state_event(&mut conn, &StateEventWrite { event_id: "$m1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("alice joins");
         let cutoff = e1.stream_id;
-        apply_state_event(&mut conn, "$m2", ROOM, 1, "m.room.member", &bob, r#"{"membership":"invite"}"#, 1100, T0).expect("bob invited later");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$m2", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"invite"}"#, origin_server_ts: 1100, now: T0 }).expect("bob invited later");
 
         let at_cutoff = state_events_of_type_at(&conn, ROOM, "m.room.member", cutoff).expect("at cutoff");
         assert_eq!(at_cutoff.len(), 1, "bob's invite lands strictly after the cutoff and must be excluded");
@@ -3693,10 +3748,10 @@ mod tests {
         let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000097", T0).expect("alice");
         let bob = ensure_matrix_user(&conn, 2, "bob0000000000000000000000000097", T0).expect("bob");
 
-        apply_state_event(&mut conn, "$create", ROOM, 1, "m.room.create", "", r#"{"room_version":"11"}"#, 900, T0).expect("create");
-        apply_state_event(&mut conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
-        apply_state_event(&mut conn, "$jr", ROOM, 1, "m.room.join_rules", "", r#"{"join_rule":"invite"}"#, 1100, T0).expect("join rules");
-        apply_state_event(&mut conn, "$m2", ROOM, 1, "m.room.member", &bob, r#"{"membership":"invite"}"#, 1200, T0).expect("bob invited");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$create", room_id: ROOM, sender_user_id: 1, event_type: "m.room.create", state_key: "", content: r#"{"room_version":"11"}"#, origin_server_ts: 900, now: T0 }).expect("create");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$m1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("alice joins");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$jr", room_id: ROOM, sender_user_id: 1, event_type: "m.room.join_rules", state_key: "", content: r#"{"join_rule":"invite"}"#, origin_server_ts: 1100, now: T0 }).expect("join rules");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$m2", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"invite"}"#, origin_server_ts: 1200, now: T0 }).expect("bob invited");
 
         let stripped = stripped_invite_state(&conn, ROOM, 1).expect("stripped state");
         let types: Vec<&str> = stripped.iter().map(|v| v["type"].as_str().expect("type")).collect();
@@ -3722,13 +3777,13 @@ mod tests {
         let bob = ensure_matrix_user(&conn, 3, "bob0000000000000000000000000097", T0).expect("bob");
         let carol = ensure_matrix_user(&conn, 4, "carol0000000000000000000000097a", T0).expect("carol");
 
-        apply_state_event(&mut conn, "$a1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins");
-        let boundary = apply_state_event(&mut conn, "$b1", ROOM, 1, "m.room.member", &bob, r#"{"membership":"join"}"#, 1100, T0)
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$a1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("alice joins");
+        let boundary = apply_state_event(&mut conn, &StateEventWrite { event_id: "$b1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"join"}"#, origin_server_ts: 1100, now: T0 })
             .expect("bob joins")
             .stream_id;
-        apply_state_event(&mut conn, "$a2", ROOM, 1, "m.room.member", &alice, r#"{"membership":"leave"}"#, 1200, T0).expect("alice leaves");
-        apply_state_event(&mut conn, "$b2", ROOM, 1, "m.room.member", &bob, r#"{"membership":"ban"}"#, 1300, T0).expect("bob banned");
-        apply_state_event(&mut conn, "$c1", ROOM, 1, "m.room.member", &carol, r#"{"membership":"join"}"#, 1400, T0).expect("carol joins (not a departure)");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$a2", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"leave"}"#, origin_server_ts: 1200, now: T0 }).expect("alice leaves");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$b2", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"ban"}"#, origin_server_ts: 1300, now: T0 }).expect("bob banned");
+        apply_state_event(&mut conn, &StateEventWrite { event_id: "$c1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &carol, content: r#"{"membership":"join"}"#, origin_server_ts: 1400, now: T0 }).expect("carol joins (not a departure)");
 
         let mut left = user_ids_with_leave_transition_in_rooms(&conn, &[ROOM.to_string()], boundary, i64::MAX).expect("query");
         left.sort_unstable();
@@ -3747,9 +3802,9 @@ mod tests {
         let alice = ensure_matrix_user(&conn, 2, "alice00000000000000000000000081", T0).expect("alice");
         let bob = ensure_matrix_user(&conn, 3, "bob0000000000000000000000000081", T0).expect("bob");
 
-        let alice_joined = apply_state_event(&mut conn, "$a1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0).expect("alice joins").stream_id;
-        let bob_invited = apply_state_event(&mut conn, "$b1", ROOM, 1, "m.room.member", &bob, r#"{"membership":"invite"}"#, 1100, T0).expect("bob invited").stream_id;
-        let bob_joined = apply_state_event(&mut conn, "$b2", ROOM, 3, "m.room.member", &bob, r#"{"membership":"join","displayname":"Bob"}"#, 1200, T0).expect("bob joins").stream_id;
+        let alice_joined = apply_state_event(&mut conn, &StateEventWrite { event_id: "$a1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("alice joins").stream_id;
+        let bob_invited = apply_state_event(&mut conn, &StateEventWrite { event_id: "$b1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"invite"}"#, origin_server_ts: 1100, now: T0 }).expect("bob invited").stream_id;
+        let bob_joined = apply_state_event(&mut conn, &StateEventWrite { event_id: "$b2", room_id: ROOM, sender_user_id: 3, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"join","displayname":"Bob"}"#, origin_server_ts: 1200, now: T0 }).expect("bob joins").stream_id;
 
         assert_eq!(membership_at(&conn, ROOM, &bob, alice_joined).expect("query"), None, "bob had no member event yet");
         assert_eq!(membership_at(&conn, ROOM, &bob, bob_invited).expect("query"), Some(Membership::Invite));
@@ -3809,7 +3864,7 @@ mod tests {
     fn adopt_dm_room_for_legacy_writes_a_key_event_only_where_the_room_has_none() {
         let mut conn = test_conn();
         native_dm_room(&conn);
-        let existing = apply_state_event(&mut conn, "$k-existing", ROOM, 1, "org.mylittlechart.legacy_dm_key", "@a:mylittlechart.org", r#"{"public_key_b64":"AAAA"}"#, 900, T0)
+        let existing = apply_state_event(&mut conn, &StateEventWrite { event_id: "$k-existing", room_id: ROOM, sender_user_id: 1, event_type: "org.mylittlechart.legacy_dm_key", state_key: "@a:mylittlechart.org", content: r#"{"public_key_b64":"AAAA"}"#, origin_server_ts: 900, now: T0 })
             .expect("existing key event");
         let key_events = [
             NewStateEvent {

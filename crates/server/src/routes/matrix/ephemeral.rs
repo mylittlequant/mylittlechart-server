@@ -443,8 +443,8 @@ mod tests {
         .expect("create room");
         let alice = matrix_store::ensure_matrix_user(conn, 1, "alice00000000000000000000000001", T0).expect("alice");
         let bob = matrix_store::ensure_matrix_user(conn, 2, "bob000000000000000000000000002", T0).expect("bob");
-        matrix_store::apply_state_event(conn, "$m1", ROOM, 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 900, T0).expect("alice joins");
-        matrix_store::apply_state_event(conn, "$m2", ROOM, 1, "m.room.member", &bob, r#"{"membership":"join"}"#, 1000, T0).expect("bob joins");
+        matrix_store::apply_state_event(conn, &matrix_store::StateEventWrite { event_id: "$m1", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 900, now: T0 }).expect("alice joins");
+        matrix_store::apply_state_event(conn, &matrix_store::StateEventWrite { event_id: "$m2", room_id: ROOM, sender_user_id: 1, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("bob joins");
         (alice, bob)
     }
 
@@ -489,7 +489,7 @@ mod tests {
     fn private_receipt_wakes_only_own_devices() {
         let mut conn = test_conn();
         make_room_with_two_members(&mut conn);
-        let event = matrix_store::insert_timeline_event(&mut conn, "$msg", ROOM, 2, "m.room.message", "{}", 1000, None).expect("message");
+        let event = matrix_store::insert_timeline_event(&mut conn, "$msg", ROOM, 2, "m.room.message", "{}", 1000).expect("message");
 
         let room = matrix_store::get_room(&conn, ROOM).expect("get room").expect("room exists");
         let wake_ids = apply_receipt(&mut conn, &room, 1, ReceiptType::ReadPrivate, &event.event_id, 1500)
@@ -502,7 +502,7 @@ mod tests {
     fn read_receipt_wakes_every_joined_member() {
         let mut conn = test_conn();
         make_room_with_two_members(&mut conn);
-        let event = matrix_store::insert_timeline_event(&mut conn, "$msg", ROOM, 2, "m.room.message", "{}", 1000, None).expect("message");
+        let event = matrix_store::insert_timeline_event(&mut conn, "$msg", ROOM, 2, "m.room.message", "{}", 1000).expect("message");
 
         let room = matrix_store::get_room(&conn, ROOM).expect("get room").expect("room exists");
         let wake_ids = apply_receipt(&mut conn, &room, 1, ReceiptType::Read, &event.event_id, 1500)
@@ -517,8 +517,8 @@ mod tests {
     fn backwards_receipt_is_a_noop() {
         let mut conn = test_conn();
         make_room_with_two_members(&mut conn);
-        let e1 = matrix_store::insert_timeline_event(&mut conn, "$e1", ROOM, 2, "m.room.message", "{}", 1000, None).expect("e1");
-        let e2 = matrix_store::insert_timeline_event(&mut conn, "$e2", ROOM, 2, "m.room.message", "{}", 2000, None).expect("e2");
+        let e1 = matrix_store::insert_timeline_event(&mut conn, "$e1", ROOM, 2, "m.room.message", "{}", 1000).expect("e1");
+        let e2 = matrix_store::insert_timeline_event(&mut conn, "$e2", ROOM, 2, "m.room.message", "{}", 2000).expect("e2");
         let room = matrix_store::get_room(&conn, ROOM).expect("get room").expect("room exists");
 
         let forward = apply_receipt(&mut conn, &room, 1, ReceiptType::Read, &e2.event_id, 2500).expect("advance to e2");
@@ -537,7 +537,7 @@ mod tests {
     fn fully_read_is_stored_as_room_account_data() {
         let mut conn = test_conn();
         make_room_with_two_members(&mut conn);
-        let event = matrix_store::insert_timeline_event(&mut conn, "$msg", ROOM, 2, "m.room.message", "{}", 1000, None).expect("message");
+        let event = matrix_store::insert_timeline_event(&mut conn, "$msg", ROOM, 2, "m.room.message", "{}", 1000).expect("message");
         let room = matrix_store::get_room(&conn, ROOM).expect("get room").expect("room exists");
 
         let wake_ids = apply_read_markers(&mut conn, &room, 1, Some(&event.event_id), None, None, 1500).expect("apply read markers");
@@ -552,7 +552,7 @@ mod tests {
     fn read_markers_can_combine_fully_read_with_a_receipt() {
         let mut conn = test_conn();
         make_room_with_two_members(&mut conn);
-        let event = matrix_store::insert_timeline_event(&mut conn, "$msg", ROOM, 2, "m.room.message", "{}", 1000, None).expect("message");
+        let event = matrix_store::insert_timeline_event(&mut conn, "$msg", ROOM, 2, "m.room.message", "{}", 1000).expect("message");
         let room = matrix_store::get_room(&conn, ROOM).expect("get room").expect("room exists");
 
         let wake_ids =
@@ -583,7 +583,7 @@ mod tests {
             None,
         )
         .expect("create other room");
-        let foreign_event = matrix_store::insert_timeline_event(&mut conn, "$foreign", OTHER_ROOM, 1, "m.room.message", "{}", 1000, None).expect("foreign event");
+        let foreign_event = matrix_store::insert_timeline_event(&mut conn, "$foreign", OTHER_ROOM, 1, "m.room.message", "{}", 1000).expect("foreign event");
 
         let room = matrix_store::get_room(&conn, ROOM).expect("get room").expect("room exists");
         let err = apply_receipt(&mut conn, &room, 1, ReceiptType::Read, &foreign_event.event_id, 1500).unwrap_err();
