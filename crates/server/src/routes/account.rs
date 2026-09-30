@@ -19,6 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_token};
@@ -184,6 +185,11 @@ pub struct SetNickRequest {
 /// backstop, then enforces the forbidden-nick registry, the reserved-name
 /// list (exact and impersonation-by-prefix), uniqueness, and the cooldown.
 ///
+/// A successful change also re-stamps the new label as `displayname` into the
+/// caller's Matrix member events (every room they are joined or invited in,
+/// `routes::matrix::rooms::propagate_display_name_change`) and wakes those
+/// rooms' members, so peers' clients pick up the new name.
+///
 /// Response on success: `{ "nick": "...", "effective_label": "..." }`.
 /// `400` invalid format or forbidden nick (distinguished by the `code`
 /// field alongside `error`), `409` taken or reserved (distinguished in the
@@ -224,23 +230,35 @@ pub async fn set_nick(
             .into_response();
     }
 
-    let result = tokio::task::spawn_blocking(move || -> Result<(String, String), NickError> {
-        let conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        let reserved_cache = state.control_plane().reserved_nick_cache_snapshot();
-        crate::db::set_nick(&conn, user_id, &nick, &reserved_cache)?;
-        // Read back what was actually stored rather than trusting the local
-        // `nick` variable — same read-after-write shape as
-        // `db::redeem_gift_code` returning the computed `paid_until` instead
-        // of echoing the request.
-        let stored_nick = crate::db::nick_for_user(&conn, user_id)?.unwrap_or(nick);
-        let effective_label = crate::db::effective_label_for_user(&conn, user_id)?;
-        Ok((stored_nick, effective_label))
+    let state_for_wake = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<(String, String, HashSet<i64>), NickError> {
+        let cp = state.control_plane();
+        let (stored_nick, effective_label) = {
+            let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+            let reserved_cache = cp.reserved_nick_cache_snapshot();
+            crate::db::set_nick(&conn, user_id, &nick, &reserved_cache)?;
+            // Read back what was actually stored rather than trusting the local
+            // `nick` variable — same read-after-write shape as
+            // `db::redeem_gift_code` returning the computed `paid_until` instead
+            // of echoing the request.
+            let stored_nick = crate::db::nick_for_user(&conn, user_id)?.unwrap_or(nick);
+            let effective_label = crate::db::effective_label_for_user(&conn, user_id)?;
+            (stored_nick, effective_label)
+        };
+        // The identity guard is released before the messenger write (lock
+        // order `db` -> `messenger`, and the propagation locks `db` itself):
+        // the new nick is re-stamped into the user's Matrix member events so
+        // other members' clients show it. The nick change is committed
+        // either way; a propagation failure is logged inside.
+        let wake_ids = crate::routes::matrix::rooms::propagate_display_name_change(cp, user_id);
+        Ok((stored_nick, effective_label, wake_ids))
     })
     .await;
 
     match result {
-        Ok(Ok((nick, effective_label))) => {
+        Ok(Ok((nick, effective_label, wake_ids))) => {
             tracing::info!("nick changed: user_id={} nick={}", user_id, nick);
+            state_for_wake.control_plane().live.wake_many(wake_ids.into_iter().map(|id| format!("user:{id}")));
             Json(serde_json::json!({ "nick": nick, "effective_label": effective_label })).into_response()
         }
         Ok(Err(NickError::Invalid)) => (

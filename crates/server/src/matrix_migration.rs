@@ -109,7 +109,9 @@ use mylittlechart_server::matrix_store::{self, RoomKind};
 
 use crate::db;
 use crate::dm_db;
-use crate::routes::matrix::rooms::{dm_pair_key, find_reusable_dm_room, invite_power_level, power_levels_content, room_kind_settings, state_event};
+use crate::routes::matrix::rooms::{
+    dm_pair_key, find_reusable_dm_room, invite_power_level, join_member_content, power_levels_content, room_kind_settings, state_event,
+};
 
 /// State event type for a migrated room's copy of each member's DM identity
 /// key (plan §2 manager decision 5). Content:
@@ -314,7 +316,8 @@ fn conversation_read_receipts(
 
 /// Migrate every `dm_conversations` row that has no matching
 /// `rooms.legacy_dm_id` yet into a Matrix DM room (plan §7). `identity` is
-/// the main identity database connection (`public_id` lookups only);
+/// the main identity database connection (`public_id` and effective-label
+/// lookups only — the label is each party's member-event `displayname`);
 /// `social` is `social.db`, read-only throughout; `now` (RFC3339) stamps
 /// [`mylittlechart_server::matrix_store::ensure_matrix_user`]'s
 /// `matrix_users.created_at` for any party touched for the first time here.
@@ -423,10 +426,17 @@ fn migrate_one_conversation(
     let invite_level = invite_power_level(RoomKind::Dm, None);
     let bootstrap_origin_ts = rfc3339_to_millis(&conv.created_at)?;
 
+    // Each party's `displayname` is their effective label (nick, then the
+    // provider name, then the public id) — a client names the DM after the
+    // peer's member-event `displayname`, so a bare `{"membership":"join"}`
+    // would title every migrated DM with a 32-hex public id.
+    let lo_label = db::effective_label_for_user(identity, conv.user_lo)?;
+    let hi_label = db::effective_label_for_user(identity, conv.user_hi)?;
+
     let mut state_events = vec![
         state_event("m.room.create", "", conv.user_lo, serde_json::json!({ "room_version": matrix_store::MATRIX_ROOM_VERSION })),
-        state_event("m.room.member", &lo_mxid, conv.user_lo, serde_json::json!({ "membership": "join" })),
-        state_event("m.room.member", &hi_mxid, conv.user_hi, serde_json::json!({ "membership": "join" })),
+        state_event("m.room.member", &lo_mxid, conv.user_lo, join_member_content(&lo_label)),
+        state_event("m.room.member", &hi_mxid, conv.user_hi, join_member_content(&hi_label)),
         state_event("m.room.power_levels", "", conv.user_lo, power_levels_content(&lo_mxid, RoomKind::Dm, invite_level)),
         state_event("m.room.join_rules", "", conv.user_lo, serde_json::json!({ "join_rule": join_rule.as_str() })),
         state_event(
@@ -706,7 +716,9 @@ mod tests {
 
     fn identity_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory sqlite");
-        conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, public_id TEXT NOT NULL);").expect("schema");
+        // The columns `db::effective_label_for_user` reads, nothing else.
+        conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, public_id TEXT NOT NULL, nick TEXT, display_name TEXT NOT NULL DEFAULT '');")
+            .expect("schema");
         conn
     }
 
@@ -848,6 +860,42 @@ mod tests {
         let join_rules = matrix_store::current_state_event(&messenger, &room.id, "m.room.join_rules", "").expect("query").expect("exists");
         let join_rules_content: serde_json::Value = serde_json::from_str(&join_rules.content).expect("json");
         assert_eq!(join_rules_content["join_rule"], "invite");
+    }
+
+    /// The `content` of `user_id`'s current `m.room.member` event in `room_id`.
+    fn member_content(messenger: &Connection, room_id: &str, user_id: i64) -> serde_json::Value {
+        let mxid = matrix_store::mxid_of(messenger, user_id).expect("query").expect("registered");
+        let event = matrix_store::current_state_event(messenger, room_id, "m.room.member", &mxid).expect("query").expect("member event exists");
+        serde_json::from_str(&event.content).expect("json")
+    }
+
+    #[test]
+    fn migrated_room_member_events_carry_each_partys_effective_label() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        // lo picked a nick (it wins over the provider name); hi never did, so
+        // hi's label is the provider display name.
+        identity.execute("UPDATE users SET nick = 'lo_nick', display_name = 'Lo Provider' WHERE id = 1", []).expect("lo nick");
+        identity.execute("UPDATE users SET display_name = 'Hi Provider' WHERE id = 2", []).expect("hi provider name");
+
+        migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("migrate");
+
+        let room = matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").expect("room exists");
+        let lo = member_content(&messenger, &room.id, conv.user_lo);
+        let hi = member_content(&messenger, &room.id, conv.user_hi);
+        assert_eq!(lo["membership"], "join");
+        assert_eq!(lo["displayname"], "lo_nick", "a nick beats the provider display name");
+        assert_eq!(hi["membership"], "join");
+        assert_eq!(hi["displayname"], "Hi Provider", "no nick: the provider display name is the label");
+    }
+
+    #[test]
+    fn migrated_room_member_event_falls_back_to_the_public_id_without_a_nick_or_name() {
+        let (identity, social, mut messenger, conv) = base_fixture();
+        migrate_legacy_dms(&mut messenger, &social, &identity, NOW).expect("migrate");
+
+        let room = matrix_store::room_by_legacy_dm_id(&messenger, conv.id).expect("query").expect("room exists");
+        let lo = member_content(&messenger, &room.id, conv.user_lo);
+        assert_eq!(lo["displayname"], "0000000000000000000000000000lo1", "the effective label's last fallback is the public id");
     }
 
     #[test]

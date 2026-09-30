@@ -496,8 +496,10 @@ async fn profile_response(state: Arc<AppState>, headers: HeaderMap, user_id: Str
 
     let displayname = tokio::task::spawn_blocking(move || -> Result<String, MatrixError> {
         let cp = state.control_plane();
-        let messenger_conn = cp.messenger_conn();
+        // Lock order `db` -> `messenger` (taking `messenger` first deadlocked
+        // against every path that holds `db` and then wants `messenger`).
         let identity_conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+        let messenger_conn = cp.messenger_conn();
         profile_displayname(&identity_conn, &messenger_conn, &user_id)
     })
     .await

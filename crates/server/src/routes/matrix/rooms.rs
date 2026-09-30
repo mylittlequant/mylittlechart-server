@@ -164,17 +164,72 @@ fn derive_room_kind(is_direct: bool, invite_count: usize, visibility_public: boo
     Ok(RoomKind::Group)
 }
 
-/// The `content` of the invitee's `m.room.member` invite event. A DM invite
-/// also carries `is_direct: true` (the Matrix convention): the invitee's
-/// client reads it from `invite_state` to classify the room as a DM and
-/// record it in `m.direct`; without it the room would surface as a group.
-/// Every other kind carries the bare membership only.
-fn invite_member_content(kind: RoomKind) -> serde_json::Value {
-    let mut content = serde_json::json!({ "membership": "invite" });
+/// `content` with the user's `displayname` stamped in. The server owns this
+/// field of every `join`/`invite` member event it writes (the Matrix
+/// convention): a client names a DM after the peer's member-event
+/// `displayname` and lists members by it, falling back to the mxid localpart
+/// (the 32-hex public id) when it is absent. An empty `displayname` (no
+/// identity row behind the user) leaves the field out rather than stamping
+/// an empty name.
+fn with_displayname(mut content: serde_json::Value, displayname: &str) -> serde_json::Value {
+    if !displayname.is_empty() {
+        content["displayname"] = serde_json::Value::String(displayname.to_string());
+    }
+    content
+}
+
+/// The `content` of a `join` `m.room.member` event for a user whose
+/// effective label is `displayname` (see [`with_displayname`]).
+/// `pub(crate)` — the legacy-DM migration's bootstrap writes the same event.
+pub(crate) fn join_member_content(displayname: &str) -> serde_json::Value {
+    with_displayname(serde_json::json!({ "membership": "join" }), displayname)
+}
+
+/// The `content` of the invitee's `m.room.member` invite event, carrying the
+/// invitee's own effective label as `displayname`. A DM invite also carries
+/// `is_direct: true` (the Matrix convention): the invitee's client reads it
+/// from `invite_state` to classify the room as a DM and record it in
+/// `m.direct`; without it the room would surface as a group. Every other
+/// kind carries the membership and the `displayname` only.
+fn invite_member_content(kind: RoomKind, displayname: &str) -> serde_json::Value {
+    let mut content = with_displayname(serde_json::json!({ "membership": "invite" }), displayname);
     if kind == RoomKind::Dm {
         content["is_direct"] = serde_json::Value::Bool(true);
     }
     content
+}
+
+/// A joined user's own `m.room.member` update (`PUT state`, the profile-update
+/// exception in [`check_state_event_type_allowed`]) with `displayname`
+/// forced to the effective label: the nick is the source of truth (`PUT
+/// /profile/{userId}/displayname` is refused for the same reason), so a
+/// client-chosen name is overwritten, and dropped when there is no label to
+/// stamp instead. Every other field of the client's content is kept.
+fn stamp_own_member_displayname(content: &str, displayname: &str) -> Result<String, MatrixError> {
+    let mut value: serde_json::Value = serde_json::from_str(content)?;
+    let Some(fields) = value.as_object_mut() else {
+        return Err(MatrixError::invalid_param("m.room.member content must be an object"));
+    };
+    if displayname.is_empty() {
+        fields.remove("displayname");
+    } else {
+        fields.insert("displayname".to_string(), serde_json::Value::String(displayname.to_string()));
+    }
+    Ok(value.to_string())
+}
+
+/// The creator's `join` and every invitee's `invite` `m.room.member` state
+/// events of a fresh room, each stamped with its own user's effective label
+/// (`invitees` is `(mxid, label)` per invited user). The creator's event
+/// comes first: `m.room.power_levels` must follow the member events it
+/// refers to (see [`matrix_store::create_room_with_state`]).
+fn bootstrap_member_events(kind: RoomKind, creator: (i64, &str, &str), invitees: &[(String, String)]) -> Vec<matrix_store::NewStateEvent> {
+    let (creator_user_id, creator_mxid, creator_label) = creator;
+    let mut events = vec![state_event("m.room.member", creator_mxid, creator_user_id, join_member_content(creator_label))];
+    for (mxid, label) in invitees {
+        events.push(state_event("m.room.member", mxid, creator_user_id, invite_member_content(kind, label)));
+    }
+    events
 }
 
 /// `join_rule`, `history_visibility`, `is_encrypted` per plan §5's table.
@@ -266,9 +321,11 @@ fn check_encryption_state_change(event_type: &str, join_rule: JoinRule, already_
 /// event directly, bypassing every kick/ban/invite-specific rule this
 /// module otherwise enforces (target-level checks, txn-dedup, the right
 /// wake set, ...). The ONE exception: a joined user updating their OWN
-/// `m.room.member` event while its `membership` stays `join` (a
-/// displayname/profile change) — membership itself only ever changes
-/// through join/leave/invite/kick/ban.
+/// `m.room.member` event while its `membership` stays `join` (a profile
+/// update; [`put_state_inner`] then forces its `displayname` to the nick's
+/// effective label via [`stamp_own_member_displayname`], so the client's own
+/// name never sticks) — membership itself only ever changes through
+/// join/leave/invite/kick/ban.
 fn check_state_event_type_allowed(event_type: &str, state_key: &str, caller_mxid: &str, content_str: &str) -> Result<(), MatrixError> {
     if event_type == "m.room.create" {
         return Err(MatrixError::forbidden("m.room.create cannot be modified"));
@@ -446,10 +503,89 @@ fn has_nick_now(cp: &crate::state::ControlPlane, user_id: i64) -> rusqlite::Resu
     Ok(db::user_nick(&identity_conn, user_id)?.is_some())
 }
 
+/// `user_id`'s effective label ([`db::effective_label_for_user`]: nick, then
+/// the provider display name, then the public id) under a short identity
+/// lock — the `displayname` every server-written `join`/`invite` member event
+/// carries. The caller must hold NO `messenger` (or `social`) guard: lock
+/// order is `db` -> `social` -> `messenger`.
+fn effective_label_now(cp: &crate::state::ControlPlane, user_id: i64) -> rusqlite::Result<String> {
+    let identity_conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+    db::effective_label_for_user(&identity_conn, user_id)
+}
+
+// ============================================================================
+// Display-name propagation — a changed nick re-stamps the user's member events
+// ============================================================================
+
+/// Re-stamp `user_id`'s current effective label into their `m.room.member`
+/// event in every room they are `join`ed or `invite`d in
+/// ([`matrix_store::refresh_member_displayname`]), after a nick change
+/// committed to the identity database. Returns the users to wake (empty when
+/// the user never used the messenger). Never fails the nick change that
+/// called it — that change is already committed: a failure here is logged,
+/// and the boot backfill ([`backfill_member_displaynames`]) converges the
+/// stale event on the next start.
+///
+/// Locks: `db` (label, released), then `messenger` — in that order, never
+/// nested. The caller must hold NO `db` guard (the mutex is not reentrant)
+/// and must wake the returned set only after its own `spawn_blocking`
+/// resolves, like every other write in this module.
+pub(crate) fn propagate_display_name_change(cp: &crate::state::ControlPlane, user_id: i64) -> HashSet<i64> {
+    let label = match effective_label_now(cp, user_id) {
+        Ok(label) => label,
+        Err(e) => {
+            tracing::error!("display-name propagation: label lookup for user {} failed: {}", user_id, e);
+            return HashSet::new();
+        }
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let origin_ts = chrono::Utc::now().timestamp_millis();
+    let mut messenger_conn = cp.messenger_conn();
+    match matrix_store::refresh_member_displayname(&mut messenger_conn, user_id, &label, &now, origin_ts) {
+        Ok(refresh) => {
+            if refresh.rooms_updated > 0 {
+                tracing::info!("display-name propagation: user {} re-stamped in {} room(s)", user_id, refresh.rooms_updated);
+            }
+            refresh.affected_user_ids
+        }
+        Err(e) => {
+            tracing::error!("display-name propagation: user {} failed: {:?}", user_id, e);
+            HashSet::new()
+        }
+    }
+}
+
+/// Boot backfill: stamp every messenger user's effective label into their
+/// existing `join`/`invite` member events that lack it or carry a stale one —
+/// rooms created before the server wrote `displayname`, and labels that
+/// changed while no propagation ran (a provider display name refreshed at
+/// login, an account merge). Idempotent: an up-to-date event is skipped, so a
+/// repeat pass writes nothing. Returns how many member events were written.
+///
+/// Runs at boot on the plain connections (identity, then messenger — the
+/// crate's lock order; no `ControlPlane` exists yet, so nothing is woken).
+pub(crate) fn backfill_member_displaynames(identity_conn: &Connection, messenger_conn: &mut Connection, now: &str) -> Result<usize, matrix_store::MatrixStoreError> {
+    let origin_ts = chrono::Utc::now().timestamp_millis();
+    let mut events_written = 0;
+    for user_id in matrix_store::matrix_user_ids(messenger_conn)? {
+        let label = db::effective_label_for_user(identity_conn, user_id)?;
+        events_written += matrix_store::refresh_member_displayname(messenger_conn, user_id, &label, now, origin_ts)?.rooms_updated;
+    }
+    Ok(events_written)
+}
+
 // ============================================================================
 // DB-only action cores — `&mut Connection`, no `MatrixCaller`, unit-tested
 // directly against an in-memory `matrix_store` fixture
 // ============================================================================
+
+/// The invitee of [`apply_invite`]: the resolved internal user id and the
+/// effective label to stamp into their invite event as `displayname`.
+#[derive(Debug, Clone, Copy)]
+struct InviteTarget<'a> {
+    user_id: i64,
+    displayname: &'a str,
+}
 
 /// The invite action's whole DB-side decision + write (plan §4's `invite`
 /// row: Member + PowerCheck(invite), refuses an already-invited/joined or
@@ -458,15 +594,20 @@ fn has_nick_now(cp: &crate::state::ControlPlane, user_id: i64) -> rusqlite::Resu
 /// connection this function deliberately does NOT take) and this module's
 /// own tests. Returns the wake set (every joined+invited member, including
 /// the new invitee).
+///
+/// The invite event carries the invitee's `displayname` (`target`), resolved
+/// by the caller from the identity database BEFORE it takes the messenger
+/// connection this function writes through.
 fn apply_invite(
     conn: &mut Connection,
     room_id: &str,
     caller_user_id: i64,
     caller_mxid: &str,
-    target_user_id: i64,
+    target: InviteTarget<'_>,
     now: &str,
     origin_ts: i64,
 ) -> Result<HashSet<i64>, MatrixError> {
+    let target_user_id = target.user_id;
     let room = matrix_store::get_room(conn, room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
     let caller_membership = matrix_store::room_member(conn, room_id, caller_user_id)?.map(|m| m.membership);
     require_member(caller_membership)?;
@@ -488,7 +629,7 @@ fn apply_invite(
         caller_user_id,
         "m.room.member",
         &target_mxid,
-        &invite_member_content(room.kind).to_string(),
+        &invite_member_content(room.kind, target.displayname).to_string(),
         origin_ts,
         now,
     )?;
@@ -595,8 +736,18 @@ pub(super) fn apply_membership_power_action(
 
 /// `POST /join`'s write for an already-invited or newly-public-eligible
 /// caller (idempotent-join and ban checks happen in the handler, before the
-/// paid gate — see [`join_room`]). Returns the post-join wake set.
-fn apply_join(conn: &mut Connection, room_id: &str, caller_user_id: i64, caller_mxid: &str, now: &str, origin_ts: i64) -> Result<HashSet<i64>, MatrixError> {
+/// paid gate — see [`join_room`]). Returns the post-join wake set. The join
+/// event carries the caller's effective label as `displayname`, resolved by
+/// the caller BEFORE it takes the messenger connection this writes through.
+fn apply_join(
+    conn: &mut Connection,
+    room_id: &str,
+    caller_user_id: i64,
+    caller_mxid: &str,
+    displayname: &str,
+    now: &str,
+    origin_ts: i64,
+) -> Result<HashSet<i64>, MatrixError> {
     matrix_store::apply_state_event(
         conn,
         &matrix_store::new_event_id(),
@@ -604,7 +755,7 @@ fn apply_join(conn: &mut Connection, room_id: &str, caller_user_id: i64, caller_
         caller_user_id,
         "m.room.member",
         caller_mxid,
-        &serde_json::json!({ "membership": "join" }).to_string(),
+        &join_member_content(displayname).to_string(),
         origin_ts,
         now,
     )?;
@@ -671,14 +822,25 @@ async fn create_room(State(state): State<Arc<AppState>>, headers: HeaderMap, Jso
         let now = chrono::Utc::now().to_rfc3339();
         let origin_ts = chrono::Utc::now().timestamp_millis();
 
+        // Identity first, then messenger, never nested the other way round:
+        // resolve every invitee, then their effective labels (the
+        // `displayname` each member event carries) with only `db` held.
         let mut invite_user_ids = Vec::with_capacity(req.invite.len());
-        {
+        let (caller_label, invitee_labels) = {
             let identity_conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
-            let messenger_conn = cp.messenger_conn();
-            for mxid in &req.invite {
-                invite_user_ids.push(resolve_target_user(&identity_conn, &messenger_conn, mxid, &now)?);
+            {
+                let messenger_conn = cp.messenger_conn();
+                for mxid in &req.invite {
+                    invite_user_ids.push(resolve_target_user(&identity_conn, &messenger_conn, mxid, &now)?);
+                }
             }
-        }
+            let caller_label = db::effective_label_for_user(&identity_conn, caller.user_id)?;
+            let invitee_labels = invite_user_ids
+                .iter()
+                .map(|&invitee_id| db::effective_label_for_user(&identity_conn, invitee_id))
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            (caller_label, invitee_labels)
+        };
         if invite_user_ids.contains(&caller.user_id) {
             return Err(MatrixError::invalid_param("cannot invite yourself"));
         }
@@ -697,14 +859,13 @@ async fn create_room(State(state): State<Arc<AppState>>, headers: HeaderMap, Jso
         let (join_rule, history_visibility, is_encrypted) = room_kind_settings(kind);
         let invite_level = invite_power_level(kind, invite_override);
 
-        let mut state_events = vec![
-            state_event("m.room.create", "", caller.user_id, serde_json::json!({ "room_version": matrix_store::MATRIX_ROOM_VERSION })),
-            state_event("m.room.member", &caller.mxid, caller.user_id, serde_json::json!({ "membership": "join" })),
-        ];
-        for &invitee_id in &invite_user_ids {
+        let mut invitees = Vec::with_capacity(invite_user_ids.len());
+        for (&invitee_id, label) in invite_user_ids.iter().zip(invitee_labels) {
             let mxid = matrix_store::mxid_of(&messenger_conn, invitee_id)?.ok_or_else(MatrixError::internal)?;
-            state_events.push(state_event("m.room.member", &mxid, caller.user_id, invite_member_content(kind)));
+            invitees.push((mxid, label));
         }
+        let mut state_events = vec![state_event("m.room.create", "", caller.user_id, serde_json::json!({ "room_version": matrix_store::MATRIX_ROOM_VERSION }))];
+        state_events.extend(bootstrap_member_events(kind, (caller.user_id, &caller.mxid, &caller_label), &invitees));
         state_events.push(state_event("m.room.power_levels", "", caller.user_id, power_levels_content(&caller.mxid, kind, invite_level)));
         state_events.push(state_event("m.room.join_rules", "", caller.user_id, serde_json::json!({ "join_rule": join_rule.as_str() })));
         state_events.push(state_event(
@@ -791,10 +952,11 @@ async fn join_room(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(
             }
         }
 
+        let displayname = effective_label_now(cp, caller.user_id)?;
         let now = chrono::Utc::now().to_rfc3339();
         let origin_ts = chrono::Utc::now().timestamp_millis();
         let mut messenger_conn = cp.messenger_conn();
-        let ids = apply_join(&mut messenger_conn, &room_id_for_blocking, caller.user_id, &caller.mxid, &now, origin_ts)?;
+        let ids = apply_join(&mut messenger_conn, &room_id_for_blocking, caller.user_id, &caller.mxid, &displayname, &now, origin_ts)?;
         Ok(Some(ids))
     })
     .await
@@ -858,10 +1020,15 @@ async fn invite_member(
         matrix_store::get_room(&cp.messenger_conn(), &room_id_for_blocking)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
 
         let now = chrono::Utc::now().to_rfc3339();
-        let target_user_id = {
+        // `db` first; the invitee's label (the invite event's `displayname`)
+        // is read with only `db` held, before the messenger write below.
+        let (target_user_id, target_label) = {
             let identity_conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
-            let messenger_conn = cp.messenger_conn();
-            resolve_target_user(&identity_conn, &messenger_conn, &target_mxid, &now)?
+            let target_user_id = {
+                let messenger_conn = cp.messenger_conn();
+                resolve_target_user(&identity_conn, &messenger_conn, &target_mxid, &now)?
+            };
+            (target_user_id, db::effective_label_for_user(&identity_conn, target_user_id)?)
         };
         if target_user_id == caller.user_id {
             return Err(MatrixError::invalid_param("cannot invite yourself"));
@@ -869,7 +1036,8 @@ async fn invite_member(
 
         let origin_ts = chrono::Utc::now().timestamp_millis();
         let mut messenger_conn = cp.messenger_conn();
-        apply_invite(&mut messenger_conn, &room_id_for_blocking, caller.user_id, &caller.mxid, target_user_id, &now, origin_ts)
+        let target = InviteTarget { user_id: target_user_id, displayname: &target_label };
+        apply_invite(&mut messenger_conn, &room_id_for_blocking, caller.user_id, &caller.mxid, target, &now, origin_ts)
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -1128,6 +1296,17 @@ async fn put_state_inner(
         require_member(caller_membership)?;
         check_state_event_type_allowed(&event_type_for_blocking, &state_key_for_blocking, &caller.mxid, &content_str)?;
         check_encryption_state_change(&event_type_for_blocking, room.join_rule, already_encrypted)?;
+
+        // The one `m.room.member` PUT that gets through is the caller's own
+        // profile update: the nick decides the `displayname`, never the
+        // client. The label is read with no messenger guard held (the block
+        // above released it), `db` before the write below.
+        let content_str = if event_type_for_blocking == "m.room.member" {
+            let label = effective_label_now(cp, caller.user_id)?;
+            stamp_own_member_displayname(&content_str, &label)?
+        } else {
+            content_str
+        };
 
         let sufficient = matrix_store::user_level(&power_levels, &caller.mxid) >= matrix_store::event_level(&power_levels, &event_type_for_blocking, true);
         if !sufficient {
@@ -1592,7 +1771,7 @@ mod tests {
         matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1100, T0)
             .expect("power levels grant alice invite power");
 
-        let wake_ids = apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, 2, T0, 2000).expect("invite succeeds");
+        let wake_ids = apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, InviteTarget { user_id: 2, displayname: "Bob" }, T0, 2000).expect("invite succeeds");
         assert!(wake_ids.contains(&1), "the inviter's own other devices must be woken");
         assert!(wake_ids.contains(&2), "the invitee must be woken");
         assert_eq!(
@@ -1615,7 +1794,7 @@ mod tests {
         matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1200, T0)
             .expect("power levels grant alice invite power");
 
-        let err = apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, 2, T0, 2000).unwrap_err();
+        let err = apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, InviteTarget { user_id: 2, displayname: "Bob" }, T0, 2000).unwrap_err();
         assert_eq!(err.errcode, "M_INVALID_PARAM");
     }
 
@@ -1638,7 +1817,7 @@ mod tests {
         let power_levels_content = serde_json::json!({ "users": { alice.clone(): 100 } }).to_string();
         matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1100, T0)
             .expect("power levels grant alice invite power");
-        apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, 2, T0, 2000).expect("invite succeeds");
+        apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, InviteTarget { user_id: 2, displayname: "Bob" }, T0, 2000).expect("invite succeeds");
         (conn, bob)
     }
 
@@ -1660,9 +1839,237 @@ mod tests {
 
     #[test]
     fn create_room_invite_content_marks_only_a_dm_direct() {
-        assert_eq!(invite_member_content(RoomKind::Dm), serde_json::json!({ "membership": "invite", "is_direct": true }));
-        assert_eq!(invite_member_content(RoomKind::Group), serde_json::json!({ "membership": "invite" }));
-        assert_eq!(invite_member_content(RoomKind::Channel), serde_json::json!({ "membership": "invite" }));
+        assert_eq!(invite_member_content(RoomKind::Dm, "Bob"), serde_json::json!({ "membership": "invite", "is_direct": true, "displayname": "Bob" }));
+        assert_eq!(invite_member_content(RoomKind::Group, "Bob"), serde_json::json!({ "membership": "invite", "displayname": "Bob" }));
+        assert_eq!(invite_member_content(RoomKind::Channel, "Bob"), serde_json::json!({ "membership": "invite", "displayname": "Bob" }));
+    }
+
+    // ---- displayname: every join/invite member event carries the TARGET
+    // user's effective label (nick, else the provider name, else the public id) ----
+
+    fn identity_conn() -> Connection {
+        crate::db::init_db(":memory:", &"0".repeat(64)).expect("init identity test db")
+    }
+
+    /// One identity user with only a provider display name; returns
+    /// `(user_id, public_id)`.
+    fn seed_user(identity: &Connection, provider_user_id: &str, provider_name: &str) -> (i64, String) {
+        let user_id = db::upsert_user(identity, "github", provider_user_id, provider_name, None, T0).expect("seed user");
+        let public_id = db::get_user_public_id(identity, user_id).expect("public id");
+        (user_id, public_id)
+    }
+
+    /// `(alice, bob)` in one identity database: alice chose the nick
+    /// `alice_nick` (label = nick); bob never did (label = his provider name
+    /// `Bob Provider`).
+    fn alice_with_nick_and_bob_without() -> (Connection, (i64, String), (i64, String)) {
+        let identity = identity_conn();
+        let alice = seed_user(&identity, "alice-gh", "Alice Provider");
+        let bob = seed_user(&identity, "bob-gh", "Bob Provider");
+        db::set_nick(&identity, alice.0, "alice_nick", &[]).expect("alice's nick");
+        (identity, alice, bob)
+    }
+
+    fn member_content_of(conn: &Connection, room_id: &str, mxid: &str) -> serde_json::Value {
+        let event = matrix_store::current_state_event(conn, room_id, "m.room.member", mxid).expect("query").expect("member event exists");
+        serde_json::from_str(&event.content).expect("member content is json")
+    }
+
+    #[test]
+    fn create_room_dm_member_events_carry_each_users_effective_label_and_the_invite_keeps_is_direct() {
+        let (identity, (alice_id, alice_public), (bob_id, bob_public)) = alice_with_nick_and_bob_without();
+        let alice_label = db::effective_label_for_user(&identity, alice_id).expect("alice label");
+        let bob_label = db::effective_label_for_user(&identity, bob_id).expect("bob label");
+        assert_eq!(alice_label, "alice_nick");
+        assert_eq!(bob_label, "Bob Provider");
+
+        let mut messenger = test_conn();
+        let alice_mxid = matrix_store::ensure_matrix_user(&messenger, alice_id, &alice_public, T0).expect("alice");
+        let bob_mxid = matrix_store::ensure_matrix_user(&messenger, bob_id, &bob_public, T0).expect("bob");
+
+        // The exact event assembly `create_room` runs, written through the
+        // same one-transaction batch entry point.
+        let mut state_events = vec![state_event("m.room.create", "", alice_id, serde_json::json!({ "room_version": matrix_store::MATRIX_ROOM_VERSION }))];
+        state_events.extend(bootstrap_member_events(RoomKind::Dm, (alice_id, &alice_mxid, &alice_label), &[(bob_mxid.clone(), bob_label.clone())]));
+        let (join_rule, history_visibility, is_encrypted) = room_kind_settings(RoomKind::Dm);
+        let bootstrap = matrix_store::RoomBootstrap {
+            room_id: "!dm:mylittlechart.org",
+            kind: RoomKind::Dm,
+            creator_user_id: alice_id,
+            created_at: T0,
+            is_encrypted,
+            join_rule,
+            history_visibility,
+            dm_pair_key: Some("1:2"),
+            legacy_dm_id: None,
+        };
+        matrix_store::create_room_with_state(&mut messenger, bootstrap, &state_events, 1000).expect("create room");
+
+        assert_eq!(
+            member_content_of(&messenger, "!dm:mylittlechart.org", &alice_mxid),
+            serde_json::json!({ "membership": "join", "displayname": "alice_nick" }),
+            "the creator's join carries the creator's nick"
+        );
+        let invite = invitee_stripped_member_event(&messenger, "!dm:mylittlechart.org", &bob_mxid);
+        assert_eq!(
+            invite["content"],
+            serde_json::json!({ "membership": "invite", "is_direct": true, "displayname": "Bob Provider" }),
+            "the invite carries the INVITEE's label and still marks the room direct"
+        );
+        assert_eq!(invite["sender"], alice_mxid, "the creator sends the invite");
+    }
+
+    #[test]
+    fn bootstrap_member_events_put_the_creator_first_and_keep_a_group_invite_free_of_is_direct() {
+        let events = bootstrap_member_events(
+            RoomKind::Group,
+            (1, "@alice:mylittlechart.org", "Alice"),
+            &[("@bob:mylittlechart.org".to_string(), "Bob".to_string()), ("@carol:mylittlechart.org".to_string(), "Carol".to_string())],
+        );
+        assert_eq!(events.len(), 3);
+        let contents: Vec<serde_json::Value> = events.iter().map(|e| serde_json::from_str(&e.content).expect("json")).collect();
+        assert_eq!(events[0].state_key, "@alice:mylittlechart.org");
+        assert_eq!(contents[0], serde_json::json!({ "membership": "join", "displayname": "Alice" }));
+        assert_eq!(contents[1], serde_json::json!({ "membership": "invite", "displayname": "Bob" }));
+        assert_eq!(contents[2], serde_json::json!({ "membership": "invite", "displayname": "Carol" }));
+        assert!(events.iter().all(|e| e.event_type == "m.room.member" && e.sender_user_id == 1), "the creator sends every bootstrap member event");
+    }
+
+    #[test]
+    fn apply_invite_stamps_the_targets_effective_label_nick_first_then_the_provider_name() {
+        let (identity, (alice_id, alice_public), (bob_id, bob_public)) = alice_with_nick_and_bob_without();
+        let (carol_id, carol_public) = seed_user(&identity, "carol-gh", "Carol Provider");
+        db::set_nick(&identity, bob_id, "kestrel", &[]).expect("bob's nick");
+
+        let mut conn = test_conn();
+        make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, alice_id);
+        let alice = matrix_store::ensure_matrix_user(&conn, alice_id, &alice_public, T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, bob_id, &bob_public, T0).expect("bob");
+        let carol = matrix_store::ensure_matrix_user(&conn, carol_id, &carol_public, T0).expect("carol");
+        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", alice_id, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+            .expect("alice joins");
+        let power_levels_content = serde_json::json!({ "users": { alice.clone(): 100 } }).to_string();
+        matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", alice_id, "m.room.power_levels", "", &power_levels_content, 1100, T0)
+            .expect("power levels grant alice invite power");
+
+        for (target_id, expected_label) in [(bob_id, "kestrel"), (carol_id, "Carol Provider")] {
+            let label = db::effective_label_for_user(&identity, target_id).expect("label");
+            assert_eq!(label, expected_label);
+            let target = InviteTarget { user_id: target_id, displayname: &label };
+            apply_invite(&mut conn, "!r:mylittlechart.org", alice_id, &alice, target, T0, 2000).expect("invite succeeds");
+        }
+        assert_eq!(member_content_of(&conn, "!r:mylittlechart.org", &bob), serde_json::json!({ "membership": "invite", "displayname": "kestrel" }));
+        assert_eq!(
+            member_content_of(&conn, "!r:mylittlechart.org", &carol),
+            serde_json::json!({ "membership": "invite", "displayname": "Carol Provider" }),
+            "no nick: the provider display name is the label"
+        );
+    }
+
+    #[test]
+    fn apply_join_stamps_the_callers_effective_label() {
+        let (identity, (alice_id, alice_public), (bob_id, bob_public)) = alice_with_nick_and_bob_without();
+        let mut conn = test_conn();
+        make_room(&conn, "!chan:mylittlechart.org", RoomKind::Channel, alice_id);
+        matrix_store::ensure_matrix_user(&conn, alice_id, &alice_public, T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, bob_id, &bob_public, T0).expect("bob");
+
+        let label = db::effective_label_for_user(&identity, bob_id).expect("bob label");
+        apply_join(&mut conn, "!chan:mylittlechart.org", bob_id, &bob, &label, T0, 2000).expect("bob joins");
+
+        assert_eq!(member_content_of(&conn, "!chan:mylittlechart.org", &bob), serde_json::json!({ "membership": "join", "displayname": "Bob Provider" }));
+        assert_eq!(matrix_store::room_member(&conn, "!chan:mylittlechart.org", bob_id).expect("query").expect("row").membership, Membership::Join);
+    }
+
+    #[test]
+    fn a_member_event_without_any_label_carries_no_displayname() {
+        assert_eq!(join_member_content(""), serde_json::json!({ "membership": "join" }));
+        assert_eq!(invite_member_content(RoomKind::Dm, ""), serde_json::json!({ "membership": "invite", "is_direct": true }));
+    }
+
+    // ---- a client cannot pick its own displayname ----
+
+    #[test]
+    fn own_member_update_cannot_spoof_a_displayname() {
+        let alice = "@alice:mylittlechart.org";
+        let spoofed = r#"{"membership":"join","displayname":"Admin (verified)","avatar_url":"mxc://x/y"}"#;
+
+        // The route lets the update through …
+        assert!(check_state_event_type_allowed("m.room.member", alice, alice, spoofed).is_ok());
+        // … and overwrites the name with the nick's label, keeping the rest.
+        let stamped: serde_json::Value = serde_json::from_str(&stamp_own_member_displayname(spoofed, "alice_nick").expect("stamp")).expect("json");
+        assert_eq!(stamped["displayname"], "alice_nick");
+        assert_eq!(stamped["membership"], "join");
+        assert_eq!(stamped["avatar_url"], "mxc://x/y");
+
+        // No name sent at all: the label is stamped anyway.
+        let stamped: serde_json::Value = serde_json::from_str(&stamp_own_member_displayname(r#"{"membership":"join"}"#, "alice_nick").expect("stamp")).expect("json");
+        assert_eq!(stamped["displayname"], "alice_nick");
+
+        // Nothing to stamp: the client's name is dropped, never kept.
+        let stamped: serde_json::Value = serde_json::from_str(&stamp_own_member_displayname(spoofed, "").expect("stamp")).expect("json");
+        assert!(stamped.get("displayname").is_none());
+
+        assert_eq!(stamp_own_member_displayname("[]", "alice_nick").unwrap_err().errcode, "M_INVALID_PARAM");
+    }
+
+    #[test]
+    fn a_spoofed_own_member_event_is_stored_with_the_nicks_label() {
+        let (identity, (alice_id, alice_public), _bob) = alice_with_nick_and_bob_without();
+        let mut conn = test_conn();
+        make_room(&conn, "!r:mylittlechart.org", RoomKind::Group, alice_id);
+        let alice = matrix_store::ensure_matrix_user(&conn, alice_id, &alice_public, T0).expect("alice");
+        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", alice_id, "m.room.member", &alice, r#"{"membership":"join","displayname":"alice_nick"}"#, 1000, T0)
+            .expect("alice joins");
+
+        // The `PUT state` write path: gate, stamp, store.
+        let spoofed = r#"{"membership":"join","displayname":"Somebody Else"}"#;
+        check_state_event_type_allowed("m.room.member", &alice, &alice, spoofed).expect("own join update is allowed");
+        let label = db::effective_label_for_user(&identity, alice_id).expect("label");
+        let stored = stamp_own_member_displayname(spoofed, &label).expect("stamp");
+        matrix_store::apply_state_event(&mut conn, "$m2", "!r:mylittlechart.org", alice_id, "m.room.member", &alice, &stored, 2000, T0).expect("store");
+
+        assert_eq!(member_content_of(&conn, "!r:mylittlechart.org", &alice)["displayname"], "alice_nick");
+    }
+
+    // ---- nick change / boot backfill: stale member events are re-stamped ----
+
+    #[test]
+    fn backfill_restamps_events_that_predate_the_displayname_and_follows_a_nick_change() {
+        let (identity, (alice_id, alice_public), (bob_id, bob_public)) = alice_with_nick_and_bob_without();
+        let mut conn = test_conn();
+        let alice = matrix_store::ensure_matrix_user(&conn, alice_id, &alice_public, T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, bob_id, &bob_public, T0).expect("bob");
+        let (room_a, room_b, room_left) = ("!a:mylittlechart.org", "!b:mylittlechart.org", "!left:mylittlechart.org");
+        for room in [room_a, room_b, room_left] {
+            make_room(&conn, room, RoomKind::Group, alice_id);
+            // Events as a server that never stamped a name wrote them.
+            matrix_store::apply_state_event(&mut conn, &matrix_store::new_event_id(), room, alice_id, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+                .expect("alice joins");
+            matrix_store::apply_state_event(&mut conn, &matrix_store::new_event_id(), room, bob_id, "m.room.member", &bob, r#"{"membership":"join"}"#, 1100, T0)
+                .expect("bob joins");
+        }
+        matrix_store::apply_state_event(&mut conn, &matrix_store::new_event_id(), room_left, bob_id, "m.room.member", &bob, r#"{"membership":"leave"}"#, 1200, T0)
+            .expect("bob leaves the third room");
+
+        let written = backfill_member_displaynames(&identity, &mut conn, T0).expect("backfill");
+        assert_eq!(written, 5, "alice in three rooms, bob in the two he is still in");
+        for room in [room_a, room_b] {
+            assert_eq!(member_content_of(&conn, room, &alice)["displayname"], "alice_nick");
+            assert_eq!(member_content_of(&conn, room, &bob)["displayname"], "Bob Provider");
+        }
+        assert_eq!(member_content_of(&conn, room_left, &bob), serde_json::json!({ "membership": "leave" }), "a room the user left is not touched");
+        assert_eq!(backfill_member_displaynames(&identity, &mut conn, T0).expect("second pass"), 0, "an up-to-date event is left alone");
+
+        // Bob picks a nick: the next pass re-stamps him where he is joined,
+        // and nobody else.
+        db::set_nick(&identity, bob_id, "plum_walrus", &[]).expect("bob's new nick");
+        assert_eq!(backfill_member_displaynames(&identity, &mut conn, T0).expect("after the nick change"), 2);
+        for room in [room_a, room_b] {
+            assert_eq!(member_content_of(&conn, room, &bob)["displayname"], "plum_walrus");
+            assert_eq!(member_content_of(&conn, room, &alice)["displayname"], "alice_nick");
+        }
+        assert_eq!(member_content_of(&conn, room_left, &bob), serde_json::json!({ "membership": "leave" }));
     }
 
     // ---- manager review 2026-09-24: /leave also accepts an invited caller ----

@@ -707,6 +707,19 @@ async fn main() {
                 }
             }
 
+            // Member-event `displayname` backfill: rooms created before the
+            // server stamped each user's effective label into their
+            // `m.room.member` events (clients title a DM after the peer's
+            // `displayname`, so those rooms show a 32-hex public id), plus
+            // any label that changed while no propagation ran. Idempotent —
+            // an up-to-date event is skipped. Plain connections, identity
+            // then messenger; a failure is logged and does not stop boot.
+            match routes::matrix::rooms::backfill_member_displaynames(&db_conn, &mut messenger_conn, &migration_now) {
+                Ok(0) => {}
+                Ok(written) => tracing::info!("Member displayname backfill: {} member event(s) re-stamped", written),
+                Err(e) => tracing::error!("Member displayname backfill failed: {:?}", e),
+            }
+
             // Initialize the operational database (plain SQLite, no key wait —
             // see state::ControlPlane::ops_db). Then run the one-time move of
             // `devices`/`releases` out of identity, if their identity copies
