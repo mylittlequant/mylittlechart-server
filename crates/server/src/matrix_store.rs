@@ -36,6 +36,13 @@
 //! manager decision: `public_id` is immutable, so this mapping never
 //! changes and is safe to cache here rather than re-deriving it from the
 //! identity database on every response).
+//!
+//! The one place a label does end up in this database is the `displayname`
+//! field of an `m.room.member` event's `content` — the Matrix convention,
+//! and what a client names a DM and lists members by. Callers stamp the
+//! identity database's effective label into every `join`/`invite` member
+//! event they write, and [`refresh_member_displayname`] re-stamps it into
+//! the user's existing member events when the label changes.
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::HashSet;
@@ -934,6 +941,97 @@ pub fn apply_state_event(conn: &mut Connection, write: &StateEventWrite<'_>) -> 
     )?;
     tx.commit()?;
     Ok(event)
+}
+
+/// What one [`refresh_member_displayname`] pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DisplaynameRefresh {
+    /// How many rooms got a new `m.room.member` event for the user.
+    pub rooms_updated: usize,
+    /// Every `user_id` that must be woken for those new events: each updated
+    /// room's joined and invited members, the refreshed user included.
+    pub affected_user_ids: HashSet<i64>,
+}
+
+/// Re-stamp `displayname` into `user_id`'s own `m.room.member` event in every
+/// room where they are currently `join`ed or `invite`d, so the other
+/// members' clients see the new name. A room whose current member event
+/// already carries exactly `displayname` is skipped (the pass is idempotent,
+/// which is what lets the boot backfill call it for every user on every
+/// start). The new event keeps the current content (an invite keeps its
+/// `is_direct` marker) and only replaces `displayname`; a `join` refresh is
+/// sent by the user, an `invite` refresh keeps the inviter as its sender —
+/// [`stripped_invite_state`] reads the inviter off that field. `leave`/`ban`
+/// rows are never touched.
+///
+/// A user with no [`matrix_users`] row (never used the messenger) or an empty
+/// `displayname` is a no-op. All rooms land in ONE transaction: a failure
+/// leaves every room exactly as it was. The label itself comes from the
+/// identity database, which this module never reads — the caller resolves it
+/// BEFORE taking the messenger connection (lock order `db` -> `social` ->
+/// `messenger`).
+pub fn refresh_member_displayname(
+    conn: &mut Connection,
+    user_id: i64,
+    displayname: &str,
+    now: &str,
+    origin_server_ts: i64,
+) -> Result<DisplaynameRefresh, MatrixStoreError> {
+    let mut outcome = DisplaynameRefresh::default();
+    if displayname.is_empty() {
+        return Ok(outcome);
+    }
+    let Some(mxid) = mxid_of(conn, user_id)? else {
+        return Ok(outcome);
+    };
+
+    let tx = conn.transaction()?;
+    for membership in [Membership::Join, Membership::Invite] {
+        for room_id in rooms_for_user(&tx, user_id, Some(membership))? {
+            let Some(current) = current_state_event(&tx, &room_id, "m.room.member", &mxid)? else {
+                continue;
+            };
+            let mut content: serde_json::Value = serde_json::from_str(&current.content)?;
+            if content.get("displayname").and_then(|v| v.as_str()) == Some(displayname) {
+                continue;
+            }
+            let Some(fields) = content.as_object_mut() else {
+                continue;
+            };
+            fields.insert("displayname".to_string(), serde_json::Value::String(displayname.to_string()));
+
+            let sender_user_id = if membership == Membership::Join { user_id } else { current.sender_user_id };
+            apply_state_event_in_tx(
+                &tx,
+                &new_event_id(),
+                &room_id,
+                sender_user_id,
+                "m.room.member",
+                &mxid,
+                &content.to_string(),
+                origin_server_ts,
+                now,
+            )?;
+            outcome.rooms_updated += 1;
+            outcome.affected_user_ids.insert(user_id);
+            for member in room_members(&tx, &room_id, None)? {
+                if matches!(member.membership, Membership::Join | Membership::Invite) {
+                    outcome.affected_user_ids.insert(member.user_id);
+                }
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// Every `user_id` that has a [`matrix_users`] row — the boot backfill's
+/// worklist of users whose member events may predate the `displayname`
+/// stamping.
+pub fn matrix_user_ids(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT user_id FROM matrix_users ORDER BY user_id")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    rows.collect()
 }
 
 // ============================================================================
@@ -3824,6 +3922,113 @@ mod tests {
         assert_eq!(rooms_with_member_events_in_window(&conn, &rooms, bob_invited, bob_joined).expect("rooms"), vec![ROOM.to_string()]);
         assert!(rooms_with_member_events_in_window(&conn, &rooms, bob_joined, i64::MAX).expect("rooms after the last member event").is_empty());
         assert!(rooms_with_member_events_in_window(&conn, &[], 0, i64::MAX).expect("empty room set").is_empty());
+    }
+
+    // ---- a changed label is re-stamped into the user's member events ----
+
+    const ROOM_A: &str = "!roomA:mylittlechart.org";
+    const ROOM_B: &str = "!roomB:mylittlechart.org";
+    const ROOM_C: &str = "!roomC:mylittlechart.org";
+
+    fn make_room_with_kind(conn: &Connection, room_id: &str, kind: RoomKind) {
+        create_room(conn, room_id, kind, 1, T0, false, JoinRule::Invite, HistoryVisibility::Shared, None, None).expect("create room");
+    }
+
+    fn member_content_in(conn: &Connection, room_id: &str, mxid: &str) -> serde_json::Value {
+        let event = current_state_event(conn, room_id, "m.room.member", mxid).expect("query").expect("member event exists");
+        serde_json::from_str(&event.content).expect("member content is json")
+    }
+
+    fn member_event_count(conn: &Connection, room_id: &str, mxid: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE room_id = ?1 AND event_type = 'm.room.member' AND state_key = ?2",
+            params![room_id, mxid],
+            |row| row.get(0),
+        )
+        .expect("count member events")
+    }
+
+    #[test]
+    fn refresh_member_displayname_restamps_every_joined_room_and_skips_a_room_the_user_left() {
+        let mut conn = test_conn();
+        let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000091", T0).expect("alice");
+        let bob = ensure_matrix_user(&conn, 2, "bob0000000000000000000000000091", T0).expect("bob");
+        for room in [ROOM_A, ROOM_B, ROOM_C] {
+            make_room_with_kind(&conn, room, RoomKind::Group);
+            apply_state_event(&mut conn, &StateEventWrite { event_id: &new_event_id(), room_id: room, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join","displayname":"old_alice"}"#, origin_server_ts: 1000, now: T0 })
+                .expect("alice joins");
+            apply_state_event(&mut conn, &StateEventWrite { event_id: &new_event_id(), room_id: room, sender_user_id: 2, event_type: "m.room.member", state_key: &bob, content: r#"{"membership":"join","displayname":"bob_nick"}"#, origin_server_ts: 1100, now: T0 })
+                .expect("bob joins");
+        }
+        apply_state_event(&mut conn, &StateEventWrite { event_id: &new_event_id(), room_id: ROOM_C, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"leave"}"#, origin_server_ts: 1200, now: T0 }).expect("alice leaves C");
+
+        let refresh = refresh_member_displayname(&mut conn, 1, "new_alice", T0, 5000).expect("refresh");
+
+        assert_eq!(refresh.rooms_updated, 2, "the two rooms alice is still joined in");
+        for room in [ROOM_A, ROOM_B] {
+            let content = member_content_in(&conn, room, &alice);
+            assert_eq!(content["membership"], "join");
+            assert_eq!(content["displayname"], "new_alice");
+            assert_eq!(member_event_count(&conn, room, &alice), 2, "a NEW member event lands; the old one stays in history");
+            let event = current_state_event(&conn, room, "m.room.member", &alice).expect("query").expect("exists");
+            assert_eq!(event.sender_user_id, 1, "a join refresh is sent by the user themself");
+            assert_eq!(event.origin_server_ts, 5000);
+            assert_eq!(member_content_in(&conn, room, &bob)["displayname"], "bob_nick", "another member's event is never touched");
+        }
+        assert_eq!(member_content_in(&conn, ROOM_C, &alice), serde_json::json!({ "membership": "leave" }), "the left room gets no new event");
+        assert_eq!(member_event_count(&conn, ROOM_C, &alice), 2, "join + leave, nothing more");
+        assert_eq!(refresh.affected_user_ids, HashSet::from([1, 2]), "alice and bob are woken; room C's members are not part of it");
+
+        let repeat = refresh_member_displayname(&mut conn, 1, "new_alice", T0, 6000).expect("second pass");
+        assert_eq!(repeat, DisplaynameRefresh::default(), "an up-to-date event is skipped, so a repeat pass writes nothing");
+        assert_eq!(member_event_count(&conn, ROOM_A, &alice), 2);
+    }
+
+    #[test]
+    fn refresh_member_displayname_keeps_an_invite_events_sender_and_is_direct() {
+        let mut conn = test_conn();
+        let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000092", T0).expect("alice");
+        let bob = ensure_matrix_user(&conn, 2, "bob0000000000000000000000000092", T0).expect("bob");
+        make_room_with_kind(&conn, ROOM_A, RoomKind::Dm);
+        apply_state_event(&mut conn, &StateEventWrite { event_id: &new_event_id(), room_id: ROOM_A, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join","displayname":"alice_nick"}"#, origin_server_ts: 1000, now: T0 })
+            .expect("alice joins");
+        apply_state_event(
+            &mut conn,
+            &StateEventWrite {
+                event_id: &new_event_id(),
+                room_id: ROOM_A,
+                sender_user_id: 1,
+                event_type: "m.room.member",
+                state_key: &bob,
+                content: r#"{"membership":"invite","is_direct":true}"#,
+                origin_server_ts: 1100,
+                now: T0,
+            },
+        )
+        .expect("alice invites bob");
+
+        let refresh = refresh_member_displayname(&mut conn, 2, "bob_nick", T0, 5000).expect("refresh");
+
+        assert_eq!(refresh.rooms_updated, 1);
+        let content = member_content_in(&conn, ROOM_A, &bob);
+        assert_eq!(content, serde_json::json!({ "membership": "invite", "is_direct": true, "displayname": "bob_nick" }));
+        let event = current_state_event(&conn, ROOM_A, "m.room.member", &bob).expect("query").expect("exists");
+        assert_eq!(event.sender_user_id, 1, "the inviter stays the sender: stripped invite state reads the inviter off it");
+        assert_eq!(room_member(&conn, ROOM_A, 2).expect("query").expect("row").membership, Membership::Invite, "still an invitation");
+        assert_eq!(refresh.affected_user_ids, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn refresh_member_displayname_is_a_noop_without_a_matrix_user_or_a_label() {
+        let mut conn = test_conn();
+        let alice = ensure_matrix_user(&conn, 1, "alice00000000000000000000000093", T0).expect("alice");
+        make_room_with_kind(&conn, ROOM_A, RoomKind::Group);
+        apply_state_event(&mut conn, &StateEventWrite { event_id: &new_event_id(), room_id: ROOM_A, sender_user_id: 1, event_type: "m.room.member", state_key: &alice, content: r#"{"membership":"join"}"#, origin_server_ts: 1000, now: T0 }).expect("alice joins");
+
+        assert_eq!(refresh_member_displayname(&mut conn, 99, "ghost", T0, 5000).expect("unknown user"), DisplaynameRefresh::default());
+        assert_eq!(refresh_member_displayname(&mut conn, 1, "", T0, 5000).expect("empty label"), DisplaynameRefresh::default());
+        assert_eq!(member_event_count(&conn, ROOM_A, &alice), 1);
+        assert_eq!(matrix_user_ids(&conn).expect("ids"), vec![1]);
     }
 
     // ---- P16 S-d: adopting a native DM room for a legacy conversation ----
