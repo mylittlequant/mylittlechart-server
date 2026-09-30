@@ -23,11 +23,16 @@
 //! # Share-a-room gate
 //!
 //! `/keys/query`, `/keys/claim`, `/keys/changes`, and `PUT /sendToDevice` all
-//! restrict to the caller themself or a user who currently shares a JOINED
-//! room with them ([`peers_sharing_a_room_with`]) — the plan's own
-//! anti-directory-scraping rule. A disallowed target comes back empty/
-//! dropped, never an error that would let a caller distinguish "no such
-//! user" from "exists but not visible to you".
+//! restrict to the caller themself or a user who shares a room with them
+//! ([`peers_sharing_a_room_with`]): the caller must be JOINED to a room in
+//! which the peer is JOINED or INVITED — the plan's own anti-directory-
+//! scraping rule, widened by the invited half so a client that sends before
+//! its invitee joins can still encrypt to them (it shares its first Megolm
+//! session with join+invite members; our rooms use `history_visibility:
+//! shared`, so the invitee reads it on joining). An invited caller gets no
+//! visibility at all. A disallowed target comes back empty/dropped, never an
+//! error that would let a caller distinguish "no such user" from "exists but
+//! not visible to you".
 //!
 //! # Every write is one transaction, then one wake
 //!
@@ -115,18 +120,22 @@ pub(crate) fn routes() -> Router<Arc<AppState>> {
 // ============================================================================
 
 /// Every user id the caller may see key material for through this module's
-/// share-a-room gate: `user_id` itself, plus every user who currently shares
-/// a JOINED room with them (plan P9 brief: `/keys/query`/`/keys/claim`/
-/// `PUT /sendToDevice` "restrict to users who share a room with the caller,
-/// or the caller"). A target outside this set is dropped/emptied by the
-/// caller, never distinguished from "no such account" — see this module's
-/// own doc.
+/// share-a-room gate: `user_id` itself, plus every user who is JOINED or
+/// INVITED in a room the caller is JOINED to (plan P9 brief: `/keys/query`/
+/// `/keys/claim`/`PUT /sendToDevice` "restrict to users who share a room
+/// with the caller, or the caller"; the invited half is P16 S-e — see this
+/// module's own doc). The caller must be joined: a room where the caller is
+/// only invited, has left, or is banned contributes nothing. A target
+/// outside this set is dropped/emptied by the caller, never distinguished
+/// from "no such account".
 pub(super) fn peers_sharing_a_room_with(conn: &Connection, user_id: i64) -> rusqlite::Result<HashSet<i64>> {
     let mut ids = HashSet::new();
     ids.insert(user_id);
     for room_id in matrix_store::rooms_for_user(conn, user_id, Some(Membership::Join))? {
-        for member in matrix_store::room_members(conn, &room_id, Some(Membership::Join))? {
-            ids.insert(member.user_id);
+        for member in matrix_store::room_members(conn, &room_id, None)? {
+            if matches!(member.membership, Membership::Join | Membership::Invite) {
+                ids.insert(member.user_id);
+            }
         }
     }
     Ok(ids)
@@ -1451,6 +1460,122 @@ mod tests {
             matrix_store::apply_state_event(conn, &format!("$member-{user_id}"), room_id, members[0].0, "m.room.member", mxid, r#"{"membership":"join"}"#, 1000, T0)
                 .expect("member join");
         }
+    }
+
+    /// A room where `joined` is joined and `invited` holds a pending invite
+    /// (the inviter-sends-before-the-invitee-joins shape).
+    fn make_room_with_invitee(conn: &mut Connection, room_id: &str, joined: (i64, &str), invited: (i64, &str)) {
+        matrix_store::create_room(
+            conn,
+            room_id,
+            matrix_store::RoomKind::Dm,
+            joined.0,
+            T0,
+            true,
+            matrix_store::JoinRule::Invite,
+            matrix_store::HistoryVisibility::Shared,
+            None,
+            None,
+        )
+        .expect("create room");
+        matrix_store::apply_state_event(conn, "$member-joined", room_id, joined.0, "m.room.member", joined.1, r#"{"membership":"join"}"#, 1000, T0).expect("joined member");
+        matrix_store::apply_state_event(conn, "$member-invited", room_id, joined.0, "m.room.member", invited.1, r#"{"membership":"invite"}"#, 1100, T0).expect("invited member");
+    }
+
+    /// Upload one device with one one-time key for `user_id`.
+    fn upload_device_with_otk(conn: &mut Connection, user_id: i64, mxid: &str, device_id: &str) {
+        let request = KeysUploadRequest {
+            device_keys: Some(serde_json::json!({
+                "user_id": mxid,
+                "device_id": device_id,
+                "algorithms": [],
+                "keys": { format!("curve25519:{device_id}"): "k" },
+                "signatures": {},
+            })),
+            one_time_keys: Some(BTreeMap::from([("signed_curve25519:AAAAAQ".to_string(), serde_json::json!({ "key": "otk" }))])),
+            fallback_keys: None,
+        };
+        apply_keys_upload(conn, user_id, mxid, device_id, &request, T0).expect("upload keys");
+    }
+
+    // ---- P16 S-e: an invited peer is visible to the joined inviter, and only to them ----
+
+    #[test]
+    fn peers_sharing_a_room_with_counts_an_invited_peer_only_for_a_joined_caller() {
+        let mut conn = test_conn();
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000071", T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000071", T0).expect("bob");
+        matrix_store::ensure_matrix_user(&conn, 3, "carol0000000000000000000000071a", T0).expect("carol");
+        make_room_with_invitee(&mut conn, ROOM, (1, &alice), (2, &bob));
+
+        assert_eq!(peers_sharing_a_room_with(&conn, 1).expect("alice"), HashSet::from([1, 2]), "the joined inviter sees the invitee");
+        assert_eq!(peers_sharing_a_room_with(&conn, 2).expect("bob"), HashSet::from([2]), "an invited caller gets no visibility");
+        assert_eq!(peers_sharing_a_room_with(&conn, 3).expect("carol"), HashSet::from([3]), "an unrelated user sees nobody");
+
+        matrix_store::apply_state_event(&mut conn, "$bob-join", ROOM, 2, "m.room.member", &bob, r#"{"membership":"join"}"#, 1200, T0).expect("bob joins");
+        assert_eq!(peers_sharing_a_room_with(&conn, 2).expect("bob joined"), HashSet::from([1, 2]), "once joined, bob sees alice");
+
+        matrix_store::apply_state_event(&mut conn, "$bob-leave", ROOM, 2, "m.room.member", &bob, r#"{"membership":"leave"}"#, 1300, T0).expect("bob leaves");
+        assert_eq!(peers_sharing_a_room_with(&conn, 1).expect("alice after leave"), HashSet::from([1]), "a peer who left is no longer visible");
+    }
+
+    #[test]
+    fn inviter_can_query_and_claim_an_invited_peers_keys_but_not_the_reverse() {
+        let mut conn = test_conn();
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000072", T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000072", T0).expect("bob");
+        let carol = matrix_store::ensure_matrix_user(&conn, 3, "carol0000000000000000000000072a", T0).expect("carol");
+        make_room_with_invitee(&mut conn, ROOM, (1, &alice), (2, &bob));
+        upload_device_with_otk(&mut conn, 1, &alice, "ALICEDEV");
+        upload_device_with_otk(&mut conn, 2, &bob, "BOBDEV");
+        upload_device_with_otk(&mut conn, 3, &carol, "CAROLDEV");
+
+        // The inviter (joined) sees the invitee; an unrelated user stays hidden.
+        let requested = BTreeMap::from([(bob.clone(), Vec::new()), (carol.clone(), Vec::new())]);
+        let query = build_keys_query_response(&conn, 1, &alice, &requested).expect("alice queries");
+        assert!(query["device_keys"][bob.as_str()]["BOBDEV"].is_object(), "the inviter must see the invitee's device: {query}");
+        assert_eq!(query["device_keys"][carol.as_str()], serde_json::json!({}), "an unrelated user stays hidden");
+
+        let claim_request = BTreeMap::from([
+            (bob.clone(), BTreeMap::from([("BOBDEV".to_string(), "signed_curve25519".to_string())])),
+            (carol.clone(), BTreeMap::from([("CAROLDEV".to_string(), "signed_curve25519".to_string())])),
+        ]);
+        let claim = build_keys_claim_response(&mut conn, 1, &claim_request).expect("alice claims");
+        assert_eq!(claim["one_time_keys"][bob.as_str()]["BOBDEV"]["signed_curve25519:AAAAAQ"]["key"], "otk", "the inviter must be able to claim the invitee's key: {claim}");
+        assert!(claim["one_time_keys"].get(carol.as_str()).is_none(), "an unrelated user's keys are never claimable");
+
+        // The invited peer (not joined) gets no new visibility of the inviter.
+        let reverse_query = build_keys_query_response(&conn, 2, &bob, &BTreeMap::from([(alice.clone(), Vec::new())])).expect("bob queries");
+        assert_eq!(reverse_query["device_keys"][alice.as_str()], serde_json::json!({}), "an invited caller sees nobody");
+        let reverse_claim_request = BTreeMap::from([(alice.clone(), BTreeMap::from([("ALICEDEV".to_string(), "signed_curve25519".to_string())]))]);
+        let reverse_claim = build_keys_claim_response(&mut conn, 2, &reverse_claim_request).expect("bob claims");
+        assert!(reverse_claim["one_time_keys"].get(alice.as_str()).is_none(), "an invited caller cannot claim anything");
+    }
+
+    #[test]
+    fn send_to_device_reaches_an_invited_peer_but_not_a_stranger_or_from_an_invited_caller() {
+        let mut conn = test_conn();
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000073", T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, 2, "bob0000000000000000000000000073", T0).expect("bob");
+        let carol = matrix_store::ensure_matrix_user(&conn, 3, "carol0000000000000000000000073a", T0).expect("carol");
+        make_room_with_invitee(&mut conn, ROOM, (1, &alice), (2, &bob));
+        matrix_keys_store::create_device(&conn, 1, matrix_keys_store::CredentialKind::Bearer, "alice-cred", T0).expect("alice dev");
+        let bob_device = matrix_keys_store::create_device(&conn, 2, matrix_keys_store::CredentialKind::Bearer, "bob-cred", T0).expect("bob dev");
+        matrix_keys_store::create_device(&conn, 3, matrix_keys_store::CredentialKind::Bearer, "carol-cred", T0).expect("carol dev");
+
+        let messages_to = |mxid: &str| -> BTreeMap<String, BTreeMap<String, serde_json::Value>> {
+            BTreeMap::from([(mxid.to_string(), BTreeMap::from([("*".to_string(), serde_json::json!({ "hello": "world" }))]))])
+        };
+
+        let to_invitee = expand_send_to_device_targets(&conn, 1, &messages_to(&bob)).expect("expand to the invitee");
+        assert_eq!(to_invitee.len(), 1);
+        assert_eq!((to_invitee[0].0, to_invitee[0].1.as_str()), (2, bob_device.as_str()));
+
+        assert!(expand_send_to_device_targets(&conn, 1, &messages_to(&carol)).expect("expand to a stranger").is_empty(), "a stranger still receives nothing");
+        assert!(
+            expand_send_to_device_targets(&conn, 2, &messages_to(&alice)).expect("expand from an invited caller").is_empty(),
+            "an invited caller cannot send to-device messages"
+        );
     }
 
     // ---- plan §9 P9 test 1: keys_upload_then_query_round_trips_device_keys_verbatim ----
