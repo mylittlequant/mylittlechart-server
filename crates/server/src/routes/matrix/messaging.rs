@@ -13,7 +13,12 @@
 //! [`format_stream_token`]/[`parse_stream_token`] — `"t{stream_id}"`, a
 //! position strictly between two adjacent stream ids (a bare `"0"` also
 //! parses, naming the very beginning of the room, before any event ever
-//! existed). Both routes clamp their own `limit` to `[1, 100]`
+//! existed). A `/sync` token `"s{stream_id}_{typing_gen}"` parses too (a
+//! client that restarted pages history back from its stored `next_batch`);
+//! it names the position just AFTER `stream_id`, and the typing half is
+//! ignored — see [`StreamToken`]. `GET /messages` also accepts no `from` at
+//! all: the newest event going backward, the beginning going forward. Both
+//! routes clamp their own `limit` to `[1, 100]`
 //! ([`MESSAGES_DEFAULT_LIMIT`]/[`MESSAGES_MAX_LIMIT`], `10` default).
 //!
 //! # History visibility
@@ -105,10 +110,77 @@ fn check_rate_limits(conn: &Connection, user_id: i64, device_id: &str, now: &str
 const MESSAGES_DEFAULT_LIMIT: i64 = 10;
 const MESSAGES_MAX_LIMIT: i64 = 100;
 
-/// `"t{stream_id}"`, or a bare `"0"` — see the module doc.
-fn parse_stream_token(raw: &str) -> Result<i64, MatrixError> {
-    let digits = raw.strip_prefix('t').unwrap_or(raw);
-    digits.parse::<i64>().map_err(|_| MatrixError::invalid_param("malformed pagination token"))
+/// A parsed pagination position — see the module doc.
+///
+/// A `t{stream_id}` token (or a bare integer) sits ON event `stream_id`:
+/// a backward page starts strictly before it, a forward page strictly after
+/// it. A sync token `s{stream_id}_{typing_gen}` (a `/sync` `next_batch` or
+/// `prev_batch`) sits AFTER event `stream_id` — that event was already
+/// delivered — so a backward page from it must still include that event. The
+/// typing half of a sync token is irrelevant to history and is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamToken {
+    stream_id: i64,
+    after_event: bool,
+}
+
+impl StreamToken {
+    /// The exclusive upper bound of a page that walks backward from this
+    /// position: events with `stream_id < bound`.
+    fn backward_bound(self) -> i64 {
+        if self.after_event {
+            self.stream_id.saturating_add(1)
+        } else {
+            self.stream_id
+        }
+    }
+
+    /// The exclusive lower bound of a page that walks forward from this
+    /// position: events with `stream_id > bound`.
+    fn forward_bound(self) -> i64 {
+        self.stream_id
+    }
+
+    /// The `to=` boundary of a page walking `dir`: the far end a page must
+    /// not cross. It is the position's bound as seen from the opposite walk
+    /// direction, since `to` is approached rather than left.
+    fn to_bound(self, dir: Direction) -> i64 {
+        match dir {
+            Direction::Backward => self.forward_bound(),
+            Direction::Forward => self.backward_bound(),
+        }
+    }
+}
+
+/// `"t{stream_id}"`, a bare `"0"`, or a sync token `"s{stream_id}_{typing_gen}"`
+/// — see the module doc. Anything else, and any negative stream id, is
+/// refused with `M_INVALID_PARAM`.
+fn parse_stream_token(raw: &str) -> Result<StreamToken, MatrixError> {
+    let malformed = || MatrixError::invalid_param("malformed pagination token");
+    let token = if raw.starts_with('s') {
+        let sync = super::sync_token::parse(raw).map_err(|_| malformed())?;
+        StreamToken { stream_id: sync.stream_id, after_event: true }
+    } else {
+        let digits = raw.strip_prefix('t').unwrap_or(raw);
+        StreamToken { stream_id: digits.parse::<i64>().map_err(|_| malformed())?, after_event: false }
+    };
+    if token.stream_id < 0 {
+        return Err(malformed());
+    }
+    Ok(token)
+}
+
+/// The page start `GET /messages` walks from: the explicit `from` token when
+/// present, else the far end of the timeline for `dir` — the newest event
+/// going backward, the very beginning going forward (Matrix makes `from`
+/// optional and defines exactly this).
+fn resolve_messages_start(conn: &Connection, from: Option<StreamToken>, dir: Direction) -> rusqlite::Result<i64> {
+    Ok(match (from, dir) {
+        (Some(token), Direction::Backward) => token.backward_bound(),
+        (Some(token), Direction::Forward) => token.forward_bound(),
+        (None, Direction::Backward) => matrix_store::max_stream_id(conn)?.saturating_add(1),
+        (None, Direction::Forward) => 0,
+    })
 }
 
 fn format_stream_token(stream_id: i64) -> String {
@@ -569,7 +641,10 @@ async fn redact_event_handler(
 
 #[derive(serde::Deserialize)]
 struct MessagesQuery {
-    from: String,
+    /// Optional (Matrix v1.3+): absent means "from the newest event" for
+    /// `dir=b` and "from the beginning" for `dir=f`.
+    #[serde(default)]
+    from: Option<String>,
     #[serde(default)]
     to: Option<String>,
     #[serde(default)]
@@ -588,8 +663,8 @@ async fn get_messages(
 ) -> Result<impl IntoResponse, MatrixError> {
     let caller = auth::resolve_matrix_caller(&headers, &state).await?;
     let dir = Direction::from_query(query.dir.as_deref())?;
-    let from_stream = parse_stream_token(&query.from)?;
-    let to_stream = query.to.as_deref().map(parse_stream_token).transpose()?;
+    let from_token = query.from.as_deref().map(parse_stream_token).transpose()?;
+    let to_stream = query.to.as_deref().map(parse_stream_token).transpose()?.map(|token| token.to_bound(dir));
     let limit = clamp_limit(query.limit);
     let filter = parse_filter(query.filter.as_deref())?;
 
@@ -602,6 +677,7 @@ async fn get_messages(
             return Err(MatrixError::forbidden("no read access to this room"));
         }
 
+        let from_stream = resolve_messages_start(&messenger_conn, from_token, dir)?;
         let page = paginate_messages(&messenger_conn, &room_id, window, from_stream, to_stream, dir, limit, &filter)?;
         let mut chunk_json = Vec::with_capacity(page.chunk.len());
         for event in &page.chunk {
@@ -677,7 +753,7 @@ async fn get_relations_inner(
 ) -> Result<impl IntoResponse, MatrixError> {
     let caller = auth::resolve_matrix_caller(&headers, &state).await?;
     let before_stream = match &query.from {
-        Some(raw) => parse_stream_token(raw)?,
+        Some(raw) => parse_stream_token(raw)?.backward_bound(),
         None => i64::MAX,
     };
     let limit = clamp_limit(query.limit);
@@ -955,7 +1031,7 @@ mod tests {
         assert_eq!(page1.chunk.iter().map(|e| e.event_id.clone()).collect::<Vec<_>>(), vec!["$e5", "$e4"]);
         let end_token = page1.end.clone().expect("more to page backward");
 
-        let from2 = parse_stream_token(&end_token).expect("parse token");
+        let from2 = parse_stream_token(&end_token).expect("parse token").backward_bound();
         let page2 = paginate_messages(&conn, "!r:mylittlechart.org", matrix_store::HistoryWindow::All, from2, None, Direction::Backward, 2, &EventFilter::default())
             .expect("page2");
         assert_eq!(page2.chunk.iter().map(|e| e.event_id.clone()).collect::<Vec<_>>(), vec!["$e3", "$e2"]);
@@ -964,6 +1040,80 @@ mod tests {
             .expect("forward page");
         assert_eq!(fpage.chunk.iter().map(|e| e.event_id.clone()).collect::<Vec<_>>(), vec!["$e1", "$e2", "$e3"]);
         assert!(fpage.end.is_some());
+    }
+
+    // ---- P16 S-c: /messages accepts a sync token and a missing `from` ----
+
+    /// Five channel events `$e1..$e5` in one room; returns the connection.
+    fn room_with_five_events() -> Connection {
+        let mut conn = test_conn();
+        make_room(&conn, "!r:mylittlechart.org", matrix_store::RoomKind::Channel, 1);
+        for i in 1..=5i64 {
+            matrix_store::insert_timeline_event(&mut conn, &format!("$e{i}"), "!r:mylittlechart.org", 1, "m.room.message", "{}", 1000 * i, None).expect("insert");
+        }
+        conn
+    }
+
+    fn page_ids(conn: &Connection, from: Option<&str>, to: Option<&str>, dir: Direction, limit: i64) -> Result<Vec<String>, MatrixError> {
+        let from_token = from.map(parse_stream_token).transpose()?;
+        let to_stream = to.map(parse_stream_token).transpose()?.map(|token| token.to_bound(dir));
+        let start = resolve_messages_start(conn, from_token, dir)?;
+        let page = paginate_messages(conn, "!r:mylittlechart.org", matrix_store::HistoryWindow::All, start, to_stream, dir, limit, &EventFilter::default())?;
+        Ok(page.chunk.iter().map(|e| e.event_id.clone()).collect())
+    }
+
+    #[test]
+    fn messages_from_a_sync_token_pages_back_from_the_delivered_position() {
+        let conn = room_with_five_events();
+        let latest = matrix_store::max_stream_id(&conn).expect("max stream id");
+        // The token a `/sync` would have handed out after delivering every event.
+        let sync_token = super::super::sync_token::format(latest, 7);
+
+        let ids = page_ids(&conn, Some(&sync_token), None, Direction::Backward, 3).expect("sync-token page");
+        assert_eq!(ids, vec!["$e5", "$e4", "$e3"], "the newest delivered event must be included");
+
+        // The bare `s{n}` form and a different typing generation page identically.
+        let bare = format!("s{latest}");
+        assert_eq!(page_ids(&conn, Some(&bare), None, Direction::Backward, 3).expect("bare sync token"), ids);
+        let other_gen = super::super::sync_token::format(latest, 999);
+        assert_eq!(page_ids(&conn, Some(&other_gen), None, Direction::Backward, 3).expect("other typing gen"), ids);
+
+        // A sync token in the middle: everything up to and including its own event, newest first.
+        let e3 = matrix_store::get_event(&conn, "$e3").expect("query").expect("exists").stream_id;
+        let mid = super::super::sync_token::format(e3, 0);
+        assert_eq!(page_ids(&conn, Some(&mid), None, Direction::Backward, 10).expect("mid token"), vec!["$e3", "$e2", "$e1"]);
+
+        // Forward from a sync token starts strictly after its own event.
+        assert_eq!(page_ids(&conn, Some(&mid), None, Direction::Forward, 10).expect("forward"), vec!["$e4", "$e5"]);
+    }
+
+    #[test]
+    fn messages_without_from_start_at_the_newest_going_backward_and_the_beginning_going_forward() {
+        let conn = room_with_five_events();
+        assert_eq!(page_ids(&conn, None, None, Direction::Backward, 2).expect("backward, no from"), vec!["$e5", "$e4"]);
+        assert_eq!(page_ids(&conn, None, None, Direction::Forward, 2).expect("forward, no from"), vec!["$e1", "$e2"]);
+    }
+
+    #[test]
+    fn messages_to_bound_holds_for_a_sync_token() {
+        let conn = room_with_five_events();
+        let e2 = matrix_store::get_event(&conn, "$e2").expect("query").expect("exists").stream_id;
+        let sync_at_e2 = super::super::sync_token::format(e2, 0);
+        // Backward from the newest, stopping at a sync position after $e2: $e2 itself is behind the bound.
+        assert_eq!(page_ids(&conn, None, Some(&sync_at_e2), Direction::Backward, 10).expect("to bound"), vec!["$e5", "$e4", "$e3"]);
+        // Forward from the start, stopping at that same position: $e2 is still in front of it.
+        assert_eq!(page_ids(&conn, None, Some(&sync_at_e2), Direction::Forward, 10).expect("forward to bound"), vec!["$e1", "$e2"]);
+    }
+
+    #[test]
+    fn messages_refuse_a_malformed_token() {
+        for garbage in ["garbage", "s", "s_3", "sabc_1", "s12_x", "t-5", "-5", "s-3_0", "t", "12x"] {
+            let err = parse_stream_token(garbage).unwrap_err();
+            assert_eq!(err.errcode, "M_INVALID_PARAM", "{garbage:?} must be refused");
+        }
+        assert_eq!(parse_stream_token("t12").expect("t form"), StreamToken { stream_id: 12, after_event: false });
+        assert_eq!(parse_stream_token("0").expect("bare zero"), StreamToken { stream_id: 0, after_event: false });
+        assert_eq!(parse_stream_token("s12_3").expect("sync form"), StreamToken { stream_id: 12, after_event: true });
     }
 
     #[test]
