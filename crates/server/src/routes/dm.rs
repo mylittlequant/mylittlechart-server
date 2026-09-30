@@ -68,12 +68,14 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::auth::{extract_bearer, extract_session_id, extract_ua_hash, hash_token};
 use crate::db;
 use crate::dm_db;
 use crate::models::types::ErrorResponse;
+use crate::recipient_search::{effective_label_from_parts, paid_recipient_candidates, rank_candidate};
 use crate::social_db::{self, Class};
 use crate::state::AppState;
 
@@ -435,23 +437,6 @@ const MAX_LOOKUP_QUERY_LEN: usize = 64;
 /// How many ranked matches [`lookup_recipients`] returns at most.
 const MAX_LOOKUP_RESULTS: usize = 10;
 
-/// Ceiling on how many currently-subscription-paid accounts one lookup call
-/// loads from the identity database before scoring in Rust — the table is
-/// small enough that a single unfiltered-by-text query plus in-process
-/// ranking beats a second LIKE-shaped query per keystroke (same reasoning
-/// `db::search_users` skips for its own, admin-only, already-`LIKE`-filtered
-/// query). Ladder-boosted accounts (see [`paid_recipient_candidates`]) are
-/// loaded separately and are not bounded by this — `forum_roles`/
-/// `forum_trusted` are small, admin-managed tables.
-const PAID_CANDIDATE_LIMIT: i64 = 5000;
-
-/// A fuzzy match is only offered once the query is long enough that a
-/// distance-1 typo is unlikely to also match something unrelated; a longer
-/// query is allowed a distance of 2.
-const FUZZY_SHORT_QUERY_MAX_LEN: usize = 4;
-const FUZZY_DISTANCE_SHORT_QUERY: usize = 1;
-const FUZZY_DISTANCE_LONG_QUERY: usize = 2;
-
 #[derive(serde::Deserialize)]
 pub struct LookupQuery {
     pub q: Option<String>,
@@ -463,167 +448,6 @@ struct LookupUser {
     nick: Option<String>,
     label: String,
     rank: u8,
-}
-
-/// One row loaded from the identity database: a ladder-paid account (see
-/// [`paid_recipient_candidates`]), before it is known whether it also
-/// published a DM identity key (checked separately against the social
-/// connection — see [`lookup_recipients`]).
-struct PaidCandidate {
-    id: i64,
-    nick: Option<String>,
-    display_name: String,
-    public_id: String,
-}
-
-/// Every recipient candidate for [`lookup_recipients`]: accounts that are
-/// paid right now — an unexpired `paid_until`, a lifetime flag, or a running
-/// quant period, the same legs `db::user_is_paid` decides (bounded by
-/// [`PAID_CANDIDATE_LIMIT`]) — PLUS
-/// `boosted_ids` — accounts that reach [`Class::Paid`] via
-/// [`social_db::ladder_boosted_user_ids`] (trusted standing, or a
-/// moderator/admin role) regardless of their own subscription (owner ruling
-/// 2026-09-23, same rule [`is_dm_paid`] applies to the caller and to a
-/// conversation peer). `caller_id` is always excluded; a `boosted_ids` entry
-/// already covered by the `paid_until` query is not loaded twice.
-fn paid_recipient_candidates(
-    identity_conn: &rusqlite::Connection,
-    caller_id: i64,
-    boosted_ids: &[i64],
-    now: &str,
-) -> rusqlite::Result<Vec<PaidCandidate>> {
-    use rusqlite::{params, OptionalExtension};
-
-    let mut candidates = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
-    {
-        let mut stmt = identity_conn.prepare(
-            "SELECT id, nick, display_name, public_id FROM users
-             WHERE (paid_until > ?1 OR lifetime_paid = 1 OR lifetime_anon = 1 OR quant_active_until > ?1)
-               AND id != ?2
-             LIMIT ?3",
-        )?;
-        let mut rows = stmt.query(params![now, caller_id, PAID_CANDIDATE_LIMIT])?;
-        while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            seen_ids.insert(id);
-            candidates.push(PaidCandidate {
-                id,
-                nick: row.get(1)?,
-                display_name: row.get(2)?,
-                public_id: row.get(3)?,
-            });
-        }
-    }
-
-    for &id in boosted_ids {
-        if id == caller_id || seen_ids.contains(&id) {
-            continue;
-        }
-        let row: Option<(Option<String>, String, String)> = identity_conn
-            .query_row(
-                "SELECT nick, display_name, public_id FROM users WHERE id = ?1",
-                params![id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        if let Some((nick, display_name, public_id)) = row {
-            seen_ids.insert(id);
-            candidates.push(PaidCandidate { id, nick, display_name, public_id });
-        }
-    }
-
-    Ok(candidates)
-}
-
-/// The label [`db::effective_label_for_user`] would compute for the same
-/// three columns — inlined here (rather than a second per-row identity
-/// query) because [`lookup_recipients`] already has `nick`/`display_name`/
-/// `public_id` in hand from its one candidate-loading query.
-fn effective_label_from_parts(nick: Option<&str>, display_name: &str, public_id: &str) -> String {
-    nick.filter(|n| !n.is_empty())
-        .or_else(|| Some(display_name).filter(|d| !d.is_empty()))
-        .unwrap_or(public_id)
-        .to_string()
-}
-
-/// Optimal-string-alignment (restricted) Damerau-Levenshtein distance
-/// between `a` and `b`: insertion, deletion, substitution, and swapping two
-/// ADJACENT characters each cost 1 — a transposed pair such as `"ab"` vs
-/// `"ba"` is distance 1, not 2, but (unlike full Damerau-Levenshtein) a
-/// character already involved in a transposition cannot be edited again in
-/// the same step. Counts Unicode scalar values, not bytes, so it works the
-/// same on non-ASCII nicks/names.
-fn osa_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let (len_a, len_b) = (a.len(), b.len());
-    if len_a == 0 {
-        return len_b;
-    }
-    if len_b == 0 {
-        return len_a;
-    }
-
-    let mut dp = vec![vec![0usize; len_b + 1]; len_a + 1];
-    for (i, row) in dp.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for j in 0..=len_b {
-        dp[0][j] = j;
-    }
-    for i in 1..=len_a {
-        for j in 1..=len_b {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            let mut best = (dp[i - 1][j] + 1) // deletion
-                .min(dp[i][j - 1] + 1) // insertion
-                .min(dp[i - 1][j - 1] + cost); // match/substitution
-            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                best = best.min(dp[i - 2][j - 2] + 1); // adjacent transposition
-            }
-            dp[i][j] = best;
-        }
-    }
-    dp[len_a][len_b]
-}
-
-/// Score one candidate against an already-trimmed-lowercased `query`,
-/// ranked exactly as `routes::dm`'s module doc lists (lower is a better
-/// match): exact nick (0), nick prefix (1), display-name prefix (2),
-/// substring in either (3), fuzzy match on the nick or on any
-/// whitespace-separated word of the display name (4). `None` if nothing
-/// matches at all. `nick`/`display_name` are the candidate's raw (mixed-
-/// case) stored values; this function lowercases its own copies rather than
-/// requiring the caller to.
-fn rank_candidate(query: &str, nick: Option<&str>, display_name: &str) -> Option<u8> {
-    let nick_lower = nick.map(str::to_lowercase);
-    let display_lower = display_name.to_lowercase();
-
-    if nick_lower.as_deref() == Some(query) {
-        return Some(0);
-    }
-    if nick_lower.as_deref().is_some_and(|n| n.starts_with(query)) {
-        return Some(1);
-    }
-    if display_lower.starts_with(query) {
-        return Some(2);
-    }
-    if nick_lower.as_deref().is_some_and(|n| n.contains(query)) || display_lower.contains(query) {
-        return Some(3);
-    }
-
-    let max_distance = if query.chars().count() <= FUZZY_SHORT_QUERY_MAX_LEN {
-        FUZZY_DISTANCE_SHORT_QUERY
-    } else {
-        FUZZY_DISTANCE_LONG_QUERY
-    };
-    if nick_lower.as_deref().is_some_and(|n| osa_distance(n, query) <= max_distance) {
-        return Some(4);
-    }
-    if display_lower.split_whitespace().any(|word| osa_distance(word, query) <= max_distance) {
-        return Some(4);
-    }
-    None
 }
 
 /// `GET /dm/lookup?q=<text>` -> `{"users": [{"public_id","nick","label",
@@ -896,6 +720,21 @@ pub struct SendMessageRequest {
 /// here, not just at conversation creation — see the module doc);
 /// rate-limited to [`dm_db::DM_MESSAGE_DAILY_LIMIT`] per rolling day per
 /// sender.
+///
+/// # Bridge into the migrated Matrix room (P15)
+///
+/// Right after this route's own insert commits, it bridges the message into
+/// `conversation`'s Matrix DM room — migrating the conversation from scratch
+/// if this is its first message ever, or catching up an already-migrated
+/// room otherwise (`crate::matrix_migration::bridge_legacy_dm_send`) — and,
+/// on success, wakes that room's members ([`super::matrix::rooms`]'s own
+/// `member_and_invited_ids`, plus `ControlPlane::live`) exactly the way
+/// `routes::matrix::messaging::send_event` wakes a room after a native
+/// Matrix send, so an updated client's open `/sync` long-poll returns at
+/// once. A bridge failure never fails this route — the legacy send already
+/// committed above — it is logged once with the conversation id and the
+/// next boot's `matrix_migration::migrate_legacy_dms` catch-up closes the
+/// gap.
 pub async fn create_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -924,8 +763,10 @@ pub async fn create_message(
         ));
     }
 
+    let state_for_blocking = state.clone();
     let result = tokio::task::spawn_blocking(
-        move || -> std::result::Result<(i64, String), SendMessageRefusal> {
+        move || -> std::result::Result<(i64, String, Option<HashSet<i64>>), SendMessageRefusal> {
+            let state = state_for_blocking;
             let social_conn = state.control_plane().social_conn();
             let Some(conversation) = dm_db::get_conversation(&social_conn, conversation_id)? else {
                 return Err(SendMessageRefusal::NotFound);
@@ -954,15 +795,105 @@ pub async fn create_message(
             let now_str = now.to_rfc3339();
             let id = dm_db::create_message(&social_conn, conversation_id, user_id, &nonce, &ciphertext, &now_str)
                 .map_err(SendMessageRefusal::Message)?;
-            Ok((id, now_str))
+            // The bridge takes `db` -> `social` -> `messenger` in that order
+            // (see its doc); `social` must not still be held here.
+            drop(social_conn);
+
+            let wake_ids = bridge_legacy_dm_send_and_resolve_wake_set(&state, conversation_id, &conversation, &now_str);
+            Ok((id, now_str, wake_ids))
         },
     )
     .await;
 
     match result {
-        Ok(Ok((id, created_at))) => Json(serde_json::json!({ "id": id, "created_at": created_at })).into_response(),
+        Ok(Ok((id, created_at, wake_ids))) => {
+            if let Some(wake_ids) = wake_ids {
+                state.control_plane().live.wake_many(wake_ids.into_iter().map(|id| format!("user:{id}")));
+            }
+            Json(serde_json::json!({ "id": id, "created_at": created_at })).into_response()
+        }
         Ok(Err(e)) => send_message_refusal_response(e),
         Err(_) => internal_error(),
+    }
+}
+
+/// The bridge step [`create_message`] runs right after its own insert
+/// commits (module doc above) — pulled out to its own function so
+/// `create_message` stays readable.
+///
+/// Lock order is `db` -> `social` -> `messenger`, the same order every
+/// other path that holds more than one of them uses (the device reaper and
+/// `device_auth` take `db` then `messenger`). The caller must hold none of
+/// them. Taking `messenger` before `db` here would deadlock against the
+/// hourly reaper. `social` is only read from here on, same as every other
+/// `matrix_migration` read. Returns the room's wake set on success, `None`
+/// on ANY failure (bridging, or the follow-up wake-set lookup) — already
+/// logged here, never the caller's to handle.
+fn bridge_legacy_dm_send_and_resolve_wake_set(
+    state: &AppState,
+    conversation_id: i64,
+    conversation: &dm_db::DmConversation,
+    now: &str,
+) -> Option<HashSet<i64>> {
+    let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+    let social_conn = state.control_plane().social_conn();
+    let mut messenger_conn = state.control_plane().messenger_conn();
+    let bridge_result =
+        crate::matrix_migration::bridge_legacy_dm_send(&mut messenger_conn, &social_conn, &identity_conn, conversation, now);
+    drop(social_conn);
+    drop(identity_conn);
+
+    let room_id = match bridge_result {
+        Ok(room_id) => room_id,
+        Err(e) => {
+            tracing::error!("legacy DM bridge: conversation {} failed: {}", conversation_id, e);
+            return None;
+        }
+    };
+    resolve_wake_set(&messenger_conn, conversation_id, &room_id)
+}
+
+/// The bridge step [`mark_read`] runs right after its own update commits —
+/// same posture as [`bridge_legacy_dm_send_and_resolve_wake_set`], but never
+/// migrates a conversation that has no room yet (a read marker alone must
+/// never be what creates a room — see
+/// [`crate::matrix_migration::catch_up_legacy_dm_read`]'s own doc). Returns
+/// `None` both on failure AND on the routine "no room yet" case — either way
+/// there is nothing for the caller to wake.
+fn bridge_legacy_dm_read_and_resolve_wake_set(
+    state: &AppState,
+    social: &rusqlite::Connection,
+    conversation_id: i64,
+    conversation: &dm_db::DmConversation,
+) -> Option<HashSet<i64>> {
+    let mut messenger_conn = state.control_plane().messenger_conn();
+    let room_id = match crate::matrix_migration::catch_up_legacy_dm_read(&mut messenger_conn, social, conversation) {
+        Ok(Some(room_id)) => room_id,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::error!("legacy DM read bridge: conversation {} failed: {}", conversation_id, e);
+            return None;
+        }
+    };
+    resolve_wake_set(&messenger_conn, conversation_id, &room_id)
+}
+
+/// The wake-set lookup shared by both bridge helpers above — reused, not
+/// re-derived, so a send-bridged and a read-bridged room wake the exact same
+/// way ([`crate::routes::matrix::rooms::member_and_invited_ids`], plus
+/// `ControlPlane::live` back in the caller, exactly how
+/// `routes::matrix::messaging::send_event` wakes a room after a native
+/// Matrix send).
+fn resolve_wake_set(messenger_conn: &rusqlite::Connection, conversation_id: i64, room_id: &str) -> Option<HashSet<i64>> {
+    match crate::routes::matrix::rooms::member_and_invited_ids(messenger_conn, room_id) {
+        Ok(ids) => Some(ids),
+        Err(e) => {
+            tracing::error!(
+                "legacy DM bridge: conversation {} wake-set lookup failed for room {}: {}",
+                conversation_id, room_id, e
+            );
+            None
+        }
     }
 }
 
@@ -1072,10 +1003,31 @@ pub struct MarkReadRequest {
     pub up_to_id: i64,
 }
 
+enum MarkReadOutcome {
+    /// The conversation does not exist, or `user_id` is not one of its two
+    /// parties — same "indistinguishable from missing" posture as every
+    /// other route here.
+    NotFound,
+    /// The legacy update itself always succeeds when the conversation
+    /// exists; `Some` carries the room's wake set when the read bridge
+    /// found (and caught up) an already-migrated room, `None` when there
+    /// was nothing to bridge or the bridge itself failed (already logged).
+    Marked(Option<HashSet<i64>>),
+}
+
 /// `POST /dm/conversations/{id}/read` — `{"up_to_id": N}`. Marks every
 /// message sent by the OTHER party with `id <= up_to_id` as read. 204 on
 /// success, 404 if the conversation does not exist or the caller is not a
 /// party.
+///
+/// # Bridge into the migrated Matrix room (P15)
+///
+/// Right after this route's own update commits, it catches up
+/// `conversation`'s Matrix DM room if one already exists
+/// (`crate::matrix_migration::catch_up_legacy_dm_read` — never migrates a
+/// conversation that has no room yet, unlike [`create_message`]'s own
+/// bridge) and wakes it the same way `create_message` does. A bridge failure
+/// never fails this route — the legacy read update already committed above.
 pub async fn mark_read(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1087,23 +1039,32 @@ pub async fn mark_read(
         Err(resp) => return resp,
     };
 
-    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<bool> {
+    let state_for_blocking = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<MarkReadOutcome> {
+        let state = state_for_blocking;
         let conn = state.control_plane().social_conn();
         let Some(conversation) = dm_db::get_conversation(&conn, conversation_id)? else {
-            return Ok(false);
+            return Ok(MarkReadOutcome::NotFound);
         };
         if conversation.peer_of(user_id).is_none() {
-            return Ok(false);
+            return Ok(MarkReadOutcome::NotFound);
         }
         let now = chrono::Utc::now().to_rfc3339();
         dm_db::mark_read(&conn, conversation_id, user_id, req.up_to_id, &now)?;
-        Ok(true)
+
+        let wake_ids = bridge_legacy_dm_read_and_resolve_wake_set(&state, &conn, conversation_id, &conversation);
+        Ok(MarkReadOutcome::Marked(wake_ids))
     })
     .await;
 
     match result {
-        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(MarkReadOutcome::Marked(wake_ids))) => {
+            if let Some(wake_ids) = wake_ids {
+                state.control_plane().live.wake_many(wake_ids.into_iter().map(|id| format!("user:{id}")));
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Ok(MarkReadOutcome::NotFound)) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => {
             tracing::error!("DB error marking dm messages read: {}", e);
             internal_error()
@@ -1178,108 +1139,6 @@ mod tests {
         assert_eq!(json["error"], "paid account required for direct messages");
     }
 
-    // ---- lookup candidate resolution: paid_recipient_candidates ----
-
-    fn identity_test_conn() -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
-        conn.execute_batch(
-            "CREATE TABLE users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                provider TEXT NOT NULL DEFAULT 'test',
-                provider_user_id TEXT NOT NULL DEFAULT '',
-                display_name TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT '',
-                public_id TEXT,
-                nick TEXT,
-                paid_until TEXT,
-                lifetime_paid INTEGER NOT NULL DEFAULT 0,
-                lifetime_anon INTEGER NOT NULL DEFAULT 0,
-                quant_tier TEXT,
-                quant_active_until TEXT
-            );",
-        )
-        .expect("identity test schema");
-        conn
-    }
-
-    fn insert_identity_test_user(
-        conn: &rusqlite::Connection,
-        nick: &str,
-        public_id: &str,
-        paid_until: Option<&str>,
-    ) -> i64 {
-        conn.execute(
-            "INSERT INTO users (provider, provider_user_id, display_name, created_at, public_id, nick, paid_until)
-             VALUES ('test', ?1, ?1, '2026-01-01T00:00:00+00:00', ?2, ?1, ?3)",
-            rusqlite::params![nick, public_id, paid_until],
-        )
-        .expect("insert user");
-        conn.last_insert_rowid()
-    }
-
-    fn future_ts() -> String {
-        (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339()
-    }
-
-    /// The exact scenario the brief names: an unpaid admin-role account with
-    /// a published DM identity key is a valid lookup result — reachable
-    /// through `paid_recipient_candidates` (the ladder half) and
-    /// `dm_db::identity_key_owner_ids` (the published-key half), the same
-    /// two queries `lookup_recipients` runs.
-    #[test]
-    fn lookup_recipient_candidates_includes_an_unpaid_admin_role_account_with_a_published_key() {
-        let identity_conn = identity_test_conn();
-        let social_conn = social_test_conn();
-
-        let caller_id = insert_identity_test_user(&identity_conn, "caller", "pub-caller", Some(&future_ts()));
-        let admin_id = insert_identity_test_user(&identity_conn, "admino", "pub-admino", None);
-
-        social_db::set_role(&social_conn, admin_id, social_db::Role::Admin, "2026-09-23T00:00:00+00:00")
-            .expect("set role");
-        dm_db::upsert_identity_key(
-            &social_conn,
-            admin_id,
-            &[7u8; dm_db::DM_PUBLIC_KEY_LEN],
-            "2026-09-23T00:00:00+00:00",
-        )
-        .expect("publish key");
-
-        let boosted_ids = social_db::ladder_boosted_user_ids(&social_conn).expect("boosted ids");
-        assert!(boosted_ids.contains(&admin_id));
-
-        let now = chrono::Utc::now().to_rfc3339();
-        let candidates =
-            paid_recipient_candidates(&identity_conn, caller_id, &boosted_ids, &now).expect("candidates");
-        assert!(candidates.iter().any(|c| c.id == admin_id));
-
-        let ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
-        let keyed = dm_db::identity_key_owner_ids(&social_conn, &ids).expect("keyed");
-        assert!(keyed.contains(&admin_id));
-
-        let matched: Vec<i64> = candidates
-            .into_iter()
-            .filter(|c| keyed.contains(&c.id))
-            .filter_map(|c| rank_candidate("admino", c.nick.as_deref(), &c.display_name).map(|_| c.id))
-            .collect();
-        assert!(matched.contains(&admin_id));
-    }
-
-    #[test]
-    fn lookup_recipient_candidates_excludes_the_caller_and_deduplicates_a_boosted_id_already_paid() {
-        let identity_conn = identity_test_conn();
-        let caller_id = insert_identity_test_user(&identity_conn, "caller", "pub-caller", Some(&future_ts()));
-        let paid_and_boosted_id =
-            insert_identity_test_user(&identity_conn, "trusty", "pub-trusty", Some(&future_ts()));
-
-        let now = chrono::Utc::now().to_rfc3339();
-        let boosted_ids = vec![caller_id, paid_and_boosted_id];
-        let candidates =
-            paid_recipient_candidates(&identity_conn, caller_id, &boosted_ids, &now).expect("candidates");
-
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].id, paid_and_boosted_id);
-    }
-
     // ---- message pagination: resolve_message_page ----
 
     #[test]
@@ -1296,74 +1155,5 @@ mod tests {
     fn resolve_message_page_maps_after_and_before_to_their_own_variant() {
         assert_eq!(resolve_message_page(Some(55), None), Some(dm_db::MessagePage::After(55)));
         assert_eq!(resolve_message_page(None, Some(11)), Some(dm_db::MessagePage::Before(11)));
-    }
-
-    // ---- lookup: osa_distance ----
-
-    #[test]
-    fn osa_distance_of_identical_strings_is_zero() {
-        assert_eq!(osa_distance("kosti", "kosti"), 0);
-        assert_eq!(osa_distance("", ""), 0);
-    }
-
-    #[test]
-    fn osa_distance_counts_an_adjacent_transposition_as_one_not_two() {
-        // Plain Levenshtein would need a delete + insert (2) for this pair;
-        // OSA recognises the swapped adjacent pair as a single edit.
-        assert_eq!(osa_distance("ab", "ba"), 1);
-        assert_eq!(osa_distance("kosti", "kosit"), 1);
-    }
-
-    #[test]
-    fn osa_distance_against_empty_input_is_the_other_strings_length() {
-        assert_eq!(osa_distance("", "abc"), 3);
-        assert_eq!(osa_distance("abc", ""), 3);
-    }
-
-    #[test]
-    fn osa_distance_counts_unicode_scalar_values_not_bytes() {
-        // "über" vs "uber": one substitution (ü -> u), not the multi-byte
-        // UTF-8 distance a byte-wise comparison would report.
-        assert_eq!(osa_distance("über", "uber"), 1);
-    }
-
-    // ---- lookup: rank_candidate ----
-
-    #[test]
-    fn rank_candidate_prefers_exact_nick_over_every_other_tier() {
-        assert_eq!(rank_candidate("kosti", Some("kosti"), "Someone Else"), Some(0));
-    }
-
-    #[test]
-    fn rank_candidate_orders_nick_prefix_above_display_name_prefix() {
-        assert_eq!(rank_candidate("kos", Some("kosti"), "kostroma events"), Some(1));
-        assert_eq!(rank_candidate("kos", None, "kostroma events"), Some(2));
-    }
-
-    #[test]
-    fn rank_candidate_falls_back_to_substring_then_fuzzy() {
-        // "ost" is a substring of "kosti" but not a prefix of either field.
-        assert_eq!(rank_candidate("ost", Some("kosti"), "Someone Else"), Some(3));
-        // "kosit" (5 chars, threshold 2) is neither a substring of "kosti"
-        // nor vice versa, but is distance 1 from it (one adjacent
-        // transposition) — a fuzzy match.
-        assert_eq!(rank_candidate("kosit", Some("kosti"), "Someone Else"), Some(4));
-    }
-
-    #[test]
-    fn rank_candidate_matches_a_word_inside_display_name_by_fuzzy_distance() {
-        // "vann" (4 chars, threshold 1) fuzzy-matches "van" inside "Kosti van Trading" via one insertion.
-        assert_eq!(rank_candidate("vann", None, "Kosti van Trading"), Some(4));
-    }
-
-    #[test]
-    fn rank_candidate_none_when_nothing_matches() {
-        assert_eq!(rank_candidate("zzzzzzzzzz", Some("kosti"), "Someone Else"), None);
-    }
-
-    #[test]
-    fn rank_candidate_handles_empty_and_unicode_inputs() {
-        assert_eq!(rank_candidate("", Some(""), ""), Some(0));
-        assert_eq!(rank_candidate("über", Some("Über"), "Someone Else"), Some(0));
     }
 }

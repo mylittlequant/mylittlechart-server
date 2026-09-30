@@ -120,15 +120,18 @@ mod build_attest;
 mod db;
 mod dm_db;
 mod entitlements;
-// `live` and `share_hub` live in the library target (`lib.rs`), not here —
-// see that file's doc comment for why. `share_live` below is the glue that
-// binds the hub to this crate's accounts and share rights.
+mod matrix_migration;
+// `live`, `share_hub`, `matrix_store` and `matrix_keys_store` live in the
+// library target (`lib.rs`), not here — see that file's doc comment for why.
+// `share_live` below is the glue that binds the hub to this crate's accounts
+// and share rights.
 mod models;
 mod nick_policy;
 mod notify;
 mod opswriter;
 mod pathutil;
 mod ratelimit;
+mod recipient_search;
 mod rooms_codec;
 mod routes;
 mod share_live;
@@ -686,6 +689,53 @@ async fn main() {
             };
             tracing::info!("Social database initialized at {}", social_db_path);
 
+            // Initialize the messenger database (SQLCipher, same key, separate
+            // file — Matrix Client-Server API subset, see
+            // `docs/mlc/plans/messenger-proto-server-matrix-subset-2026-09-24.md`
+            // §6.2). `init_messenger_db` creates both schema halves (rooms/
+            // events/state and devices/keys/backup); no migration call yet
+            // (P12/P14) and no router mounted on it beyond `/_matrix/client/
+            // versions` and its `M_UNRECOGNIZED` fallback (see
+            // `routes::matrix_api_router`, nested further down).
+            let messenger_db_path = format!("{}/messenger.db", data_dir);
+            let mut messenger_conn =
+                match mylittlechart_server::matrix_store::init_messenger_db(&messenger_db_path, &key_hex) {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        tracing::error!("Failed to initialize messenger database at {}: {}", messenger_db_path, e);
+                        std::process::exit(1);
+                    }
+                };
+            tracing::info!("Messenger database initialized at {}", messenger_db_path);
+
+            // Legacy 1:1 DM migration (P12, plan §7) — boot-time, idempotent:
+            // reads `social.db`'s `dm_conversations`/`dm_messages`/
+            // `dm_identity_keys` (never writes to them) and creates the
+            // Matrix DM rooms/events/receipts/`m.direct` hints they are
+            // missing. Runs BEFORE `ControlPlane` exists, on the plain
+            // connections above, same as every other one-time boot migration
+            // in this file (`db::migrate_legacy_ops_tables`). A failure
+            // reading the conversation list itself is fatal (mirrors every
+            // other `init_*_db` failure above); a failure migrating any ONE
+            // conversation is logged by `migrate_legacy_dms` itself and does
+            // not stop boot.
+            let migration_now = chrono::Utc::now().to_rfc3339();
+            match matrix_migration::migrate_legacy_dms(&mut messenger_conn, &social_conn, &db_conn, &migration_now) {
+                Ok(report) => {
+                    if report.conversations_skipped > 0 {
+                        tracing::warn!(
+                            "Legacy DM migration skipped {} conversation(s): {:?}",
+                            report.conversations_skipped,
+                            report.skipped
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Legacy DM migration failed to read social.db: {}", e);
+                    std::process::exit(1);
+                }
+            }
+
             // Initialize the operational database (plain SQLite, no key wait —
             // see state::ControlPlane::ops_db). Then run the one-time move of
             // `devices`/`releases` out of identity, if their identity copies
@@ -787,6 +837,7 @@ async fn main() {
             let control_plane = state::ControlPlane {
                 db: Mutex::new(db_conn),
                 social: Mutex::new(social_conn),
+                messenger: Mutex::new(messenger_conn),
                 ops_db: Mutex::new(ops_conn),
                 ops_writer,
                 sync_store: crate::syncstore::SyncStore::new(
@@ -796,10 +847,18 @@ async fn main() {
                 data_dir: std::path::PathBuf::from(&data_dir),
                 reserved_nick_cache: std::sync::RwLock::new(reserved_nick_cache_entries),
                 live: mylittlechart_server::live::LiveRegistry::new(),
+                // Seeded from wall-clock milliseconds, not `TypingRegistry::new()`'s
+                // zero start — see `TypingRegistry::with_seed`'s own doc: this is
+                // what keeps a `/sync` token minted before THIS restart always
+                // comparing as strictly behind anything the fresh registry can
+                // ever assign, so a typing change is never under-reported right
+                // after a restart.
+                typing: mylittlechart_server::live::TypingRegistry::with_seed(chrono::Utc::now().timestamp_millis().max(0) as u64),
+                matrix_claim_rate_limiter: mylittlechart_server::live::ClaimRateLimiter::new(),
             };
             tracing::info!(
-                "Live event registry ready ({} topic(s))",
-                control_plane.live.topic_count()
+                "Live event registry ready ({} key(s))",
+                control_plane.live.key_count()
             );
             Some(control_plane)
         }
@@ -843,6 +902,27 @@ async fn main() {
     // re-check) — control role only: the hub's rights live in the database.
     if role == state::ServerRole::Control {
         share_live::spawn_hub_tasks(app_state.clone(), shutdown_tx.subscribe());
+    }
+
+    // One-shot Matrix device reap at boot (control role only) — devices
+    // whose credential is already gone or expired (e.g. from before this
+    // feature existed, or from a revoke path that does not go through
+    // `routes::matrix::auth::on_credential_revoked` directly, such as
+    // `routes::agent_keys::revoke_key`) get cleaned up immediately rather
+    // than waiting for the first `/_matrix/*` call that happens to touch
+    // them. The recurring hourly sweep is P14's job (plan §1.1, manager
+    // decision 3) — this is only the boot half.
+    if role == state::ServerRole::Control {
+        let cp = app_state.control_plane();
+        let now = chrono::Utc::now().to_rfc3339();
+        let identity_conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+        let mut messenger_conn = cp.messenger_conn();
+        let reaped = routes::matrix::auth::reap_expired_devices(&identity_conn, &mut messenger_conn, &cp.live, &now);
+        drop(messenger_conn);
+        drop(identity_conn);
+        if reaped > 0 {
+            tracing::info!("Reaped {} Matrix device(s) with a gone or expired credential at boot", reaped);
+        }
     }
 
     // Start the Telegram login bot (background task) — control role only.
@@ -965,6 +1045,69 @@ async fn main() {
         });
     }
 
+    // Matrix background sweeps (P14, final cadences — plan §1.1 manager
+    // decision 3 and §3.6): two independent periodic tasks, each control
+    // role only (both reach into `ControlPlane`), each logging ONLY when it
+    // actually changed something (a line per tick would be pure noise for an
+    // idle server — this codebase's own "log state changes, not ticks"
+    // convention, matched by the 12-hour cleanup task above).
+    //
+    // - Typing expiry, every 5s (`routes::matrix::ephemeral::
+    //   wake_rooms_with_expired_typing`, plan §3.6): a client's own typing
+    //   timeout is commonly a few seconds, so anything slower would leave a
+    //   stale "still typing" indicator visible to peers well past when the
+    //   typer actually stopped. Cheap regardless of cadence — it only
+    //   touches the in-memory `TypingRegistry`, no database read.
+    // - Expired-device reap, hourly (`routes::matrix::auth::
+    //   reap_expired_devices`, plan §1.1 manager decision 3): the boot-time
+    //   reap above only catches a credential that was ALREADY gone or
+    //   expired at startup; this is the backstop for one that ages past its
+    //   own `expires_at` mid-run without its holder ever making another
+    //   `/_matrix/*` call to trigger `resolve_bearer_credential`'s/
+    //   `resolve_web_credential`'s own opportunistic revoke on next use. An
+    //   hour is coarse on purpose (unlike typing, a stale device only costs
+    //   peers a wasted Megolm share until the next sweep, not a visibly
+    //   wrong UI state), and it does a real database scan
+    //   (`valid_bearer_token_hashes`/`valid_web_credential_refs` against
+    //   every device row), so a tighter interval would just be needless
+    //   load for no user-visible benefit.
+    if role == state::ServerRole::Control {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                routes::matrix::ephemeral::wake_rooms_with_expired_typing(&state, std::time::Instant::now()).await;
+            }
+        });
+    }
+    if role == state::ServerRole::Control {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+            // The boot-time reap above already ran once; skip `interval`'s
+            // own immediate first tick so this task's first real sweep
+            // lands an hour later, not right away.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let state = state.clone();
+                let reaped = tokio::task::spawn_blocking(move || {
+                    let cp = state.control_plane();
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let identity_conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut messenger_conn = cp.messenger_conn();
+                    routes::matrix::auth::reap_expired_devices(&identity_conn, &mut messenger_conn, &cp.live, &now)
+                })
+                .await
+                .unwrap_or(0);
+                if reaped > 0 {
+                    tracing::info!("Matrix device reap (hourly sweep): {} device(s) with a gone or expired credential", reaped);
+                }
+            }
+        });
+    }
+
     // CORS allowlist. The site and API are same-origin, so first-party
     // browser flows never need CORS (OAuth callbacks are top-level
     // navigations, not fetch; the desktop client is not a browser and sends
@@ -1074,6 +1217,19 @@ async fn main() {
         .route("/health", axum::routing::get(health_handler))
         .with_state(app_state.clone());
 
+    // Matrix Client-Server API subset under `/_matrix` — control role only
+    // (see `routes::matrix`'s module doc; an edge process holds no
+    // `ControlPlane` to resolve a caller or a room against). Carries the
+    // full plan §4 endpoint table (P4-P13 landed it); P14's own job here is
+    // only the boot wiring below — layering it with the SAME
+    // `ratelimit`/`no_store_api_headers` pair `api_router` gets (plan §6.2),
+    // so `/_matrix/*` is neither unthrottled per-IP nor cacheable by an
+    // intermediary, the same invariant `/api/*` already holds. Cloned ahead
+    // of the `api_router` match below, which otherwise consumes `app_state`
+    // by value.
+    let matrix_router =
+        (role == state::ServerRole::Control).then(|| routes::matrix_api_router(app_state.clone()));
+
     // `/` as its own tiny state-carrying router (see `root_or_share_og`) —
     // built ahead of the `/api` router below for the same reason
     // `health_app` is: that router consumes `app_state` by value. Registered
@@ -1112,18 +1268,33 @@ async fn main() {
     // does: without this ordering, a rate-limited response would skip
     // `no_store_api_headers` entirely and reach the caller without
     // `cache-control: no-store` — the one thing this ordering exists to
-    // prevent.
+    // prevent. `matrix_router` shares this SAME limiter (one per-IP bucket
+    // set across both `/api` and `/_matrix`, not two independent ones — both
+    // surfaces answer the same caller population) and gets the identical
+    // two-layer stack, same ordering, for the same reason.
     let api_router = api_router
         .layer(axum::middleware::from_fn_with_state(
-            rate_limiter,
+            rate_limiter.clone(),
             ratelimit::rate_limit_middleware,
         ))
         .layer(axum::middleware::from_fn(no_store_api_headers));
+    let matrix_router = matrix_router.map(|router| {
+        router
+            .layer(axum::middleware::from_fn_with_state(
+                rate_limiter,
+                ratelimit::rate_limit_middleware,
+            ))
+            .layer(axum::middleware::from_fn(no_store_api_headers))
+    });
     // `/` (see `root_or_share_og`'s doc comment) merges in alongside
     // `blog_app`/`health_app`/`outside_api` below — ahead of the static
     // fallback so the deleted landing page's index.html, if it is ever
     // restored on disk by mistake, still cannot answer here.
     let app = axum::Router::new().merge(root_app).nest("/api", api_router);
+    let app = match matrix_router {
+        Some(matrix_router) => app.nest("/_matrix", matrix_router),
+        None => app,
+    };
     // Literal routes (`/blog/posts.json`, `/blog/feed.xml`, `/blog/`, and
     // `/health` below) always win over `outside_api`'s `/{dir}/{page}`
     // parameter route and its `ServeDir` fallback regardless of merge order

@@ -6236,6 +6236,54 @@ pub fn revoke_key(
     }
 }
 
+/// The full `token_hash` a [`revoke_key`]-style prefix match resolves to, if
+/// unique — used by `routes::sessions::revoke_session` to identify which
+/// Matrix device this credential minted
+/// (`matrix_keys_store::devices.credential_ref`, see
+/// `docs/mlc/plans/messenger-proto-server-matrix-subset-2026-09-24.md` §1.1)
+/// BEFORE the row disappears, so `routes::matrix::auth::on_credential_revoked`
+/// can find it after the delete goes through. Same LIKE-prefix semantics as
+/// [`revoke_key`] (an ambiguous or absent prefix both return `None` here —
+/// the caller's own `revoke_key` call is what reports the ambiguous/not-found
+/// outcome to the HTTP layer; this function is only ever acted on when that
+/// call separately reports `DeleteKeyOutcome::Ok`).
+pub fn token_hash_for_prefix(conn: &Connection, user_id: i64, hash_prefix: &str) -> Result<Option<String>> {
+    let escaped = hash_prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let like_pattern = format!("{}%", escaped);
+    conn.query_row(
+        "SELECT token_hash FROM auth_tokens WHERE user_id = ?1 AND token_hash LIKE ?2 ESCAPE '\\'",
+        params![user_id, like_pattern],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Every `auth_tokens.token_hash` belonging to `user_id`, regardless of
+/// expiry — used by `routes::sessions::delete_account` to revoke every
+/// Matrix device the account's credentials ever minted BEFORE the
+/// identity-side delete removes these rows (plan §1.1). Unlike
+/// [`list_sessions_for_user`], this returns the full hash (never shown to a
+/// caller) and every row, expired or not — an expired token's device still
+/// deserves its own `on_credential_revoked` pass.
+pub fn all_token_hashes_for_user(conn: &Connection, user_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT token_hash FROM auth_tokens WHERE user_id = ?1")?;
+    let rows = stmt.query_map(params![user_id], |row| row.get(0))?;
+    rows.collect()
+}
+
+/// Every `web_sessions.session_id` belonging to `user_id`, regardless of
+/// expiry — same "full value, every row" contract as
+/// [`all_token_hashes_for_user`], for the web-credential half of the same
+/// `delete_account` sweep.
+pub fn all_web_session_ids_for_user(conn: &Connection, user_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT session_id FROM web_sessions WHERE user_id = ?1")?;
+    let rows = stmt.query_map(params![user_id], |row| row.get(0))?;
+    rows.collect()
+}
+
 /// Update `last_used_at` and `last_ip` for multiple keys identified by hash prefix.
 ///
 /// Each entry in `updates` is `(hash_prefix, last_ip)`. The function matches rows
@@ -7882,8 +7930,84 @@ pub fn forum_author_label(conn: &Connection, user_id: i64) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Connection, db_key_hex};
+    use super::{Connection, db_key_hex, params};
     use mylittlechart_server::share_hub::Access;
+
+    /// A bare `auth_tokens`/`web_sessions` pair — just enough schema for
+    /// [`super::token_hash_for_prefix`]/[`super::all_token_hashes_for_user`]/
+    /// [`super::all_web_session_ids_for_user`], which never touch any other
+    /// table.
+    fn credential_lookup_test_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "
+            CREATE TABLE auth_tokens (
+                token_hash TEXT PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT
+            );
+            CREATE TABLE web_sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            ",
+        )
+        .expect("test schema");
+        conn
+    }
+
+    #[test]
+    fn token_hash_for_prefix_finds_the_unique_match() {
+        let conn = credential_lookup_test_conn();
+        conn.execute(
+            "INSERT INTO auth_tokens (token_hash, user_id, created_at) VALUES ('abcdef0123456789', 7, 't')",
+            [],
+        )
+        .expect("insert token");
+
+        assert_eq!(
+            super::token_hash_for_prefix(&conn, 7, "abcdef01").expect("lookup"),
+            Some("abcdef0123456789".to_string())
+        );
+        assert_eq!(super::token_hash_for_prefix(&conn, 7, "zzzzzzzz").expect("lookup"), None);
+        assert_eq!(
+            super::token_hash_for_prefix(&conn, 99, "abcdef01").expect("lookup"),
+            None,
+            "a matching prefix under a different user_id must not resolve"
+        );
+    }
+
+    #[test]
+    fn all_token_hashes_and_web_session_ids_list_every_row_for_a_user() {
+        let conn = credential_lookup_test_conn();
+        conn.execute(
+            "INSERT INTO auth_tokens (token_hash, user_id, created_at, expires_at) VALUES
+                ('h1', 1, 't', NULL),
+                ('h2', 1, 't', '2020-01-01T00:00:00+00:00'),
+                ('h3', 2, 't', NULL)",
+            params![],
+        )
+        .expect("insert tokens");
+        conn.execute(
+            "INSERT INTO web_sessions (session_id, user_id, created_at, expires_at) VALUES
+                ('s1', 1, 't', '2099-01-01T00:00:00+00:00')",
+            params![],
+        )
+        .expect("insert session");
+
+        let mut hashes = super::all_token_hashes_for_user(&conn, 1).expect("hashes");
+        hashes.sort();
+        assert_eq!(hashes, vec!["h1".to_string(), "h2".to_string()], "expired rows are still listed");
+
+        let sessions = super::all_web_session_ids_for_user(&conn, 1).expect("sessions");
+        assert_eq!(sessions, vec!["s1".to_string()]);
+
+        assert_eq!(super::all_token_hashes_for_user(&conn, 2).expect("hashes"), vec!["h3".to_string()]);
+        assert!(super::all_web_session_ids_for_user(&conn, 2).expect("sessions").is_empty());
+    }
 
     #[test]
     fn db_key_hex_parses_hex_raw_and_whitespace() {

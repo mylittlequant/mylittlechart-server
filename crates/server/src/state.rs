@@ -91,6 +91,17 @@ pub struct ControlPlane {
     /// blocking-mutex idiom as `db` — reach it through [`ControlPlane::social_conn`].
     pub social: Mutex<rusqlite::Connection>,
 
+    /// Matrix-shaped messenger connection: `messenger.db`, the Matrix
+    /// Client-Server API subset's own store (rooms/events/state/members —
+    /// `mylittlechart_server::matrix_store` — plus devices/keys/backup —
+    /// `mylittlechart_server::matrix_keys_store`). Same key as `db`/`social`
+    /// above, its own file, opened by `matrix_store::init_messenger_db` right
+    /// after `social` in `main.rs` — see
+    /// `docs/mlc/plans/messenger-proto-server-matrix-subset-2026-09-24.md`
+    /// §6.2. One writer, same blocking-mutex idiom as `db`/`social` — reach
+    /// it through [`ControlPlane::messenger_conn`].
+    pub messenger: Mutex<rusqlite::Connection>,
+
     /// The only writer for the operational database, running on its own OS
     /// thread (see `opswriter.rs`).
     ///
@@ -144,6 +155,24 @@ pub struct ControlPlane {
     /// Constructed once at boot next to `reserved_nick_cache`; no SSE
     /// handler mounts on it yet (that is a later piece).
     pub live: mylittlechart_server::live::LiveRegistry,
+
+    /// In-memory typing-indicator state for the Matrix messenger (plan §3.6)
+    /// — see `mylittlechart_server::live::TypingRegistry`'s own module doc
+    /// for why this is the one ephemeral fact never written to
+    /// `messenger.db`. Constructed once at boot next to `live`, which every
+    /// `routes::matrix::ephemeral` write reaches through the SAME
+    /// `ControlPlane`, so a typing change and its `LiveRegistry` wake always
+    /// see the same in-process state regardless of which request handled
+    /// the write.
+    pub typing: mylittlechart_server::live::TypingRegistry,
+
+    /// Per-caller rate limiter for `POST /_matrix/client/v3/keys/claim`
+    /// (plan P9 brief: "≤ 100 device claims / minute per caller") — see
+    /// `mylittlechart_server::live::ClaimRateLimiter`'s own doc for why this
+    /// is a separate, per-user bucket rather than a reuse of the per-IP
+    /// `ratelimit::RateLimiter`. Constructed once at boot next to
+    /// `live`/`typing`.
+    pub matrix_claim_rate_limiter: mylittlechart_server::live::ClaimRateLimiter,
 }
 
 impl ControlPlane {
@@ -153,6 +182,14 @@ impl ControlPlane {
     /// every call site.
     pub fn social_conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         self.social.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lock and return the messenger connection (see the `messenger` field's
+    /// doc comment) — the accessor `routes::matrix::*` uses instead of
+    /// spelling out `.messenger.lock().unwrap_or_else(|e| e.into_inner())` at
+    /// every call site.
+    pub fn messenger_conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.messenger.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A cloned snapshot of the reserved-nick cache (see the field's doc

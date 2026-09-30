@@ -45,6 +45,7 @@ pub mod forum_v2;
 pub mod groups;
 pub mod heartbeat;
 pub mod link;
+pub mod matrix;
 pub mod notify;
 pub mod oauth;
 pub mod posts;
@@ -290,6 +291,10 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
             get(dm::list_messages).post(dm::create_message),
         )
         .route("/dm/conversations/{id}/read", post(dm::mark_read))
+        // Matrix messenger — site moderation lever (P11, outside `/_matrix`;
+        // see routes/matrix/moderation.rs's module doc for the gate and why
+        // it lives here rather than in `matrix_api_router`).
+        .merge(matrix::moderation::routes())
         .with_state(state)
 }
 
@@ -432,6 +437,16 @@ pub fn admin_api_router(state: Arc<AppState>) -> Router {
 /// db-shaped hole opened today.
 pub fn edge_api_router(_state: Arc<AppState>) -> Router {
     Router::new().route("/proxy/entitlement", get(proxy::entitlement))
+}
+
+/// Build the `/_matrix` sub-router for a control-role process — the Matrix
+/// Client-Server API subset (see `routes::matrix`'s module doc and
+/// `docs/mlc/plans/messenger-proto-server-matrix-subset-2026-09-24.md`).
+/// Mounted as `.nest("/_matrix", …)` in `main.rs`, a sibling of
+/// `.nest("/api", …)` — never called for an edge-role process, which holds
+/// no `ControlPlane` to resolve a caller or a room against.
+pub fn matrix_api_router(state: Arc<AppState>) -> Router {
+    matrix::router(state)
 }
 
 #[cfg(test)]

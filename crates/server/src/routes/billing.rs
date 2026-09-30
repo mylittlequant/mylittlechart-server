@@ -603,6 +603,9 @@ pub(crate) mod tests {
         crate::state::ControlPlane {
             db: Mutex::new(crate::db::init_db(":memory:", &key).expect("identity db")),
             social: Mutex::new(crate::social_db::init_social_db(":memory:", &key).expect("social db")),
+            messenger: Mutex::new(
+                mylittlechart_server::matrix_store::init_messenger_db(":memory:", &key).expect("messenger db"),
+            ),
             ops_db: Mutex::new(crate::db::init_ops_db(":memory:").expect("ops db")),
             ops_writer: crate::opswriter::OpsWriter::spawn(
                 rusqlite::Connection::open_in_memory().expect("ops writer db"),
@@ -613,6 +616,8 @@ pub(crate) mod tests {
             data_dir: dir,
             reserved_nick_cache: std::sync::RwLock::new(Vec::new()),
             live: mylittlechart_server::live::LiveRegistry::new(),
+            typing: mylittlechart_server::live::TypingRegistry::new(),
+            matrix_claim_rate_limiter: mylittlechart_server::live::ClaimRateLimiter::new(),
         }
     }
 

@@ -271,6 +271,7 @@ mod tests {
             db: Mutex::new(identity),
             ops_db: Mutex::new(rusqlite::Connection::open_in_memory().expect("ops db")),
             social: Mutex::new(rusqlite::Connection::open_in_memory().expect("social db")),
+            messenger: Mutex::new(rusqlite::Connection::open_in_memory().expect("messenger db")),
             ops_writer: crate::opswriter::OpsWriter::spawn(
                 rusqlite::Connection::open_in_memory().expect("ops writer db"),
                 8,
@@ -280,6 +281,8 @@ mod tests {
             data_dir: scratch,
             reserved_nick_cache: std::sync::RwLock::new(Vec::new()),
             live: mylittlechart_server::live::LiveRegistry::new(),
+            typing: mylittlechart_server::live::TypingRegistry::new(),
+            matrix_claim_rate_limiter: mylittlechart_server::live::ClaimRateLimiter::new(),
         };
         let state = Arc::new(AppState::new(
             Some(control_plane),
