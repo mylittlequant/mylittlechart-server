@@ -374,8 +374,10 @@ pub async fn resolve_matrix_caller(headers: &HeaderMap, state: &Arc<AppState>) -
 ///
 /// Call sites: `routes::sessions::revoke_session` (a UI session revoke),
 /// `routes::device_auth::logout` (cookie logout), and
-/// `routes::sessions::delete_account` (once per credential the account ever
-/// held, before the identity-side delete runs) — plus this module's own
+/// `routes::sessions::delete_account` and the anonymous-account deletions in
+/// `billing::anon` (once per credential the account ever held, through
+/// [`revoke_all_devices_of_user`], before the identity-side delete runs) —
+/// plus this module's own
 /// [`resolve_bearer_credential`]/[`resolve_web_credential`] (an
 /// opportunistic revoke on first use of an expired credential) and
 /// [`reap_expired_devices`] (the periodic backstop for every other deletion
@@ -402,6 +404,52 @@ pub fn on_credential_revoked(
 
     live.wake_many(wake_user_ids.into_iter().map(|id| format!("user:{id}")));
     Ok(())
+}
+
+/// Strip every Matrix device that any credential `user_id` ever held minted,
+/// running [`on_credential_revoked`] once per bearer token and per web
+/// session. Must run BEFORE the identity-side delete removes the
+/// `auth_tokens`/`web_sessions` rows: once they are gone there is nothing
+/// left to enumerate. Every account-deletion path calls this
+/// (`routes::sessions::delete_account`, and the anonymous-account deletions
+/// in `billing::anon`), so a deleted account's devices and sessions end at
+/// once instead of at the next [`reap_expired_devices`] sweep.
+///
+/// Takes both connections, so the caller holds the identity lock first
+/// (identity THEN messenger, this module's lock order). A failure on one
+/// credential is logged and skipped: the delete that follows must not be
+/// blocked by a messenger-side hiccup, and the reaper is the backstop for
+/// whatever was left behind.
+pub fn revoke_all_devices_of_user(
+    identity_conn: &Connection,
+    messenger_conn: &mut Connection,
+    live: &live::LiveRegistry,
+    user_id: i64,
+    now: &str,
+) {
+    match db::all_token_hashes_for_user(identity_conn, user_id) {
+        Ok(hashes) => {
+            for token_hash in hashes {
+                if let Err(e) = on_credential_revoked(messenger_conn, live, CredentialKind::Bearer, &token_hash, now) {
+                    tracing::error!("Failed to revoke a Matrix device before account delete: {}", e);
+                }
+            }
+        }
+        Err(e) => tracing::error!("Failed to list bearer credentials before account delete: {}", e),
+    }
+    match db::all_web_session_ids_for_user(identity_conn, user_id) {
+        Ok(ids) => {
+            for session_id in ids {
+                // messenger.db never holds a raw session id at rest (manager
+                // review, 2026-09-24) — hash it the same way the device row does.
+                let credential_ref = web_credential_ref(&session_id);
+                if let Err(e) = on_credential_revoked(messenger_conn, live, CredentialKind::Web, &credential_ref, now) {
+                    tracing::error!("Failed to revoke a Matrix device before account delete: {}", e);
+                }
+            }
+        }
+        Err(e) => tracing::error!("Failed to list web-session credentials before account delete: {}", e),
+    }
 }
 
 // ============================================================================

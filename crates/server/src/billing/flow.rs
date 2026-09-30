@@ -73,6 +73,28 @@ where
     .map_err(|e| FlowError::Db(e.to_string()))
 }
 
+/// [`with_db`] plus the messenger connection and its wake registry, for work
+/// that deletes an account and so has to strip its Matrix devices too. The
+/// identity lock is taken first, then the messenger lock (the lock order).
+async fn with_db_and_messenger<T, F>(state: &Arc<AppState>, work: F) -> Result<T, FlowError>
+where
+    T: Send + 'static,
+    F: FnOnce(&Connection, &mut Connection, &mylittlechart_server::live::LiveRegistry) -> rusqlite::Result<T>
+        + Send
+        + 'static,
+{
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let cp = state.control_plane();
+        let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+        let mut messenger = cp.messenger_conn();
+        work(&conn, &mut messenger, &cp.live)
+    })
+    .await
+    .map_err(|_| FlowError::Db("database task failed".to_string()))?
+    .map_err(|e| FlowError::Db(e.to_string()))
+}
+
 /// dig2pay answers 404 for a plan it does not have (yet) — the one-time
 /// account plans are created on the processor separately from MLC's catalog.
 fn processor_error(e: GatewayError) -> FlowError {
@@ -252,7 +274,7 @@ pub async fn anon_checkout(state: &Arc<AppState>, plan_id: &str, onion: bool) ->
     match checkout_for(state, user_id, plan_id, onion, true).await {
         Ok(view) => Ok(AnonCheckoutView { account_key: key.reveal(), invoice_id: view.invoice_id, pay: view.pay }),
         Err(e) => {
-            if let Err(cleanup) = with_db(state, move |conn| anon::discard_unfinished(conn, user_id)).await {
+            if let Err(cleanup) = with_db_and_messenger(state, move |conn, messenger, live| anon::discard_unfinished(conn, messenger, live, user_id)).await {
                 tracing::warn!("billing: could not discard the unfinished anonymous account {user_id}: {cleanup:?}");
             }
             Err(e)

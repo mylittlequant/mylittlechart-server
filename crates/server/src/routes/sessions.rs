@@ -394,44 +394,17 @@ pub async fn delete_account(
         let cp = state.control_plane();
 
         // Strip every Matrix device this account's credentials ever minted
-        // BEFORE the identity-side delete below removes the
+        // BEFORE the identity-side delete removes the
         // `auth_tokens`/`web_sessions` rows (plan §1.1) — once those rows are
-        // gone, there is nothing left here to enumerate.
+        // gone, there is nothing left here to enumerate. Identity lock first,
+        // then messenger (the lock order), both held until the delete is done.
         let now = chrono::Utc::now().to_rfc3339();
-        let (bearer_hashes, web_session_ids) = {
-            let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
-            (crate::db::all_token_hashes_for_user(&conn, user_id), crate::db::all_web_session_ids_for_user(&conn, user_id))
-        };
-        {
-            let mut messenger = cp.messenger_conn();
-            match bearer_hashes {
-                Ok(hashes) => {
-                    for token_hash in hashes {
-                        if let Err(e) = crate::routes::matrix::auth::on_credential_revoked(&mut messenger, &cp.live, CredentialKind::Bearer, &token_hash, &now) {
-                            tracing::error!("Failed to revoke a Matrix device before account delete: {}", e);
-                        }
-                    }
-                }
-                Err(e) => tracing::error!("Failed to list bearer credentials before account delete: {}", e),
-            }
-            match web_session_ids {
-                Ok(ids) => {
-                    for session_id in ids {
-                        // messenger.db never holds a raw session id at rest
-                        // (manager review, 2026-09-24) — hash it the same
-                        // way `on_credential_revoked`'s own device row does.
-                        let credential_ref = crate::routes::matrix::auth::web_credential_ref(&session_id);
-                        if let Err(e) = crate::routes::matrix::auth::on_credential_revoked(&mut messenger, &cp.live, CredentialKind::Web, &credential_ref, &now) {
-                            tracing::error!("Failed to revoke a Matrix device before account delete: {}", e);
-                        }
-                    }
-                }
-                Err(e) => tracing::error!("Failed to list web-session credentials before account delete: {}", e),
-            }
-        }
-
         let outcome = {
             let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+            {
+                let mut messenger = cp.messenger_conn();
+                crate::routes::matrix::auth::revoke_all_devices_of_user(&conn, &mut messenger, &cp.live, user_id, &now);
+            }
             crate::db::delete_account(&conn, user_id)
         };
         // The account row lives in identity; its telemetry lives in the

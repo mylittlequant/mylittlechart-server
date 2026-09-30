@@ -694,8 +694,10 @@ mod tests {
             .execute("UPDATE billing_invoices SET expires_at = ?1", [long_ago.as_str()])
             .expect("age the invoice");
         let report = {
-            let conn = state.control_plane().db.lock().expect("db");
-            anon::gc_pending(&conn, Utc::now()).expect("gc")
+            let cp = state.control_plane();
+            let conn = cp.db.lock().expect("db");
+            let mut messenger = cp.messenger_conn();
+            anon::gc_pending(&conn, &mut messenger, &cp.live, Utc::now()).expect("gc")
         };
         assert_eq!(report.deleted, 1);
         assert_eq!(count(&state, "SELECT COUNT(*) FROM users WHERE provider = 'anon'"), 0);
@@ -721,8 +723,10 @@ mod tests {
         let long_ago = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
         state.control_plane().db.lock().expect("db").execute("UPDATE billing_invoices SET expires_at = ?1", [long_ago.as_str()]).expect("age");
         let report = {
-            let conn = state.control_plane().db.lock().expect("db");
-            anon::gc_pending(&conn, Utc::now()).expect("gc")
+            let cp = state.control_plane();
+            let conn = cp.db.lock().expect("db");
+            let mut messenger = cp.messenger_conn();
+            anon::gc_pending(&conn, &mut messenger, &cp.live, Utc::now()).expect("gc")
         };
         assert_eq!(report.deleted, 0);
         let (status, _, _) = key_sign_in(&router, IP_B, &key).await;

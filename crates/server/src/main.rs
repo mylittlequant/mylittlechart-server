@@ -995,7 +995,12 @@ async fn main() {
                     // Anonymous accounts bought but never paid for: deleted
                     // once their invoice has been expired for a day (one
                     // with money attached is kept for a human).
-                    match crate::billing::anon::gc_pending(&conn, chrono::Utc::now()) {
+                    // Identity lock (`conn`) is held, so the messenger lock
+                    // is taken after it — the lock order.
+                    let mut messenger_conn = cp.messenger_conn();
+                    let gc_result = crate::billing::anon::gc_pending(&conn, &mut messenger_conn, &cp.live, chrono::Utc::now());
+                    drop(messenger_conn);
+                    match gc_result {
                         Ok(report) if report.deleted > 0 || report.kept_with_payment > 0 => tracing::info!(
                             "Anonymous account GC: {} unpaid deleted, {} kept because a payment is attached",
                             report.deleted,

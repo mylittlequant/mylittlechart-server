@@ -27,6 +27,7 @@
 //! that hands it to the buyer.
 
 use chrono::{DateTime, Duration, Utc};
+use mylittlechart_server::live::LiveRegistry;
 use rand::Rng;
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use sha2::{Digest, Sha256};
@@ -218,7 +219,14 @@ pub fn rotate_key(conn: &Connection, user_id: i64, new_key: &AccountKey, now: Da
 /// Delete an anonymous account and every billing row that hangs off it
 /// (subscriptions, invoices, the dig2pay customer mapping, the key). Grants
 /// and payment events are left: they are records, not state.
-fn delete_account(conn: &Connection, user_id: i64) -> Result<()> {
+///
+/// The account's Matrix devices go first, through the same hook every other
+/// credential deletion uses (`revoke_all_devices_of_user`), because the
+/// identity-side delete below removes the token and session rows that hook
+/// enumerates. `conn` is the identity connection, already locked by the
+/// caller; `messenger` is locked after it (identity THEN messenger).
+fn delete_account(conn: &Connection, messenger: &mut Connection, live: &LiveRegistry, user_id: i64) -> Result<()> {
+    crate::routes::matrix::auth::revoke_all_devices_of_user(conn, messenger, live, user_id, &Utc::now().to_rfc3339());
     for table in ["billing_subscriptions", "billing_invoices", "billing_subscribers", "billing_anon_accounts"] {
         conn.execute(&format!("DELETE FROM {table} WHERE user_id = ?1"), params![user_id])?;
     }
@@ -229,7 +237,9 @@ fn delete_account(conn: &Connection, user_id: i64) -> Result<()> {
 /// Roll back an anonymous checkout that never produced an invoice (dig2pay
 /// refused or was unreachable). Only ever removes a PENDING account with no
 /// invoice, so it cannot touch one a payer already holds an address for.
-pub fn discard_unfinished(conn: &Connection, user_id: i64) -> Result<bool> {
+/// `messenger` and `live` are the Matrix side of the deletion (see
+/// [`delete_account`]).
+pub fn discard_unfinished(conn: &Connection, messenger: &mut Connection, live: &LiveRegistry, user_id: i64) -> Result<bool> {
     let pending = status_of(conn, user_id)? == Some(AccountStatus::Pending);
     let invoices: i64 = conn.query_row(
         "SELECT COUNT(*) FROM billing_invoices WHERE user_id = ?1",
@@ -239,7 +249,7 @@ pub fn discard_unfinished(conn: &Connection, user_id: i64) -> Result<bool> {
     if !pending || invoices > 0 {
         return Ok(false);
     }
-    delete_account(conn, user_id)?;
+    delete_account(conn, messenger, live, user_id)?;
     Ok(true)
 }
 
@@ -258,7 +268,9 @@ pub struct GcReport {
 /// measured from its creation), together with their billing rows. Also drops
 /// key rows whose user is gone. A pending account whose invoice carries a
 /// payment flag (partial, over, funds pending, late) or any grant is KEPT.
-pub fn gc_pending(conn: &Connection, now: DateTime<Utc>) -> Result<GcReport> {
+/// `messenger` and `live` are the Matrix side of each deletion (see
+/// [`delete_account`]).
+pub fn gc_pending(conn: &Connection, messenger: &mut Connection, live: &LiveRegistry, now: DateTime<Utc>) -> Result<GcReport> {
     let mut report = GcReport::default();
     let pending: Vec<(i64, String)> = {
         let mut stmt =
@@ -285,7 +297,7 @@ pub fn gc_pending(conn: &Connection, now: DateTime<Utc>) -> Result<GcReport> {
             .max()
             .or_else(|| DateTime::parse_from_rfc3339(&created_at).ok().map(|t| t.with_timezone(&Utc)));
         if expiry.is_some_and(|t| t + GC_GRACE < now) {
-            delete_account(conn, user_id)?;
+            delete_account(conn, messenger, live, user_id)?;
             report.deleted += 1;
         }
     }
@@ -300,7 +312,7 @@ pub fn gc_pending(conn: &Connection, now: DateTime<Utc>) -> Result<GcReport> {
 mod tests {
     use super::*;
     use crate::billing::store::{self, GrantState, InvoiceKind, InvoiceRow, INVOICE_NEW};
-    use crate::billing::testkit::{conn, seed_user};
+    use crate::billing::testkit::{conn, matrix_side, seed_user};
 
     fn invoice(user_id: i64, id: &str, expires: DateTime<Utc>) -> InvoiceRow {
         InvoiceRow {
@@ -462,11 +474,12 @@ mod tests {
     #[test]
     fn a_key_whose_user_is_gone_finds_nothing() {
         let conn = conn();
+        let (mut mx, live) = matrix_side();
         let key = AccountKey::generate();
         let uid = create_pending(&conn, &key, Utc::now()).expect("create");
         crate::db::delete_account(&conn, uid).expect("delete");
         assert!(find_by_key(&conn, &key).expect("find").is_none());
-        gc_pending(&conn, Utc::now()).expect("gc");
+        gc_pending(&conn, &mut mx, &live, Utc::now()).expect("gc");
         let rows: i64 = conn.query_row("SELECT COUNT(*) FROM billing_anon_accounts", [], |r| r.get(0)).expect("count");
         assert_eq!(rows, 0, "the dangling key row is swept");
     }
@@ -476,13 +489,14 @@ mod tests {
     #[test]
     fn gc_deletes_a_pending_account_a_day_after_its_invoice_expired_with_its_billing_rows() {
         let conn = conn();
+        let (mut mx, live) = matrix_side();
         let now = Utc::now();
         let expired = now - Duration::hours(25);
         let (key, uid) = pending_with_invoice(&conn, "old", expired, now - Duration::hours(30));
         let (fresh_key, fresh) = pending_with_invoice(&conn, "fresh", now + Duration::hours(1), now);
         let (recent_key, recent) = pending_with_invoice(&conn, "recent", now - Duration::hours(23), now - Duration::hours(24));
 
-        let report = gc_pending(&conn, now).expect("gc");
+        let report = gc_pending(&conn, &mut mx, &live, now).expect("gc");
         assert_eq!(report, GcReport { deleted: 1, kept_with_payment: 0 });
         assert!(!exists(&conn, uid));
         assert!(find_by_key(&conn, &key).expect("find").is_none());
@@ -493,29 +507,31 @@ mod tests {
         assert!(exists(&conn, fresh) && find_by_key(&conn, &fresh_key).expect("find").is_some(), "an unexpired invoice is kept");
         assert!(exists(&conn, recent) && find_by_key(&conn, &recent_key).expect("find").is_some(), "expired less than a day ago is kept");
         // A second pass finds nothing more to do.
-        assert_eq!(gc_pending(&conn, now).expect("gc").deleted, 0);
+        assert_eq!(gc_pending(&conn, &mut mx, &live, now).expect("gc").deleted, 0);
     }
 
     #[test]
     fn gc_never_touches_an_active_account_or_an_oauth_account() {
         let conn = conn();
+        let (mut mx, live) = matrix_side();
         let now = Utc::now();
         let (_, active) = pending_with_invoice(&conn, "paid", now - Duration::days(30), now - Duration::days(31));
         activate(&conn, active, now).expect("activate");
         let oauth = seed_user(&conn, "oauth");
-        gc_pending(&conn, now).expect("gc");
+        gc_pending(&conn, &mut mx, &live, now).expect("gc");
         assert!(exists(&conn, active) && exists(&conn, oauth));
     }
 
     #[test]
     fn gc_keeps_an_old_pending_account_that_has_money_attached() {
         let conn = conn();
+        let (mut mx, live) = matrix_side();
         let now = Utc::now();
         let (_, partial) = pending_with_invoice(&conn, "partial", now - Duration::days(3), now - Duration::days(4));
         conn.execute("UPDATE billing_invoices SET flags_json = '[\"partial\"]' WHERE user_id = ?1", params![partial]).expect("flag");
         let (_, granted) = pending_with_invoice(&conn, "granted", now - Duration::days(3), now - Duration::days(4));
         conn.execute("UPDATE billing_invoices SET grant_state = 'granted' WHERE user_id = ?1", params![granted]).expect("grant");
-        let report = gc_pending(&conn, now).expect("gc");
+        let report = gc_pending(&conn, &mut mx, &live, now).expect("gc");
         assert_eq!(report, GcReport { deleted: 0, kept_with_payment: 2 });
         assert!(exists(&conn, partial) && exists(&conn, granted));
     }
@@ -523,10 +539,11 @@ mod tests {
     #[test]
     fn gc_measures_an_account_without_an_invoice_from_its_creation() {
         let conn = conn();
+        let (mut mx, live) = matrix_side();
         let now = Utc::now();
         let old = create_pending(&conn, &AccountKey::generate(), now - Duration::hours(30)).expect("old");
         let young = create_pending(&conn, &AccountKey::generate(), now - Duration::hours(2)).expect("young");
-        assert_eq!(gc_pending(&conn, now).expect("gc").deleted, 1);
+        assert_eq!(gc_pending(&conn, &mut mx, &live, now).expect("gc").deleted, 1);
         assert!(!exists(&conn, old) && exists(&conn, young));
     }
 
@@ -535,9 +552,10 @@ mod tests {
         use crate::billing::plans::{AccountPlanIds, Catalog};
         use crate::billing::webhook::{process, Outcome};
         let conn = conn();
+        let (mut mx, live) = matrix_side();
         let now = Utc::now();
         let (_, uid) = pending_with_invoice(&conn, "late", now - Duration::hours(30), now - Duration::hours(40));
-        gc_pending(&conn, now).expect("gc");
+        gc_pending(&conn, &mut mx, &live, now).expect("gc");
         assert!(!exists(&conn, uid));
 
         let catalog = Catalog::build(&AccountPlanIds::default(), &std::collections::BTreeMap::new());
@@ -556,20 +574,53 @@ mod tests {
     }
 
     #[test]
+    fn deleting_an_account_strips_its_matrix_devices_at_once_and_only_its_own() {
+        use crate::routes::matrix::auth::web_credential_ref;
+        use mylittlechart_server::matrix_keys_store::{create_device, list_devices, CredentialKind};
+        let conn = conn();
+        let (mut mx, live) = matrix_side();
+        let now = Utc::now();
+        let stamp = now.to_rfc3339();
+        let (_, doomed) = pending_with_invoice(&conn, "doomed", now - Duration::hours(30), now - Duration::hours(40));
+        let (_, kept) = pending_with_invoice(&conn, "kept", now + Duration::hours(1), now);
+        for (uid, hash, session) in [(doomed, "hash-doomed", "sess-doomed"), (kept, "hash-kept", "sess-kept")] {
+            conn.execute(
+                "INSERT INTO auth_tokens (token_hash, user_id, created_at) VALUES (?1, ?2, ?3)",
+                params![hash, uid, stamp],
+            )
+            .expect("token");
+            conn.execute(
+                "INSERT INTO web_sessions (session_id, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params![session, uid, stamp, (now + Duration::days(1)).to_rfc3339()],
+            )
+            .expect("session");
+            create_device(&mx, uid, CredentialKind::Bearer, hash, &stamp).expect("bearer device");
+            create_device(&mx, uid, CredentialKind::Web, &web_credential_ref(session), &stamp).expect("web device");
+        }
+        assert_eq!(list_devices(&mx, doomed).expect("list").len(), 2);
+
+        assert_eq!(gc_pending(&conn, &mut mx, &live, now).expect("gc").deleted, 1);
+
+        assert!(list_devices(&mx, doomed).expect("list").is_empty(), "the deleted account's devices are gone at once");
+        assert_eq!(list_devices(&mx, kept).expect("list").len(), 2, "another account's devices stay");
+    }
+
+    #[test]
     fn discarding_an_unfinished_checkout_removes_only_a_pending_account_with_no_invoice() {
         let conn = conn();
+        let (mut mx, live) = matrix_side();
         let now = Utc::now();
         let key = AccountKey::generate();
         let unfinished = create_pending(&conn, &key, now).expect("create");
-        assert!(discard_unfinished(&conn, unfinished).expect("discard"));
+        assert!(discard_unfinished(&conn, &mut mx, &live, unfinished).expect("discard"));
         assert!(!exists(&conn, unfinished));
 
         let (_, with_invoice) = pending_with_invoice(&conn, "held", now + Duration::hours(1), now);
-        assert!(!discard_unfinished(&conn, with_invoice).expect("discard"), "a payer already holds an address for it");
+        assert!(!discard_unfinished(&conn, &mut mx, &live, with_invoice).expect("discard"), "a payer already holds an address for it");
         let active = create_pending(&conn, &AccountKey::generate(), now).expect("create");
         activate(&conn, active, now).expect("activate");
-        assert!(!discard_unfinished(&conn, active).expect("discard"));
-        assert!(!discard_unfinished(&conn, seed_user(&conn, "oauth")).expect("discard"));
+        assert!(!discard_unfinished(&conn, &mut mx, &live, active).expect("discard"));
+        assert!(!discard_unfinished(&conn, &mut mx, &live, seed_user(&conn, "oauth")).expect("discard"));
     }
 
     // ------------------------------------------- an account with no OAuth

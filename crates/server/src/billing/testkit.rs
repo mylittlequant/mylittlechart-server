@@ -11,6 +11,14 @@ pub fn conn() -> Connection {
     crate::db::init_db(":memory:", &"0".repeat(64)).expect("init identity test db")
 }
 
+/// A fresh in-memory messenger database and wake registry: the Matrix side
+/// the anonymous-account deletions strip an account's devices from.
+pub fn matrix_side() -> (Connection, mylittlechart_server::live::LiveRegistry) {
+    let messenger = mylittlechart_server::matrix_store::init_messenger_db(":memory:", &"0".repeat(64))
+        .expect("init messenger test db");
+    (messenger, mylittlechart_server::live::LiveRegistry::new())
+}
+
 /// Create an account and return its id.
 pub fn seed_user(conn: &Connection, name: &str) -> i64 {
     crate::db::upsert_user(conn, "github", name, name, None, &Utc::now().to_rfc3339()).expect("seed user")
