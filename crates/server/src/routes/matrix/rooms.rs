@@ -164,6 +164,19 @@ fn derive_room_kind(is_direct: bool, invite_count: usize, visibility_public: boo
     Ok(RoomKind::Group)
 }
 
+/// The `content` of the invitee's `m.room.member` invite event. A DM invite
+/// also carries `is_direct: true` (the Matrix convention): the invitee's
+/// client reads it from `invite_state` to classify the room as a DM and
+/// record it in `m.direct`; without it the room would surface as a group.
+/// Every other kind carries the bare membership only.
+fn invite_member_content(kind: RoomKind) -> serde_json::Value {
+    let mut content = serde_json::json!({ "membership": "invite" });
+    if kind == RoomKind::Dm {
+        content["is_direct"] = serde_json::Value::Bool(true);
+    }
+    content
+}
+
 /// `join_rule`, `history_visibility`, `is_encrypted` per plan §5's table.
 /// `pub(crate)` — also the P12 legacy-DM migration's bootstrap builder (see
 /// `routes::matrix::mod`'s own doc comment on `pub(crate) mod rooms`).
@@ -453,6 +466,7 @@ fn apply_invite(
     now: &str,
     origin_ts: i64,
 ) -> Result<HashSet<i64>, MatrixError> {
+    let room = matrix_store::get_room(conn, room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
     let caller_membership = matrix_store::room_member(conn, room_id, caller_user_id)?.map(|m| m.membership);
     require_member(caller_membership)?;
     let power_levels = power_levels_of(conn, room_id)?;
@@ -473,7 +487,7 @@ fn apply_invite(
         caller_user_id,
         "m.room.member",
         &target_mxid,
-        &serde_json::json!({ "membership": "invite" }).to_string(),
+        &invite_member_content(room.kind).to_string(),
         origin_ts,
         now,
     )?;
@@ -688,7 +702,7 @@ async fn create_room(State(state): State<Arc<AppState>>, headers: HeaderMap, Jso
         ];
         for &invitee_id in &invite_user_ids {
             let mxid = matrix_store::mxid_of(&messenger_conn, invitee_id)?.ok_or_else(MatrixError::internal)?;
-            state_events.push(state_event("m.room.member", &mxid, caller.user_id, serde_json::json!({ "membership": "invite" })));
+            state_events.push(state_event("m.room.member", &mxid, caller.user_id, invite_member_content(kind)));
         }
         state_events.push(state_event("m.room.power_levels", "", caller.user_id, power_levels_content(&caller.mxid, kind, invite_level)));
         state_events.push(state_event("m.room.join_rules", "", caller.user_id, serde_json::json!({ "join_rule": join_rule.as_str() })));
@@ -1602,6 +1616,52 @@ mod tests {
 
         let err = apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, 2, T0, 2000).unwrap_err();
         assert_eq!(err.errcode, "M_INVALID_PARAM");
+    }
+
+    // ---- P16 S-a: a DM invite carries `is_direct`, a group invite does not ----
+
+    /// The invitee's own `m.room.member` invite event, in the stripped shape
+    /// `GET /sync` puts into `rooms.invite.{roomId}.invite_state.events`.
+    fn invitee_stripped_member_event(conn: &Connection, room_id: &str, invitee_mxid: &str) -> serde_json::Value {
+        let event = matrix_store::current_state_event(conn, room_id, "m.room.member", invitee_mxid).expect("query").expect("invitee member event exists");
+        matrix_store::stripped_state_json(conn, &event).expect("stripped json")
+    }
+
+    fn invite_bob_into(kind: RoomKind, suffix: &str) -> (Connection, String) {
+        let mut conn = test_conn();
+        make_room(&conn, "!r:mylittlechart.org", kind, 1);
+        let alice = matrix_store::ensure_matrix_user(&conn, 1, &format!("alice000000000000000000000000{suffix}"), T0).expect("alice");
+        let bob = matrix_store::ensure_matrix_user(&conn, 2, &format!("bob00000000000000000000000000{suffix}"), T0).expect("bob");
+        matrix_store::apply_state_event(&mut conn, "$m1", "!r:mylittlechart.org", 1, "m.room.member", &alice, r#"{"membership":"join"}"#, 1000, T0)
+            .expect("alice joins");
+        let power_levels_content = serde_json::json!({ "users": { alice.clone(): 100 } }).to_string();
+        matrix_store::apply_state_event(&mut conn, "$pl", "!r:mylittlechart.org", 1, "m.room.power_levels", "", &power_levels_content, 1100, T0)
+            .expect("power levels grant alice invite power");
+        apply_invite(&mut conn, "!r:mylittlechart.org", 1, &alice, 2, T0, 2000).expect("invite succeeds");
+        (conn, bob)
+    }
+
+    #[test]
+    fn dm_invite_member_event_carries_is_direct() {
+        let (conn, bob) = invite_bob_into(RoomKind::Dm, "61");
+        let stripped = invitee_stripped_member_event(&conn, "!r:mylittlechart.org", &bob);
+        assert_eq!(stripped["content"]["membership"], "invite");
+        assert_eq!(stripped["content"]["is_direct"], serde_json::Value::Bool(true), "a DM invite must tell the invitee the room is direct");
+    }
+
+    #[test]
+    fn group_invite_member_event_has_no_is_direct() {
+        let (conn, bob) = invite_bob_into(RoomKind::Group, "62");
+        let stripped = invitee_stripped_member_event(&conn, "!r:mylittlechart.org", &bob);
+        assert_eq!(stripped["content"]["membership"], "invite");
+        assert!(stripped["content"].get("is_direct").is_none(), "a group invite must not claim the room is direct");
+    }
+
+    #[test]
+    fn create_room_invite_content_marks_only_a_dm_direct() {
+        assert_eq!(invite_member_content(RoomKind::Dm), serde_json::json!({ "membership": "invite", "is_direct": true }));
+        assert_eq!(invite_member_content(RoomKind::Group), serde_json::json!({ "membership": "invite" }));
+        assert_eq!(invite_member_content(RoomKind::Channel), serde_json::json!({ "membership": "invite" }));
     }
 
     // ---- manager review 2026-09-24: /leave also accepts an invited caller ----
