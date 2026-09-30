@@ -20,6 +20,21 @@
 /// `forum_trusted` are small, admin-managed tables.
 const PAID_CANDIDATE_LIMIT: i64 = 5000;
 
+/// Keep only the candidates `caller_id` may see: discoverable accounts and the
+/// caller's friends, no block either way (`db::visible_in_search`). Used by
+/// every recipient search (DM lookup, Matrix user directory) so a hidden
+/// account is never offered. A failed visibility read hides the candidate.
+pub(crate) fn retain_visible(
+    identity_conn: &rusqlite::Connection,
+    caller_id: i64,
+    candidates: Vec<PaidCandidate>,
+) -> Vec<PaidCandidate> {
+    candidates
+        .into_iter()
+        .filter(|c| crate::db::visible_in_search(identity_conn, caller_id, c.id).unwrap_or(false))
+        .collect()
+}
+
 /// A fuzzy match is only offered once the query is long enough that a
 /// distance-1 typo is unlikely to also match something unrelated; a longer
 /// query is allowed a distance of 2.
@@ -204,6 +219,28 @@ mod tests {
         social_db::create_social_schema(&conn).expect("social schema");
         dm_db::create_dm_schema(&conn).expect("dm schema");
         conn
+    }
+
+    #[test]
+    fn retain_visible_drops_hidden_accounts_blocked_pairs_and_keeps_friends() {
+        let conn = crate::db::init_db(":memory:", &"0".repeat(64)).expect("identity db");
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut candidates = Vec::new();
+        let mut ids = Vec::new();
+        for name in ["seeker", "openone", "hiddenone", "friendone", "blockedone"] {
+            let id = crate::db::upsert_user(&conn, "github", name, name, None, &now).expect("user");
+            ids.push(id);
+            candidates.push(PaidCandidate { id, nick: Some(name.to_string()), display_name: name.to_string(), public_id: name.to_string() });
+        }
+        let (seeker, open, _hidden, friend, blocked) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        for id in [open, blocked] {
+            crate::db::set_account_discoverable(&conn, id, true).expect("on");
+        }
+        conn.execute("INSERT INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)", rusqlite::params![seeker, friend, now]).expect("friend");
+        conn.execute("INSERT INTO blocks (user_id, blocked_id, created_at) VALUES (?1, ?2, ?3)", rusqlite::params![blocked, seeker, now]).expect("block");
+        candidates.remove(0);
+        let kept: Vec<String> = retain_visible(&conn, seeker, candidates).into_iter().filter_map(|c| c.nick).collect();
+        assert_eq!(kept, vec!["openone".to_string(), "friendone".to_string()]);
     }
 
     // ---- lookup candidate resolution: paid_recipient_candidates ----

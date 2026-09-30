@@ -610,7 +610,7 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
         [],
     );
     let _ = conn.execute(
-        "ALTER TABLE users ADD COLUMN discoverable INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE users ADD COLUMN discoverable INTEGER NOT NULL DEFAULT 0",
         [],
     );
     let _ = conn.execute_batch(
@@ -940,6 +940,7 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
     // idempotent.
     crate::staff::migrate(&conn)?;
     migrate_gift_codes(&conn)?;
+    migrate_private_by_default(&conn)?;
 
     Ok(conn)
 }
@@ -1947,7 +1948,7 @@ pub fn search_share_nicks(
            AND nick IS NOT NULL AND nick != ''
            AND LOWER(nick) LIKE ?2 ESCAPE '\\'
            AND (
-             IFNULL(discoverable, 1) = 1
+             IFNULL(discoverable, 0) = 1
              OR EXISTS (
                SELECT 1 FROM friendships
                WHERE user_id = ?1 AND friend_id = users.id
@@ -4005,12 +4006,12 @@ pub fn visible_in_search(conn: &Connection, caller: i64, target: i64) -> Result<
     }
     let discoverable: i64 = conn
         .query_row(
-            "SELECT IFNULL(discoverable, 1) FROM users WHERE id = ?1",
+            "SELECT IFNULL(discoverable, 0) FROM users WHERE id = ?1",
             params![target],
             |row| row.get(0),
         )
         .optional()?
-        .unwrap_or(1);
+        .unwrap_or(0);
     if discoverable != 0 {
         return Ok(true);
     }
@@ -4027,12 +4028,12 @@ pub fn visible_in_search(conn: &Connection, caller: i64, target: i64) -> Result<
 pub fn account_discoverable(conn: &Connection, user_id: i64) -> Result<bool> {
     let v: Option<i64> = conn
         .query_row(
-            "SELECT IFNULL(discoverable, 1) FROM users WHERE id = ?1",
+            "SELECT IFNULL(discoverable, 0) FROM users WHERE id = ?1",
             params![user_id],
             |row| row.get(0),
         )
         .optional()?;
-    Ok(v.unwrap_or(1) != 0)
+    Ok(v.unwrap_or(0) != 0)
 }
 
 pub fn set_account_discoverable(conn: &Connection, user_id: i64, on: bool) -> Result<()> {
@@ -4058,41 +4059,180 @@ pub fn list_friend_nicks(conn: &Connection, user_id: i64) -> Result<Vec<String>>
     Ok(out)
 }
 
-pub fn create_friend_invite(conn: &Connection, inviter: i64, now: &str, expires: &str) -> Result<String> {
+/// Most friend invites one account may have outstanding (unexpired and not
+/// used up) at once.
+pub const MAX_ACTIVE_FRIEND_INVITES: i64 = 20;
+
+/// Most uses one friend invite may be given.
+pub const MAX_FRIEND_INVITE_USES: i64 = 10;
+
+/// Most friend requests one account may have pending at once.
+pub const MAX_PENDING_FRIEND_REQUESTS: i64 = 100;
+
+/// Create a friend invite for `inviter`: `max_uses` redemptions (1..=
+/// [`MAX_FRIEND_INVITE_USES`], clamped), valid until `expires`. An invite is
+/// the only way to reach an account that is not discoverable. Expired rows of
+/// every account are deleted on the way, so the table does not fill up.
+/// `Err("too many invites")` once `inviter` holds [`MAX_ACTIVE_FRIEND_INVITES`].
+pub fn create_friend_invite(
+    conn: &Connection,
+    inviter: i64,
+    now: &str,
+    expires: &str,
+    max_uses: i64,
+) -> Result<std::result::Result<String, &'static str>> {
+    conn.execute("DELETE FROM friend_invites WHERE expires_at <= ?1", params![now])?;
+    let active: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM friend_invites WHERE inviter_id = ?1",
+        params![inviter],
+        |row| row.get(0),
+    )?;
+    if active >= MAX_ACTIVE_FRIEND_INVITES {
+        return Ok(Err("too many invites"));
+    }
     let token = generate_share_token();
     conn.execute(
-        "INSERT INTO friend_invites (token, inviter_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-        params![token, inviter, now, expires],
+        "INSERT INTO friend_invites (token, inviter_id, created_at, expires_at, max_uses, uses)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        params![token, inviter, now, expires, max_uses.clamp(1, MAX_FRIEND_INVITE_USES)],
     )?;
-    Ok(token)
+    Ok(Ok(token))
 }
 
-/// Both directions, so each side finds the other. Returns false if the
-/// invite is missing, expired, or is the inviter accepting their own link.
-pub fn accept_friend_invite(conn: &Connection, token: &str, accepter: i64, now: &str) -> Result<bool> {
-    let inviter: Option<i64> = conn
+/// One outstanding friend invite of an account.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FriendInviteRow {
+    pub token: String,
+    pub max_uses: i64,
+    pub uses: i64,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+/// `inviter`'s outstanding (unexpired) friend invites, newest first.
+pub fn list_friend_invites(conn: &Connection, inviter: i64, now: &str) -> Result<Vec<FriendInviteRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT token, max_uses, uses, created_at, expires_at FROM friend_invites
+         WHERE inviter_id = ?1 AND expires_at > ?2 ORDER BY created_at DESC, rowid DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![inviter, now], |row| {
+            Ok(FriendInviteRow {
+                token: row.get(0)?,
+                max_uses: row.get(1)?,
+                uses: row.get(2)?,
+                created_at: row.get(3)?,
+                expires_at: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Delete `inviter`'s own invite `token`; `false` when it is not theirs.
+pub fn revoke_friend_invite(conn: &Connection, inviter: i64, token: &str) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM friend_invites WHERE token = ?1 AND inviter_id = ?2",
+        params![token, inviter],
+    )?;
+    Ok(n > 0)
+}
+
+/// Redeem friend invite `token` for `accepter`: the two accounts become
+/// friends directly, both ways, whatever either one's `discoverable` flag.
+/// Returns the inviter's id, or `None` for a missing, expired or used-up
+/// invite, the inviter's own link, an inviter who is gone, or a pair where
+/// either side has blocked the other — all one answer, so an invite cannot be
+/// used to probe or to get around a block. A use is consumed only when a new
+/// friendship is made; the last use deletes the invite. One savepoint.
+pub fn accept_friend_invite(conn: &Connection, token: &str, accepter: i64, now: &str) -> Result<Option<i64>> {
+    conn.execute_batch("SAVEPOINT friend_invite;")?;
+    let done = accept_friend_invite_inner(conn, token, accepter, now);
+    match &done {
+        Ok(_) => conn.execute_batch("RELEASE friend_invite;")?,
+        Err(_) => {
+            // The original failure is what the caller needs.
+            let _ = conn.execute_batch("ROLLBACK TO friend_invite; RELEASE friend_invite;");
+        }
+    }
+    done
+}
+
+fn accept_friend_invite_inner(conn: &Connection, token: &str, accepter: i64, now: &str) -> Result<Option<i64>> {
+    let row: Option<(i64, i64, i64)> = conn
         .query_row(
-            "SELECT inviter_id FROM friend_invites WHERE token = ?1 AND expires_at > ?2",
+            "SELECT inviter_id, max_uses, uses FROM friend_invites WHERE token = ?1 AND expires_at > ?2",
             params![token, now],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some(inviter) = inviter else {
-        return Ok(false);
+    let Some((inviter, max_uses, uses)) = row else {
+        return Ok(None);
     };
-    if inviter == accepter {
-        return Ok(false);
+    if inviter == accepter || uses >= max_uses || blocked_either(conn, inviter, accepter)? {
+        return Ok(None);
     }
-    conn.execute(
-        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
-        params![inviter, accepter, now],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO friendships (user_id, friend_id, created_at) VALUES (?1, ?2, ?3)",
-        params![accepter, inviter, now],
-    )?;
-    conn.execute("DELETE FROM friend_invites WHERE token = ?1", params![token])?;
-    Ok(true)
+    let inviter_exists = conn
+        .query_row("SELECT 1 FROM users WHERE id = ?1", params![inviter], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !inviter_exists {
+        return Ok(None);
+    }
+    if are_friends(conn, inviter, accepter)? {
+        return Ok(Some(inviter));
+    }
+    link_friends(conn, inviter, accepter, now)?;
+    if uses + 1 >= max_uses {
+        conn.execute("DELETE FROM friend_invites WHERE token = ?1", params![token])?;
+    } else {
+        conn.execute("UPDATE friend_invites SET uses = uses + 1 WHERE token = ?1", params![token])?;
+    }
+    Ok(Some(inviter))
+}
+
+fn are_friends(conn: &Connection, a: i64, b: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM friendships WHERE user_id = ?1 AND friend_id = ?2",
+            params![a, b],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Any standing relation `caller` has with `target` that lets `caller` keep
+/// acting on them by nick even when they are not discoverable: friendship, a
+/// pending request either way, a subscription either way, or a block `caller`
+/// placed. A block the OTHER side placed is deliberately not included.
+fn related(conn: &Connection, caller: i64, target: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM friendships WHERE user_id = ?1 AND friend_id = ?2)
+                OR EXISTS (SELECT 1 FROM friend_requests WHERE (from_id = ?1 AND to_id = ?2) OR (from_id = ?2 AND to_id = ?1))
+                OR EXISTS (SELECT 1 FROM subscriptions WHERE (user_id = ?1 AND target_id = ?2) OR (user_id = ?2 AND target_id = ?1))
+                OR EXISTS (SELECT 1 FROM blocks WHERE user_id = ?1 AND blocked_id = ?2)",
+            params![caller, target],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Resolve `nick` for `caller` the way every by-nick path must: the exact nick
+/// of an account `caller` may see (discoverable, or already a friend, and no
+/// block either way), or `caller`'s own. A hidden account, a blocked pair and a
+/// nick nobody holds all give `None`, so the answer never reveals that a hidden
+/// account exists. Staff and ops paths use [`user_id_for_nick`] instead.
+pub fn visible_user_id_for_nick(conn: &Connection, caller: i64, nick: &str) -> Result<Option<i64>> {
+    let Some(id) = user_id_for_nick(conn, nick)? else {
+        return Ok(None);
+    };
+    if id == caller {
+        return Ok(Some(id));
+    }
+    Ok(visible_in_search(conn, caller, id)?.then_some(id))
 }
 
 fn blocked_either(conn: &Connection, a: i64, b: i64) -> Result<bool> {
@@ -4135,6 +4275,8 @@ pub struct SocialLists {
     pub incoming: Vec<String>,
     pub outgoing: Vec<String>,
     pub subscriptions: Vec<String>,
+    /// Accounts subscribed to this one (every friend requester is one).
+    pub subscribers: Vec<String>,
     pub blocked: Vec<String>,
 }
 
@@ -4158,6 +4300,12 @@ pub fn social_lists(conn: &Connection, user_id: i64) -> Result<SocialLists> {
             conn,
             "SELECT u.nick FROM subscriptions s JOIN users u ON u.id = s.target_id
              WHERE s.user_id = ?1 AND u.nick IS NOT NULL AND u.nick != '' ORDER BY LOWER(u.nick)",
+            user_id,
+        )?,
+        subscribers: nicks_for(
+            conn,
+            "SELECT u.nick FROM subscriptions s JOIN users u ON u.id = s.user_id
+             WHERE s.target_id = ?1 AND u.nick IS NOT NULL AND u.nick != '' ORDER BY LOWER(u.nick)",
             user_id,
         )?,
         blocked: nicks_for(
@@ -4193,9 +4341,24 @@ fn unlink(conn: &Connection, a: i64, b: i64) -> Result<()> {
     Ok(())
 }
 
-/// `request` does not create a friendship. `approve` does, both ways.
-/// `subscribe` is one row, from the caller to the nick, with no friendship.
-/// `block` removes friendship, requests, and subscriptions in both directions.
+/// Actions on another account, addressed by nick.
+///
+/// Reach: the target must be visible to `caller` ([`visible_in_search`]:
+/// discoverable or already a friend, no block either way) or already related
+/// to them ([`related`]: friend, pending request, subscription, or a block
+/// `caller` placed). Anything else answers `"no such nick"` exactly as an
+/// unknown nick does, so a hidden account is not revealed and a blocked sender
+/// no longer learns it is blocked.
+///
+/// `request` first makes `caller` a subscriber of the target and records a
+/// pending request; it does not create a friendship, except that a request
+/// crossing an incoming one links the two at once. `approve` turns a pending
+/// request from the target into a friendship both ways (the subscription
+/// stays). `decline` deletes the pending request from the target and KEEPS the
+/// requester's subscription: they stay a follower until the target blocks
+/// them. `subscribe`/`unsubscribe` are one row from the caller to the target.
+/// `remove` ends a friendship and any pending request. `block` removes
+/// friendship, requests and subscriptions in both directions.
 pub fn social_act(conn: &Connection, caller: i64, nick: &str, action: &str, now: &str) -> Result<std::result::Result<(), &'static str>> {
     let Some((target, _)) = user_by_nick(conn, nick)? else {
         return Ok(Err("no such nick"));
@@ -4203,20 +4366,16 @@ pub fn social_act(conn: &Connection, caller: i64, nick: &str, action: &str, now:
     if target == caller {
         return Ok(Err("that is you"));
     }
+    if !visible_in_search(conn, caller, target)? && !related(conn, caller, target)? {
+        return Ok(Err("no such nick"));
+    }
     let blocked = blocked_either(conn, caller, target)?;
     match action {
         "request" => {
             if blocked {
                 return Ok(Err("blocked"));
             }
-            let already: Option<i64> = conn
-                .query_row(
-                    "SELECT 1 FROM friendships WHERE user_id = ?1 AND friend_id = ?2",
-                    params![caller, target],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if already.is_some() {
+            if are_friends(conn, caller, target)? {
                 return Ok(Ok(()));
             }
             let incoming: Option<i64> = conn
@@ -4230,6 +4389,18 @@ pub fn social_act(conn: &Connection, caller: i64, nick: &str, action: &str, now:
                 link_friends(conn, caller, target, now)?;
                 return Ok(Ok(()));
             }
+            let pending: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM friend_requests WHERE from_id = ?1",
+                params![caller],
+                |row| row.get(0),
+            )?;
+            if pending >= MAX_PENDING_FRIEND_REQUESTS {
+                return Ok(Err("too many requests"));
+            }
+            conn.execute(
+                "INSERT OR IGNORE INTO subscriptions (user_id, target_id, created_at) VALUES (?1, ?2, ?3)",
+                params![caller, target, now],
+            )?;
             conn.execute(
                 "INSERT OR IGNORE INTO friend_requests (from_id, to_id, created_at) VALUES (?1, ?2, ?3)",
                 params![caller, target, now],
@@ -4253,9 +4424,21 @@ pub fn social_act(conn: &Connection, caller: i64, nick: &str, action: &str, now:
             link_friends(conn, caller, target, now)?;
             Ok(Ok(()))
         }
+        "decline" => {
+            let removed = conn.execute(
+                "DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2",
+                params![target, caller],
+            )?;
+            if removed == 0 {
+                return Ok(Err("no request"));
+            }
+            Ok(Ok(()))
+        }
         "remove" => {
             conn.execute("DELETE FROM friendships WHERE user_id = ?1 AND friend_id = ?2", params![caller, target])?;
             conn.execute("DELETE FROM friendships WHERE user_id = ?1 AND friend_id = ?2", params![target, caller])?;
+            conn.execute("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2", params![caller, target])?;
+            conn.execute("DELETE FROM friend_requests WHERE from_id = ?1 AND to_id = ?2", params![target, caller])?;
             Ok(Ok(()))
         }
         "block" => {
@@ -4292,6 +4475,36 @@ pub fn social_act(conn: &Connection, caller: i64, nick: &str, action: &str, now:
         }
         _ => Ok(Err("no such nick")),
     }
+}
+
+/// Privacy by default: every account is hidden from nick search and by-nick
+/// actions until its owner turns `discoverable` on. The column predates this
+/// (it defaulted to on), so a trigger forces every NEW row off whatever the
+/// column default of an older database says, and a one-time, recorded pass
+/// switches every account that existed before it off. Friend invites gain
+/// their use counter here too.
+fn migrate_private_by_default(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS db_migrations (
+             name TEXT PRIMARY KEY,
+             applied_at TEXT NOT NULL
+         );
+         CREATE TRIGGER IF NOT EXISTS users_private_by_default
+         AFTER INSERT ON users
+         BEGIN
+             UPDATE users SET discoverable = 0 WHERE id = NEW.id;
+         END;",
+    )?;
+    crate::billing::store::add_column_if_missing(conn, "friend_invites", "max_uses", "INTEGER NOT NULL DEFAULT 1")?;
+    crate::billing::store::add_column_if_missing(conn, "friend_invites", "uses", "INTEGER NOT NULL DEFAULT 0")?;
+    let first_time = conn.execute(
+        "INSERT OR IGNORE INTO db_migrations (name, applied_at) VALUES ('private_by_default_v1', ?1)",
+        params![chrono::Utc::now().to_rfc3339()],
+    )?;
+    if first_time == 1 {
+        conn.execute("UPDATE users SET discoverable = 0", [])?;
+    }
+    Ok(())
 }
 
 /// What `caller` (`None` = signed out) may do on live share `token` right
@@ -10984,6 +11197,7 @@ mod
 #[cfg(test)]
 pub(crate) fn init_test_conn() -> Connection {
     let conn = Connection::open_in_memory().expect("in-memory sqlite");
+    crate::billing::invite::ensure_schema(&conn).expect("registration_invites schema");
     conn.execute_batch(
         "
         CREATE TABLE sync_items (
@@ -11241,5 +11455,48 @@ mod gift_batch_tests {
         assert_eq!(listed.len(), 1);
         assert_eq!((listed[0].count, listed[0].redeemed, listed[0].revoked, listed[0].days), (3, 1, 2, 10));
         assert_eq!(listed[0].created_by_nick, None);
+    }
+}
+
+#[cfg(test)]
+mod private_by_default_tests {
+    use super::*;
+
+    fn conn() -> Connection {
+        init_db(":memory:", &"0".repeat(64)).expect("init identity test db")
+    }
+
+    #[test]
+    fn the_migration_switches_existing_accounts_off_once_and_new_rows_start_off() {
+        let conn = conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let old = upsert_user(&conn, "github", "old", "old", None, &now).expect("old");
+        assert!(!account_discoverable(&conn, old).expect("flag"), "a new account starts hidden");
+
+        // A database from before the change: flags on, no marker, no trigger.
+        conn.execute_batch("DROP TRIGGER users_private_by_default; DELETE FROM db_migrations;").expect("rewind");
+        let late = upsert_user(&conn, "github", "late", "late", None, &now).expect("late");
+        set_account_discoverable(&conn, old, true).expect("on");
+        set_account_discoverable(&conn, late, true).expect("on");
+
+        migrate_private_by_default(&conn).expect("migrate");
+        assert!(!account_discoverable(&conn, old).expect("flag") && !account_discoverable(&conn, late).expect("flag"));
+
+        // Applied once: an owner who turns it on afterwards keeps it on across restarts.
+        set_account_discoverable(&conn, old, true).expect("on");
+        migrate_private_by_default(&conn).expect("migrate again");
+        assert!(account_discoverable(&conn, old).expect("flag"));
+
+        // The trigger forces every new row off, even where the column default says on.
+        conn.execute(
+            "INSERT INTO users (provider, provider_user_id, display_name, created_at, discoverable)
+             VALUES ('github', 'fresh', 'fresh', ?1, 1)",
+            params![now],
+        )
+        .expect("insert");
+        let fresh: i64 = conn
+            .query_row("SELECT discoverable FROM users WHERE provider_user_id = 'fresh'", [], |r| r.get(0))
+            .expect("flag");
+        assert_eq!(fresh, 0);
     }
 }

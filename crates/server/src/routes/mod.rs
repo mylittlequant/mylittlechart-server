@@ -175,7 +175,12 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         )
         .route("/account/friends", get(account::friends).post(account::add_friend))
         .route("/account/privacy", patch(account::set_privacy))
-        .route("/account/friend-invites", post(account::create_friend_invite))
+        .route("/account/discoverable", axum::routing::put(account::set_discoverable))
+        .route(
+            "/account/friend-invites",
+            post(account::create_friend_invite).get(account::list_friend_invites),
+        )
+        .route("/account/friend-invites/{token}", delete(account::revoke_friend_invite))
         .route(
             "/account/friend-invites/{token}/accept",
             post(account::accept_friend_invite),

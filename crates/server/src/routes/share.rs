@@ -1230,7 +1230,7 @@ pub async fn create_share_grant(
         }
 
         let grantee_user_id = match &body.grantee_nick {
-            Some(nick) => match crate::db::user_id_for_nick(&conn, nick)? {
+            Some(nick) => match crate::db::visible_user_id_for_nick(&conn, user_id, nick)? {
                 Some(uid) => Some(uid),
                 None => return Ok(CreateShareGrantOutcome::UnknownNick),
             },

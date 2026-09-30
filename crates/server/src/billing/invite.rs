@@ -25,6 +25,28 @@ use sha2::{Digest, Sha256};
 
 use super::anon::{self, Credential};
 
+/// Create the `registration_invites` table (idempotent). `db::set_nick` reads
+/// it, so every identity database and test fixture that has `users` needs it.
+pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS registration_invites (
+            id          TEXT    PRIMARY KEY,
+            code_hash   TEXT    NOT NULL UNIQUE,
+            nick        TEXT    NOT NULL,
+            nick_lower  TEXT    NOT NULL,
+            paid_days   INTEGER NOT NULL DEFAULT 0,
+            note        TEXT    NOT NULL DEFAULT '',
+            created_at  TEXT    NOT NULL,
+            expires_at  TEXT    NOT NULL,
+            created_by  INTEGER,
+            redeemed_at TEXT,
+            redeemed_by INTEGER,
+            revoked_at  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_registration_invites_nick ON registration_invites(nick_lower);",
+    )
+}
+
 /// How long an invite stays redeemable.
 pub const TTL: Duration = Duration::days(30);
 

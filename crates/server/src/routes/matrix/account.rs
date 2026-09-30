@@ -648,7 +648,9 @@ async fn user_directory_search(
         let now = chrono::Utc::now().to_rfc3339();
         let candidates = {
             let identity_conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
-            recipient_search::paid_recipient_candidates(&identity_conn, caller.user_id, &boosted_ids, &now)?
+            // Hidden accounts are not in the directory (friends of the caller are).
+            let found = recipient_search::paid_recipient_candidates(&identity_conn, caller.user_id, &boosted_ids, &now)?;
+            recipient_search::retain_visible(&identity_conn, caller.user_id, found)
         };
 
         let (matched, limited) = rank_directory_candidates(candidates, &query, limit);

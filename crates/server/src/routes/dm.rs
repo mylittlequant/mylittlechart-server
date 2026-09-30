@@ -307,15 +307,20 @@ async fn require_nick(state: Arc<AppState>, user_id: i64) -> Result<(), Response
 // direct query against the identity connection rather than a shared helper.
 // ============================================================================
 
-/// Resolve a `public_id` or nick (case-insensitive) to a `user_id`.
-fn resolve_user_by_label(conn: &rusqlite::Connection, label: &str) -> rusqlite::Result<Option<i64>> {
+/// Resolve a `public_id` or nick (case-insensitive) to a `user_id` on behalf
+/// of `caller`. A `public_id` is an unguessable capability and always
+/// resolves; a nick resolves only to an account `caller` may see
+/// (`db::visible_user_id_for_nick`), so a hidden account answers exactly like
+/// an unknown label.
+pub(crate) fn resolve_user_by_label(conn: &rusqlite::Connection, caller: i64, label: &str) -> rusqlite::Result<Option<i64>> {
     use rusqlite::{params, OptionalExtension};
-    conn.query_row(
-        "SELECT id FROM users WHERE public_id = ?1 OR LOWER(nick) = LOWER(?1) LIMIT 1",
-        params![label],
-        |row| row.get(0),
-    )
-    .optional()
+    let by_public_id: Option<i64> = conn
+        .query_row("SELECT id FROM users WHERE public_id = ?1 LIMIT 1", params![label], |row| row.get(0))
+        .optional()?;
+    if by_public_id.is_some() {
+        return Ok(by_public_id);
+    }
+    db::visible_user_id_for_nick(conn, caller, label)
 }
 
 /// `public_id` for `user_id`, or a fixed placeholder if the account is gone
@@ -388,14 +393,15 @@ pub async fn publish_identity(
 /// indistinguishable to the caller, same "no distinguishable states"
 /// posture `routes::forum` uses for a hidden thread.
 pub async fn get_identity(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(label): Path<String>) -> Response {
-    if let Err(resp) = require_dm_access(state.clone(), &headers).await {
-        return resp;
-    }
+    let caller_id = match require_dm_access(state.clone(), &headers).await {
+        Ok(uid) => uid,
+        Err(resp) => return resp,
+    };
 
     type IdentityLookup = Option<(String, String, Option<dm_db::DmIdentityKey>)>;
     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<IdentityLookup> {
         let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(target_id) = resolve_user_by_label(&identity_conn, &label)? else {
+        let Some(target_id) = resolve_user_by_label(&identity_conn, caller_id, &label)? else {
             return Ok(None);
         };
         let public_id = db::get_user_public_id(&identity_conn, target_id)?;
@@ -491,10 +497,7 @@ pub async fn lookup_recipients(
         let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
         let candidates = paid_recipient_candidates(&identity_conn, caller_id, &boosted_ids, &now)?;
-        let candidates: Vec<_> = candidates
-            .into_iter()
-            .filter(|c| crate::db::visible_in_search(&identity_conn, caller_id, c.id).unwrap_or(true))
-            .collect();
+        let candidates = crate::recipient_search::retain_visible(&identity_conn, caller_id, candidates);
         drop(identity_conn);
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -568,7 +571,7 @@ pub async fn create_conversation(
         let state = state.clone();
         move || -> rusqlite::Result<PeerLookup> {
             let identity_conn = state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(peer_id) = resolve_user_by_label(&identity_conn, &with_label)? else {
+            let Some(peer_id) = resolve_user_by_label(&identity_conn, user_id, &with_label)? else {
                 return Ok(None);
             };
             let peer_is_paid = db::user_is_paid(&identity_conn, peer_id)?;

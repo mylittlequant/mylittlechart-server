@@ -318,7 +318,7 @@ pub async fn add_group_member(
         if !crate::db::grant_group_is_owned_by(&conn, group_id, user_id)? {
             return Ok(AddMemberOutcome::GroupNotFound);
         }
-        let Some(member_id) = crate::db::user_id_for_nick(&conn, &body.nick)? else {
+        let Some(member_id) = crate::db::visible_user_id_for_nick(&conn, user_id, &body.nick)? else {
             return Ok(AddMemberOutcome::UnknownNick);
         };
         let current = crate::db::count_grant_group_members(&conn, group_id)?;

@@ -456,6 +456,7 @@ pub async fn me(
                 effective_label,
                 provider: primary_provider,
                 providers,
+                discoverable: crate::db::account_discoverable(&conn, user_id)?,
             }))
         } else {
             Ok(None)

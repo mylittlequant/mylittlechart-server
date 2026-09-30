@@ -302,6 +302,8 @@ pub struct MeResponse {
     pub provider: String,
     /// All providers linked to this account.
     pub providers: Vec<ProviderInfo>,
+    /// Whether nick search may find this account (off by default).
+    pub discoverable: bool,
 }
 
 // ============================================================================
