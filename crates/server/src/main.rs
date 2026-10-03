@@ -137,6 +137,7 @@ mod routes;
 mod share_live;
 mod social_db;
 mod staff;
+mod login_gate;
 mod state;
 mod syncstore;
 mod text_policy;
@@ -910,6 +911,15 @@ async fn main() {
         Some(billing) => app_state.with_billing(billing),
         None => app_state,
     });
+
+    // The login-challenge toggle is a row written by the staff route. The hot
+    // path reads the atomic; this is the only load, after migrations.
+    if role == state::ServerRole::Control {
+        let conn = app_state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = app_state.load_login_challenge(&conn) {
+            tracing::error!("Failed to load the login challenge toggle: {e}");
+        }
+    }
 
     // Live share hub background work (shutdown close, periodic rights
     // re-check) — control role only: the hub's rights live in the database.

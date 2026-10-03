@@ -199,6 +199,12 @@ pub struct AuthorizeQuery {
     /// the device poll completes without manual code entry.
     #[serde(default)]
     pub device_code: Option<String>,
+    /// Issued challenge id. Required on this URL while the login challenge is on.
+    #[serde(default)]
+    pub challenge_id: Option<String>,
+    /// Solution paired with `challenge_id`.
+    #[serde(default)]
+    pub challenge_solution: Option<String>,
 }
 
 /// Deserializes a query string flag that can be `"1"`, `"true"`, `"yes"`, or absent.

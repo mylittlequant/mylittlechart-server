@@ -28,6 +28,7 @@
 //! | `POST /api/staff/invites {nick, paid_days, note}` | issue a one-time registration invite; the code comes back ONCE |
 //! | `GET /api/staff/invites` | the invites and their status, no code values |
 //! | `POST /api/staff/invites/{id}/revoke` | withdraw a pending invite and release its nick |
+//! | `PUT /api/staff/login-challenge {"on": bool}` | turn the login challenge on or off |
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -591,6 +592,48 @@ pub async fn revoke_invite(State(state): State<Arc<AppState>>, headers: HeaderMa
     }
 }
 
+/// Body of `PUT /api/staff/login-challenge`.
+#[derive(Deserialize)]
+pub struct LoginChallengeBody {
+    /// `true` requires a solution on the sign-in routes; `false` is today's behaviour.
+    on: bool,
+}
+
+/// `PUT /api/staff/login-challenge {"on": bool}` — a signed-in admin.
+///
+/// Writes `app_settings.login_challenge` (`on` or `off`) and one
+/// `staff_audit` row (`login_challenge.set`, target `login_challenge`,
+/// params `{"on": ...}` only) in the same transaction, then publishes the
+/// flag the hot path reads. `403 forbidden` for anyone else. One of the
+/// actor's 30 writes a minute.
+pub async fn set_login_challenge(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<LoginChallengeBody>,
+) -> Response {
+    let actor = match staff(&state, &headers).await {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    if let Err(response) = spend_write(&state, &actor) {
+        return response;
+    }
+    let on = body.on;
+    match audited(&state, &actor, "login_challenge.set", move |conn| {
+        crate::login_gate::set_stored(conn, on)?;
+        Ok(Ok(Done { value: (), target: "login_challenge".to_string(), params: json!({ "on": on }) }))
+    })
+    .await
+    {
+        Ok(()) => {
+            state.set_login_challenge_enabled(on);
+            tracing::info!("staff {} set login challenge on={on}", actor.user_id);
+            Json(json!({ "on": on })).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
 // ============================================================================
 // Lookup
 // ============================================================================
@@ -741,7 +784,7 @@ mod tests {
         let (status, list) = get_json(&router, &admin, "/staff/gift-batches", None).await;
         assert_eq!((status, list), (StatusCode::OK, json!([])));
 
-        let routes: [(Method, &str, Option<Value>); 7] = [
+        let routes: [(Method, &str, Option<Value>); 8] = [
             (Method::POST, "/staff/gift-codes", Some(json!({ "days": 5, "count": 1, "note": "" }))),
             (Method::GET, "/staff/gift-batches", None),
             (Method::POST, "/staff/gift-batches/gb_x/revoke", Some(json!({}))),
@@ -749,6 +792,7 @@ mod tests {
             (Method::POST, "/staff/grants/lifetime", Some(json!({ "nick": "plainmember", "grant": "lifetime_paid", "note": "x" }))),
             (Method::POST, "/staff/grants/lifetime/revoke", Some(json!({ "nick": "plainmember", "grant": "lifetime_paid" }))),
             (Method::GET, "/staff/user?nick=plainmember", None),
+            (Method::PUT, "/staff/login-challenge", Some(json!({ "on": true }))),
         ];
         let mut refusals = Vec::new();
         for (method, uri, body) in &routes {
@@ -763,7 +807,7 @@ mod tests {
                 refusals.push((status, answer));
             }
         }
-        assert_eq!(refusals.len(), 28);
+        assert_eq!(refusals.len(), 32);
         for (status, answer) in &refusals {
             assert_eq!(*status, StatusCode::FORBIDDEN);
             assert_eq!(answer, &json!({ "error": "forbidden" }), "moderator, member, bad token and no session look alike");
@@ -1107,5 +1151,54 @@ mod tests {
             assert!(!logs.contains(code.as_str()), "a gift code was logged");
             assert!(!logs.contains(&code.to_lowercase()), "a gift code was logged");
         }
+    }
+
+    #[tokio::test]
+    async fn setting_the_login_challenge_writes_one_audit_row_and_the_hot_flag() {
+        let state = app_state(None);
+        let router = control_api_router(state.clone());
+        let (admin_id, admin) = account(&state, "rootadmin", Some(Role::Admin));
+        assert!(!state.login_challenge_enabled());
+
+        let authorization = format!("Bearer {admin}");
+        let (status, _, answer) = send_from(
+            &router,
+            DEFAULT_CLIENT_IP,
+            Method::PUT,
+            "/staff/login-challenge",
+            &[("authorization", authorization.as_str()), ("content-type", "application/json")],
+            Some(json!({ "on": true }).to_string()),
+        )
+        .await;
+        assert_eq!((status, answer), (StatusCode::OK, json!({ "on": true })));
+        assert!(state.login_challenge_enabled());
+        {
+            let conn = state.control_plane().db.lock().expect("db");
+            let value: String = conn
+                .query_row("SELECT value FROM app_settings WHERE key = 'login_challenge'", [], |row| row.get(0))
+                .expect("row");
+            assert_eq!(value, "on");
+        }
+        let rows = audit(&state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].actor_user_id, admin_id);
+        assert_eq!(rows[0].action, "login_challenge.set");
+        assert_eq!(rows[0].target, "login_challenge");
+        assert_eq!(rows[0].params, json!({ "on": true }));
+
+        let (status, _, answer) = send_from(
+            &router,
+            DEFAULT_CLIENT_IP,
+            Method::PUT,
+            "/staff/login-challenge",
+            &[("authorization", authorization.as_str()), ("content-type", "application/json")],
+            Some(json!({ "on": false }).to_string()),
+        )
+        .await;
+        assert_eq!((status, answer), (StatusCode::OK, json!({ "on": false })));
+        assert!(!state.login_challenge_enabled());
+        let rows = audit(&state);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].params, json!({ "on": false }));
     }
 }

@@ -1,5 +1,6 @@
 //! Shared application state passed through axum via `Arc<AppState>`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -290,6 +291,12 @@ pub struct AppState {
     /// Writes per minute a staff account may make through `/api/staff/*`
     /// (`crate::staff::WRITES_PER_MINUTE`), keyed by account id.
     staff_writes: crate::billing::throttle::SlidingLimiter<i64>,
+
+    /// Hot copy of `app_settings.login_challenge`. Missing row and the default are off.
+    login_challenge_on: AtomicBool,
+
+    /// The live challenge implementation. Proof of work today.
+    login_challenge: Arc<dyn crate::login_gate::LoginChallenge + Send + Sync>,
 }
 
 /// `alert_daemon` object in `/health`'s JSON body (see `main.rs`'s health
@@ -358,7 +365,30 @@ impl AppState {
                 crate::staff::WRITES_PER_MINUTE,
                 0,
             ),
+            login_challenge_on: AtomicBool::new(false),
+            login_challenge: Arc::new(crate::login_gate::PowChallenge::new()),
         }
+    }
+
+    /// Whether sign-in is behind the login challenge. Hot path: no database.
+    pub fn login_challenge_enabled(&self) -> bool {
+        self.login_challenge_on.load(Ordering::Acquire)
+    }
+
+    /// Publish the toggle after its row has committed (or at boot).
+    pub fn set_login_challenge_enabled(&self, on: bool) {
+        self.login_challenge_on.store(on, Ordering::Release);
+    }
+
+    /// Read `app_settings.login_challenge` into the atomic. A missing row is off.
+    pub fn load_login_challenge(&self, conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+        self.set_login_challenge_enabled(crate::login_gate::stored_enabled(conn)?);
+        Ok(())
+    }
+
+    /// The challenge implementation behind the toggle.
+    pub fn login_challenge(&self) -> &(dyn crate::login_gate::LoginChallenge + Send + Sync) {
+        self.login_challenge.as_ref()
     }
 
     /// Attach the billing adapter's runtime (see the `billing` field).

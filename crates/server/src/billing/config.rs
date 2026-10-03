@@ -51,6 +51,15 @@ const DEFAULT_KEY_FAILS: usize = 20;
 /// The window every abuse budget above is measured over.
 const ABUSE_WINDOW: Duration = Duration::from_secs(3600);
 
+/// Anonymous checkouts one onion host may start per hour, on a single shared key.
+const ONION_CHECKOUTS_PER_HOUR: usize = 30;
+/// Failed key, invoice and invite attempts one onion host may make per minute, one shared key.
+const ONION_FAILURES_PER_MINUTE: usize = 30;
+/// Failed attempts of one credential hash per hour.
+const CREDENTIAL_FAILURES_PER_HOUR: usize = 5;
+const INVITE_CODE_FAILURES_PER_HOUR: usize = 5;
+const ONION_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
 /// Overall timeout of one merchant API call when `DIG2PAY_TIMEOUT_SECS` is
 /// unset or unparsable.
 const DEFAULT_TIMEOUT_SECS: u64 = 15;
@@ -218,6 +227,14 @@ pub struct BillingRuntime {
     onion_hosts: Vec<String>,
     anon_create: SlidingLimiter<IpAddr>,
     key_failures: SlidingLimiter<IpAddr>,
+    /// Onion checkouts. One key, so a clearnet address's counter is not this one.
+    onion_checkouts: SlidingLimiter<()>,
+    /// Onion failures of key sign-in, invoice reads and invite redemption together.
+    onion_failures: SlidingLimiter<()>,
+    /// SHA-256 of a presented credential. Five failures an hour for that hash only.
+    credential_failures: SlidingLimiter<[u8; 32]>,
+    /// SHA-256 of a normalized invite code. Five failures an hour for that code only.
+    invite_code_failures: SlidingLimiter<[u8; 32]>,
 }
 
 impl BillingRuntime {
@@ -238,6 +255,10 @@ impl BillingRuntime {
                 settings.anon_global_per_hour,
             ),
             key_failures: SlidingLimiter::new(ABUSE_WINDOW, settings.key_fails_per_ip_per_hour, 0),
+            onion_checkouts: SlidingLimiter::new(ABUSE_WINDOW, ONION_CHECKOUTS_PER_HOUR, 0),
+            onion_failures: SlidingLimiter::new(ONION_FAILURE_WINDOW, ONION_FAILURES_PER_MINUTE, 0),
+            credential_failures: SlidingLimiter::new(ABUSE_WINDOW, CREDENTIAL_FAILURES_PER_HOUR, 0),
+            invite_code_failures: SlidingLimiter::new(ABUSE_WINDOW, INVITE_CODE_FAILURES_PER_HOUR, 0),
         }
     }
 
@@ -246,9 +267,31 @@ impl BillingRuntime {
         &self.anon_create
     }
 
-    /// The per-IP throttle on failed account-key attempts.
+    /// Clearnet per-address failures (key sign-in, invoice reads, invite redemption).
+    /// An onion host does not spend this counter.
     pub fn key_failure_limiter(&self) -> &SlidingLimiter<IpAddr> {
         &self.key_failures
+    }
+
+    /// Onion checkouts: one shared key, 30 per hour. Does not touch the clearnet budgets.
+    pub fn onion_checkout_limiter(&self) -> &SlidingLimiter<()> {
+        &self.onion_checkouts
+    }
+
+    /// Onion failures of key sign-in, invoice reads and invite redemption: one shared key, 30 per minute.
+    pub fn onion_failure_limiter(&self) -> &SlidingLimiter<()> {
+        &self.onion_failures
+    }
+
+    /// Failures of one credential hash (SHA-256 of the presented secret), five per hour.
+    pub fn credential_failure_limiter(&self) -> &SlidingLimiter<[u8; 32]> {
+        &self.credential_failures
+    }
+
+    /// Failures of one normalized invite code, five per hour. A code that does not
+    /// normalize has no row here; the address or onion flood still counts it.
+    pub fn invite_code_failure_limiter(&self) -> &SlidingLimiter<[u8; 32]> {
+        &self.invite_code_failures
     }
 
     /// Read the environment and the key/secret files. Never fails: whatever

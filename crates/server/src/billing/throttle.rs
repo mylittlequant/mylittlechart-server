@@ -7,7 +7,12 @@
 //! * `POST /api/auth/account-key` and `GET /api/billing/anon-invoice/{id}` —
 //!   [`SlidingLimiter::is_blocked`] before looking a key up and
 //!   [`SlidingLimiter::record`] on every failure: after N failures an IP is
-//!   refused until its oldest failure leaves the window.
+//!   refused until its oldest failure leaves the window. The routes keep two
+//!   further limiters of this same type: the SHA-256 of the presented
+//!   credential (five failures an hour for that hash only) and, for an onion
+//!   `Host`, one shared flood key instead of the clearnet address. An onion
+//!   checkout uses its own single key and does not spend the clearnet
+//!   per-IP counter or the clearnet global cap.
 //!
 //! This sits beside the app-wide token bucket in `ratelimit.rs` (which keeps
 //! its own short-burst budget per route class); it exists because these

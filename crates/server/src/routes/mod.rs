@@ -24,7 +24,7 @@
 
 use axum::{
     extract::DefaultBodyLimit,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use std::sync::Arc;
@@ -155,6 +155,9 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/billing/anon-checkout", post(anon_account::anon_checkout))
         .route("/billing/anon-invoice/{id}", get(anon_account::anon_invoice))
         .route("/auth/account-key", post(anon_account::sign_in))
+        .route("/auth/login-policy", get(crate::login_gate::login_policy))
+        .route("/auth/challenge", get(crate::login_gate::issue_challenge))
+        .route("/auth/challenge.js", get(crate::login_gate::challenge_script))
         .route("/account/key/rotate", post(anon_account::rotate))
         .route("/auth/invite/redeem", post(anon_account::redeem_invite))
         // The in-app admin tab (routes/staff.rs): the same operations as the
@@ -169,6 +172,7 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/staff/user", get(staff::user_lookup))
         .route("/staff/invites", post(staff::issue_invite).get(staff::list_invites))
         .route("/staff/invites/{id}/revoke", post(staff::revoke_invite))
+        .route("/staff/login-challenge", put(staff::set_login_challenge))
         .route(
             "/billing/webhook",
             post(billing::webhook).layer(DefaultBodyLimit::max(billing::WEBHOOK_MAX_BODY_BYTES)),

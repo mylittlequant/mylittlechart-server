@@ -70,7 +70,7 @@ fn generate_code() -> String {
 /// The canonical form of what a user typed: case, hyphens and spaces are
 /// ignored and Crockford's look-alikes apply (`O` reads `0`, `I` and `L` read
 /// `1`). `None` unless it is exactly [`CODE_CHARS`] alphabet characters.
-fn normalize_code(input: &str) -> Option<String> {
+pub(crate) fn normalize_code(input: &str) -> Option<String> {
     let mut out = String::with_capacity(CODE_CHARS);
     for c in input.chars() {
         if c == '-' || c.is_whitespace() {

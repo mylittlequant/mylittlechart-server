@@ -45,6 +45,14 @@ pub async fn authorize(
     Path(provider): Path<String>,
     Query(query): Query<AuthorizeQuery>,
 ) -> Response {
+    if state.login_challenge_enabled() {
+        let id = query.challenge_id.as_deref().unwrap_or("");
+        let solution = query.challenge_solution.as_deref().unwrap_or("");
+        if !crate::login_gate::solution_accepted(state.login_challenge(), id, solution, chrono::Utc::now()) {
+            return crate::login_gate::interstitial();
+        }
+    }
+
     let redirect_port = query.redirect_port.unwrap_or(0);
     let is_web_flow = redirect_port == 0;
 

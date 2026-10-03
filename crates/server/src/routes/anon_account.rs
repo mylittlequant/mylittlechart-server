@@ -19,13 +19,17 @@
 //! Nothing in this file formats a credential or an invite code into a log
 //! line or an error body. Sign-in, invoice reads and invite redemption answer
 //! every unusable secret with the same `401` (`invalid account key`, resp.
-//! `invalid invite code`) and count it as a failure of the caller's address;
-//! the routes that create or change a credential (`anon-checkout`, `rotate`,
-//! `redeem`) answer a malformed one with `400 invalid_credential`.
+//! `invalid invite code`). On a clearnet host that counts against the address
+//! and, for a presented account credential, against the SHA-256 of that
+//! credential. On an onion host it counts against one shared flood key instead
+//! of the address. A missing or bad login challenge, while the staff toggle
+//! is on, is `403 challenge_required` and counts as neither. The routes that
+//! create or change a credential (`anon-checkout`, `rotate`, `redeem`) answer
+//! a malformed one with `400 invalid_credential`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{ConnectInfo, Extension, Path, State},
@@ -35,12 +39,12 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::auth::extract_ua_hash;
 use crate::billing::anon::{self, AccountStatus, AnonAccount, Credential, Rotation};
 use crate::billing::flow;
 use crate::billing::invite::{self, RedeemRefusal};
-use crate::billing::throttle::SlidingLimiter;
 use crate::billing::BillingRuntime;
 use crate::models::types::ErrorResponse;
 use crate::routes::billing::{error, flow_error, invoice_json, signed_in};
@@ -67,13 +71,53 @@ fn invalid_credential() -> Response {
 
 /// `429` with a `Retry-After` of the limiter's whole window (the safe upper
 /// bound; the oldest hit leaves sooner).
-fn rate_limited(limiter: &SlidingLimiter<IpAddr>) -> Response {
+fn rate_limited(retry_after: Duration) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
-        [(header::RETRY_AFTER, limiter.window().as_secs().to_string())],
+        [(header::RETRY_AFTER, retry_after.as_secs().to_string())],
         Json(ErrorResponse::new("rate_limited")),
     )
         .into_response()
+}
+
+fn credential_digest(presented: &str) -> [u8; 32] {
+    Sha256::digest(presented.as_bytes()).into()
+}
+
+/// The address (clearnet) or the shared onion flood key is checked before the
+/// credential hash: a spent address refuses even a credential that has never
+/// failed. The hash is additional, and only for a presented account credential.
+fn refusal_if_blocked(billing: &BillingRuntime, ip: IpAddr, onion: bool, presented: Option<&str>) -> Option<Response> {
+    if onion {
+        let limiter = billing.onion_failure_limiter();
+        if limiter.is_blocked((), Instant::now()) {
+            return Some(rate_limited(limiter.window()));
+        }
+    } else {
+        let limiter = billing.key_failure_limiter();
+        if limiter.is_blocked(ip, Instant::now()) {
+            return Some(rate_limited(limiter.window()));
+        }
+    }
+    if let Some(presented) = presented {
+        let limiter = billing.credential_failure_limiter();
+        if limiter.is_blocked(credential_digest(presented), Instant::now()) {
+            return Some(rate_limited(limiter.window()));
+        }
+    }
+    None
+}
+
+fn record_failure(billing: &BillingRuntime, ip: IpAddr, onion: bool, presented: Option<&str>) {
+    let now = Instant::now();
+    if onion {
+        billing.onion_failure_limiter().record((), now);
+    } else {
+        billing.key_failure_limiter().record(ip, now);
+    }
+    if let Some(presented) = presented {
+        billing.credential_failure_limiter().record(credential_digest(presented), now);
+    }
 }
 
 /// The address a request is budgeted against — the same resolution the
@@ -136,9 +180,18 @@ pub async fn anon_checkout(
     let Some(credential) = Credential::parse(&body.credential) else {
         return invalid_credential();
     };
-    let limiter = billing.anon_create_limiter();
-    if !limiter.try_acquire(caller_ip(&headers, peer), Instant::now()) {
-        return rate_limited(limiter);
+    let now = Instant::now();
+    if onion {
+        // Does not spend the clearnet per-IP counter or the clearnet global cap.
+        let limiter = billing.onion_checkout_limiter();
+        if !limiter.try_acquire((), now) {
+            return rate_limited(limiter.window());
+        }
+    } else {
+        let limiter = billing.anon_create_limiter();
+        if !limiter.try_acquire(caller_ip(&headers, peer), now) {
+            return rate_limited(limiter.window());
+        }
     }
     match flow::anon_checkout(&state, plan_id, onion, credential).await {
         Ok(view) => (StatusCode::CREATED, Json(json!({ "invoice_id": view.invoice_id, "pay": view.pay }))).into_response(),
@@ -154,24 +207,24 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("AccountKey "))
 }
 
-/// Look a presented credential up, under the per-IP failure throttle.
+/// Look a presented credential up, under the failure throttles.
 ///
-/// `Err` is the response to send (`429` once the address has used up its
-/// failures; the credential is not even looked at then). `Ok(None)` is an
-/// unusable credential — malformed or unknown — and has been counted as a
-/// failure.
+/// `Err` is the response to send (`429` once the address, the onion flood
+/// key, or this credential's hash has used up its failures; the credential
+/// is not looked up then). `Ok(None)` is an unusable credential — malformed
+/// or unknown — and has been counted.
 async fn account_for_key(
     state: &Arc<AppState>,
     billing: &BillingRuntime,
     presented: Option<&str>,
     ip: IpAddr,
+    onion: bool,
 ) -> Result<Option<AnonAccount>, Response> {
-    let failures = billing.key_failure_limiter();
-    if failures.is_blocked(ip, Instant::now()) {
-        return Err(rate_limited(failures));
+    if let Some(response) = refusal_if_blocked(billing, ip, onion, presented) {
+        return Err(response);
     }
     let Some(key) = presented.and_then(Credential::parse) else {
-        failures.record(ip, Instant::now());
+        record_failure(billing, ip, onion, presented);
         return Ok(None);
     };
     let state = state.clone();
@@ -183,7 +236,7 @@ async fn account_for_key(
     match found {
         Ok(Ok(Some(account))) => Ok(Some(account)),
         Ok(Ok(None)) => {
-            failures.record(ip, Instant::now());
+            record_failure(billing, ip, onion, presented);
             Ok(None)
         }
         Ok(Err(e)) => {
@@ -211,7 +264,8 @@ pub async fn anon_invoice(
         return error(StatusCode::SERVICE_UNAVAILABLE, "billing_not_configured");
     };
     let ip = caller_ip(&headers, peer);
-    let account = match account_for_key(&state, &billing, presented_key(&headers), ip).await {
+    let onion = billing.is_onion_request(&headers);
+    let account = match account_for_key(&state, &billing, presented_key(&headers), ip, onion).await {
         Ok(Some(account)) => account,
         Ok(None) => return invalid_key(),
         Err(response) => return response,
@@ -286,17 +340,21 @@ pub async fn sign_in(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Json(body): Json<SignInBody>,
 ) -> Response {
+    if let Err(response) = crate::login_gate::enforce(&state, &headers) {
+        return response;
+    }
     let Some(billing) = state.billing() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "billing_not_configured");
     };
     let ip = caller_ip(&headers, peer);
-    let account = match account_for_key(&state, &billing, Some(body.credential.as_str()), ip).await {
+    let onion = billing.is_onion_request(&headers);
+    let account = match account_for_key(&state, &billing, Some(body.credential.as_str()), ip, onion).await {
         Ok(Some(account)) => account,
         Ok(None) => return invalid_key(),
         Err(response) => return response,
     };
     if account.status != AccountStatus::Active {
-        billing.key_failure_limiter().record(ip, Instant::now());
+        record_failure(&billing, ip, onion, Some(body.credential.as_str()));
         return invalid_key();
     }
     open_session(state, &headers, account.user_id).await
@@ -373,17 +431,30 @@ pub async fn redeem_invite(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Json(body): Json<RedeemBody>,
 ) -> Response {
+    if let Err(response) = crate::login_gate::enforce(&state, &headers) {
+        return response;
+    }
     let Some(billing) = state.billing() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "billing_not_configured");
     };
     let ip = caller_ip(&headers, peer);
-    let failures = billing.key_failure_limiter();
-    if failures.is_blocked(ip, Instant::now()) {
-        return rate_limited(failures);
+    let onion = billing.is_onion_request(&headers);
+    if let Some(response) = refusal_if_blocked(&billing, ip, onion, None) {
+        return response;
     }
     let Some(credential) = Credential::parse(&body.credential) else {
         return invalid_credential();
     };
+    let code_key = invite::normalize_code(&body.invite_code).map(|normalized| {
+        let digest: [u8; 32] = Sha256::digest(normalized.as_bytes()).into();
+        digest
+    });
+    if let Some(key) = code_key {
+        let limiter = billing.invite_code_failure_limiter();
+        if limiter.is_blocked(key, Instant::now()) {
+            return rate_limited(limiter.window());
+        }
+    }
     let code = body.invite_code;
     let db_state = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -397,7 +468,10 @@ pub async fn redeem_invite(
             open_session(state, &headers, redeemed.user_id).await
         }
         Ok(Ok(Err(RedeemRefusal::InvalidCode))) => {
-            failures.record(ip, Instant::now());
+            record_failure(&billing, ip, onion, None);
+            if let Some(key) = code_key {
+                billing.invite_code_failure_limiter().record(key, Instant::now());
+            }
             invalid_invite()
         }
         Ok(Ok(Err(RedeemRefusal::NickUnavailable))) => error(StatusCode::CONFLICT, "nick_unavailable"),
@@ -416,7 +490,7 @@ mod tests {
     use crate::billing::plans::{DEFAULT_ANON_TOR_ID, DEFAULT_PAID_TOR_ID};
     use crate::billing::testkit::{capture_logs, captured_logs};
     use crate::routes::billing::tests::{
-        app_state, deliver_ok, get_json, one_time_settlement, post_json, runtime, runtime_with, send_from, sign_in,
+        app_state, deliver_ok, get_json, one_time_settlement, post_json, runtime, runtime_with, send, send_from, sign_in,
         spawn_merchant, ONION_HOST,
     };
     use crate::routes::control_api_router;
@@ -461,14 +535,61 @@ mod tests {
     }
 
     async fn invoice_with_key(router: &Router, ip: [u8; 4], credential: &str, invoice: &str) -> (StatusCode, HeaderMap, Value) {
-        let authorization = format!("AccountKey {credential}");
+        invoice_from(router, ip, None, credential, invoice).await
+    }
+
+    async fn key_sign_in_at(
+        router: &Router,
+        ip: [u8; 4],
+        host: Option<&str>,
+        credential: &str,
+        challenge: Option<&str>,
+    ) -> (StatusCode, HeaderMap, Value) {
+        let mut headers = vec![("content-type", "application/json")];
+        if let Some(host) = host {
+            headers.push(("host", host));
+        }
+        if let Some(challenge) = challenge {
+            headers.push(("x-login-challenge", challenge));
+        }
         send_from(
             router,
             ip,
-            Method::GET,
-            &format!("/billing/anon-invoice/{invoice}"),
-            &[("authorization", authorization.as_str())],
-            None,
+            Method::POST,
+            "/auth/account-key",
+            &headers,
+            Some(json!({ "credential": credential }).to_string()),
+        )
+        .await
+    }
+
+    async fn invoice_from(
+        router: &Router,
+        ip: [u8; 4],
+        host: Option<&str>,
+        credential: &str,
+        invoice: &str,
+    ) -> (StatusCode, HeaderMap, Value) {
+        let authorization = format!("AccountKey {credential}");
+        let mut headers = vec![("authorization", authorization.as_str())];
+        if let Some(host) = host {
+            headers.push(("host", host));
+        }
+        send_from(router, ip, Method::GET, &format!("/billing/anon-invoice/{invoice}"), &headers, None).await
+    }
+
+    async fn redeem_at(router: &Router, ip: [u8; 4], host: Option<&str>, code: &str, credential: &str) -> (StatusCode, HeaderMap, Value) {
+        let mut headers = vec![("content-type", "application/json")];
+        if let Some(host) = host {
+            headers.push(("host", host));
+        }
+        send_from(
+            router,
+            ip,
+            Method::POST,
+            "/auth/invite/redeem",
+            &headers,
+            Some(json!({ "invite_code": code, "credential": credential }).to_string()),
         )
         .await
     }
@@ -1205,6 +1326,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn five_failures_of_one_invite_code_do_not_block_a_different_code() {
+        let state = app_state(Some(runtime(None)));
+        let router = control_api_router(state);
+        let same = "AAAA-AAAA-AAAA-AAAA-AAAA";
+        for _ in 0..5 {
+            let (status, _, _) = redeem_from(&router, IP_A, same, &fresh()).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let (status, _, blocked) = redeem_from(&router, IP_A, same, &fresh()).await;
+        assert_eq!((status, blocked["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")));
+        let (status, _, _) = redeem_from(&router, IP_A, "BBBB-BBBB-BBBB-BBBB-BBBB", &fresh()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "a different code still has its own five");
+    }
+
+    #[tokio::test]
     async fn invite_redemption_is_throttled_per_address_like_key_sign_in() {
         let state = app_state(Some(runtime_with(None, &[("MLC_BILLING_KEY_FAILS_PER_IP_PER_HOUR", "3")])));
         let router = control_api_router(state.clone());
@@ -1298,5 +1434,136 @@ mod tests {
         // The account of the admin itself holds its nick.
         let (status, answer) = issue_invite(&router, &admin, json!({ "nick": "rootadmin" })).await;
         assert_eq!((status, answer["error"].as_str()), (StatusCode::CONFLICT, Some("nick taken")));
+    }
+
+    #[tokio::test]
+    async fn toggle_off_sign_in_needs_no_header_and_toggle_on_is_403_without_spending_a_failure() {
+        let (base, _merchant) = spawn_merchant().await;
+        let state = app_state(Some(runtime_with(Some(&base), &[("MLC_BILLING_KEY_FAILS_PER_IP_PER_HOUR", "1")])));
+        let router = control_api_router(state.clone());
+        let (good, _) = paid_account(&router, &state, IP_B, 1).await;
+
+        let (status, policy) = send(&router, Method::GET, "/auth/login-policy", &[], None).await;
+        assert_eq!((status, policy), (StatusCode::OK, json!({ "on": false })));
+        let (status, missing) = send(&router, Method::GET, "/auth/challenge", &[], None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+
+        let (status, _, session) = key_sign_in(&router, IP_A, &good).await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+
+        state.set_login_challenge_enabled(true);
+        let (status, policy) = send(&router, Method::GET, "/auth/login-policy", &[], None).await;
+        assert_eq!((status, policy), (StatusCode::OK, json!({ "on": true, "kind": "pow" })));
+        let (status, issued) = send(&router, Method::GET, "/auth/challenge", &[], None).await;
+        assert_eq!(status, StatusCode::OK, "{issued}");
+        assert_eq!(issued["kind"], "pow");
+        assert_eq!(issued["difficulty"], 18);
+        let id = issued["id"].as_str().expect("id").to_string();
+        assert_eq!(id.len(), 32);
+        assert!(issued["expires_at"].as_str().is_some_and(|t| t.contains('T')));
+
+        for _ in 0..3 {
+            let (status, headers, body) = key_sign_in(&router, IP_A, &good).await;
+            assert_eq!((status, body), (StatusCode::FORBIDDEN, json!({ "error": "challenge_required" })));
+            assert!(headers.get(header::SET_COOKIE).is_none());
+        }
+        let (status, _, body) = key_sign_in(&router, IP_A, "not a key").await;
+        assert_eq!((status, body), (StatusCode::FORBIDDEN, json!({ "error": "challenge_required" })));
+
+        let (status, _, _) = checkout_from(&router, IP_A, ANON, CLEARNET, &fresh()).await;
+        assert_eq!(status, StatusCode::CREATED, "checkout is not behind the challenge");
+
+        let nonce = crate::login_gate::solve_for_test(&id);
+        let header = format!("{id}.{nonce}");
+        let (status, _, session) = key_sign_in_at(&router, IP_A, None, &good, Some(&header)).await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        let (status, _, replay) = key_sign_in_at(&router, IP_A, None, &good, Some(&header)).await;
+        assert_eq!((status, replay), (StatusCode::FORBIDDEN, json!({ "error": "challenge_required" })));
+
+        state.set_login_challenge_enabled(false);
+        let (status, _, session) = key_sign_in(&router, IP_A, &good).await;
+        assert_eq!(status, StatusCode::OK, "the 403s did not spend a failure: {session}");
+    }
+
+    #[tokio::test]
+    async fn five_failures_of_one_credential_do_not_block_a_different_one() {
+        let (base, _merchant) = spawn_merchant().await;
+        let state = app_state(Some(runtime_with(Some(&base), &[("MLC_BILLING_KEY_FAILS_PER_IP_PER_HOUR", "100")])));
+        let router = control_api_router(state.clone());
+        let (good, _) = paid_account(&router, &state, IP_B, 1).await;
+        let bad = fresh();
+        for n in 1..=5 {
+            let (status, _, body) = key_sign_in(&router, IP_A, &bad).await;
+            assert_eq!((status, body["error"].as_str()), (StatusCode::UNAUTHORIZED, Some("invalid account key")), "failure {n}");
+        }
+        let (status, headers, blocked) = key_sign_in(&router, IP_A, &bad).await;
+        assert_eq!((status, blocked["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")));
+        assert_eq!(headers.get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()), Some("3600"));
+        let (status, _, other) = key_sign_in(&router, IP_A, &fresh()).await;
+        assert_eq!((status, other["error"].as_str()), (StatusCode::UNAUTHORIZED, Some("invalid account key")), "a different credential is still tried");
+        let (status, _, session) = key_sign_in(&router, IP_A, &good).await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+    }
+
+    #[tokio::test]
+    async fn onion_failures_do_not_spend_a_clearnet_address_and_cap_at_thirty_a_minute() {
+        let state = app_state(Some(runtime_with(None, &[("MLC_BILLING_KEY_FAILS_PER_IP_PER_HOUR", "3")])));
+        let router = control_api_router(state);
+        let onion_peer = [127, 0, 0, 1];
+
+        for n in 1..=3 {
+            let (status, _, _) = key_sign_in(&router, IP_A, &fresh()).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "clearnet failure {n}");
+        }
+        let (status, _, _) = key_sign_in(&router, IP_A, &fresh()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "clearnet address brake");
+
+        for n in 1..=30 {
+            let (status, _, body) = key_sign_in_at(&router, onion_peer, Some(ONION_HOST), &fresh(), None).await;
+            assert_eq!((status, body["error"].as_str()), (StatusCode::UNAUTHORIZED, Some("invalid account key")), "onion failure {n}");
+        }
+        let (status, headers, blocked) = key_sign_in_at(&router, onion_peer, Some(ONION_HOST), &fresh(), None).await;
+        assert_eq!((status, blocked["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")));
+        assert_eq!(headers.get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()), Some("60"));
+
+        let (status, _, _) = invoice_from(&router, onion_peer, Some(ONION_HOST), &fresh(), "grp_1").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "invoice reads share the onion flood key");
+        let (status, _, answer) = redeem_at(&router, onion_peer, Some(ONION_HOST), "junk", "not-a-credential").await;
+        assert_eq!((status, answer["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")), "invite redemption shares it");
+
+        for n in 1..=3 {
+            let (status, _, _) = key_sign_in(&router, onion_peer, &fresh()).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "clearnet from 127.0.0.1 still has its own budget, hit {n}");
+        }
+        let (status, _, _) = key_sign_in(&router, onion_peer, &fresh()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let (status, _, _) = key_sign_in(&router, IP_B, &fresh()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "another clearnet address is unaffected");
+    }
+
+    #[tokio::test]
+    async fn onion_checkout_allows_thirty_an_hour_without_spending_clearnet_budgets() {
+        let (base, merchant) = spawn_merchant().await;
+        let state = app_state(Some(runtime_with(Some(&base), &[("MLC_BILLING_ANON_GLOBAL_PER_HOUR", "5")])));
+        let router = control_api_router(state);
+        let onion_peer = [127, 0, 0, 1];
+
+        for n in 1..=30 {
+            let (status, _, answer) = checkout_from(&router, onion_peer, DEFAULT_ANON_TOR_ID, ONION_HOST, &fresh()).await;
+            assert_eq!(status, StatusCode::CREATED, "onion checkout {n}: {answer}");
+        }
+        let (status, headers, answer) = checkout_from(&router, onion_peer, DEFAULT_ANON_TOR_ID, ONION_HOST, &fresh()).await;
+        assert_eq!((status, answer["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")));
+        assert_eq!(headers.get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()), Some("3600"));
+        let (status, _, answer) = checkout_from(&router, onion_peer, ANON, ONION_HOST, &fresh()).await;
+        assert_eq!((status, answer["error"].as_str()), (StatusCode::BAD_REQUEST, Some("plan_not_available")), "a bad plan still spends nothing");
+
+        for n in 1..=5 {
+            let (status, _, answer) = checkout_from(&router, IP_A, ANON, CLEARNET, &fresh()).await;
+            assert_eq!(status, StatusCode::CREATED, "clearnet checkout {n}: {answer}");
+        }
+        let (status, _, answer) = checkout_from(&router, IP_A, ANON, CLEARNET, &fresh()).await;
+        assert_eq!((status, answer["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")));
+        assert_eq!(merchant.lock().expect("mock").created, 35, "30 onion + 5 clearnet, and the onion calls did not eat the global 5");
     }
 }

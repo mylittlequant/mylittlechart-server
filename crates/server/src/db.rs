@@ -939,6 +939,7 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
     // columns behind the in-app admin tab (`routes/staff.rs`) — additive and
     // idempotent.
     crate::staff::migrate(&conn)?;
+    crate::login_gate::migrate(&conn)?;
     migrate_gift_codes(&conn)?;
     migrate_private_by_default(&conn)?;
 

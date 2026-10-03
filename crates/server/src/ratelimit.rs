@@ -5,14 +5,21 @@
 //! this is a small, purpose-built `axum::middleware::from_fn_with_state`
 //! middleware layered on the `/api` sub-router (see `main.rs`) rather than a
 //! pulled-in crate. Four traffic classes (see [`BucketKind`]), each with its
-//! own token bucket per client IP:
+//! own token bucket per key (a session secret, or the client IP):
 //!
 //! | Class       | Paths                                                          | Rate     | Burst |
 //! |-------------|-----------------------------------------------------------------|----------|-------|
 //! | `auth_poll` | `/auth/poll`, `/auth/agent-key/poll`, `/auth/link/poll`, `/auth/tg-login/poll` | 60/min | 30 |
-//! | `oauth`     | `/oauth/*`, `/auth/*/init`, `/auth/*/start`, `/auth/account-key`, `/billing/anon-checkout` | 20/min   | 20    |
+//! | `oauth`     | `/oauth/*`, `/auth/*/init`, `/auth/*/start`                        | 20/min   | 20    |
 //! | `api_write` | every other POST/PUT/PATCH/DELETE                                | 120/min | 120   |
 //! | `api_read`  | every other GET (and anything not matched above)                 | 600/min | 600   |
+//!
+//! The bucket key is the SHA-256 of a `session_id` cookie, or of a
+//! `Authorization: Bearer` token when there is no such cookie, and
+//! [`client_ip`] otherwise. Two different cookies do not share a bucket.
+//! The same cookie does. A request with no session is keyed by IP, exactly
+//! as before. `client_ip` itself is unchanged and still ignores
+//! `X-Forwarded-For` from an untrusted peer.
 //!
 //! A refusal answers `429` with an EMPTY body and a `retry-after` header —
 //! the exact same shape regardless of which bucket or path triggered it, so
@@ -37,6 +44,9 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use sha2::{Digest, Sha256};
+
+use crate::auth::{extract_bearer, extract_session_id};
 
 /// Which bucket a request's (method, path) falls into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,12 +91,6 @@ fn classify(path: &str, method: &Method) -> BucketKind {
     {
         return BucketKind::Oauth;
     }
-    // The two unauthenticated anonymous-account routes (a key guess and an
-    // account creation) get the strict class too, on top of their own
-    // per-hour budgets in `billing::throttle`.
-    if path == "/auth/account-key" || path == "/auth/invite/redeem" || path == "/billing/anon-checkout" {
-        return BucketKind::Oauth;
-    }
     match *method {
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE => BucketKind::ApiWrite,
         _ => BucketKind::ApiRead,
@@ -128,6 +132,29 @@ pub(crate) fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     peer
 }
 
+/// What a request's tokens are counted against. A secret and an address never collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BucketKey {
+    Ip(IpAddr),
+    Secret([u8; 32]),
+}
+
+fn secret_digest(secret: &str) -> [u8; 32] {
+    Sha256::digest(secret.as_bytes()).into()
+}
+
+/// Cookie first, then a bearer token, else the client IP.
+fn bucket_key(headers: &HeaderMap, peer: IpAddr) -> BucketKey {
+    if let Some(session_id) = extract_session_id(headers) {
+        return BucketKey::Secret(secret_digest(&session_id));
+    }
+    let authorization = headers.get(axum::http::header::AUTHORIZATION).and_then(|value| value.to_str().ok());
+    if let Some(token) = extract_bearer(authorization) {
+        return BucketKey::Secret(secret_digest(token));
+    }
+    BucketKey::Ip(client_ip(headers, peer))
+}
+
 /// A classic token bucket: `tokens` accumulate at `refill_per_sec`, capped
 /// at `capacity`, and one is spent per allowed request.
 #[derive(Debug, Clone, Copy)]
@@ -159,9 +186,9 @@ impl TokenBucket {
     }
 }
 
-/// One client IP's four buckets, plus when it was last seen — the sweep
+/// One key's four buckets, plus when it was last seen — the sweep
 /// (see [`RateLimiter::sweep`]) drops entries idle past a threshold so a
-/// long-running process never accumulates one entry per IP that ever made
+/// long-running process never accumulates one entry per key that ever made
 /// one request.
 struct IpEntry {
     buckets: HashMap<BucketKind, TokenBucket>,
@@ -171,7 +198,7 @@ struct IpEntry {
 /// Shared, process-wide rate limiter — one instance lives in an `Arc` handed
 /// to [`rate_limit_middleware`] via `axum::middleware::from_fn_with_state`.
 pub struct RateLimiter {
-    entries: Mutex<HashMap<IpAddr, IpEntry>>,
+    entries: Mutex<HashMap<BucketKey, IpEntry>>,
 }
 
 impl RateLimiter {
@@ -181,12 +208,12 @@ impl RateLimiter {
         }
     }
 
-    /// `true` if `ip` still has a token in `kind`'s bucket (and spends it).
-    fn check(&self, ip: IpAddr, kind: BucketKind) -> bool {
+    /// `true` if `key` still has a token in `kind`'s bucket (and spends it).
+    fn check(&self, key: BucketKey, kind: BucketKind) -> bool {
         let (capacity, refill_per_sec) = kind.limits();
         let now = Instant::now();
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = entries.entry(ip).or_insert_with(|| IpEntry {
+        let entry = entries.entry(key).or_insert_with(|| IpEntry {
             buckets: HashMap::new(),
             last_seen: now,
         });
@@ -250,9 +277,9 @@ pub async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let ip = client_ip(req.headers(), peer.ip());
+    let key = bucket_key(req.headers(), peer.ip());
     let kind = classify(req.uri().path(), req.method());
-    if !limiter.check(ip, kind) {
+    if !limiter.check(key, kind) {
         return too_many_requests();
     }
     next.run(req).await
@@ -264,10 +291,13 @@ mod tests {
 
     #[test]
     fn the_anonymous_account_routes_are_in_the_strict_class() {
-        assert_eq!(classify("/auth/account-key", &Method::POST), BucketKind::Oauth);
-        assert_eq!(classify("/billing/anon-checkout", &Method::POST), BucketKind::Oauth);
-        assert_eq!(classify("/auth/invite/redeem", &Method::POST), BucketKind::Oauth);
+        assert_eq!(classify("/auth/account-key", &Method::POST), BucketKind::ApiWrite);
+        assert_eq!(classify("/billing/anon-checkout", &Method::POST), BucketKind::ApiWrite);
+        assert_eq!(classify("/auth/invite/redeem", &Method::POST), BucketKind::ApiWrite);
         assert_eq!(classify("/billing/checkout", &Method::POST), BucketKind::ApiWrite);
+        assert_eq!(classify("/oauth/github/authorize", &Method::GET), BucketKind::Oauth);
+        assert_eq!(classify("/auth/link/init", &Method::POST), BucketKind::Oauth);
+        assert_eq!(classify("/auth/link/start", &Method::POST), BucketKind::Oauth);
     }
 
     #[test]
@@ -312,24 +342,24 @@ mod tests {
         let b: IpAddr = "203.0.113.2".parse().expect("valid ip");
         // Exhaust `a`'s oauth bucket (capacity 20) without touching `b`'s.
         for _ in 0..20 {
-            assert!(limiter.check(a, BucketKind::Oauth));
+            assert!(limiter.check(BucketKey::Ip(a), BucketKind::Oauth));
         }
-        assert!(!limiter.check(a, BucketKind::Oauth));
-        assert!(limiter.check(b, BucketKind::Oauth));
+        assert!(!limiter.check(BucketKey::Ip(a), BucketKind::Oauth));
+        assert!(limiter.check(BucketKey::Ip(b), BucketKind::Oauth));
     }
 
     #[test]
     fn rate_limiter_sweep_drops_only_idle_entries() {
         let limiter = RateLimiter::new();
         let ip: IpAddr = "203.0.113.9".parse().expect("valid ip");
-        assert!(limiter.check(ip, BucketKind::ApiRead));
+        assert!(limiter.check(BucketKey::Ip(ip), BucketKind::ApiRead));
         {
             let mut entries = limiter.entries.lock().expect("lock");
-            entries.get_mut(&ip).expect("entry exists").last_seen =
+            entries.get_mut(&BucketKey::Ip(ip)).expect("entry exists").last_seen =
                 Instant::now() - Duration::from_secs(11 * 60);
         }
         limiter.sweep(Duration::from_secs(10 * 60));
-        assert!(!limiter.entries.lock().expect("lock").contains_key(&ip));
+        assert!(!limiter.entries.lock().expect("lock").contains_key(&BucketKey::Ip(ip)));
     }
 
     #[test]
@@ -387,5 +417,47 @@ mod tests {
         assert!(is_wireguard_control_subnet("10.77.255.254".parse().expect("valid ip")));
         assert!(!is_wireguard_control_subnet("10.78.0.1".parse().expect("valid ip")));
         assert!(!is_wireguard_control_subnet("10.76.0.1".parse().expect("valid ip")));
+    }
+
+    #[test]
+    fn a_session_cookie_is_bucketed_apart_from_127_0_0_1_with_no_cookie() {
+        let limiter = RateLimiter::new();
+        let loopback: IpAddr = "127.0.0.1".parse().expect("valid ip");
+        let bare = HeaderMap::new();
+        let bare_key = bucket_key(&bare, loopback);
+        assert_eq!(bare_key, BucketKey::Ip(loopback));
+
+        let mut authed = HeaderMap::new();
+        authed.insert("cookie", "session_id=aaa".parse().expect("valid header"));
+        let cookie_key = bucket_key(&authed, loopback);
+        assert_ne!(cookie_key, bare_key);
+
+        let mut again = HeaderMap::new();
+        again.insert("cookie", "other=1; session_id=aaa".parse().expect("valid header"));
+        assert_eq!(bucket_key(&again, loopback), cookie_key, "the same cookie shares a bucket");
+
+        let mut other = HeaderMap::new();
+        other.insert("cookie", "session_id=bbb".parse().expect("valid header"));
+        let other_key = bucket_key(&other, loopback);
+        assert_ne!(other_key, cookie_key, "two cookies do not share a bucket");
+
+        for _ in 0..20 {
+            assert!(limiter.check(cookie_key, BucketKind::Oauth));
+        }
+        assert!(!limiter.check(cookie_key, BucketKind::Oauth));
+        assert!(limiter.check(bare_key, BucketKind::Oauth), "127.0.0.1 with no cookie is its own bucket");
+        assert!(limiter.check(other_key, BucketKind::Oauth));
+
+        let mut bearer = HeaderMap::new();
+        bearer.insert("authorization", "Bearer tok-a".parse().expect("valid header"));
+        assert_ne!(bucket_key(&bearer, loopback), bare_key);
+        let mut account_key = HeaderMap::new();
+        account_key.insert("authorization", "AccountKey abc".parse().expect("valid header"));
+        assert_eq!(bucket_key(&account_key, loopback), bare_key, "an account key is not a bearer session");
+
+        let mut both = HeaderMap::new();
+        both.insert("cookie", "session_id=aaa".parse().expect("valid header"));
+        both.insert("authorization", "Bearer tok-a".parse().expect("valid header"));
+        assert_eq!(bucket_key(&both, loopback), cookie_key, "a cookie wins over a bearer");
     }
 }
