@@ -1,13 +1,18 @@
 //! Reverse proxy for `/_matrix` once the messenger runs as its own process.
 //!
 //! The product server keeps the public listener. When `MESSENGER_UPSTREAM`
-//! is set it forwards that prefix byte for byte and does not mount the
-//! in-process routes. The chart client does not change.
+//! is set it forwards that prefix and does not mount the in-process
+//! routes. A client-supplied `x-account-assertion` is always removed.
+//! When `MLC_BRIDGE_SECRET` is set, a resolved chart account gets a
+//! signed assertion. The chart client does not change.
 
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use std::sync::Arc;
+
+use crate::state::AppState;
 
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -15,10 +20,11 @@ const BODY_LIMIT: usize = 64 * 1024 * 1024;
 pub struct Upstream {
     base: String,
     client: reqwest::Client,
+    app: Arc<AppState>,
 }
 
 impl Upstream {
-    pub fn new(base: String) -> Self {
+    pub fn new(base: String, app: Arc<AppState>) -> Self {
         // Loopback only. Do not inherit HTTP_PROXY, and do not follow a
         // redirect — the chart client has to see the messenger's own status.
         let client = reqwest::Client::builder()
@@ -27,12 +33,12 @@ impl Upstream {
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .expect("messenger upstream client");
-        Self { base: base.trim_end_matches('/').to_string(), client }
+        Self { base: base.trim_end_matches('/').to_string(), client, app }
     }
 }
 
-pub fn router(base: String) -> axum::Router {
-    axum::Router::new().fallback(forward).with_state(Upstream::new(base))
+pub fn router(base: String, app: Arc<AppState>) -> axum::Router {
+    axum::Router::new().fallback(forward).with_state(Upstream::new(base, app))
 }
 
 fn hop(name: &header::HeaderName) -> bool {
@@ -75,12 +81,28 @@ async fn forward(State(upstream): State<Upstream>, OriginalUri(uri): OriginalUri
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let headers_in = req.headers().clone();
+    let path_and_query = uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".to_string());
     let body = match axum::body::to_bytes(req.into_body(), BODY_LIMIT).await {
         Ok(body) => body,
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
     };
     let mut headers = reqwest::header::HeaderMap::new();
     copy_headers(&headers_in, &mut headers);
+    headers.remove(crate::account_bridge::ASSERTION_HEADER);
+    let method_name = method.as_str().to_string();
+    let app = upstream.app.clone();
+    let headers_for_auth = headers_in;
+    let assertion = tokio::task::spawn_blocking(move || {
+        assertion_for(&app, &headers_for_auth, &method_name, &path_and_query)
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(assertion) = assertion {
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&assertion) {
+            headers.insert(crate::account_bridge::ASSERTION_HEADER, value);
+        }
+    }
     let sent = upstream.client.request(method, url).headers(headers).body(body.to_vec()).send().await;
     let received = match sent {
         Ok(received) => received,
@@ -113,6 +135,35 @@ async fn forward(State(upstream): State<Upstream>, OriginalUri(uri): OriginalUri
         }
     };
     response.body(Body::from(bytes.to_vec())).unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+fn assertion_for(app: &AppState, headers: &HeaderMap, method: &str, path_and_query: &str) -> Option<String> {
+    let secret = crate::account_bridge::secret()?;
+    let session_id = crate::auth::extract_session_id(headers);
+    let bearer = crate::auth::extract_bearer(
+        headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()),
+    );
+    if session_id.is_none() && bearer.is_none() {
+        return None;
+    }
+    let cp = app.control_plane();
+    let conn = cp.db.lock().unwrap_or_else(|error| error.into_inner());
+    let (user_id, cred_ref) = if let Some(session_id) = session_id {
+        let ua_hash = crate::auth::extract_ua_hash(headers);
+        let user_id = crate::db::resolve_web_session(&conn, &session_id, &ua_hash).ok().flatten()?;
+        (user_id, crate::routes::matrix::auth::web_credential_ref(&session_id))
+    } else {
+        let raw = bearer?;
+        let cred_ref = crate::auth::hash_token(raw);
+        let user_id = crate::db::resolve_token_hash_with_expiry(&conn, &cred_ref).ok().flatten()?;
+        (user_id, cred_ref)
+    };
+    let nick = crate::db::nick_for_user(&conn, user_id).ok().flatten()?;
+    if nick.is_empty() {
+        return None;
+    }
+    let paid = crate::db::user_is_paid(&conn, user_id).unwrap_or(false);
+    Some(crate::account_bridge::assertion_header(&secret, method, path_and_query, &nick, paid, &cred_ref))
 }
 
 fn hop_str(name: &str) -> bool {

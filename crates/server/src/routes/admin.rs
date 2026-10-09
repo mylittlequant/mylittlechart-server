@@ -1039,20 +1039,23 @@ pub async fn admin_set_user_nick(
     let state_for_wake = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let cp = state.control_plane();
-        let reserved = {
+        let (old_nick, reserved) = {
             let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
-            crate::db::admin_set_nick(&conn, user_id, &nick)?
+            let old_nick = crate::db::nick_for_user(&conn, user_id).unwrap_or(None).unwrap_or_default();
+            let reserved = crate::db::admin_set_nick(&conn, user_id, &nick)?;
+            (old_nick, reserved)
         };
         // Identity guard released first (lock order `db` -> `messenger`): the
         // assigned nick is re-stamped into the user's Matrix member events,
         // same as a self-service change.
         let wake_ids = crate::routes::matrix::rooms::propagate_display_name_change(cp, user_id);
-        Ok::<_, crate::db::AdminNickError>((reserved, wake_ids))
+        Ok::<_, crate::db::AdminNickError>((old_nick, reserved, wake_ids))
     })
     .await;
 
     match result {
-        Ok(Ok((reserved, wake_ids))) => {
+        Ok(Ok((old_nick, reserved, wake_ids))) => {
+            crate::account_bridge::emit_nick_changed(&old_nick, &nick_for_response);
             state_for_wake.control_plane().live.wake_many(wake_ids.into_iter().map(|id| format!("user:{id}")));
             Json(serde_json::json!({
                 "user_id": user_id,

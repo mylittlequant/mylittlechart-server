@@ -137,6 +137,11 @@ pub fn control_api_router(state: Arc<AppState>) -> Router {
         .route("/account/redeem", post(account::redeem))
         // Account nick change (cookie-session or bearer auth, same as redeem).
         .route("/account/nick", post(account::set_nick))
+        // Messenger bridge. 404 until MLC_BRIDGE_SECRET is set. Admit creates
+        // a chart account for mail, federation, or any other external source
+        // and never copies that source's name into the nick.
+        .route("/bridge/admit", post(crate::account_bridge::admit))
+        .route("/bridge/credentials", get(crate::account_bridge::credentials))
         // dig2pay billing adapter (see routes/billing.rs): four signed-in
         // routes, the PUBLIC plan catalog (an anonymous account is bought by
         // a visitor with no session; it holds no per-user state and sits

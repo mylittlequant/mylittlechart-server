@@ -372,8 +372,9 @@ fn redeem_in_savepoint(
         return Ok(Err(RedeemRefusal::CredentialInUse));
     }
     let user_id = anon::create_active(conn, credential, now)?;
+    let old_nick = crate::db::nick_for_user(conn, user_id).ok().flatten().unwrap_or_default();
     match crate::db::admin_set_nick(conn, user_id, &nick) {
-        Ok(_) => {}
+        Ok(_) => crate::account_bridge::emit_nick_changed(&old_nick, &nick),
         Err(crate::db::AdminNickError::Db(e)) => return Err(e),
         Err(_) => return Ok(Err(RedeemRefusal::NickUnavailable)),
     }

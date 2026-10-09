@@ -259,11 +259,15 @@ pub fn rotate_key(conn: &Connection, user_id: i64, new_key: &Credential, now: Da
 /// enumerates. `conn` is the identity connection, already locked by the
 /// caller; `messenger` is locked after it (identity THEN messenger).
 fn delete_account(conn: &Connection, messenger: &mut Connection, live: &LiveRegistry, user_id: i64) -> Result<()> {
+    let nick = crate::db::nick_for_user(conn, user_id).ok().flatten();
     crate::routes::matrix::auth::revoke_all_devices_of_user(conn, messenger, live, user_id, &Utc::now().to_rfc3339());
     for table in ["billing_subscriptions", "billing_invoices", "billing_subscribers", "billing_anon_accounts"] {
         conn.execute(&format!("DELETE FROM {table} WHERE user_id = ?1"), params![user_id])?;
     }
     crate::db::delete_account(conn, user_id)?;
+    if let Some(nick) = nick.as_deref() {
+        crate::account_bridge::emit_account_deleted(nick);
+    }
     Ok(())
 }
 

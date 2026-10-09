@@ -401,11 +401,20 @@ pub async fn delete_account(
         let now = chrono::Utc::now().to_rfc3339();
         let outcome = {
             let conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
+            let nick = crate::db::nick_for_user(&conn, user_id).ok().flatten();
             {
                 let mut messenger = cp.messenger_conn();
                 crate::routes::matrix::auth::revoke_all_devices_of_user(&conn, &mut messenger, &cp.live, user_id, &now);
             }
-            crate::db::delete_account(&conn, user_id)
+            let deleted = crate::db::delete_account(&conn, user_id);
+            if let Ok((n, _)) = &deleted {
+                if *n > 0 {
+                    if let Some(nick) = nick.as_deref() {
+                        crate::account_bridge::emit_account_deleted(nick);
+                    }
+                }
+            }
+            deleted
         };
         // The account row lives in identity; its telemetry lives in the
         // operational database (2026-08-30 store split), its hot-plane sync

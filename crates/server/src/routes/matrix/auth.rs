@@ -389,6 +389,7 @@ pub fn on_credential_revoked(
     credential_ref: &str,
     now: &str,
 ) -> rusqlite::Result<()> {
+    crate::account_bridge::emit_credential_revoked(credential_ref);
     let revoked = matrix_keys_store::delete_device_by_credential(messenger_conn, credential_kind, credential_ref, now)?;
     let Some((revoked_user_id, _device_id)) = revoked else {
         return Ok(());

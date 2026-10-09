@@ -35,9 +35,16 @@
 //!                            Unset keeps today's product server.
 //!   MESSENGER_UPSTREAM     — on the product server, base URL of the messenger
 //!                            process (`http://127.0.0.1:19210`). `/_matrix`
-//!                            is forwarded byte for byte and the in-process
+//!                            is forwarded to that process and the in-process
 //!                            routes are not mounted. Ignored when
 //!                            `MLC_PROCESS=messenger`.
+//!   MLC_BRIDGE_SECRET      — shared HMAC secret for the messenger bridge.
+//!                            Unset: the proxy does not add an assertion and
+//!                            `/api/bridge/*` answers 404. The proxy still
+//!                            strips a client-supplied assertion header.
+//!   MLC_BRIDGE_EVENTS_URL  — where revoke, delete, and nick-change events
+//!                            are posted. Unset: no event is sent. Direct
+//!                            writes into the current messenger database stay.
 //!   MLC_TELEMETRY_RETENTION_DAYS — days of `device_metrics` rows (the
 //!                            telemetry time series) to keep in the
 //!                            operational database before the periodic
@@ -124,6 +131,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::timeout::TimeoutLayer;
 
+mod account_bridge;
 mod account_merge;
 mod auth;
 mod billing;
@@ -1312,7 +1320,9 @@ async fn main() {
     // peer is the product server, so one bucket would cover every caller.
     // The product server keeps the limiter on the proxied prefix.
     let matrix_router = if proxy_matrix {
-        messenger_upstream.clone().map(messenger_proxy::router)
+        messenger_upstream
+            .clone()
+            .map(|base| messenger_proxy::router(base, app_state.clone()))
     } else if role == state::ServerRole::Control {
         Some(routes::matrix_api_router(app_state.clone()))
     } else {
