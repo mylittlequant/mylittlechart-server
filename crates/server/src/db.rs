@@ -734,12 +734,13 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
     )?;
 
     // Safe migration: add the account nick to users (operator ruling
-    // 2026-09-05). NULL means "not chosen" — the displayed label falls back
-    // to display_name, then public_id (see db::effective_label_for_user);
-    // nick is never backfilled from display_name because OAuth display
-    // names are not guaranteed unique. Like paid_until and public_id above,
-    // an existing installation only ever gains these columns through the
-    // ALTERs below — CREATE TABLE users up top is never edited for them.
+    // 2026-09-05). An empty nick is filled with a random handle further
+    // down (`backfill_issued_nicks`), not from the OAuth display name.
+    // The displayed label still falls back to display_name, then public_id
+    // (see db::effective_label_for_user) only when issuance has not run.
+    // Like paid_until and public_id above, an existing installation only
+    // ever gains these columns through the ALTERs below — CREATE TABLE
+    // users up top is never edited for them.
     let _ = conn.execute("ALTER TABLE users ADD COLUMN nick TEXT", []);
     let _ = conn.execute("ALTER TABLE users ADD COLUMN nick_changed_at TEXT", []);
     // Case-insensitive uniqueness, only enforced once a nick is chosen — must
@@ -794,6 +795,14 @@ pub fn init_db(path: &str, key_hex: &str) -> Result<Connection> {
             if forbidden_report.empty_after_normalize.len() == 1 { "y" } else { "ies" },
             forbidden_report.empty_after_normalize,
         );
+    }
+
+    // Every account has a nick. Rows that predate that rule (NULL or empty)
+    // get a random one here. `nick_changed_at` stays NULL so the first
+    // self-service `set_nick` is still free of the 30-day cooldown.
+    let issued = backfill_issued_nicks(&conn)?;
+    if issued > 0 {
+        tracing::info!("issued random nicks to {issued} accounts that had none");
     }
 
     // Safe migration: add profile_id column to sync_items (for multi-profile scoping).
@@ -1647,6 +1656,9 @@ pub fn upsert_user(
         params![provider, provider_user_id],
         |row| row.get(0),
     )?;
+    // New accounts, and any row that still has no nick, leave this call with one.
+    // A nick already chosen is left alone, including `nick_changed_at`.
+    assign_issued_nick_if_empty(conn, id)?;
 
     let (email_addr, email_verified) = email_bind_params(email);
     conn.execute(
@@ -1834,18 +1846,123 @@ pub fn get_user_public_id(conn: &Connection, user_id: i64) -> Result<String> {
 }
 
 // ============================================================================
-// Account nicks (operator ruling 2026-09-05)
+// Account nicks (operator ruling 2026-09-05, issuance 2026-10-10)
 //
-// A nick is an account attribute, not a separate identity: on creation the
-// column stays NULL and the account is labeled by its OAuth display_name
-// (see `effective_label_for_user`'s fallback chain). The user may CHANGE it
-// once every `NICK_CHANGE_COOLDOWN_DAYS` to a globally unique (case
-// insensitive) handle via `set_nick`. Never backfilled automatically —
-// OAuth display names collide across accounts, a chosen nick must not.
+// The nick is the account's name. Creation and boot fill an empty `nick`
+// with a random handle (`assign_issued_nick_if_empty`); OAuth display names
+// are not used, they collide. `users.id` stays a row counter. `public_id`
+// stays the old local label and is not the name.
+//
+// Issuance writes `nick` only. `nick_changed_at` stays NULL, so the first
+// self-service `set_nick` is not inside the 30-day cooldown. A later change
+// still goes through `set_nick`.
 // ============================================================================
 
 /// Minimum time between two nick changes on the same account.
 const NICK_CHANGE_COOLDOWN_DAYS: i64 = 30;
+
+/// How many random candidates to try before giving up on one account.
+const ISSUED_NICK_ATTEMPTS: usize = 64;
+
+/// Four consonant-vowel pairs, lowercase, 8 letters. Shorter than the
+/// hex-lookalike rule, no digits, no separators, so the shape gates pass
+/// before the forbidden and reserved checks reject a rare bad draw.
+fn issued_nick_candidate() -> String {
+    use rand::Rng;
+    const CONSONANTS: &[u8] = b"bcdfghjklmnpqrstvwxyz";
+    const VOWELS: &[u8] = b"aeiou";
+    let mut rng = rand::thread_rng();
+    let mut nick = String::with_capacity(8);
+    for _ in 0..4 {
+        nick.push(CONSONANTS[rng.gen_range(0..CONSONANTS.len())] as char);
+        nick.push(VOWELS[rng.gen_range(0..VOWELS.len())] as char);
+    }
+    nick
+}
+
+/// `registration_invites` is created by the billing schema, which runs after
+/// `init_db`. A missing table means nothing is held.
+fn invite_holds_nick(conn: &Connection, nick_lower: &str) -> Result<bool> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'registration_invites'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !table_exists {
+        return Ok(false);
+    }
+    crate::billing::invite::nick_held(conn, nick_lower, chrono::Utc::now())
+}
+
+fn issued_nick_rejected(conn: &Connection, nick: &str, reserved: &[ReservedNickEntry]) -> Result<bool> {
+    if !nick_format_valid(nick) || !crate::nick_policy::nick_shape_ok(nick) {
+        return Ok(true);
+    }
+    if crate::nick_policy::forbidden_hit(nick).is_some() {
+        return Ok(true);
+    }
+    let lower = nick.to_lowercase();
+    if is_nick_reserved(conn, &lower)? || invite_holds_nick(conn, &lower)? {
+        return Ok(true);
+    }
+    let handles: Vec<crate::nick_policy::ReservedHandle<'_>> = reserved
+        .iter()
+        .map(|entry| crate::nick_policy::ReservedHandle {
+            nick_lower: &entry.nick,
+            category: &entry.category,
+        })
+        .collect();
+    Ok(crate::nick_policy::impersonation_hit(nick, &handles).is_some())
+}
+
+/// Fill `user_id`'s nick when it is NULL or empty. Writes `nick` only.
+/// Returns whether this call stored a new nick.
+pub fn assign_issued_nick_if_empty(conn: &Connection, user_id: i64) -> Result<bool> {
+    let current = nick_for_user(conn, user_id)?;
+    if current.as_deref().is_some_and(|nick| !nick.is_empty()) {
+        return Ok(false);
+    }
+    let reserved = reserved_nick_entries(conn)?;
+    for _ in 0..ISSUED_NICK_ATTEMPTS {
+        let nick = issued_nick_candidate();
+        if issued_nick_rejected(conn, &nick, &reserved)? {
+            continue;
+        }
+        match conn.execute(
+            "UPDATE users SET nick = ?1 WHERE id = ?2 AND (nick IS NULL OR nick = '')",
+            params![nick, user_id],
+        ) {
+            Ok(0) => return Ok(false),
+            Ok(_) => return Ok(true),
+            Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    tracing::error!("could not issue a nick for user {user_id} after {ISSUED_NICK_ATTEMPTS} candidates");
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+        Some(format!("issued nick exhausted for user_id={user_id}")),
+    ))
+}
+
+/// One pass over accounts that have no nick. Idempotent.
+fn backfill_issued_nicks(conn: &Connection) -> Result<usize> {
+    let mut stmt = conn.prepare("SELECT id FROM users WHERE nick IS NULL OR nick = ''")?;
+    let ids = stmt.query_map([], |row| row.get(0))?.collect::<Result<Vec<i64>>>()?;
+    drop(stmt);
+    let mut issued = 0usize;
+    for user_id in ids {
+        if assign_issued_nick_if_empty(conn, user_id)? {
+            issued += 1;
+        }
+    }
+    Ok(issued)
+}
 
 /// Format rules for a chosen nick: 3-24 ASCII characters, letters/digits plus
 /// `_`, `-`, `.`, and the first character must be a letter or digit (so a
@@ -9124,6 +9241,51 @@ mod tests {
         assert!(!super::nick_format_valid("abc def"));
         assert!(!super::nick_format_valid("abc!"));
         assert!(super::nick_format_valid("a1_b-c.d"));
+    }
+
+    #[test]
+    fn issued_nick_fills_empty_without_starting_the_cooldown() {
+        let conn = share_test_conn();
+        crate::billing::invite::ensure_schema(&conn).expect("registration_invites");
+        let uid = insert_share_user(&conn, "alice", Some("pub-alice"));
+        let other = insert_share_user(&conn, "bob", Some("pub-bob"));
+        super::set_nick(&conn, other, "keptnick", &[]).expect("chosen nick");
+
+        assert!(super::assign_issued_nick_if_empty(&conn, uid).expect("issue"));
+        let issued = super::nick_for_user(&conn, uid).expect("nick").expect("issued nick");
+        assert!(super::nick_format_valid(&issued));
+        assert!(crate::nick_policy::nick_shape_ok(&issued));
+        assert!(crate::nick_policy::forbidden_hit(&issued).is_none());
+        let changed_at: Option<String> = conn
+            .query_row("SELECT nick_changed_at FROM users WHERE id = ?1", [uid], |row| row.get(0))
+            .expect("changed_at");
+        assert_eq!(changed_at, None, "issuance must not start the 30-day cooldown");
+
+        assert!(!super::assign_issued_nick_if_empty(&conn, uid).expect("second issue"));
+        assert_eq!(super::nick_for_user(&conn, uid).expect("nick").as_deref(), Some(issued.as_str()));
+        assert!(!super::assign_issued_nick_if_empty(&conn, other).expect("leave chosen"));
+        assert_eq!(super::nick_for_user(&conn, other).expect("nick").as_deref(), Some("keptnick"));
+
+        // The first self-service change is still allowed, and it replaces the random nick.
+        super::set_nick(&conn, uid, "chosenone", &[]).expect("first chosen nick");
+        assert_eq!(super::nick_for_user(&conn, uid).expect("nick").as_deref(), Some("chosenone"));
+    }
+
+    #[test]
+    fn upsert_user_issues_a_nick() {
+        let conn = share_test_conn();
+        crate::billing::invite::ensure_schema(&conn).expect("registration_invites");
+        let now = chrono::Utc::now().to_rfc3339();
+        let uid = super::upsert_user(&conn, "github", "gh-issued", "Alice", None, &now).expect("upsert");
+        let nick = super::nick_for_user(&conn, uid).expect("nick").expect("issued");
+        assert!(super::nick_format_valid(&nick));
+        let again = super::upsert_user(&conn, "github", "gh-issued", "Alice Again", None, &now).expect("upsert again");
+        assert_eq!(again, uid);
+        assert_eq!(super::nick_for_user(&conn, uid).expect("nick").as_deref(), Some(nick.as_str()));
+        let changed_at: Option<String> = conn
+            .query_row("SELECT nick_changed_at FROM users WHERE id = ?1", [uid], |row| row.get(0))
+            .expect("changed_at");
+        assert_eq!(changed_at, None);
     }
 
     #[test]
