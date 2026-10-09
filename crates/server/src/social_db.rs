@@ -51,6 +51,8 @@ pub fn init_social_db(path: &str, key_hex: &str) -> Result<Connection> {
     conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key_hex))?;
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    // Shared with the messenger process. See `db::init_db`.
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
     create_social_schema(&conn)?;
     // DM tables (`dm_db.rs`) live in this same file — same storage split,
     // separate module because the crypto/paid-gate posture is unrelated to

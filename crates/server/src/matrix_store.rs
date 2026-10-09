@@ -498,6 +498,9 @@ pub fn init_messenger_db(path: &str, key_hex: &str) -> rusqlite::Result<Connecti
     conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))?;
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    // Product server and messenger process both open this file: the product
+    // server still revokes devices on session revoke and account delete.
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
     create_matrix_schema(&conn)?;
     crate::matrix_keys_store::create_matrix_keys_schema(&conn)?;
     Ok(conn)

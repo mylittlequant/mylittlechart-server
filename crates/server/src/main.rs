@@ -27,6 +27,17 @@
 //!   BUILD_ATTEST_ENFORCE   — "true"/"1" to reject unsigned clients (default: false)
 //!   BUILD_ATTEST_MAX_AGE_DAYS — max build age in days (default: 365)
 //!   MLC_DBKEY_PATH         — SQLCipher key file in tmpfs (default: /run/mlc/dbkey)
+//!   MLC_DBKEY_RETAIN       — "1" leaves that file in place after boot so a
+//!                            second process can read it. The product server
+//!                            sets this; the messenger process does not, and
+//!                            deletes the file.
+//!   MLC_PROCESS            — "messenger" runs only `/health` and `/_matrix`.
+//!                            Unset keeps today's product server.
+//!   MESSENGER_UPSTREAM     — on the product server, base URL of the messenger
+//!                            process (`http://127.0.0.1:19210`). `/_matrix`
+//!                            is forwarded byte for byte and the in-process
+//!                            routes are not mounted. Ignored when
+//!                            `MLC_PROCESS=messenger`.
 //!   MLC_TELEMETRY_RETENTION_DAYS — days of `device_metrics` rows (the
 //!                            telemetry time series) to keep in the
 //!                            operational database before the periodic
@@ -121,6 +132,7 @@ mod db;
 mod dm_db;
 mod entitlements;
 mod matrix_migration;
+mod messenger_proxy;
 // `live`, `share_hub`, `matrix_store` and `matrix_keys_store` live in the
 // library target (`lib.rs`), not here — see that file's doc comment for why.
 // `share_live` below is the glue that binds the hub to this crate's accounts
@@ -551,6 +563,37 @@ async fn main() {
     let role = state::ServerRole::from_env();
     tracing::info!("Server role: {}", role);
 
+    // Same binary, two processes. Unset keeps `/_matrix` in this process.
+    // `MLC_PROCESS=messenger` serves only `/health` and `/_matrix`.
+    // `MESSENGER_UPSTREAM` on the product process forwards that prefix and
+    // does not mount the in-process routes. Messenger wins if both are set,
+    // so a mis-set unit cannot proxy to itself.
+    let messenger_only = std::env::var("MLC_PROCESS")
+        .map(|v| v.trim() == "messenger")
+        .unwrap_or(false);
+    let messenger_upstream = std::env::var("MESSENGER_UPSTREAM").ok().and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    if messenger_only && role != state::ServerRole::Control {
+        tracing::error!("MLC_PROCESS=messenger requires MLC_ROLE=control");
+        std::process::exit(1);
+    }
+    let proxy_matrix =
+        role == state::ServerRole::Control && messenger_upstream.is_some() && !messenger_only;
+    if messenger_only {
+        tracing::info!("messenger process: /health and /_matrix only");
+    } else if proxy_matrix {
+        tracing::info!(
+            "messenger proxy: /_matrix -> {}",
+            messenger_upstream.as_deref().unwrap_or("")
+        );
+    }
+
     // Read configuration from environment.
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -720,34 +763,38 @@ async fn main() {
             // other `init_*_db` failure above); a failure migrating any ONE
             // conversation is logged by `migrate_legacy_dms` itself and does
             // not stop boot.
-            let migration_now = chrono::Utc::now().to_rfc3339();
-            match matrix_migration::migrate_legacy_dms(&mut messenger_conn, &social_conn, &db_conn, &migration_now) {
-                Ok(report) => {
-                    if report.conversations_skipped > 0 {
-                        tracing::warn!(
-                            "Legacy DM migration skipped {} conversation(s): {:?}",
-                            report.conversations_skipped,
-                            report.skipped
-                        );
+            // The messenger process owns these boot writes once `/_matrix`
+            // has moved. Running them in both processes races the same rows.
+            if !proxy_matrix {
+                let migration_now = chrono::Utc::now().to_rfc3339();
+                match matrix_migration::migrate_legacy_dms(&mut messenger_conn, &social_conn, &db_conn, &migration_now) {
+                    Ok(report) => {
+                        if report.conversations_skipped > 0 {
+                            tracing::warn!(
+                                "Legacy DM migration skipped {} conversation(s): {:?}",
+                                report.conversations_skipped,
+                                report.skipped
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Legacy DM migration failed to read social.db: {}", e);
+                        std::process::exit(1);
                     }
                 }
-                Err(e) => {
-                    tracing::error!("Legacy DM migration failed to read social.db: {}", e);
-                    std::process::exit(1);
-                }
-            }
 
-            // Member-event `displayname` backfill: rooms created before the
-            // server stamped each user's effective label into their
-            // `m.room.member` events (clients title a DM after the peer's
-            // `displayname`, so those rooms show a 32-hex public id), plus
-            // any label that changed while no propagation ran. Idempotent —
-            // an up-to-date event is skipped. Plain connections, identity
-            // then messenger; a failure is logged and does not stop boot.
-            match routes::matrix::rooms::backfill_member_displaynames(&db_conn, &mut messenger_conn, &migration_now) {
-                Ok(0) => {}
-                Ok(written) => tracing::info!("Member displayname backfill: {} member event(s) re-stamped", written),
-                Err(e) => tracing::error!("Member displayname backfill failed: {:?}", e),
+                // Member-event `displayname` backfill: rooms created before the
+                // server stamped each user's effective label into their
+                // `m.room.member` events (clients title a DM after the peer's
+                // `displayname`, so those rooms show a 32-hex public id), plus
+                // any label that changed while no propagation ran. Idempotent —
+                // an up-to-date event is skipped. Plain connections, identity
+                // then messenger; a failure is logged and does not stop boot.
+                match routes::matrix::rooms::backfill_member_displaynames(&db_conn, &mut messenger_conn, &migration_now) {
+                    Ok(0) => {}
+                    Ok(written) => tracing::info!("Member displayname backfill: {} member event(s) re-stamped", written),
+                    Err(e) => tracing::error!("Member displayname backfill failed: {:?}", e),
+                }
             }
 
             // Initialize the operational database (plain SQLite, no key wait —
@@ -810,7 +857,7 @@ async fn main() {
             // after opening its own read-only connection with it.
             let alert_daemon_enabled =
                 std::env::var("MLC_ALERT_DAEMON").map(|v| v == "1").unwrap_or(false);
-            if alert_daemon_enabled {
+            if alert_daemon_enabled && !messenger_only {
                 let poll_secs: u64 = std::env::var("MLC_ALERT_POLL_SECS")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -914,7 +961,7 @@ async fn main() {
 
     // The login-challenge toggle is a row written by the staff route. The hot
     // path reads the atomic; this is the only load, after migrations.
-    if role == state::ServerRole::Control {
+    if role == state::ServerRole::Control && !messenger_only {
         let conn = app_state.control_plane().db.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = app_state.load_login_challenge(&conn) {
             tracing::error!("Failed to load the login challenge toggle: {e}");
@@ -923,7 +970,7 @@ async fn main() {
 
     // Live share hub background work (shutdown close, periodic rights
     // re-check) — control role only: the hub's rights live in the database.
-    if role == state::ServerRole::Control {
+    if role == state::ServerRole::Control && !messenger_only {
         share_live::spawn_hub_tasks(app_state.clone(), shutdown_tx.subscribe());
     }
 
@@ -935,7 +982,7 @@ async fn main() {
     // than waiting for the first `/_matrix/*` call that happens to touch
     // them. The recurring hourly sweep is P14's job (plan §1.1, manager
     // decision 3) — this is only the boot half.
-    if role == state::ServerRole::Control {
+    if role == state::ServerRole::Control && !proxy_matrix {
         let cp = app_state.control_plane();
         let now = chrono::Utc::now().to_rfc3339();
         let identity_conn = cp.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -951,7 +998,7 @@ async fn main() {
     // Start the Telegram login bot (background task) — control role only.
     // The bot calls db::confirm_tg_login_token synchronously via the closure,
     // which needs the control plane; an edge process has none.
-    if role == state::ServerRole::Control {
+    if role == state::ServerRole::Control && !messenger_only {
         let bot_token = app_state.telegram_bot_token.clone();
         let confirm_fn: tg_login_bot::ConfirmFn = {
             let state = app_state.clone();
@@ -975,7 +1022,7 @@ async fn main() {
     // — both the cold plane (SQL `sync_items`) and the hot plane (files under
     // `<data_dir>/sync/`, see `syncstore::cleanup_inactive`; added 2026-08-30
     // — the SQL sweep alone never touched hot-only users' files).
-    if role == state::ServerRole::Control {
+    if role == state::ServerRole::Control && !messenger_only {
         let state = app_state.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 60 * 60));
@@ -1020,17 +1067,22 @@ async fn main() {
                     // with money attached is kept for a human).
                     // Identity lock (`conn`) is held, so the messenger lock
                     // is taken after it — the lock order.
-                    let mut messenger_conn = cp.messenger_conn();
-                    let gc_result = crate::billing::anon::gc_pending(&conn, &mut messenger_conn, &cp.live, chrono::Utc::now());
-                    drop(messenger_conn);
-                    match gc_result {
-                        Ok(report) if report.deleted > 0 || report.kept_with_payment > 0 => tracing::info!(
-                            "Anonymous account GC: {} unpaid deleted, {} kept because a payment is attached",
-                            report.deleted,
-                            report.kept_with_payment
-                        ),
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("Anonymous account GC failed: {e}"),
+                    // Messenger process owns the messenger database lock for
+                    // this sweep once `/_matrix` is proxied. The product
+                    // server still expires sessions and shares.
+                    if !proxy_matrix {
+                        let mut messenger_conn = cp.messenger_conn();
+                        let gc_result = crate::billing::anon::gc_pending(&conn, &mut messenger_conn, &cp.live, chrono::Utc::now());
+                        drop(messenger_conn);
+                        match gc_result {
+                            Ok(report) if report.deleted > 0 || report.kept_with_payment > 0 => tracing::info!(
+                                "Anonymous account GC: {} unpaid deleted, {} kept because a payment is attached",
+                                report.deleted,
+                                report.kept_with_payment
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("Anonymous account GC failed: {e}"),
+                        }
                     }
                     drop(ops_conn);
                     drop(conn);
@@ -1099,7 +1151,7 @@ async fn main() {
     //   (`valid_bearer_token_hashes`/`valid_web_credential_refs` against
     //   every device row), so a tighter interval would just be needless
     //   load for no user-visible benefit.
-    if role == state::ServerRole::Control {
+    if role == state::ServerRole::Control && !proxy_matrix {
         let state = app_state.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -1109,7 +1161,7 @@ async fn main() {
             }
         });
     }
-    if role == state::ServerRole::Control {
+    if role == state::ServerRole::Control && !proxy_matrix {
         let state = app_state.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
@@ -1195,7 +1247,7 @@ async fn main() {
     // check on every request — an admin surface that isn't listening cannot
     // be reached by a bug, and "is it up" is externally verifiable the same
     // way `/health`'s absence would be: connection refused.
-    let dash_app = (role == state::ServerRole::Control).then(|| {
+    let dash_app = (role == state::ServerRole::Control && !messenger_only).then(|| {
         axum::Router::new()
             .route("/", axum::routing::get(routes::dashboard::render))
             .with_state(app_state.clone())
@@ -1206,7 +1258,7 @@ async fn main() {
     // mirror. Control role only, same reasoning as `dash_app` above: every
     // one of these reads `state.control_plane()` directly, which an edge
     // process does not have.
-    let blog_app = (role == state::ServerRole::Control).then(|| {
+    let blog_app = (role == state::ServerRole::Control && !messenger_only).then(|| {
         axum::Router::new()
             .route("/blog/posts.json", axum::routing::get(routes::posts::compat_posts_json))
             .route("/blog/feed.xml", axum::routing::get(routes::posts::feed_xml))
@@ -1227,7 +1279,7 @@ async fn main() {
     // response); the concurrency/timeout backstops mirror the main app's
     // own (`ConcurrencyLimitLayer`/`TimeoutLayer` further down). No per-IP
     // rate limit here — the admin listener has exactly one loopback peer.
-    let admin_app = (role == state::ServerRole::Control).then(|| {
+    let admin_app = (role == state::ServerRole::Control && !messenger_only).then(|| {
         axum::Router::new()
             .nest("/api", routes::admin_api_router(app_state.clone()))
             .layer(axum::middleware::from_fn(no_store_api_headers))
@@ -1255,8 +1307,17 @@ async fn main() {
     // intermediary, the same invariant `/api/*` already holds. Cloned ahead
     // of the `api_router` match below, which otherwise consumes `app_state`
     // by value.
-    let matrix_router =
-        (role == state::ServerRole::Control).then(|| routes::matrix_api_router(app_state.clone()));
+    // In-process routes, or a byte-for-byte proxy once the messenger process
+    // owns them. The messenger process does not rate-limit here: its only
+    // peer is the product server, so one bucket would cover every caller.
+    // The product server keeps the limiter on the proxied prefix.
+    let matrix_router = if proxy_matrix {
+        messenger_upstream.clone().map(messenger_proxy::router)
+    } else if role == state::ServerRole::Control {
+        Some(routes::matrix_api_router(app_state.clone()))
+    } else {
+        None
+    };
 
     // `/` as its own tiny state-carrying router (see `root_or_share_og`) —
     // built ahead of the `/api` router below for the same reason
@@ -1284,57 +1345,69 @@ async fn main() {
         state::ServerRole::Control => routes::control_api_router(app_state),
         state::ServerRole::Edge => routes::edge_api_router(app_state),
     };
-    // Per-IP token-bucket rate limiting (see ratelimit.rs) — one process-wide
-    // limiter, swept for idle entries every 5 minutes.
-    let rate_limiter = Arc::new(ratelimit::RateLimiter::new());
-    ratelimit::spawn_sweeper(rate_limiter.clone());
-    // Layering order here matters: `rate_limit_middleware` is added FIRST
-    // (innermost) and `no_store_api_headers` SECOND (outermost) — each
-    // subsequent `.layer()` call wraps the previous one, so the outermost
-    // layer's post-response step ALWAYS runs, even when an inner layer
-    // short-circuits with an early response. That is exactly what a 429
-    // does: without this ordering, a rate-limited response would skip
-    // `no_store_api_headers` entirely and reach the caller without
-    // `cache-control: no-store` — the one thing this ordering exists to
-    // prevent. `matrix_router` shares this SAME limiter (one per-IP bucket
-    // set across both `/api` and `/_matrix`, not two independent ones — both
-    // surfaces answer the same caller population) and gets the identical
-    // two-layer stack, same ordering, for the same reason.
-    let api_router = api_router
-        .layer(axum::middleware::from_fn_with_state(
-            rate_limiter.clone(),
-            ratelimit::rate_limit_middleware,
-        ))
-        .layer(axum::middleware::from_fn(no_store_api_headers));
-    let matrix_router = matrix_router.map(|router| {
-        router
+    let app = if messenger_only {
+        // Built so `app_state` is still consumed the same way. Not mounted.
+        let _ = (root_app, api_router, blog_app, outside_api);
+        let matrix_router =
+            matrix_router.map(|router| router.layer(axum::middleware::from_fn(no_store_api_headers)));
+        let app = axum::Router::new().merge(health_app);
+        match matrix_router {
+            Some(matrix_router) => app.nest("/_matrix", matrix_router),
+            None => app,
+        }
+    } else {
+        // Per-IP token-bucket rate limiting (see ratelimit.rs) — one process-wide
+        // limiter, swept for idle entries every 5 minutes.
+        let rate_limiter = Arc::new(ratelimit::RateLimiter::new());
+        ratelimit::spawn_sweeper(rate_limiter.clone());
+        // Layering order here matters: `rate_limit_middleware` is added FIRST
+        // (innermost) and `no_store_api_headers` SECOND (outermost) — each
+        // subsequent `.layer()` call wraps the previous one, so the outermost
+        // layer's post-response step ALWAYS runs, even when an inner layer
+        // short-circuits with an early response. That is exactly what a 429
+        // does: without this ordering, a rate-limited response would skip
+        // `no_store_api_headers` entirely and reach the caller without
+        // `cache-control: no-store` — the one thing this ordering exists to
+        // prevent. `matrix_router` shares this SAME limiter (one per-IP bucket
+        // set across both `/api` and `/_matrix`, not two independent ones — both
+        // surfaces answer the same caller population) and gets the identical
+        // two-layer stack, same ordering, for the same reason.
+        let api_router = api_router
             .layer(axum::middleware::from_fn_with_state(
-                rate_limiter,
+                rate_limiter.clone(),
                 ratelimit::rate_limit_middleware,
             ))
-            .layer(axum::middleware::from_fn(no_store_api_headers))
-    });
-    // `/` (see `root_or_share_og`'s doc comment) merges in alongside
-    // `blog_app`/`health_app`/`outside_api` below — ahead of the static
-    // fallback so the deleted landing page's index.html, if it is ever
-    // restored on disk by mistake, still cannot answer here.
-    let app = axum::Router::new().merge(root_app).nest("/api", api_router);
-    let app = match matrix_router {
-        Some(matrix_router) => app.nest("/_matrix", matrix_router),
-        None => app,
+            .layer(axum::middleware::from_fn(no_store_api_headers));
+        let matrix_router = matrix_router.map(|router| {
+            router
+                .layer(axum::middleware::from_fn_with_state(
+                    rate_limiter,
+                    ratelimit::rate_limit_middleware,
+                ))
+                .layer(axum::middleware::from_fn(no_store_api_headers))
+        });
+        // `/` (see `root_or_share_og`'s doc comment) merges in alongside
+        // `blog_app`/`health_app`/`outside_api` below — ahead of the static
+        // fallback so the deleted landing page's index.html, if it is ever
+        // restored on disk by mistake, still cannot answer here.
+        let app = axum::Router::new().merge(root_app).nest("/api", api_router);
+        let app = match matrix_router {
+            Some(matrix_router) => app.nest("/_matrix", matrix_router),
+            None => app,
+        };
+        // Literal routes (`/blog/posts.json`, `/blog/feed.xml`, `/blog/`, and
+        // `/health` below) always win over `outside_api`'s `/{dir}/{page}`
+        // parameter route and its `ServeDir` fallback regardless of merge order
+        // — matchit prioritises a static path segment over a dynamic one — so
+        // these merges can happen anywhere ahead of `.layer(...)` below. Exactly
+        // one of the routers being merged here (`outside_api`) sets a
+        // `fallback_service`; axum panics at merge time if two did.
+        let app = match blog_app {
+            Some(blog_app) => app.merge(blog_app),
+            None => app,
+        };
+        app.merge(health_app).merge(outside_api)
     };
-    // Literal routes (`/blog/posts.json`, `/blog/feed.xml`, `/blog/`, and
-    // `/health` below) always win over `outside_api`'s `/{dir}/{page}`
-    // parameter route and its `ServeDir` fallback regardless of merge order
-    // — matchit prioritises a static path segment over a dynamic one — so
-    // these merges can happen anywhere ahead of `.layer(...)` below. Exactly
-    // one of the routers being merged here (`outside_api`) sets a
-    // `fallback_service`; axum panics at merge time if two did.
-    let app = match blog_app {
-        Some(blog_app) => app.merge(blog_app),
-        None => app,
-    };
-    let app = app.merge(health_app).merge(outside_api);
     let app = app
         .layer(cors)
         .layer(axum::middleware::from_fn(security_headers))
