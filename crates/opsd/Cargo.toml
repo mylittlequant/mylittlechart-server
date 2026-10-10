@@ -15,11 +15,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
-# NB: not the workspace rusqlite — that one carries bundled-sqlcipher-vendored-openssl
-# (the production DB needs SQLCipher), which requires a working perl to build
-# openssl-src and does not compile on the Windows opbox. opsd.sqlite holds no
-# secrets (audit/kv only), so plain bundled SQLite suffices.
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Same pin as the server: rusqlite 0.40, bundled-sqlcipher. Vendored
+# OpenSSL stays on the musl target only. opsd.sqlite has no key; SQLCipher
+# still opens that plaintext file.
+rusqlite = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 subtle = { workspace = true }
