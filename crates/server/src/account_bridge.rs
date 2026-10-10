@@ -381,6 +381,71 @@ pub async fn credentials(State(state): State<Arc<AppState>>, headers: HeaderMap)
 
 pub const ASSERTION_HEADER: &str = HEADER_ASSERTION;
 
+/// Edge link. All three values must be set, or the product keeps the
+/// loopback messenger proxy. The secret is raw UTF-8, the same bytes the
+/// core uses. It is not logged.
+#[derive(Clone)]
+pub struct SeamLink {
+    pub base: String,
+    pub secret: Vec<u8>,
+    pub token: String,
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+pub fn seam_link() -> Option<SeamLink> {
+    let base = nonempty_env("M4A_PRODUCT_EDGE_URL")?;
+    let secret = nonempty_env("M4A_ASSERTION_SECRET")?;
+    let token = nonempty_env("M4A_LINK_TOKEN")?;
+    let base = base.trim_end_matches('/').to_string();
+    if base.is_empty() {
+        return None;
+    }
+    Some(SeamLink { base, secret: secret.into_bytes(), token })
+}
+
+/// Path the core checks: the edge removes a leading `/_matrix`.
+pub fn core_path(path_and_query: &str) -> &str {
+    let stripped = path_and_query.strip_prefix("/_matrix").unwrap_or(path_and_query);
+    if stripped.is_empty() {
+        "/"
+    } else {
+        stripped
+    }
+}
+
+/// Sign with `m4a-seam` over [`core_path`], not over the path the client used.
+pub fn seam_assertion(
+    secret: &[u8],
+    method: &str,
+    path_and_query: &str,
+    nick: &str,
+    paid: bool,
+    cred_ref: &str,
+) -> String {
+    let iat = chrono::Utc::now().timestamp();
+    let nonce_bytes: [u8; 16] = rand::random();
+    let assertion = m4a_seam::Assertion {
+        nick: nick.to_string(),
+        cred_ref: cred_ref.to_string(),
+        authenticated: 1,
+        paid: if paid { 1 } else { 0 },
+        iat,
+        exp: iat + m4a_seam::ASSERTION_TTL_S,
+        nonce: hex::encode(nonce_bytes),
+    };
+    m4a_seam::sign_assertion(secret, method, core_path(path_and_query), &assertion)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +462,32 @@ mod tests {
         assert!(verify_assertion("other-secret", "GET", "/_matrix/client/v3/sync?timeout=0", &header, now).is_err());
         assert!(verify_assertion("test-secret", "POST", "/_matrix/client/v3/sync?timeout=0", &header, now).is_err());
         assert!(verify_assertion("test-secret", "GET", "/_matrix/client/v3/sync?timeout=0", &header, now + 120).is_err());
+    }
+
+    #[test]
+    fn seam_signs_the_path_the_core_sees() {
+        let secret = b"test-secret";
+        let header = seam_assertion(secret, "GET", "/_matrix/client/v3/sync?timeout=0", "ada", true, "abc");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let ok = m4a_seam::verify_assertion(
+            &[secret.to_vec()],
+            &header,
+            "GET",
+            "/client/v3/sync?timeout=0",
+            now_ms,
+            30_000,
+        )
+        .expect("core path");
+        assert_eq!((ok.nick.as_str(), ok.paid, ok.cred_ref.as_str()), ("ada", 1, "abc"));
+        assert!(m4a_seam::verify_assertion(
+            &[secret.to_vec()],
+            &header,
+            "GET",
+            "/_matrix/client/v3/sync?timeout=0",
+            now_ms,
+            30_000,
+        )
+        .is_err());
     }
 
     #[test]

@@ -22,6 +22,8 @@ rand = { workspace = true }
 reqwest = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
+# Assertion wire shared with the messenger core. No SQLite in this crate.
+m4a-seam = "0.2.0"
 tokio-util = { workspace = true }
 subtle = { workspace = true }
 dotenvy = { workspace = true }

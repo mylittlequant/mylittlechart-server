@@ -587,18 +587,23 @@ async fn main() {
             Some(trimmed.to_string())
         }
     });
+    // All three, or none. Set, the proxy dials the edge and signs with
+    // m4a-seam. Unset, MESSENGER_UPSTREAM stays the upstream.
+    let seam = account_bridge::seam_link();
+    let proxy_base = seam.as_ref().map(|link| link.base.clone()).or_else(|| messenger_upstream.clone());
     if messenger_only && role != state::ServerRole::Control {
         tracing::error!("MLC_PROCESS=messenger requires MLC_ROLE=control");
         std::process::exit(1);
     }
-    let proxy_matrix =
-        role == state::ServerRole::Control && messenger_upstream.is_some() && !messenger_only;
+    let proxy_matrix = role == state::ServerRole::Control && proxy_base.is_some() && !messenger_only;
     if messenger_only {
         tracing::info!("messenger process: /health and /_matrix only");
+    } else if proxy_matrix && seam.is_some() {
+        tracing::info!("messenger proxy: /_matrix -> seam edge");
     } else if proxy_matrix {
         tracing::info!(
             "messenger proxy: /_matrix -> {}",
-            messenger_upstream.as_deref().unwrap_or("")
+            proxy_base.as_deref().unwrap_or("")
         );
     }
 
@@ -1320,9 +1325,9 @@ async fn main() {
     // peer is the product server, so one bucket would cover every caller.
     // The product server keeps the limiter on the proxied prefix.
     let matrix_router = if proxy_matrix {
-        messenger_upstream
+        proxy_base
             .clone()
-            .map(|base| messenger_proxy::router(base, app_state.clone()))
+            .map(|base| messenger_proxy::router(base, app_state.clone(), seam.clone()))
     } else if role == state::ServerRole::Control {
         Some(routes::matrix_api_router(app_state.clone()))
     } else {

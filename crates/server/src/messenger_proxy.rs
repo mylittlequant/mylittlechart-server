@@ -5,6 +5,11 @@
 //! routes. A client-supplied `x-account-assertion` is always removed.
 //! When `MLC_BRIDGE_SECRET` is set, a resolved chart account gets a
 //! signed assertion. The chart client does not change.
+//!
+//! `M4A_PRODUCT_EDGE_URL`, `M4A_ASSERTION_SECRET` and `M4A_LINK_TOKEN`
+//! together replace that upstream. The signature then comes from `m4a-seam`
+//! over the path with `/_matrix` removed, and the chart bearer is not
+//! forwarded. Any one of the three unset keeps today's proxy.
 
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
@@ -21,10 +26,11 @@ pub struct Upstream {
     base: String,
     client: reqwest::Client,
     app: Arc<AppState>,
+    seam: Option<crate::account_bridge::SeamLink>,
 }
 
 impl Upstream {
-    pub fn new(base: String, app: Arc<AppState>) -> Self {
+    pub fn new(base: String, app: Arc<AppState>, seam: Option<crate::account_bridge::SeamLink>) -> Self {
         // Loopback only. Do not inherit HTTP_PROXY, and do not follow a
         // redirect — the chart client has to see the messenger's own status.
         let client = reqwest::Client::builder()
@@ -33,12 +39,16 @@ impl Upstream {
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .expect("messenger upstream client");
-        Self { base: base.trim_end_matches('/').to_string(), client, app }
+        Self { base: base.trim_end_matches('/').to_string(), client, app, seam }
     }
 }
 
-pub fn router(base: String, app: Arc<AppState>) -> axum::Router {
-    axum::Router::new().fallback(forward).with_state(Upstream::new(base, app))
+pub fn router(
+    base: String,
+    app: Arc<AppState>,
+    seam: Option<crate::account_bridge::SeamLink>,
+) -> axum::Router {
+    axum::Router::new().fallback(forward).with_state(Upstream::new(base, app, seam))
 }
 
 fn hop(name: &header::HeaderName) -> bool {
@@ -89,18 +99,45 @@ async fn forward(State(upstream): State<Upstream>, OriginalUri(uri): OriginalUri
     let mut headers = reqwest::header::HeaderMap::new();
     copy_headers(&headers_in, &mut headers);
     headers.remove(crate::account_bridge::ASSERTION_HEADER);
+    headers.remove(m4a_seam::DEFAULT_ASSERTION_HEADER);
+    headers.remove(m4a_seam::LINK_TOKEN_HEADER);
+    headers.remove(m4a_seam::ANON_READ_HEADER);
     let method_name = method.as_str().to_string();
     let app = upstream.app.clone();
     let headers_for_auth = headers_in;
+    let seam = upstream.seam.clone();
+    let path_for_auth = path_and_query.clone();
+    let method_for_auth = method_name.clone();
     let assertion = tokio::task::spawn_blocking(move || {
-        assertion_for(&app, &headers_for_auth, &method_name, &path_and_query)
+        assertion_for(&app, &headers_for_auth, &method_for_auth, &path_for_auth, seam.as_ref())
     })
     .await
     .ok()
     .flatten();
+    if let Some(link) = &upstream.seam {
+        headers.remove(header::AUTHORIZATION);
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&link.token) {
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(m4a_seam::LINK_TOKEN_HEADER.as_bytes()) {
+                headers.insert(name, value);
+            }
+        }
+    }
     if let Some(assertion) = assertion {
+        let name = if upstream.seam.is_some() {
+            m4a_seam::DEFAULT_ASSERTION_HEADER
+        } else {
+            crate::account_bridge::ASSERTION_HEADER
+        };
         if let Ok(value) = reqwest::header::HeaderValue::from_str(&assertion) {
-            headers.insert(crate::account_bridge::ASSERTION_HEADER, value);
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
+                headers.insert(name, value);
+            }
+        }
+    } else if upstream.seam.is_some()
+        && m4a_seam::anon_read_path_ok(&method_name, crate::account_bridge::core_path(&path_and_query))
+    {
+        if let Ok(name) = reqwest::header::HeaderName::from_bytes(m4a_seam::ANON_READ_HEADER.as_bytes()) {
+            headers.insert(name, reqwest::header::HeaderValue::from_static("1"));
         }
     }
     let sent = upstream.client.request(method, url).headers(headers).body(body.to_vec()).send().await;
@@ -137,8 +174,17 @@ async fn forward(State(upstream): State<Upstream>, OriginalUri(uri): OriginalUri
     response.body(Body::from(bytes.to_vec())).unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
-fn assertion_for(app: &AppState, headers: &HeaderMap, method: &str, path_and_query: &str) -> Option<String> {
-    let secret = crate::account_bridge::secret()?;
+fn assertion_for(
+    app: &AppState,
+    headers: &HeaderMap,
+    method: &str,
+    path_and_query: &str,
+    seam: Option<&crate::account_bridge::SeamLink>,
+) -> Option<String> {
+    let secret = match seam {
+        Some(_) => None,
+        None => Some(crate::account_bridge::secret()?),
+    };
     let session_id = crate::auth::extract_session_id(headers);
     let bearer = crate::auth::extract_bearer(
         headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()),
@@ -163,7 +209,24 @@ fn assertion_for(app: &AppState, headers: &HeaderMap, method: &str, path_and_que
         return None;
     }
     let paid = crate::db::user_is_paid(&conn, user_id).unwrap_or(false);
-    Some(crate::account_bridge::assertion_header(&secret, method, path_and_query, &nick, paid, &cred_ref))
+    if let Some(link) = seam {
+        return Some(crate::account_bridge::seam_assertion(
+            &link.secret,
+            method,
+            path_and_query,
+            &nick,
+            paid,
+            &cred_ref,
+        ));
+    }
+    Some(crate::account_bridge::assertion_header(
+        secret.as_deref()?,
+        method,
+        path_and_query,
+        &nick,
+        paid,
+        &cred_ref,
+    ))
 }
 
 fn hop_str(name: &str) -> bool {
