@@ -82,7 +82,13 @@ pub const DEFAULT_BACKUP_PULL_DIR: &str = "E:\\backups\\mlc-c2-1";
 
 /// systemd units opsd is allowed to touch remotely. Anything outside this
 /// list is rejected before a command string is ever built (injection guard).
-pub const UNIT_WHITELIST: [&str; 4] = ["mlc-server", "nginx", "nftables", "fail2ban"];
+pub const UNIT_WHITELIST: [&str; 5] = [
+    "mlc-server",
+    "mlc-messenger",
+    "nginx",
+    "nftables",
+    "fail2ban",
+];
 
 #[derive(Debug, Clone)]
 pub struct BoxConfig {

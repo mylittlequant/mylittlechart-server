@@ -60,7 +60,7 @@ where
 const STATUS_DESC: &str = "One SSH round-trip to control: systemd ActiveState/SubState for \
 mlc-server/nginx/nftables/fail2ban, app health, disk/mem, uptime. Read-only, safe.";
 const RESTART_DESC: &str = "Body {unit}. Restarts one systemd unit on control — whitelist only: \
-mlc-server | nginx | nftables | fail2ban (state::UNIT_WHITELIST); anything else is rejected before a \
+mlc-server | mlc-messenger | nginx | nftables | fail2ban (state::UNIT_WHITELIST); anything else is rejected before a \
 command string is built. Drops the unit's traffic/connections for the restart duration.";
 const LOGS_DESC: &str = "Journal tail from control (query unit=, default mlc-server; lines=, default 50, \
 clamped 1..500 server-side; unit restricted to the same whitelist as /api/restart). Read-only, safe.";
